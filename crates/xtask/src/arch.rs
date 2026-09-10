@@ -25,7 +25,7 @@
 //!   update.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::Value;
@@ -462,27 +462,6 @@ fn cargo_metadata(root: &Path) -> Result<Value, String> {
         .map_err(|e| format!("cargo metadata printed invalid JSON: {e}"))
 }
 
-/// Walk up from start to the nearest directory whose Cargo.toml declares a
-/// [workspace] section. xtask lives inside the workspace, so its own exe path
-/// is useless — the caller's CWD is the anchor.
-fn find_workspace_root(start: &Path) -> Result<PathBuf, String> {
-    let mut dir = Some(start);
-    while let Some(d) = dir {
-        let manifest = d.join("Cargo.toml");
-        if manifest.is_file() {
-            let text = std::fs::read_to_string(&manifest).unwrap_or_default();
-            if text.lines().any(|line| line.trim() == "[workspace]") {
-                return Ok(d.to_path_buf());
-            }
-        }
-        dir = d.parent();
-    }
-    Err(format!(
-        "no workspace root (a Cargo.toml with a [workspace] section) found above {}",
-        start.display()
-    ))
-}
-
 /// The packages the rules constrain, in first-appearance order.
 fn checked_packages() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = Vec::new();
@@ -504,7 +483,7 @@ pub fn run() -> i32 {
             return 2;
         }
     };
-    let root = match find_workspace_root(&cwd) {
+    let root = match crate::find_workspace_root(&cwd) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("check-arch: {e}");
