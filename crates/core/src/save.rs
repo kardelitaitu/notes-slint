@@ -152,8 +152,7 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError>
     // reported success for a note the user can never open again. The strip
     // rule now applies to every component, extended prefix or not, through
     // the same shared predicate path_policy judges with.
-    if crate::path_policy::any_component_is_stripped(target)
-    {
+    if crate::path_policy::any_component_is_stripped(target) {
         return Err(SaveError::InvalidPath(
             "a component of the path ends with '.' or a space, which Windows strips — the file written would not be the one named; rename the target"
                 .to_owned(),
@@ -729,8 +728,7 @@ mod tests {
     /// test pinned the carve-out that wrote a note nothing else could open
     /// (plain spelling StrippedName, dialog and Explorer unreachable).
     #[test]
-    fn extended_prefix_stripped_target_is_refused_too()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn extended_prefix_stripped_target_is_refused_too() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         // canonicalise returns the verbatim \\?\ form, which also rules out
         // 8.3 short names in the composed target.
