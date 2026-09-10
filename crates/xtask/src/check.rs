@@ -27,6 +27,10 @@ pub enum Outcome {
     Timeout,
     CouldNotRun,
     Skipped,
+    /// The step ran and DECLINED: exit 3 means "this environment cannot host
+    /// this check", which is neither a pass nor a failure. Only smoke uses it -
+    /// a session with no interactive desktop must not be held against anyone.
+    Declined,
 }
 
 impl Outcome {
@@ -40,6 +44,7 @@ impl Outcome {
             Outcome::CouldNotRun if advisory => "COULD NOT RUN (advisory — does not gate)",
             Outcome::CouldNotRun => "COULD NOT RUN",
             Outcome::Skipped => "SKIPPED (--quick)",
+            Outcome::Declined => "DECLINED (no desktop here)",
         }
     }
 
@@ -151,6 +156,18 @@ fn step_specs() -> Vec<StepSpec> {
             budget_secs: 180,
         },
         StepSpec {
+            name: "smoke",
+            display: "cargo run -p xtask -- smoke (advisory: opens a real window on this desktop)",
+            program: "cargo",
+            args: &["run", "-p", "xtask", "--quiet", "--", "smoke"],
+            // Advisory, never a gate: a runner with no desktop is not a broken
+            // repo, and a GUI row that goes red for an environmental reason
+            // trains people to ignore the row. --quick skips it too.
+            advisory: true,
+            quick_skippable: true,
+            budget_secs: 120,
+        },
+        StepSpec {
             name: "bridge",
             display: "cargo check -p notes-bridge-gpui (advisory: excluded from the gate by design, D1)",
             program: "cargo",
@@ -170,6 +187,10 @@ fn step_specs() -> Vec<StepSpec> {
         },
     ]
 }
+
+/// A step exits 3 to say it DECLINED (see Outcome::Declined). It can never
+/// gate: an environment without a desktop is not a broken repo.
+const DECLINED_EXIT: i32 = 3;
 
 /// Spawn the child with inherited stdio (its output streams; its exit code is
 /// the truth) and enforce a wall-clock budget. A deadlocked test suite must
@@ -192,6 +213,8 @@ fn run_child(spec: &StepSpec, root: &Path) -> Outcome {
             Ok(Some(status)) => {
                 return if status.success() {
                     Outcome::Pass
+                } else if status.code() == Some(DECLINED_EXIT) {
+                    Outcome::Declined
                 } else {
                     Outcome::Fail
                 };
@@ -236,7 +259,7 @@ pub fn run(quick: bool) -> i32 {
     println!("check: workspace root {}", root.display());
     if quick {
         println!(
-            "check: --quick — the workspace-wide clippy and test steps are SKIPPED; this is not a full verdict"
+            "check: --quick — the workspace-wide clippy and test steps and the GUI smoke row are              SKIPPED; this is not a full verdict"
         );
     }
     let specs = step_specs();
@@ -291,7 +314,15 @@ pub fn run(quick: bool) -> i32 {
         "check: {gate_failures} gate failures, {advisory_failures} advisory failures, {skipped} skipped -> exit {code}"
     );
     if quick && code == 0 {
-        println!("check: --quick pass is NOT a full pass — steps clippy and test were skipped");
+        let names: Vec<&str> = verdicts
+            .iter()
+            .filter(|v| v.outcome == Outcome::Skipped)
+            .map(|v| v.name)
+            .collect();
+        println!(
+            "check: --quick pass is NOT a full pass — steps {} were skipped",
+            names.join(", ")
+        );
     }
     code
 }
@@ -328,6 +359,25 @@ mod tests {
             !deps.quick_skippable,
             "check-deps reads manifests only; --quick must not skip it"
         );
+    }
+
+    /// xtask is inside the workspace gate, so a step that opens a real window
+    /// must not be able to run by default: it has to be advisory AND skipped by
+    /// --quick, or a headless runner goes red for an environmental reason.
+    #[test]
+    fn the_gui_step_can_never_gate_and_never_runs_by_default() {
+        let smoke = step_specs()
+            .into_iter()
+            .find(|s| s.name == "smoke")
+            .expect("smoke row");
+        assert!(smoke.advisory, "smoke opens a window; it must never gate");
+        assert!(smoke.quick_skippable, "--quick must not open a window");
+        assert!(
+            smoke.budget_secs > 60,
+            "the row budget must exceed the harness's own deadlines"
+        );
+        let declined_gates = Outcome::Declined.gates();
+        assert!(!declined_gates, "a declined row cannot gate anything");
     }
 
     #[test]
@@ -430,6 +480,21 @@ mod tests {
             exit_code(&verdicts),
             1,
             "--quick still reports real failures"
+        );
+    }
+
+    #[test]
+    fn a_declined_step_never_gates() {
+        // exit 3 from smoke: reported, never fatal, and never a PASS either.
+        let verdicts = vec![
+            v("fmt", Outcome::Pass, false),
+            v("smoke", Outcome::Declined, true),
+        ];
+        assert_eq!(exit_code(&verdicts), 0);
+        assert!(!Outcome::Declined.gates(), "a decline is not a failure");
+        assert!(
+            !Outcome::Declined.label(true).contains("PASS"),
+            "a decline must not read as a pass"
         );
     }
 

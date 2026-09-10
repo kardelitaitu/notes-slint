@@ -5,6 +5,7 @@ mod check;
 mod deps;
 mod fixtures;
 mod metadata;
+mod smoke;
 
 fn usage() {
     eprintln!("usage: cargo xtask check-arch");
@@ -13,6 +14,11 @@ fn usage() {
     );
     eprintln!("usage: cargo xtask check-deps");
     eprintln!("       reject dependency declarations that can drift from the workspace templates");
+    eprintln!("usage: cargo xtask smoke [--reuse-state]");
+    eprintln!(
+        "       launch the built binary, close its window with WM_CLOSE, prove it exits by itself"
+    );
+    eprintln!("       (opens a real window; exits 3 when there is no desktop to test on)");
     eprintln!("usage: cargo xtask check [--quick]");
     eprintln!(
         "       run the AGENTS.md gate with per-step verdicts (--quick skips the slow steps)"
@@ -41,6 +47,7 @@ fn main() {
         }
         Some("check-arch") => std::process::exit(arch::run()),
         Some("check-deps") => std::process::exit(deps::run()),
+        Some("smoke") => std::process::exit(smoke::run(&args[1..])),
         Some("fixtures") => match args.get(1).map(String::as_str) {
             Some("generate") => std::process::exit(fixtures::run_generate()),
             Some("verify") => std::process::exit(fixtures::run_verify(&args[2..])),
