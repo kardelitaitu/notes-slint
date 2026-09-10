@@ -60,6 +60,11 @@
 //!   the stale exe sitting in target/debug;
 //! * 5 - the binary is OLDER THAN ITS SOURCES: the build no-oped or --no-build
 //!   was used, so whatever would be tested is not this tree.
+//! * 6 - the WINDOW MEMORY PROMISE DID NOT HOLD: the app ran, closed cleanly and
+//!   persisted something, but the seeded rect was not restored, or a harness-driven
+//!   move never reached session.json, or the relaunch came back elsewhere. Geometry
+//!   that could not be measured prints "NOT JUDGED (advisory)" and leaves the exit
+//!   code alone - an unverifiable step must not be reported as a pass or a failure.
 //! * 3 - DECLINED for a reason that is not the app's fault: no interactive
 //!   desktop (no sessions win32k user32.dll), no window handle even though the
 //!   app kept running, or the session path holding foreign state this harness
@@ -998,6 +1003,586 @@ fn report_binary(exe: &Path, root: &Path, built: bool) {
     );
 }
 
+/// The geometry round trip: seed a rect, launch, read where the window really
+/// is in FRAME and CLIENT pixels, move it, close, read what got persisted, then
+/// relaunch and read where it came back. Prints numbers, never an assert string.
+const GEOMETRY_PROBE: &str = r#"
+param([Parameter(Mandatory)][string]$Exe, [string]$ErrFile,
+       [int]$SeedX = 0, [int]$SeedY = 0, [int]$SeedW = 0, [int]$SeedH = 0,
+       [int]$MoveX = -1, [int]$MoveY = -1,
+       [int]$WindowSecs = 10, [int]$SettleMs = 4500, [int]$CloseSecs = 10)
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Windows.Forms
+$wa = [System.Windows.Forms.SystemInformation]::WorkingArea
+"WORK=$($wa.X),$($wa.Y),$($wa.X + $wa.Width),$($wa.Y + $wa.Height)"
+$code = @'
+using System;
+using System.Runtime.InteropServices;
+public static class WIN {
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+  [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hh, bool rep);
+}
+'@
+if (-not (Add-Type -TypeDefinition $code -PassThru)) { 'WIN32=0'; 'PROBE_DONE=1'; exit 0 }
+'WIN32=1'
+$interactive = [Environment]::UserInteractive
+$windowed = (Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1)
+if (-not ($interactive -and $windowed)) { 'DESKTOP=0'; 'PROBE_DONE=1'; exit 0 }
+'DESKTOP=1'
+'DESKTOP=1'
+# WindowSecs 0 = answer WORK/DESKTOP/WIN32 and leave without launching: the seed
+# rect has to be computed from the work area BEFORE the app starts, so the round
+# trip's first call must not open a window.
+if ($WindowSecs -eq 0) { 'REPORTONLY=1'; 'PROBE_DONE=1'; exit 0 }
+$p = Start-Process -FilePath $Exe -PassThru -RedirectStandardError $ErrFile
+if ($null -eq $p) { 'SPAWN=0'; 'PROBE_DONE=1'; exit 0 }
+$deadline = (Get-Date).AddSeconds($WindowSecs)
+$handle = [IntPtr]::zero
+while ((Get-Date) -lt $deadline) {
+    $p.Refresh()
+    if ($p.MainWindowHandle -ne 0) { $handle = $p.MainWindowHandle; break }
+    if ($p.HasExited) { break }
+    Start-Sleep -Milliseconds 100
+}
+"HANDLE=$([int64]$handle)"
+function Get-Frame($h) {
+    $r = New-Object WIN+RECT
+    if ([WIN]::GetWindowRect($h, [ref]$r)) { return "$($r.Left),$($r.Top),$($r.Right),$($r.Bottom)" }
+    return ''
+}
+function Get-Client($h) {
+    $r = New-Object WIN+RECT
+    $pt = New-Object WIN+POINT
+    if (-not [WIN]::GetClientRect($h, [ref]$r)) { return '' }
+    if (-not [WIN]::ClientToScreen($h, [ref]$pt)) { return '' }
+    return "$($pt.X),$($pt.Y),$($pt.X + $r.Right),$($pt.Y + $r.Bottom)"
+}
+"FRAME=$(Get-Frame $handle)"
+"CLIENT=$(Get-Client $handle)"
+if ($MoveX -ge 0) {
+    $f = Get-Frame $handle
+    if ($f -ne '') {
+        $a = $f.Split(',')
+        $w = [int]$a[2] - [int]$a[0]
+        $hh = [int]$a[3] - [int]$a[1]
+        [void][WIN]::MoveWindow($handle, $MoveX, $MoveY, $w, $hh, $true)
+        Start-Sleep -Milliseconds $SettleMs
+        $f2 = Get-Frame $handle
+        $c2 = Get-Client $handle
+        "MOVED=$([int]($f2 -ne $f))"
+        "FRAME_AFTER=$f2"
+        "CLIENT_AFTER=$c2"
+    } else { 'MOVED=0' }
+}
+if ($handle -ne 0 -and -not $p.HasExited) { [void]$p.CloseMainWindow() }
+if (-not $p.HasExited) { [void]$p.WaitForExit($CloseSecs * 1000) }
+if ($p.HasExited) { 'EXITED_WITHOUT_KILL=1'; "EXIT_CODE=$($p.ExitCode)" } else {
+    'EXITED_WITHOUT_KILL=0'; Stop-Process -Id $p.Id -Force; $p.WaitForExit()
+}
+'PROBE_DONE=1'
+exit 0
+"#;
+
+/// A rectangle in screen pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub l: i32,
+    pub t: i32,
+    pub r: i32,
+    pub b: i32,
+}
+
+impl Rect {
+    pub fn parse(text: &str) -> Option<Rect> {
+        let n: Vec<i32> = text
+            .trim()
+            .split(',')
+            .filter_map(|s| s.trim().parse::<i32>().ok())
+            .collect();
+        if n.len() == 4 {
+            Some(Rect {
+                l: n[0],
+                t: n[1],
+                r: n[2],
+                b: n[3],
+            })
+        } else {
+            None
+        }
+    }
+    fn within(&self, other: &Rect, tol: i32) -> bool {
+        (self.l - other.l).abs() <= tol
+            && (self.t - other.t).abs() <= tol
+            && (self.r - other.r).abs() <= tol
+            && (self.b - other.b).abs() <= tol
+    }
+    fn deltas(&self, target: &Rect) -> [i32; 4] {
+        [
+            self.l - target.l,
+            self.t - target.t,
+            self.r - target.r,
+            self.b - target.b,
+        ]
+    }
+    pub fn text(&self) -> String {
+        format!("{},{},{},{}", self.l, self.t, self.r, self.b)
+    }
+}
+
+/// Where a window sits relative to the rect it was told to restore.
+///
+/// TOLERANCE, and why a few pixels still separates the two failure modes: the
+/// app persists what gpui reports (client area), while GetWindowRect answers in
+/// frame pixels, and on this build the frame is the 8/19/8/20 chrome - a 16 px
+/// horizontal and 39 px vertical difference. A tolerance of 6 px is therefore
+/// wide enough for rounding at a non-100% DPI and narrow enough that "restored
+/// in the wrong space" cannot pass as "restored at all": it shows up as
+/// ChromeOffset with the real numbers printed, not as a green line.
+pub const PLACEMENT_TOLERANCE: i32 = 6;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// The window is where the seed said, measured in the named space.
+    At { space: &'static str },
+    /// It is off by about exactly the chrome: a space confusion, not a memory loss.
+    ChromeOffset { deltas: [i32; 4] },
+    /// Nothing about that explains it.
+    Off { deltas: [i32; 4] },
+    /// No rect could be read at all.
+    Unreadable,
+}
+
+pub fn place(seed: &Rect, frame: Option<&Rect>, client: Option<&Rect>) -> Placement {
+    let tol = PLACEMENT_TOLERANCE;
+    if client.is_some_and(|c| c.within(seed, tol)) {
+        return Placement::At { space: "client" };
+    }
+    if frame.is_some_and(|f| f.within(seed, tol)) {
+        return Placement::At { space: "frame" };
+    }
+    // The chrome is measurable on this very window, so the offset signature can
+    // be compared against it instead of against a remembered number.
+    if let (Some(f), Some(c)) = (frame, client) {
+        let chrome = [c.l - f.l, c.t - f.t, c.r - f.r, c.b - f.b];
+        for probe in [f, c] {
+            let d = probe.deltas(seed);
+            if d.iter()
+                .zip(chrome.iter())
+                .all(|(a, b)| (*a + *b).abs() <= tol)
+            {
+                return Placement::ChromeOffset { deltas: d };
+            }
+        }
+    }
+    match frame.or(client) {
+        Some(p) => Placement::Off {
+            deltas: p.deltas(seed),
+        },
+        None => Placement::Unreadable,
+    }
+}
+
+/// The persisted rect, out of the app's own session.json.
+pub fn persisted_rect(text: &str) -> Option<Rect> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let rect = value.get("rect")?;
+    let n = |k: &str| {
+        rect.get(k)
+            .and_then(serde_json::Value::as_i64)
+            .map(|v| v as i32)
+    };
+    Some(Rect {
+        l: n("x")?,
+        t: n("y")?,
+        r: n("x")? + n("w")?,
+        b: n("y")? + n("h")?,
+    })
+}
+
+/// Did the app persist the rect the harness chose, the seed, or neither?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Persisted {
+    Moved,
+    StillTheSeed,
+    Neither { got: Rect },
+    NothingWritten,
+}
+
+pub fn persisted(got: Option<Rect>, seed: &Rect, moved: &Rect) -> Persisted {
+    let Some(got) = got else {
+        return Persisted::NothingWritten;
+    };
+    if got.within(moved, PLACEMENT_TOLERANCE) {
+        Persisted::Moved
+    } else if got.within(seed, PLACEMENT_TOLERANCE) {
+        Persisted::StillTheSeed
+    } else {
+        Persisted::Neither { got }
+    }
+}
+/// A geometry round trip that could not be measured. Never a pass, never a red:
+/// a line saying what was not proven.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Geometry {
+    /// restore / persist / relaunch all matched, with the rects printed.
+    Proven {
+        restore: &'static str,
+        relaunch: &'static str,
+    },
+    /// Something about the machine or the app refused to be deterministic.
+    NotJudged(&'static str),
+    /// Measured, and the promise did not hold.
+    Broken(Vec<String>),
+}
+
+/// Where the harness put the window, and where the app thought it was.
+pub const SEEDED: (i32, i32, i32, i32) = (337, 241, 620, 420);
+pub const MOVE_BY: (i32, i32) = (53, 37);
+/// The seed is far from the built-in default (120,90,800,600) on purpose: an
+/// app that ignored the stored rect lands on the default, and an app that never
+/// opened a window lands nowhere, so a coincidence cannot produce a green run.
+pub const DEFAULT_RECT_HINT: &str = "120,90,800,600";
+/// Longer than one flush tick plus the poll quiet window (the bridge reports
+/// "quiet N ms, force N ms"; 4.5 s clears the observed 1 s quiet and a 3 s force).
+pub const SETTLE_MS: i32 = 4500;
+/// A geometry failure is its own verdict, so a CI annotation can name it: the
+/// app ran, closed cleanly and persisted something, but not the right thing.
+pub const GEOMETRY_FAILED_EXIT: i32 = 6;
+
+/// Fit the seed inside a work area that might be one monitor, might be two, and
+/// might not be 100% scaled. None means "cannot be judged here".
+pub fn seed_in(work: &Rect, size: (i32, i32), default_hint: &Rect) -> Option<(Rect, Rect)> {
+    let (w, h) = size;
+    if work.r - work.l < w + 40 || work.b - work.t < h + 40 {
+        return None;
+    }
+    let l = work.l + SEEDED.0.min((work.r - work.l - w) / 2);
+    let t = work.t + SEEDED.1.min((work.b - work.t - h) / 2);
+    let seed = Rect {
+        l,
+        t,
+        r: l + w,
+        b: t + h,
+    };
+    if seed == *default_hint {
+        return None;
+    }
+    // The move goes the other way if it would push the window off the right edge.
+    let dx = if seed.r + MOVE_BY.0 <= work.r {
+        MOVE_BY.0
+    } else {
+        -MOVE_BY.0
+    };
+    let dy = if seed.b + MOVE_BY.1 <= work.b {
+        MOVE_BY.1
+    } else {
+        -MOVE_BY.1
+    };
+    let moved = Rect {
+        l: seed.l + dx,
+        t: seed.t + dy,
+        r: seed.r + dx,
+        b: seed.b + dy,
+    };
+    Some((seed, moved))
+}
+
+pub fn run_probe_script(
+    script: &Path,
+    exe: &Path,
+    err_file: &Path,
+    seed: Option<&Rect>,
+    move_to: Option<(i32, i32)>,
+    secs: u64,
+) -> Result<Probe, String> {
+    let mut cmd = std::process::Command::new("pwsh");
+    cmd.args(["-NoProfile", "-NonInteractive", "-File"])
+        .arg(script)
+        .arg("-Exe")
+        .arg(exe)
+        .arg("-ErrFile")
+        .arg(err_file)
+        .arg("-WindowSecs")
+        .arg(secs.to_string())
+        .arg("-SettleMs")
+        .arg(SETTLE_MS.to_string())
+        .arg("-MoveX")
+        .arg(match move_to {
+            Some((x, _)) => x.to_string(),
+            None => "-1".to_string(),
+        })
+        .arg("-MoveY")
+        .arg(match move_to {
+            Some((_, y)) => y.to_string(),
+            None => "-1".to_string(),
+        });
+    if let Some(s) = seed {
+        cmd.arg("-SeedX")
+            .arg(s.l.to_string())
+            .arg("-SeedY")
+            .arg(s.t.to_string())
+            .arg("-SeedW")
+            .arg((s.r - s.l).to_string())
+            .arg("-SeedH")
+            .arg((s.b - s.t).to_string());
+    }
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot start the geometry probe: {e}"))?;
+    match wait_bounded(&mut child, OUTER_SECS) {
+        Ok(Some(_)) => Ok(parse_probe(&read_pipe(child.stdout.as_mut()))),
+        Ok(None) => Err("the geometry probe outlived its deadline".to_string()),
+        Err(e) => Err(e),
+    }
+}
+/// Rewrite ONLY the rect numbers in the app's own session.json, keeping every
+/// other field exactly as the app wrote it. Returns the bytes that were there
+/// before, so the caller can put them back.
+pub fn seed_session(path: &Path, seed: &Rect) -> Result<Option<Vec<u8>>, String> {
+    let before = match fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let mut value: serde_json::Value = match &before {
+        Some(bytes) => serde_json::from_slice(bytes)
+            .map_err(|e| format!("{} is not JSON the app wrote: {e}", path.display()))?,
+        None => serde_json::json!({ "rect": {} }),
+    };
+    let rect = value
+        .as_object_mut()
+        .ok_or_else(|| "session.json is not a JSON object".to_string())?;
+    let entry = rect
+        .entry("rect".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let obj = entry
+        .as_object_mut()
+        .ok_or_else(|| "session.json has no rect object to seed".to_string())?;
+    obj.insert("x".into(), serde_json::json!(seed.l));
+    obj.insert("y".into(), serde_json::json!(seed.t));
+    obj.insert("w".into(), serde_json::json!(seed.r - seed.l));
+    obj.insert("h".into(), serde_json::json!(seed.b - seed.t));
+    let text = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    fs::write(path, text).map_err(|e| format!("cannot seed {}: {e}", path.display()))?;
+    Ok(before)
+}
+
+fn probe_rect(probe: &Probe, key: &str) -> Option<Rect> {
+    probe.get(key).and_then(Rect::parse)
+}
+
+fn placement_text(p: &Placement) -> &'static str {
+    match p {
+        Placement::At { space } => space,
+        _ => "NOT-AT",
+    }
+}
+
+/// The whole round trip. Every branch prints what it learned, and anything that
+/// cannot be measured here becomes NotJudged with a reason rather than a pass.
+pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: &Path) -> Geometry {
+    let mut notes: Vec<String> = Vec::new();
+    // 1. Where is the screen, actually. WindowSecs 0 = report only, no launch.
+    let work = match run_probe_script(script, exe, err_file, None, None, 0) {
+        Err(e) => return Geometry::NotJudged(e.leak() as &str),
+        Ok(probe) => {
+            if !probe.flag("DESKTOP") {
+                return Geometry::NotJudged("no interactive desktop to place a window on");
+            }
+            if !probe.flag("WIN32") {
+                return Geometry::NotJudged("this PowerShell cannot load the Win32 declarations");
+            }
+            match probe_rect(&probe, "WORK") {
+                Some(w) => w,
+                None => return Geometry::NotJudged("the work area could not be read"),
+            }
+        }
+    };
+    let (seed, moved) = match seed_in(
+        &work,
+        (SEEDED.2, SEEDED.3),
+        &Rect {
+            l: 120,
+            t: 90,
+            r: 920,
+            b: 690,
+        },
+    ) {
+        Some(pair) => pair,
+        None => {
+            return Geometry::NotJudged(
+                "the primary work area is too small to hold the seed rect and the move",
+            );
+        }
+    };
+    println!(
+        "smoke: geometry: work area {} - seeded rect {} (default is {DEFAULT_RECT_HINT}), moved to {}",
+        work.text(),
+        seed.text(),
+        moved.text()
+    );
+    let before = match seed_session(session, &seed) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            println!("SMOKE GEOMETRY: the seed could not be written: {e}");
+            return Geometry::NotJudged("the session file refused to be seeded");
+        }
+    };
+    // 2. Launch, and see where the window really is.
+    let first = match run_probe_script(
+        script,
+        exe,
+        err_file,
+        Some(&seed),
+        Some((moved.l, moved.t)),
+        SETTLE_MS as u64 / 1000 + 12,
+    ) {
+        Err(e) => {
+            restore_session(session, before.as_deref());
+            return Geometry::NotJudged(e.leak() as &str);
+        }
+        Ok(p) => p,
+    };
+    let frame = probe_rect(&first, "FRAME");
+    let client = probe_rect(&first, "CLIENT");
+    let restore = place(&seed, frame.as_ref(), client.as_ref());
+    match &restore {
+        Placement::At { space } => println!(
+            "smoke: geometry: RESTORE ok - the window is at the seeded rect, read in {space} space (frame {} client {})",
+            frame.map(|f| f.text()).unwrap_or_else(|| "-".into()),
+            client.map(|c| c.text()).unwrap_or_else(|| "-".into())
+        ),
+        Placement::ChromeOffset { deltas } => println!(
+            "smoke: geometry: WARNING - the window is off the seeded rect by {deltas:?}, which is about the frame chrome (8/19/8/20 at 100%): the seed was applied in one space and measured in the other. Not a memory failure, so not a red."
+        ),
+        Placement::Off { deltas } => {
+            notes.push(format!(
+                "RESTORE: the window is not at the seeded rect {} (frame {} client {}), deltas {deltas:?}",
+                seed.text(),
+                frame.map(|f| f.text()).unwrap_or_else(|| "-".into()),
+                client.map(|c| c.text()).unwrap_or_else(|| "-".into())
+            ));
+        }
+        Placement::Unreadable => notes.push("RESTORE: no window rect could be read".to_string()),
+    }
+    // 3/4. It was moved by the harness; what did the app persist on close?
+    let frame_after = probe_rect(&first, "FRAME_AFTER");
+    let client_after = probe_rect(&first, "CLIENT_AFTER");
+    if !first.flag("MOVED") {
+        println!(
+            "smoke: geometry: WARNING - MoveWindow changed nothing on screen, so the persist half was not exercised"
+        );
+        restore_session(session, before.as_deref());
+        return Geometry::NotJudged("the harness could not move the window");
+    }
+    let stored = match fs::read_to_string(session) {
+        Ok(text) => persisted_rect(&text),
+        Err(_) => None,
+    };
+    let candidates = [frame_after, client_after];
+    let mut verdict = Persisted::NothingWritten;
+    for c in candidates.iter().flatten() {
+        match persisted(stored, &seed, c) {
+            Persisted::Moved => {
+                verdict = Persisted::Moved;
+                break;
+            }
+            other => {
+                if verdict == Persisted::NothingWritten {
+                    verdict = other;
+                }
+            }
+        }
+    }
+    match &verdict {
+        Persisted::Moved => println!(
+            "smoke: geometry: PERSIST ok - session.json names the moved rect (window after the move: frame {} client {}, persisted {})",
+            frame_after.map(|f| f.text()).unwrap_or_else(|| "-".into()),
+            client_after.map(|c| c.text()).unwrap_or_else(|| "-".into()),
+            stored.map(|p| p.text()).unwrap_or_else(|| "-".into())
+        ),
+        Persisted::StillTheSeed => notes.push(format!(
+            "PERSIST: session.json still says the seeded rect {} after the window was moved to frame {} - the move never reached the state file",
+            seed.text(),
+            frame_after.map(|f| f.text()).unwrap_or_else(|| "-".into())
+        )),
+        Persisted::Neither { got } => notes.push(format!(
+            "PERSIST: session.json says {} - not the seed {}, not the window after the move (frame {} client {})",
+            got.text(),
+            seed.text(),
+            frame_after.map(|f| f.text()).unwrap_or_else(|| "-".into()),
+            client_after.map(|c| c.text()).unwrap_or_else(|| "-".into())
+        )),
+        Persisted::NothingWritten => notes.push(format!(
+            "PERSIST: no rect could be read back from {} after the close",
+            session.display()
+        )),
+    }
+    // 5. Relaunch and see whether it comes back where it was left.
+    let expect = stored.unwrap_or(moved);
+    let second = match run_probe_script(script, exe, err_file, None, None, 12) {
+        Err(e) => {
+            restore_session(session, before.as_deref());
+            return Geometry::NotJudged(e.leak() as &str);
+        }
+        Ok(p) => p,
+    };
+    let f2 = probe_rect(&second, "FRAME");
+    let c2 = probe_rect(&second, "CLIENT");
+    let relaunch = place(&expect, f2.as_ref(), c2.as_ref());
+    match &relaunch {
+        Placement::At { space } => println!(
+            "smoke: geometry: RELAUNCH ok - the window came back at the persisted rect, read in {space} space (frame {} client {})",
+            f2.map(|f| f.text()).unwrap_or_else(|| "-".into()),
+            c2.map(|c| c.text()).unwrap_or_else(|| "-".into())
+        ),
+        other => notes.push(format!(
+            "RELAUNCH: the window came back at frame {} client {} instead of the persisted {} ({other:?})",
+            f2.map(|f| f.text()).unwrap_or_else(|| "-".into()),
+            c2.map(|c| c.text()).unwrap_or_else(|| "-".into()),
+            expect.text()
+        )),
+    }
+    // 6. Never leave the seed behind in place of what the app itself wrote.
+    let still_seed = fs::read_to_string(session)
+        .ok()
+        .and_then(|t| persisted_rect(&t))
+        .is_some_and(|p| p == seed);
+    if still_seed {
+        println!("smoke: geometry: the app never rewrote the seed, so the seed is removed");
+        restore_session(session, before.as_deref());
+    }
+    if notes.is_empty() {
+        Geometry::Proven {
+            restore: placement_text(&restore),
+            relaunch: placement_text(&relaunch),
+        }
+    } else {
+        Geometry::Broken(notes)
+    }
+}
+
+fn restore_session(path: &Path, bytes: Option<&[u8]>) {
+    match bytes {
+        Some(b) => {
+            if fs::write(path, b).is_err() {
+                println!(
+                    "smoke: geometry: WARNING - the pre-seed session bytes could not be put back"
+                );
+            }
+        }
+        None => {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 /// Entry point for "cargo xtask smoke [--reuse-state] [--no-build]".
 pub fn run(args: &[String]) -> i32 {
     let unknown: Vec<&str> = args
@@ -1116,9 +1701,18 @@ pub fn run(args: &[String]) -> i32 {
     }
 
     let script = temp_path("probe", "ps1");
+    // The geometry step gets its own reporter script: the first phase must stay
+    // exactly as it was proven, and a shared script would let a change to one
+    // verdict silently move the other.
+    let geom_script = temp_path("geom-probe", "ps1");
+    if let Err(e) =
+        fs::File::create(&geom_script).and_then(|mut f| f.write_all(GEOMETRY_PROBE.as_bytes()))
+    {
+        println!("SMOKE FAIL: cannot write the geometry probe: {e}");
+    }
     let out_file = temp_path("stdout", "txt");
     let err_file = temp_path("stderr", "txt");
-    let code = match fs::File::create(&script).and_then(|mut f| f.write_all(PROBE.as_bytes())) {
+    let mut code = match fs::File::create(&script).and_then(|mut f| f.write_all(PROBE.as_bytes())) {
         Err(e) => {
             eprintln!(
                 "SMOKE FAIL: cannot write the probe script to {}: {e}",
@@ -1202,6 +1796,40 @@ pub fn run(args: &[String]) -> i32 {
         },
     };
 
+    // The window-memory round trip, run INSIDE the guard that owns the user's
+    // state: it seeds session.json, moves the window and relaunches the app, so
+    // every file it touches is a file the guard will put back or justify.
+    if code == 0 {
+        let session = candidate_state_dirs(&exe)
+            .into_iter()
+            .map(|dir| dir.join(SESSION_FILE))
+            .find(|path| path.is_file());
+        match session {
+            None => println!("smoke: geometry: NOT JUDGED - no session.json to seed was found"),
+            Some(path) => match geometry_round_trip(&geom_script, &exe, &err_file, &path) {
+                Geometry::Proven { restore, relaunch } => {
+                    println!(
+                        "smoke: geometry: PASS - restore={restore} persist=moved relaunch={relaunch}"
+                    )
+                }
+                Geometry::NotJudged(why) => {
+                    println!("smoke: geometry: NOT JUDGED (advisory) - {why}")
+                }
+                Geometry::Broken(notes) => {
+                    for note in &notes {
+                        println!("SMOKE GEOMETRY FAIL: {note}");
+                    }
+                    println!("smoke: geometry: FAIL - the window memory promise did not hold");
+                    code = GEOMETRY_FAILED_EXIT;
+                }
+            },
+        }
+    } else {
+        println!(
+            "smoke: geometry: NOT RUN - the first launch did not succeed, so there is nothing to round trip"
+        );
+    }
+
     if let Some(guard) = guard.as_mut() {
         // Explicit here so the verdict can see a failed restore; Drop is the
         // backstop for every path that does not reach this line.
@@ -1212,7 +1840,7 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     }
-    for junk in [&script, &out_file, &err_file] {
+    for junk in [&script, &geom_script, &out_file, &err_file] {
         let _ = fs::remove_file(junk);
     }
     code
@@ -1715,5 +2343,247 @@ mod tests {
             .expect("open for times");
         file.set_times(fs::FileTimes::new().set_modified(when))
             .expect("set mtime");
+    }
+
+    /// D33 in the two directions, at the decision level: a bridge that stops
+    /// sending GeometryChanged (or stops polling) persists the seed and nothing
+    /// else, and a bridge that never restores lands somewhere unrelated. Both
+    /// must be red, and a genuine round trip must be green.
+    #[test]
+    fn the_geometry_verdicts_are_red_for_the_two_real_regressions() {
+        let seed = Rect {
+            l: 337,
+            t: 241,
+            r: 957,
+            b: 661,
+        };
+        let moved = Rect {
+            l: 390,
+            t: 278,
+            r: 1010,
+            b: 698,
+        };
+        // The move never reached the state file: the persisted rect is the seed.
+        assert_eq!(
+            persisted(Some(seed), &seed, &moved),
+            Persisted::StillTheSeed,
+            "a bridge that stopped reporting the drag must not pass"
+        );
+        // Something persisted, but not either candidate.
+        match persisted(
+            Some(Rect {
+                l: 10,
+                t: 10,
+                r: 20,
+                b: 20,
+            }),
+            &seed,
+            &moved,
+        ) {
+            Persisted::Neither { got } => assert_eq!(got.text(), "10,10,20,20"),
+            other => panic!("{other:?}"),
+        }
+        // The good case, in client space: the app persists what gpui reports.
+        let chrome = Rect {
+            l: seed.l - 8,
+            t: seed.t - 19,
+            r: seed.r + 8,
+            b: seed.b + 20,
+        };
+        assert_eq!(
+            persisted(Some(client_of(&moved)), &seed, &client_of(&moved),),
+            Persisted::Moved
+        );
+        // A window at the seed is At; a window at seed+chrome while the seed was
+        // applied in the other space is the distinguishable ChromeOffset.
+        assert_eq!(
+            place(&seed, Some(&chrome), Some(&seed)),
+            Placement::At { space: "client" }
+        );
+        // Both readings of "the window is where the seed said", with the real
+        // chrome between them: the app persists what gpui reports (client area),
+        // so a correct restore has CLIENT == seed and FRAME outset by 8/19/8/20.
+        assert_eq!(
+            place(&seed, Some(&chrome), Some(&seed)),
+            Placement::At { space: "client" },
+            "seed honoured in client space, the app's convention"
+        );
+        assert_eq!(
+            place(&seed, Some(&seed), Some(&client_of(&seed))),
+            Placement::At { space: "frame" },
+            "seed honoured in frame space, the other convention"
+        );
+        assert_eq!(chrome.deltas(&seed), [-8, -19, 8, 20]);
+        // The failure this separates: the seed applied in the WRONG space leaves
+        // the frame 16 px across and 39 px down off target - far beyond the 6 px
+        // tolerance - so it reads Off, never At. That is the D40 claim, asserted.
+        assert!(matches!(
+            place(&seed, Some(&client_of(&seed)), None),
+            Placement::Off { .. }
+        ));
+        assert!(matches!(
+            place(&seed, None, Some(&inset_of(&seed))),
+            Placement::Off { .. }
+        ));
+        // And an unrelated placement is a red with numbers.
+        let elsewhere = Rect {
+            l: 0,
+            t: 0,
+            r: 400,
+            b: 300,
+        };
+        match place(&seed, Some(&elsewhere), Some(&elsewhere)) {
+            Placement::Off { deltas } => assert_eq!(deltas, [-337, -241, -557, -361]),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(place(&seed, None, None), Placement::Unreadable);
+    }
+
+    fn client_of(frame: &Rect) -> Rect {
+        // The chrome on this build: 8 left, 19 top, 8 right, 20 bottom.
+        Rect {
+            l: frame.l + 8,
+            t: frame.t + 19,
+            r: frame.r - 8,
+            b: frame.b - 20,
+        }
+    }
+
+    fn inset_of(client: &Rect) -> Rect {
+        Rect {
+            l: client.l - 8,
+            t: client.t - 19,
+            r: client.r + 8,
+            b: client.b + 20,
+        }
+    }
+
+    #[test]
+    fn the_seed_is_placed_inside_the_work_area_and_never_on_the_default() {
+        let wide = Rect {
+            l: 0,
+            t: 0,
+            r: 3440,
+            b: 1392,
+        };
+        let (seed, moved) = seed_in(
+            &wide,
+            (620, 420),
+            &Rect {
+                l: 120,
+                t: 90,
+                r: 920,
+                b: 690,
+            },
+        )
+        .expect("fits");
+        assert!(seed.r <= wide.r && seed.b <= wide.b, "{seed:?}");
+        assert_ne!(
+            seed.l, 120,
+            "an app that ignored the seed lands on the default"
+        );
+        assert_eq!(seed.r - seed.l, 620);
+        assert_eq!(
+            moved.r - moved.l,
+            620,
+            "the move changes position, never size"
+        );
+        // A second monitor offset must be honoured, not assumed to start at 0.
+        let off = Rect {
+            l: 1920,
+            t: 0,
+            r: 4360,
+            b: 1080,
+        };
+        let (seed2, _) = seed_in(
+            &off,
+            (620, 420),
+            &Rect {
+                l: 120,
+                t: 90,
+                r: 920,
+                b: 690,
+            },
+        )
+        .expect("fits");
+        assert!(seed2.l >= 1920 && seed2.r <= 4360, "{seed2:?}");
+        // Too small a screen is not judged rather than forced.
+        assert_eq!(
+            seed_in(
+                &Rect {
+                    l: 0,
+                    t: 0,
+                    r: 500,
+                    b: 400
+                },
+                (620, 420),
+                &Rect {
+                    l: 120,
+                    t: 90,
+                    r: 920,
+                    b: 690
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_persisted_rect_is_read_out_of_the_apps_own_json() {
+        let text = r#"{"rect":{"x":390,"y":278,"w":620,"h":420},"maximized":false}"#;
+        assert_eq!(
+            persisted_rect(text),
+            Some(Rect {
+                l: 390,
+                t: 278,
+                r: 1010,
+                b: 698
+            })
+        );
+        assert_eq!(persisted_rect("{\"rect\":null}"), None);
+        assert_eq!(persisted_rect("not json"), None);
+        assert_eq!(Rect::parse("1,2,3"), None);
+    }
+
+    #[test]
+    fn a_seed_written_into_the_apps_file_keeps_every_other_field() {
+        let dir = std::env::temp_dir().join(format!("xtask-seed-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("session.json");
+        fs::write(
+            &path,
+            "{\"rect\":{\"x\":1,\"y\":2,\"w\":3,\"h\":4},\"pinned\":true,\"maximized\":false}",
+        )
+        .expect("write");
+        let before = seed_session(
+            &path,
+            &Rect {
+                l: 100,
+                t: 100,
+                r: 700,
+                b: 500,
+            },
+        )
+        .expect("seeded");
+        let after = fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            persisted_rect(&after),
+            Some(Rect {
+                l: 100,
+                t: 100,
+                r: 700,
+                b: 500
+            })
+        );
+        assert!(
+            after.contains("\"pinned\": true"),
+            "the seed must not reset the user's pin: {after}"
+        );
+        restore_session(&path, before.as_deref());
+        assert_eq!(
+            fs::read_to_string(&path).expect("back"),
+            "{\"rect\":{\"x\":1,\"y\":2,\"w\":3,\"h\":4},\"pinned\":true,\"maximized\":false}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
