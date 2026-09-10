@@ -20,7 +20,9 @@ pub struct StateDir(pub PathBuf);
 ///   2. the caller probed <exe_dir>/data with a single Path::exists() and
 ///      found the portable marker directory. That probe is deliberately the
 ///      caller's job — this function must stay pure — and the caller reports
-///      the finding by passing appdata = None.
+///      the finding by passing appdata = None. This split is the documented
+///      caller contract: crates/api and the bridge own the one exists()
+///      probe and pass appdata = None for a portable deployment.
 /// * INSTALLED — state lives in the per-user roaming profile:
 ///   <appdata>/notes-gpui (on Windows %APPDATA%\notes-gpui).
 ///
