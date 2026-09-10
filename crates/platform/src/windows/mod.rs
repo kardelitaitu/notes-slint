@@ -56,6 +56,10 @@ impl HostFacts for Backend {
     fn ansi_codepage(&self) -> u16 {
         ansi_codepage()
     }
+
+    fn work_area_for_rect(&self, rect: FrameRect) -> PlatformResult<(FrameRect, u32)> {
+        monitors::work_area_for_rect(rect)
+    }
 }
 
 // kernel32's GetACP, declared locally: the windows crate gates this symbol

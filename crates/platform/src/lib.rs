@@ -151,6 +151,27 @@ pub trait HostFacts: Send {
     /// answering something this build cannot decode is exactly the fact the
     /// caller needs to see.
     fn ansi_codepage(&self) -> u16;
+
+    /// The work area of the monitor a frame rect BELONGS to: the monitor whose
+    /// surface overlaps the rect the most; when nothing overlaps - the saved
+    /// monitor is gone and no window exists yet, the handle-less restore case -
+    /// the monitor NEAREST to the rect, so the caller clamps. Never blindly the
+    /// primary: a rect living fully on a live secondary has zero overlap with
+    /// the primary and would be yanked across screens. Returns the chosen
+    /// monitor's id beside the work area so the caller can persist it
+    /// (Session.monitor_id exists for this).
+    ///
+    /// The id is the numeric suffix of Win32's display-device name
+    /// (\\.\\DISPLAY<n>): a session ordinal, NOT a hardware identity - unplug
+    /// and replug can renumber, so treat it as a hint and recover placement
+    /// from the rect itself. Overlap ties are resolved by MonitorFromRect's own
+    /// ordering and are not guaranteed stable; any monitor the rect touches
+    /// yields a safe clamp, which is why this crate does not arbitrate ties.
+    /// Overlap is measured against the monitor's full surface (MonitorFromRect's
+    /// documented rule): a rect lying wholly inside a reserved edge (the
+    /// taskbar) still resolves to the monitor that edge belongs to, and that
+    /// monitor's work area is what comes back.
+    fn work_area_for_rect(&self, rect: FrameRect) -> PlatformResult<(FrameRect, u32)>;
 }
 #[cfg(test)]
 mod tests {
@@ -200,6 +221,16 @@ mod tests {
         fn ansi_codepage(&self) -> u16 {
             // A mock, not a measurement: it stands in for whatever the host answers.
             1252
+        }
+
+        fn work_area_for_rect(&self, rect: FrameRect) -> PlatformResult<(FrameRect, u32)> {
+            // A fixed two-monitor layout: a rect at or past x=1920 belongs to the
+            // mock secondary, everything else to the mock primary.
+            if rect.x >= 1920 {
+                Ok((FrameRect::new(1920, 0, 1920, 1040), 2))
+            } else {
+                Ok((FrameRect::new(0, 0, 1920, 1040), 1))
+            }
         }
     }
 
@@ -251,6 +282,22 @@ mod tests {
         // The mock's answer is a stand-in constant; the real one is measured in
         // windows/mod.rs's test.
         assert_eq!(facts.ansi_codepage(), 1252);
+    }
+
+    #[test]
+    fn the_mock_answers_the_nearest_monitor_question_without_a_display() {
+        let facts: Box<dyn HostFacts> = Box::new(Mock::default());
+        let (work, id) = facts
+            .work_area_for_rect(FrameRect::new(0, 0, 100, 100))
+            .expect("mock answers");
+        assert_eq!((work, id), (FrameRect::new(0, 0, 1920, 1040), 1));
+        let (_, id) = facts
+            .work_area_for_rect(FrameRect::new(5000, 0, 100, 100))
+            .expect("mock answers");
+        assert_eq!(
+            id, 2,
+            "a rect past the mock primary belongs to the mock secondary"
+        );
     }
 
     #[test]
