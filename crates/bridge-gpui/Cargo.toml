@@ -16,18 +16,13 @@ path = "src/main.rs"
 
 [dependencies]
 notes-api = { workspace = true }
-# gpui is NOT inherited from the workspace here, and that is forced, not taste:
-# its `windows-manifest` default feature embeds its own RT_MANIFEST id=1 (via
-# target/debug/build/gpui-*/out/gpui.lib), and rust-lld refuses a second one:
-#   error: duplicate resource: type MANIFEST (ID 24)/name ID 1/language 1033
-# so an app-supplied /MANIFESTINPUT cannot coexist with it. Cargo also refuses
-# `default-features = false` on a workspace-inherited dep, which leaves spelling
-# the dependency out as the only way to turn that feature off - and the only way
-# to get longPathAware into the shipped binary. `=0.2.2` is copied from
-# [workspace.dependencies] deliberately; the FENCE CHANGE REQUEST is to move
-# default-features = false + features = ["font-kit"] onto the workspace template
-# instead, at which point this line becomes `gpui = { workspace = true }` again.
-gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
+# Inherited, and it has to stay inherited: the workspace line turns off gpui's
+# `windows-manifest` default feature, because that feature embeds a second
+# RT_MANIFEST id=1 and rust-lld refuses an app manifest next to it (see build.rs).
+# Repeating the version here would double-pin it; inheriting means that if the
+# feature is ever re-enabled, this binary fails to LINK, loudly, and the reason is
+# in the workspace comment next to the feature.
+gpui = { workspace = true }
 # Only to read the HWND out of the window gpui created: HasWindowHandle is
 # implemented by gpui itself (src/window.rs), so this is the toolkit handle
 # accessor, not a route around the port. No windows-rs type appears in this crate.

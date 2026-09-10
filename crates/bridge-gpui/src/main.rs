@@ -28,9 +28,11 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{
     AnyWindowHandle, App, Application, Bounds, Context, IntoElement, Point, Render, Subscription,
-    Window, WindowBounds, WindowOptions, div, px, rgb, size,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
-use notes_api::{Command, EventRx, Gateway, InitialState, Settings, StateDir, WindowHandle};
+use notes_api::{
+    Command, EventRx, Gateway, InitialState, Settings, StateDir, WindowHandle, resolve_state_dir,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// The window root view for this slice: an empty surface filling the window.
@@ -75,6 +77,13 @@ fn main() {
             // drawn. Only the bridge can: the port has no window type at all.
             let options = WindowOptions {
                 window_bounds: Some(bounds_for(&initial)),
+                // The title is the cheapest proof that the running binary is this
+                // build: it carries the package version, which nothing else on
+                // screen shows yet (no menu, no status line).
+                titlebar: Some(TitlebarOptions {
+                    title: Some(format!("notes {}", env!("CARGO_PKG_VERSION")).into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
             let opened = cx.open_window(options, |_, cx| cx.new(|_| Surface));
@@ -105,6 +114,14 @@ fn main() {
 
             // STEP 4 - apply topmost. The bit came from session.json in step 1, so
             // a pinned note is pinned as it appears rather than 200 ms later.
+            //
+            // What step 4 WILL do, once the port lands the join: the engine will take
+            // the handle registered in step 3 and call notes-platform
+            // (`WindowBackend::set_topmost(handle, on)`) on the window it is pinned
+            // to, so this same command both stores the bit and raises the real HWND -
+            // today it only stores the bit, which is why a pinned session opens
+            // unpinned. That join is api work over a handle api already holds; this
+            // bridge will not import notes-platform to do it first.
             if initial.pinned {
                 send(&gateway, Command::SetPinned(true));
             }
@@ -221,17 +238,25 @@ fn report(why: &str) {
     eprintln!("notes-gpui: {why}");
 }
 
-/// PLACEHOLDER, and a FENCE CHANGE REQUEST: the state-directory rule is
-/// `resolve_state_dir(exe_dir, appdata)` in notes-core, and the port re-exports
-/// only the `StateDir` type - so a bridge that may import nothing else in this
-/// repo cannot ask where its state lives. Below is the installed half of that
-/// rule, duplicated, and it must go the moment `api` re-exports the resolver.
+/// Where app state lives. The D-STATE rule is notes-core's and the port now
+/// re-exports it as `resolve_state_dir`, so the duplicated installed-half-of-the-
+/// rule that used to sit here is gone: this function keeps only the two things
+/// the re-export documents as the CALLER'S job - the existence probe (a `data`
+/// directory beside the executable means a portable deployment, and for that one
+/// APPDATA must be passed as None, because an installed app must not be redirected
+/// by a one-word launcher change) and reading the roaming profile it actually has,
+/// never a path assembled from a home directory.
 fn state_dir() -> StateDir {
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        return StateDir(PathBuf::from(appdata).join("notes-gpui"));
-    }
-    let fallback = std::env::current_exe()
+    // No exe path means no probe and no portable marker: fall back to the current
+    // directory rather than inventing a profile. It cannot happen from a shipped
+    // binary, and `resolve_state_dir` is pure, so nothing is written either way.
+    let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("data")));
-    StateDir(fallback.unwrap_or_else(|| PathBuf::from(".")))
+        .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let portable = exe_dir.join("data").is_dir();
+    let appdata = (!portable)
+        .then(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .flatten();
+    resolve_state_dir(&exe_dir, appdata.as_deref())
 }
