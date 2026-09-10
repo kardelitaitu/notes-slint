@@ -7,7 +7,10 @@ publish.workspace = true
 
 # NOTE: cargo (measured 1.98.0) forbids overriding inherited workspace lints,
 # so the workspace set is spelled out here with unsafe_code relaxed from the
-# workspace "forbid" to "deny" — platform is the one crate that may use unsafe.
+# workspace "forbid" to "deny" - platform is the one crate that may use unsafe.
+# "deny" rather than "allow" is deliberate: src/windows/ opts in with a scoped
+# #![allow(unsafe_code)], so unsafe cannot leak into any other module, and every
+# unsafe block still carries its own "// SAFETY:" comment (AGENTS.md).
 [lints.rust]
 unsafe_code = "deny"
 unused_crate_dependencies = "warn"
@@ -15,3 +18,11 @@ unused_crate_dependencies = "warn"
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 
+# Both deps are used on this host. `windows` sits in a target table rather than
+# [dependencies] because unused_crate_dependencies = "warn" is a gate error: on a
+# non-Windows host it must be absent, not merely unused.
+[dependencies]
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
