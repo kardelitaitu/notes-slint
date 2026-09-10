@@ -19,6 +19,10 @@
 //!   tempfile itself pulls windows-sys — a detail of an allowed dependency,
 //!   not a layering violation. Following dev edges transitively would
 //!   reimplement the transitive "cargo tree -i" mistake this tool replaces.
+//! * Repo-crate rules are STRUCTURAL: they read metadata.workspace_members at
+//!   runtime, so a crate added to the workspace tomorrow is forbidden where
+//!   the rules say "nothing else in this repo" — no name list to forget to
+//!   update.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -32,9 +36,10 @@ const NOTES_PLATFORM: &str = "notes-platform";
 const NOTES_BRIDGE: &str = "notes-bridge-gpui";
 const XTASK: &str = "xtask";
 
-/// UI toolkit crates: belong only behind the api port, inside bridges.
+/// UI toolkit and browser-boundary crates: belong only behind the api port,
+/// inside bridges.
 const UI_TOOLKITS: &[&str] = &[
-    "gpui", "winit", "egui", "eframe", "iced", "slint", "tauri", "gtk", "gdk",
+    "gpui", "winit", "egui", "eframe", "iced", "slint", "tauri", "gtk", "gdk", "web-sys",
 ];
 
 /// Win32 / browser FFI crates: belong only in notes-platform.
@@ -49,8 +54,19 @@ const OS_FFI: &[&str] = &[
     "web-sys",
 ];
 
-/// Repo crates that sit downstream of core; core is a leaf.
-const DOWNSTREAM_OF_CORE: &[&str] = &[NOTES_PLATFORM, NOTES_API, NOTES_BRIDGE];
+/// What a rule forbids. Name lists cover external crates; the structural
+/// variant covers "every other workspace member", whatever it is named.
+#[derive(Clone, Copy)]
+pub enum Forbidden {
+    Names(&'static [&'static str]),
+    /// Every workspace member whose name is not in allowed, plus the extra
+    /// names in also (for crates such as gpui that are not workspace
+    /// members). The checked package itself is always exempt.
+    Members {
+        allowed: &'static [&'static str],
+        also: &'static [&'static str],
+    },
+}
 
 /// How far a forbidden name may sit from the checked package.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,83 +81,107 @@ pub struct Rule {
     pub id: &'static str,
     pub package: &'static str,
     pub scope: Scope,
-    pub forbidden: &'static [&'static str],
+    pub forbidden: Forbidden,
 }
 
 /// The layering invariants, one row per (rule id, package) pairing.
-///
-/// "Allowed direct" columns of the rule table document the intended shape;
-/// the forbidden columns below are what this tool actually enforces.
 pub const RULES: &[Rule] = &[
-    // notes-core is pure Rust: no UI toolkit, no OS FFI, no repo crate
-    // downstream of it. Direct + transitive: a smuggled gpui three hops away
-    // is still core learning about UI.
-    Rule {
-        id: "core-is-pure",
-        package: NOTES_CORE,
-        scope: Scope::DirectAndTransitive,
-        forbidden: UI_TOOLKITS,
-    },
+    // notes-core is pure Rust: no OS/browser FFI, no UI toolkit, and —
+    // structurally — no workspace member anywhere in its closure. It is a
+    // leaf: core-orthogonal-to-platform catches notes-platform, notes-api, a
+    // bridge, xtask, and any member crate that does not exist yet.
     Rule {
         id: "core-no-os",
         package: NOTES_CORE,
         scope: Scope::DirectAndTransitive,
-        forbidden: OS_FFI,
+        forbidden: Forbidden::Names(OS_FFI),
+    },
+    Rule {
+        id: "core-is-pure",
+        package: NOTES_CORE,
+        scope: Scope::DirectAndTransitive,
+        forbidden: Forbidden::Names(UI_TOOLKITS),
     },
     Rule {
         id: "core-orthogonal-to-platform",
         package: NOTES_CORE,
         scope: Scope::DirectAndTransitive,
-        forbidden: DOWNSTREAM_OF_CORE,
+        forbidden: Forbidden::Members {
+            allowed: &[NOTES_CORE],
+            also: &[],
+        },
     },
-    // Orthogonality is symmetric: platform must not know core either, and api
-    // is the only place their outputs are joined.
+    // Orthogonality is symmetric and structural: platform may not know ANY
+    // other member — core, api, a bridge, a helper that does not exist yet.
     Rule {
         id: "core-orthogonal-to-platform",
         package: NOTES_PLATFORM,
         scope: Scope::DirectOnly,
-        forbidden: &[NOTES_CORE, NOTES_API],
+        forbidden: Forbidden::Members {
+            allowed: &[NOTES_PLATFORM],
+            also: &[],
+        },
     },
-    // The port is UI-agnostic (no toolkit anywhere in its closure). windows
-    // flows through notes-platform by design, so only the direct OS-FFI edge
-    // is policed here — the direct-edge form of "never re-exported through a
-    // public api type"; the re-export itself is beyond cargo metadata's reach.
+    // The port is UI-agnostic: no toolkit or browser FFI anywhere in its
+    // closure. windows flows through notes-platform by design, so only the
+    // direct OS-FFI edge is policed — the direct-edge form of "never
+    // re-exported through a public api type"; the re-export itself is beyond
+    // cargo metadata's reach.
     Rule {
         id: "port-is-ui-agnostic",
         package: NOTES_API,
         scope: Scope::DirectAndTransitive,
-        forbidden: UI_TOOLKITS,
+        forbidden: Forbidden::Names(UI_TOOLKITS),
     },
     Rule {
         id: "port-is-ui-agnostic",
         package: NOTES_API,
         scope: Scope::DirectOnly,
-        forbidden: OS_FFI,
+        forbidden: Forbidden::Names(OS_FFI),
     },
-    // Platform is OS plumbing, not UI: the toolkit and browser FFI stay out.
-    // It shares the port's UI-agnosticism id — platform must be just as
-    // UI-agnostic as the port it feeds.
+    // Platform is OS plumbing, not UI: the full toolkit + browser FFI list,
+    // direct-only.
     Rule {
         id: "port-is-ui-agnostic",
         package: NOTES_PLATFORM,
         scope: Scope::DirectOnly,
-        forbidden: &["gpui", "web-sys"],
+        forbidden: Forbidden::Names(UI_TOOLKITS),
     },
-    // A bridge imports api and its own toolkit, nothing else in this repo.
-    // Direct edges only: its transitive payload contains notes-core by design
-    // (bridge -> api -> core) — checking transitively here is the AGENTS.md bug.
+    // The port joins core and platform and NOTHING else — no bridge, no
+    // helper crate, whatever it ends up being named (structural, so a new
+    // workspace member cannot slip through as a backdoor around the port).
+    Rule {
+        id: "no-new-backdoor",
+        package: NOTES_API,
+        scope: Scope::DirectOnly,
+        forbidden: Forbidden::Members {
+            allowed: &[NOTES_CORE, NOTES_PLATFORM],
+            also: &[],
+        },
+    },
+    // A bridge imports api and its own toolkit, nothing else in this repo —
+    // structurally: every member except api is forbidden, DIRECT ONLY (its
+    // transitive payload contains core and platform BY DESIGN; checking
+    // transitively here is the AGENTS.md false-fail).
     Rule {
         id: "bridge-sees-only-api",
         package: NOTES_BRIDGE,
         scope: Scope::DirectOnly,
-        forbidden: &[NOTES_CORE, NOTES_PLATFORM, XTASK],
+        forbidden: Forbidden::Members {
+            allowed: &[NOTES_API],
+            also: &[],
+        },
     },
-    // The checker must not depend on what it checks.
+    // The checker must not depend on what it checks: no member, and gpui
+    // besides (gpui is not a workspace member, so it is named explicitly).
     Rule {
         id: "checker-is-independent",
         package: XTASK,
         scope: Scope::DirectOnly,
-        forbidden: &[NOTES_CORE, NOTES_API, NOTES_PLATFORM, NOTES_BRIDGE, "gpui"],
+        forbidden: Forbidden::Members {
+            allowed: &[XTASK],
+            also: &["gpui"],
+        },
     },
 ];
 
@@ -189,10 +229,37 @@ impl Violation {
 
 /// The workspace dependency graph, reduced to what the rules need.
 pub struct Graph {
+    /// Names of the workspace member packages (metadata.workspace_members).
+    pub(crate) members: BTreeSet<String>,
     /// package name -> direct dependency names (normal + dev + build edges)
     pub(crate) direct: BTreeMap<String, BTreeSet<String>>,
     /// package name -> names reachable via normal/build edges
     pub(crate) closure: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// The names a rule forbids, resolved against the graph. Structural rules
+/// become concrete name sets here, so evaluate() stays a single scan.
+fn banned_names(rule: &Rule, graph: &Graph) -> BTreeSet<String> {
+    let mut banned: BTreeSet<String> = BTreeSet::new();
+    match rule.forbidden {
+        Forbidden::Names(names) => {
+            for name in names {
+                banned.insert(name.to_string());
+            }
+        }
+        Forbidden::Members { allowed, also } => {
+            for member in &graph.members {
+                if member.as_str() != rule.package && !allowed.contains(&member.as_str()) {
+                    banned.insert(member.clone());
+                }
+            }
+            for name in also {
+                banned.insert(name.to_string());
+            }
+        }
+    }
+    banned.remove(rule.package); // a package is never its own violation
+    banned
 }
 
 /// Pure rule evaluation over a parsed graph. No I/O, so tests can poison
@@ -203,8 +270,9 @@ pub fn evaluate(graph: &Graph) -> Vec<Violation> {
         let Some(direct) = graph.direct.get(rule.package) else {
             continue; // an absent checked package is reported by run(), not guessed at here
         };
+        let banned = banned_names(rule, graph);
         for dep in direct {
-            if rule.forbidden.contains(&dep.as_str()) {
+            if banned.contains(dep.as_str()) {
                 violations.push(Violation {
                     rule: rule.id,
                     package: rule.package,
@@ -223,7 +291,7 @@ pub fn evaluate(graph: &Graph) -> Vec<Violation> {
             if direct.contains(dep) {
                 continue; // already reported as (direct), the stronger form
             }
-            if rule.forbidden.contains(&dep.as_str()) {
+            if banned.contains(dep.as_str()) {
                 violations.push(Violation {
                     rule: rule.id,
                     package: rule.package,
@@ -259,6 +327,23 @@ pub fn graph_from_metadata(v: &Value) -> Result<Graph, String> {
             .and_then(Value::as_str)
             .ok_or_else(|| format!("metadata: package {id} without name"))?;
         name_of_id.insert(id, name);
+    }
+
+    // Workspace members: the structural rules are written against this set,
+    // so a crate added to the workspace is covered without touching this file.
+    let member_ids = v
+        .get("workspace_members")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "metadata: missing 'workspace_members'".to_string())?;
+    let mut members: BTreeSet<String> = BTreeSet::new();
+    for id in member_ids {
+        let id = id
+            .as_str()
+            .ok_or_else(|| "metadata: workspace member without id".to_string())?;
+        let name = name_of_id
+            .get(id)
+            .ok_or_else(|| format!("metadata: workspace member {id} not found in packages"))?;
+        members.insert(name.to_string());
     }
 
     // Direct edges: packages[].dependencies[]. The kind field is JSON null for
@@ -354,7 +439,11 @@ pub fn graph_from_metadata(v: &Value) -> Result<Graph, String> {
         closure.insert(name.to_string(), reached);
     }
 
-    Ok(Graph { direct, closure })
+    Ok(Graph {
+        members,
+        direct,
+        closure,
+    })
 }
 
 /// Run cargo metadata for the workspace at root and parse it. .output() drains
@@ -467,8 +556,9 @@ pub fn run() -> i32 {
 mod tests {
     use super::*;
 
-    fn graph(direct: &[(&str, &[&str])], closure: &[(&str, &[&str])]) -> Graph {
+    fn graph(members: &[&str], direct: &[(&str, &[&str])], closure: &[(&str, &[&str])]) -> Graph {
         Graph {
+            members: members.iter().map(|s| s.to_string()).collect(),
             direct: direct
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
@@ -480,10 +570,15 @@ mod tests {
         }
     }
 
+    fn workspace() -> Vec<&'static str> {
+        vec![NOTES_CORE, NOTES_API, NOTES_PLATFORM, NOTES_BRIDGE, XTASK]
+    }
+
     /// Mirrors the real workspace: exactly what the rule table calls allowed,
     /// including windows reaching api only through notes-platform.
     fn clean_graph() -> Graph {
         graph(
+            &workspace(),
             &[
                 (
                     "notes-core",
@@ -543,6 +638,7 @@ mod tests {
     /// the transitive path is exercised too.
     fn poisoned_graph() -> Graph {
         graph(
+            &workspace(),
             &[
                 ("notes-core", &["serde", "gpui", "notes-platform"]),
                 ("notes-api", &["notes-core", "notes-platform", "gpui"]),
@@ -598,6 +694,72 @@ mod tests {
         );
     }
 
+    /// THE regression test for the proven holes: a sixth member exists only in
+    /// this fixture — no rule table edit knows its name — and every
+    /// reach-around is still caught, while the sanctioned edges stay silent.
+    #[test]
+    fn structural_member_rules_catch_new_members_without_code_edits() {
+        let g = graph(
+            &[
+                NOTES_CORE,
+                NOTES_API,
+                NOTES_PLATFORM,
+                NOTES_BRIDGE,
+                "notes-helper",
+                XTASK,
+            ],
+            &[
+                ("notes-core", &["serde"]),
+                (
+                    "notes-api",
+                    &["notes-core", "notes-platform", "notes-helper"],
+                ),
+                ("notes-platform", &["windows", "notes-bridge-gpui", "winit"]),
+                ("notes-bridge-gpui", &["notes-api", "gpui", "notes-helper"]),
+                ("xtask", &["serde_json"]),
+            ],
+            &[],
+        );
+        let violations = evaluate(&g);
+        assert_eq!(
+            violations.len(),
+            4,
+            "exactly the four reach-arounds: {violations:?}"
+        );
+        let expected = [
+            (
+                "core-orthogonal-to-platform",
+                NOTES_PLATFORM,
+                "notes-bridge-gpui",
+            ),
+            ("port-is-ui-agnostic", NOTES_PLATFORM, "winit"),
+            ("no-new-backdoor", NOTES_API, "notes-helper"),
+            ("bridge-sees-only-api", NOTES_BRIDGE, "notes-helper"),
+        ];
+        for (rule, package, dep) in expected {
+            assert!(
+                violations.iter().any(|v| v.rule == rule
+                    && v.package == package
+                    && v.dep == dep
+                    && v.via == Via::Direct),
+                "missing {rule}: {package} -> {dep} in {violations:?}"
+            );
+        }
+        // The allowed shapes stay silent.
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.package == NOTES_API && (v.dep == NOTES_CORE || v.dep == NOTES_PLATFORM)),
+            "api -> core and api -> platform are the join point, not a backdoor: {violations:?}"
+        );
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.package == NOTES_BRIDGE && (v.dep == NOTES_API || v.dep == "gpui")),
+            "bridge -> api + its own toolkit is the one thing a bridge may do: {violations:?}"
+        );
+    }
+
     #[test]
     fn api_may_reach_windows_only_through_platform() {
         // The documented limit: windows in api's closure is by design; the
@@ -616,6 +778,7 @@ mod tests {
     #[test]
     fn transitive_poisoning_is_caught_and_not_duplicated() {
         let g = graph(
+            &[NOTES_CORE],
             &[("notes-core", &["innocent-lib"])],
             &[("notes-core", &["innocent-lib", "gpui"])],
         );
@@ -651,10 +814,12 @@ mod tests {
 
     /// Minimal cargo-metadata fixture: proves identity matching runs on
     /// deps[].pkg (names arrive underscore-normalised), dev edges are
-    /// direct-only, and build edges are followed.
+    /// direct-only, build edges are followed, and workspace_members feeds the
+    /// structural rules.
     #[test]
     fn metadata_fixture_parses_ids_and_edge_kinds() {
         let meta = serde_json::json!({
+            "workspace_members": ["id:core", "id:api", "id:bridge"],
             "packages": [
                 { "id": "id:core", "name": "notes-core", "dependencies": [
                     { "name": "serde", "kind": null },
@@ -705,6 +870,9 @@ mod tests {
 
         let g = graph_from_metadata(&meta).expect("fixture must parse");
 
+        let members: Vec<&str> = g.members.iter().map(String::as_str).collect();
+        assert_eq!(members, ["notes-api", "notes-bridge-gpui", "notes-core"]);
+
         let core_direct = g.direct.get("notes-core").expect("core direct edges");
         assert_eq!(core_direct.len(), 3, "dev edge counts as a direct edge");
         assert!(core_direct.contains("tempfile"));
@@ -739,7 +907,9 @@ mod tests {
         );
 
         // End to end over the parsed fixture: gpui reaches core (transitive)
-        // and api (transitive) through innocent-lib, and nothing else fires.
+        // and api (transitive) through innocent-lib, and nothing else fires —
+        // in particular the structural member rules stay quiet: api's only
+        // member deps are notes-core (allowed) and bridge's is notes-api.
         let violations = evaluate(&g);
         assert_eq!(violations.len(), 2, "{violations:?}");
         assert_eq!(violations[0].rule, "core-is-pure");
