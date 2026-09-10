@@ -17,7 +17,7 @@ pub mod topmost;
 use ::windows::Win32::Foundation::HWND;
 use ::windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
-use crate::{FrameRect, PlatformError, PlatformResult, WindowBackend};
+use crate::{FrameRect, HostFacts, PlatformError, PlatformResult, WindowBackend};
 
 /// The Win32 implementation of [`WindowBackend`].
 ///
@@ -36,6 +36,10 @@ impl WindowBackend for Backend {
         monitors::frame_rect(handle)
     }
 
+    fn restore_frame_rect(&self, handle: isize) -> PlatformResult<FrameRect> {
+        monitors::restore_frame_rect(handle)
+    }
+
     fn set_frame_rect(&mut self, handle: isize, r: FrameRect, scale: f32) -> PlatformResult<()> {
         monitors::set_frame_rect(handle, r, scale)
     }
@@ -43,6 +47,37 @@ impl WindowBackend for Backend {
     fn primary_work_area(&self) -> PlatformResult<FrameRect> {
         monitors::primary_work_area()
     }
+}
+
+/// The handle-free machine facts. Implemented for the same [`Backend`] unit
+/// struct: it holds nothing, so a second type would carry these no better, and
+/// `api` then registers one object fewer.
+impl HostFacts for Backend {
+    fn ansi_codepage(&self) -> u16 {
+        ansi_codepage()
+    }
+}
+
+// kernel32's GetACP, declared locally: the windows crate gates this symbol
+// behind the `Win32_Globalization` feature, which this crate does not enable
+// (the feature list lives in the manager-owned root manifest). The generated
+// binding would link the very same kernel32 export with the very same
+// signature - windows-0.61's own `windows_link!` emission for GetACP is
+// exactly this - so here it is spelled by hand. It is marked `safe` because
+// GetACP takes no arguments, touches no pointers, and has no documented
+// failure mode: a pure query of the calling process's logon session, sound
+// to call from anywhere.
+unsafe extern "system" {
+    safe fn GetACP() -> u32;
+}
+
+/// The process ANSI code page - see [`crate::HostFacts::ansi_codepage`].
+pub fn ansi_codepage() -> u16 {
+    // Windows code pages are 16-bit identifiers by definition, so the u32 the
+    // API returns always fits; the cast cannot truncate a value GetACP can
+    // produce, and the crate's no-panic rule forbids a try_from unwrap.
+    let codepage: u32 = GetACP();
+    codepage as u16
 }
 
 /// Turns an `isize` into an `HWND`, or refuses it.
@@ -87,7 +122,7 @@ pub(crate) fn win32_error(api: &'static str, error: ::windows::core::Error) -> P
 #[cfg(test)]
 mod tests {
     use super::Backend;
-    use crate::{FrameRect, PlatformError, PlatformResult, WindowBackend};
+    use crate::{FrameRect, HostFacts, PlatformError, PlatformResult, WindowBackend};
 
     /// Runs the three handle-taking seams and returns their verdicts. None of the
     /// handles used here can name a live window: a USER handle value is 4-byte
@@ -99,6 +134,7 @@ mod tests {
         vec![
             backend.set_topmost(handle, true),
             backend.frame_rect(handle).map(|_| ()),
+            backend.restore_frame_rect(handle).map(|_| ()),
             backend.set_frame_rect(handle, FrameRect::new(0, 0, 10, 10), 1.0),
         ]
     }
@@ -134,5 +170,21 @@ mod tests {
         fn assert_object_safe<T: WindowBackend + Send + ?Sized>() {}
         assert_object_safe::<Backend>();
         assert_object_safe::<dyn WindowBackend>();
+        fn assert_facts_object_safe<T: HostFacts + Send + ?Sized>() {}
+        assert_facts_object_safe::<Backend>();
+        assert_facts_object_safe::<dyn HostFacts>();
+    }
+
+    /// GetACP is a measurement of THIS host, not a constant in this crate: the
+    /// test asserts only what every host must satisfy (a code page identifier is
+    /// a non-zero 16-bit value) and prints the measured number for the record.
+    #[test]
+    fn ansi_codepage_is_a_measured_nonzero_code_page() {
+        let codepage = Backend.ansi_codepage();
+        eprintln!("ansi_codepage measured on this host: {codepage}");
+        assert_ne!(
+            codepage, 0,
+            "GetACP answered nothing; that is not a code page"
+        );
     }
 }

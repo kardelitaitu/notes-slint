@@ -7,7 +7,8 @@ use ::windows::Win32::Graphics::Gdi::{
     MonitorFromPoint, MonitorFromWindow,
 };
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
+    GetWindowPlacement, GetWindowRect, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOZORDER,
+    SetWindowPos, WINDOWPLACEMENT,
 };
 
 use super::{to_hwnd, win32_error};
@@ -45,6 +46,27 @@ pub fn frame_rect(handle: isize) -> PlatformResult<FrameRect> {
     unsafe { GetWindowRect(hwnd, &mut rect) }
         .map_err(|error| win32_error("GetWindowRect", error))?;
     Ok(from_win32(rect))
+}
+
+/// The restore (normal) frame rect of `handle` - see
+/// [`crate::WindowBackend::restore_frame_rect`].
+pub fn restore_frame_rect(handle: isize) -> PlatformResult<FrameRect> {
+    let hwnd = to_hwnd(handle)?;
+    let mut placement = WINDOWPLACEMENT {
+        length: core::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..WINDOWPLACEMENT::default()
+    };
+    // SAFETY: GetWindowPlacement reads only `length`, set above to exactly
+    // `size_of::<WINDOWPLACEMENT>()` as the API demands, and writes its fields
+    // into `&mut placement`, a live repr(C) local that outlives the call. The
+    // HWND is the one `to_hwnd` accepted from IsWindow at check time; a window
+    // destroyed since makes the call return FALSE rather than fault, and the
+    // returned Result maps that FALSE into an error carrying this call's OS code.
+    // `rcNormalPosition` is reported whatever the current show state; the
+    // show-state fields are copied but never interpreted here.
+    unsafe { GetWindowPlacement(hwnd, &mut placement) }
+        .map_err(|error| win32_error("GetWindowPlacement", error))?;
+    Ok(from_win32(placement.rcNormalPosition))
 }
 
 /// Moves and resizes `handle` to `r`, after `r.scaled(scale)` - see
@@ -128,7 +150,10 @@ fn work_area_of(monitor: HMONITOR) -> PlatformResult<FrameRect> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PLACEMENT_FLAGS, from_win32, monitor_work_area, set_frame_rect, work_area_of};
+    use super::{
+        PLACEMENT_FLAGS, frame_rect, from_win32, monitor_work_area, restore_frame_rect,
+        set_frame_rect, work_area_of,
+    };
     use crate::{FrameRect, PlatformError, PlatformResult, WindowBackend};
     use ::windows::Win32::Foundation::RECT;
     use ::windows::Win32::Graphics::Gdi::HMONITOR;
@@ -181,6 +206,25 @@ mod tests {
             assert!(
                 matches!(result, Err(PlatformError::InvalidHandle)),
                 "{result:?}"
+            );
+        }
+    }
+
+    /// The restore rect goes through the same handle guard as the live rect, so a
+    /// garbage handle maps to the SAME refusal for both - and never panics.
+    #[test]
+    fn restore_frame_rect_maps_a_garbage_handle_like_frame_rect() {
+        for handle in [0, 2, 3, isize::MIN + 1] {
+            let live = frame_rect(handle).map(|_| ());
+            let restore = restore_frame_rect(handle).map(|_| ());
+            assert!(
+                matches!(restore, Err(PlatformError::InvalidHandle)),
+                "handle {handle:#x}: expected InvalidHandle, got {restore:?}",
+            );
+            assert_eq!(
+                core::mem::discriminant(&live),
+                core::mem::discriminant(&restore),
+                "handle {handle:#x}: the two rect seams must refuse alike",
             );
         }
     }

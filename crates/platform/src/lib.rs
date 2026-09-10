@@ -34,6 +34,9 @@ seam, not a policy engine. What it deliberately does *not* own:
 - `PlatformError` / `PlatformResult` - the error contract. Every fallible function
   returns it, and nothing in this crate panics.
 - `WindowBackend` - the trait `api` consumes.
+- `HostFacts` - the handle-free machine facts (the process ANSI code page), on the
+  same seam rules; platform-only facts enter through `api`, never through the
+  bridge, which may not import this crate at all.
 - `windows` - the Win32 implementation (`windows::topmost`, `windows::monitors`):
   the only module that allows `unsafe`, and every unsafe block carries a
   `// SAFETY:` comment naming the call and the invariant that makes it valid.
@@ -103,6 +106,19 @@ pub trait WindowBackend: Send {
     /// The window frame rectangle, in the unit `FrameRect` documents.
     fn frame_rect(&self, handle: isize) -> PlatformResult<FrameRect>;
 
+    /// The window's RESTORE frame rect: `GetWindowPlacement`'s
+    /// `rcNormalPosition` - the rect the USER sees as "the size I left it",
+    /// even while the window is maximized. Same unit as [`FrameRect`] (physical
+    /// frame pixels). `GetWindowRect` on a maximized window returns a rect that
+    /// EXCEEDS the monitor by the invisible borders, so storing it would persist
+    /// a lie; this is the only correct source for the persisted rect.
+    ///
+    /// The normal position is returned regardless of the current show state:
+    /// whether the window is maximized right now is what `WNDPLACEMENT`'s
+    /// `showCmd` and `flags` fields report, and interpreting them - "restore it
+    /// maximized?", "un-maximize first?" - is a decision above this crate.
+    fn restore_frame_rect(&self, handle: isize) -> PlatformResult<FrameRect>;
+
     /// Places and sizes the window at `r`.
     ///
     /// `scale` is the single unit conversion this seam performs: it is applied to `r`
@@ -118,9 +134,27 @@ pub trait WindowBackend: Send {
     /// screen resolution.
     fn primary_work_area(&self) -> PlatformResult<FrameRect>;
 }
+
+/// Machine facts that need no window handle. Same rule as [`WindowBackend`]:
+/// call out, value back, decide nothing, no policy, no caching.
+///
+/// Why this seam exists and why it is not the bridge's job: the product opens
+/// ordinary text files too, and core can only write back a code page it can
+/// decode (CP1252 by hand, anything else refused, never guessed). The bridge
+/// may import `notes-api` plus its toolkit and nothing else, so "the bridge
+/// will supply GetACP" is unimplementable. The rule this seam establishes:
+/// **platform-only facts enter through api, never through the bridge** - as an
+/// action where possible, as data only when a UI must render it.
+pub trait HostFacts: Send {
+    /// `GetACP()`: the ANSI code page of this process's logon session. A
+    /// measured value, not a constant: it is what the host answers, and a host
+    /// answering something this build cannot decode is exactly the fact the
+    /// caller needs to see.
+    fn ansi_codepage(&self) -> u16;
+}
 #[cfg(test)]
 mod tests {
-    use super::{FrameRect, PlatformError, PlatformResult, WindowBackend};
+    use super::{FrameRect, HostFacts, PlatformError, PlatformResult, WindowBackend};
 
     /// A stand-in for `api`: it implements the seam with no window, no desktop and
     /// no `windows` dependency, which is the point of the shape - bare `isize`
@@ -140,6 +174,12 @@ mod tests {
             Ok(FrameRect::new(1, 2, 3, 4))
         }
 
+        fn restore_frame_rect(&self, _handle: isize) -> PlatformResult<FrameRect> {
+            // Not recorded: the trait method takes &self (a rect read is a query),
+            // so the mock cannot push into its call log through it.
+            Ok(FrameRect::new(5, 6, 7, 8))
+        }
+
         fn set_frame_rect(
             &mut self,
             handle: isize,
@@ -153,6 +193,13 @@ mod tests {
 
         fn primary_work_area(&self) -> PlatformResult<FrameRect> {
             Err(PlatformError::NoMonitor)
+        }
+    }
+
+    impl HostFacts for Mock {
+        fn ansi_codepage(&self) -> u16 {
+            // A mock, not a measurement: it stands in for whatever the host answers.
+            1252
         }
     }
 
@@ -191,6 +238,19 @@ mod tests {
             backend.primary_work_area(),
             Err(PlatformError::NoMonitor)
         ));
+    }
+
+    #[test]
+    fn the_mock_serves_both_seams_without_a_window() {
+        let backend: Box<dyn WindowBackend> = Box::new(Mock::default());
+        assert!(matches!(
+            backend.restore_frame_rect(0x1234),
+            Ok(rect) if rect == FrameRect::new(5, 6, 7, 8)
+        ));
+        let facts: Box<dyn HostFacts> = Box::new(Mock::default());
+        // The mock's answer is a stand-in constant; the real one is measured in
+        // windows/mod.rs's test.
+        assert_eq!(facts.ansi_codepage(), 1252);
     }
 
     #[test]
