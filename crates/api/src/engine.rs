@@ -37,6 +37,11 @@ const AUTOSAVE_IDLE: Duration = Duration::from_millis(750);
 /// constant instead of hunting strings.
 const NOT_WIRED: &str = "the save path is not wired in this build: notes-core's encoding and save engines land in the next slice";
 
+/// How many commands the shutdown drain will process, at most. Why the budget is
+/// a count rather than a duration, and what happens when it runs out, is written
+/// down at [`Engine::drain`].
+const MAX_DRAIN: usize = 4_096;
+
 thread_local! {
     /// Set when an engine loop starts, on that thread only. See
     /// [`on_engine_thread`].
@@ -280,11 +285,35 @@ impl Engine {
     /// of [`Gateway::drop`](crate::Gateway), which removes the last Sender so
     /// the engine stops at Disconnected instead. Both paths are tested in
     /// tests/reentrancy.rs; only the drop path joins.
+    /// Two properties this loop has to keep, both learned from a mutation test
+    /// rather than from reading it:
+    ///
+    /// * **No recursion.** A Shutdown found INSIDE the queue is the instruction
+    ///   already being carried out, so here it is a no-op. Handing it back to
+    ///   [`Self::handle`] called drain() again, and thousands of queued Shutdowns
+    ///   overflowed the engine thread's stack and killed the process - not a panic, so
+    ///   nothing unwinds, nothing joins, and the "clean exit" this function promises
+    ///   becomes a dead process. Pinned by
+    ///   [`drain_never_recurses_on_a_queued_shutdown`].
+    /// * **A bound.** try_recv succeeds for as long as anyone keeps sending, so the
+    ///   drain stops at [`MAX_DRAIN`] and the excess dies with the thread. A
+    ///   truncated exit loses events; a hung one loses the process, because
+    ///   [`Gateway::drop`](crate::Gateway) waits in join() with no timeout. Pinned by
+    ///   [`drain_stops_at_its_budget_instead_of_hanging_shutdown`].
+    ///
+    /// [`Flow::Exit`] is never returned from in here: the caller is the one already
+    /// exiting, so a nested exit is the case handled above, not a second exit.
     fn drain(&mut self) {
-        while let Ok(command) = self.cmd_rx.try_recv() {
-            // A second Shutdown in the queue is the instruction already being
-            // carried out; keep draining instead of recursing.
-            let _ = self.handle(command);
+        for _ in 0..MAX_DRAIN {
+            match self.cmd_rx.try_recv() {
+                // Already carrying this one out: not a re-entry, not an event.
+                Ok(Command::Shutdown) => continue,
+                Ok(command) => {
+                    let _ = self.handle(command);
+                }
+                // Nothing left in the queue. This is the normal exit.
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => return,
+            }
         }
     }
 
@@ -338,6 +367,123 @@ impl Engine {
 mod tests {
     use super::*;
     use notes_core::Rect;
+
+    /// An engine wired to channels the test holds both ends of, so the queue can be
+    /// filled before a single command is handled. No thread: every assertion below
+    /// drives the same methods `run()` calls, which is what makes the
+    /// drain ordering exact rather than a race with a scheduler.
+    fn wired() -> (Engine, mpsc::Sender<Command>, mpsc::Receiver<Event>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let engine = Engine::new(
+            cmd_rx,
+            event_tx,
+            StateDir(PathBuf::from("unused-in-these-tests")),
+            Session::default(),
+            Settings::default(),
+        );
+        (engine, cmd_tx, event_rx)
+    }
+
+    /// Everything emitted so far, as revision numbers. In this build every
+    /// unservable Flush answers with SaveFailed carrying its own revision (D11:
+    /// a failed save must not look like a saved buffer), which is exactly what
+    /// makes the drain order observable without touching engine internals.
+    fn emitted(events: &mpsc::Receiver<Event>) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::SaveFailed { revision, .. } => out.push(revision),
+                other => panic!("unexpected event while draining: {other:?}"),
+            }
+        }
+        out
+    }
+
+    fn flush(revision: u64) -> Command {
+        Command::Flush {
+            text: String::new(),
+            revision,
+        }
+    }
+
+    /// BLOCKER 2, the teeth the reviewer asked for: the drain must actually run,
+    /// and it must answer what was queued BEHIND the Shutdown, in order.
+    ///
+    /// Removing the `drain()` call from the Shutdown arm empties this
+    /// assertion (revisions 3 and 4 never arrive), which is the mutation the
+    /// reviewer ran. Nothing here waits on a thread, so a passing run is proof
+    /// rather than a timing coincidence.
+    #[test]
+    fn drain_answers_commands_queued_behind_shutdown_in_order() {
+        let (mut engine, cmd_tx, events) = wired();
+        for revision in 1..=2u64 {
+            cmd_tx.send(flush(revision)).expect("unbounded");
+        }
+        cmd_tx.send(Command::Shutdown).expect("unbounded");
+        for revision in 3..=4u64 {
+            cmd_tx.send(flush(revision)).expect("unbounded");
+        }
+
+        // What run() does when recv() hands it the Shutdown.
+        assert_eq!(engine.handle(Command::Shutdown), Flow::Exit);
+        assert_eq!(
+            emitted(&events),
+            vec![1, 2, 3, 4],
+            "everything queued before AND behind the Shutdown must be answered, in order",
+        );
+    }
+
+    /// BLOCKER 1: a Shutdown found inside the drain is the instruction already
+    /// being carried out, not a reason to call handle() -> drain() again.
+    ///
+    /// The recursion was a process killer, not a panic: thousands of queued
+    /// Shutdowns blew the engine thread stack, so no unwind ran and
+    /// Gateway::drop never joined. 20 000 is well past the 2 000 that reproduced
+    /// it, and this test only needs to RETURN to pass.
+    #[test]
+    fn drain_never_recurses_on_a_queued_shutdown() {
+        let (mut engine, cmd_tx, _events) = wired();
+        for _ in 0..20_000 {
+            cmd_tx.send(Command::Shutdown).expect("unbounded");
+        }
+        assert_eq!(engine.handle(Command::Shutdown), Flow::Exit);
+        // Iterative means bounded work: the loop cannot have consumed more than
+        // its budget, and it must still have left the excess in the queue.
+        assert!(engine.cmd_rx.try_recv().is_ok(), "the excess stays queued");
+    }
+
+    /// MAJOR 3: the drain is bounded, so a producer that keeps sending cannot
+    /// hold shutdown open forever - and Gateway::drop, which waits in join() with
+    /// no timeout anywhere on that path, cannot be hung by it.
+    #[test]
+    fn drain_stops_at_its_budget_instead_of_hanging_shutdown() {
+        let (mut engine, cmd_tx, events) = wired();
+        let excess = MAX_DRAIN + 5;
+        for revision in 0..excess as u64 {
+            cmd_tx.send(flush(revision)).expect("unbounded");
+        }
+
+        assert_eq!(engine.handle(Command::Shutdown), Flow::Exit);
+        let answered = emitted(&events);
+        assert_eq!(
+            answered.len(),
+            MAX_DRAIN,
+            "the drain must stop at exactly its budget",
+        );
+        assert_eq!(answered.first().copied(), Some(0));
+        assert_eq!(answered.last().copied(), Some(MAX_DRAIN as u64 - 1));
+        // The 5 over the budget are dropped by the exit, not panicked over, and
+        // not half-written: they never reach handle() at all.
+        let mut left = 0usize;
+        while engine.cmd_rx.try_recv().is_ok() {
+            left += 1;
+        }
+        assert_eq!(
+            left, 5,
+            "the excess is left in the queue and dies with the thread"
+        );
+    }
 
     /// A quiet engine driven by hand: no thread, no channel to babysit. The
     /// thread-level behaviour belongs to tests/reentrancy.rs; what lives here is
