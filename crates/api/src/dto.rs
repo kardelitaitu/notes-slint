@@ -33,14 +33,17 @@ pub use notes_core::geometry::Rect;
 /// `api` probing the filesystem itself.
 pub use notes_core::paths::StateDir;
 
-// CONTRACT for the next api slice — un-comment this one line, nothing else:
-// the persisted session that `Gateway::initial_state()` will hand a bridge
-// before it creates the window (rect, monitor id, scale, maximized, pinned,
-// last path). Its exact path is `notes_core::session::Session`, defined in
-// crates/core/src/session.rs, which this slice was fenced not to reference:
-// the file was being written in the same wave by another worker. Nothing else
-// in this crate depends on it, so un-commenting is a one-line change.
-//
-// Note it is NOT `Copy` and NOT `Eq` (it carries an `f32` scale factor and a
-// `PathBuf`), so it rides as a clone, not as a `FileMeta`-sized value.
-// pub use notes_core::session::Session;
+/// The persisted window session: rect (frame pixels), monitor id, scale,
+/// maximised, pinned, and the document that was last open. Owned by `notes-core`,
+/// re-exported because [`Gateway::initial_state`](crate::Gateway::initial_state)
+/// hands it to a bridge before the window exists, so the bridge has to be able to
+/// NAME the type it is being handed (docs/architecture.md §5.5 step 1).
+///
+/// Neither `Copy` nor `Eq`: it carries an f32 scale factor and a PathBuf, so it
+/// rides as a clone. That is also why it is not inside `FileMeta`, which is
+/// deliberately a small `Copy` struct.
+///
+/// Storage is core's (session.json, written atomically); restoring it onto a real
+/// window is the bridge's. The port moves the value and interprets nothing - and
+/// note that the pin bit lives HERE, one home, per D10.
+pub use notes_core::session::Session;

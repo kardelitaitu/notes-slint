@@ -6,14 +6,22 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-# notes-core: dto.rs re-exports the core types a Command or Event has to carry
-# (geometry::Rect, paths::StateDir), because a bridge may import api and nothing
-# else in this repo — so those types must be nameable from this crate.
+# notes-core: dto.rs re-exports the core types a Command, an Event or
+# InitialState has to carry (geometry::Rect, paths::StateDir, session::Session),
+# because a bridge may import api and nothing else in this repo — those types
+# have to be nameable from here. gateway.rs also reads session.json through it:
+# the one synchronous pre-window read the port is allowed (D-STATE).
 # thiserror: event::SaveError, whose Display text is the UI copy.
 # Deps are added only as used: unused_crate_dependencies + clippy -D warnings
 # make an unused dep a hard gate error.
 notes-core = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# tests/reentrancy.rs points a Gateway at a throwaway state directory holding a
+# hand-written session.json and a decoy note file. notes-core already uses
+# tempfile for exactly this, so no new crate enters the graph.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

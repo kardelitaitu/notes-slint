@@ -6,10 +6,12 @@
 //! `api` in turn never names a bridge, a widget or a keystroke. The arrow points
 //! one way: bridge → api, never api → bridge.
 //!
-//! This slice is the DATA of the port only — the two enums, their payloads and
-//! the errors that ride on them. No engine, no threads, no `Gateway` yet. The
-//! section "Shape of the next slice" below records what that will be, so the
-//! following worker does not have to guess it.
+//! Two halves now. The VOCABULARY — [`Command`], [`Event`] and the data that
+//! rides on them — is FROZEN: read it, do not edit it. The LIFECYCLE —
+//! [`Gateway`] and its one engine thread — is what this slice wires, and it
+//! carries no disk I/O: the file arms answer with a [`SaveError`] naming the
+//! engine they are waiting on, and the next slice (W5) replaces exactly those
+//! arms. `What exists, and what W5 adds` below, instead of guessing from code.
 //!
 //! # The four rules
 //!
@@ -94,45 +96,121 @@
 //! a product surface: renaming a variant is a refactor, editing its text is a
 //! decision. `event.rs` pins every string verbatim in a test for that reason.
 //!
-//! # Shape of the next slice (recorded here, deliberately NOT implemented)
+//! # What exists, and what W5 adds
+//!
+//! Wired now, exactly as the last slice recorded it:
 //!
 //! ```text
 //! Gateway::start(state_dir: StateDir, settings: Settings) -> (Gateway, EventRx)
 //! Gateway::send(&self, command: Command)
 //! Gateway::initial_state(&self) -> InitialState
+//! Gateway::engine_is_alive(&self) -> bool      // a test seam, see below
 //! pub type EventRx = std::sync::mpsc::Receiver<Event>;
 //! ```
 //!
-//! * **`std::sync::mpsc`, UNBOUNDED in both directions** — a command channel in,
-//!   an event channel out, one `mpsc::channel()` pair each way. On this toolchain
-//!   (rustc 1.98) `mpsc::channel()` IS the unbounded flavour: `unbounded_channel`,
-//!   `UnboundedSender` and `UnboundedReceiver` no longer exist in `std`, so do not
-//!   go looking for them. `sync_channel(n)` is the bounded one and is NOT what the
-//!   gateway uses — unbounded is what makes rule 4 possible, because `send` must
-//!   never block the UI thread and a full bounded queue is a blocked frame.
-//!   `Sender` is `Clone + Send`, which is how every GPUI callback gets one.
-//!   Back-pressure is core's debounce, not the channel's.
-//! * **One engine thread**, owned by `Gateway`, joining on `Command::Shutdown`.
-//!   It owns the `core` state and the registered [`WindowHandle`].
-//! * `start` RECEIVES an already-resolved [`StateDir`]: per D-STATE the caller
-//!   does the `<exe_dir>\data` portable probe, and `api` never touches the
-//!   filesystem to find itself.
-//! * `Settings` and `InitialState` are `core` types, to be re-exported from
-//!   `dto.rs` beside `Rect` and `StateDir`. `initial_state()` is what a bridge
-//!   reads BEFORE it creates the window, so geometry *restore* stays bridge work
-//!   while geometry *storage* stays core work (AGENTS.md, startup order).
+//! Not wired, all of it W5's, and none of it silent: [`Command::Open`],
+//! [`Command::SaveAs`] and [`Command::Flush`] have no file engines to run
+//! (notes-core's encoding and save modules are being written right now),
+//! [`Command::ClearRecents`] has no list to clear, the session write that a
+//! [`Command::GeometryChanged`] queues is never performed, and the registered
+//! [`WindowHandle`] is stored but unused — applying topmost goes through
+//! notes-platform, which this crate has no dependency on and which `check-arch`
+//! keeps out.
 //!
-//! The tripwire: if anything in this crate grows a `thread::spawn`, a `RefCell`,
-//! an `Instant`, or a `match` that decides something about the user's data, it
-//! has stopped being a port.
+//! * [`Settings`] is an api-side placeholder because notes-core has no settings
+//!   module yet. W5 deletes it and re-exports the core type; the
+//!   [`Gateway::start`] parameter name survives the swap unchanged.
+//! * The 750 ms cadence in `engine::AUTOSAVE_IDLE` is a constant until a loaded
+//!   interval replaces it. M4 changes the BODY of the tick arm, not the shape.
+//! * [`Command::Open`] reports its failure through [`Event::SaveFailed`]
+//!   because the frozen vocabulary has no load-failure variant. The honest fix is
+//!   an `Event::LoadFailed` — a vocabulary change, and this line is the note
+//!   asking for it rather than a private workaround inside the engine.
+//!
+//! # The channels, and why unbounded is load-bearing
+//!
+//! D24: in rustc 1.98's std there is NO `mpsc::unbounded_channel` —
+//! `mpsc::channel()` IS the unbounded pair, and `sync_channel(n)` is the bounded
+//! one. Two `mpsc::channel()` pairs, one per direction:
+//!
+//! ```text
+//! let (cmd_tx, cmd_rx): (Sender<Command>, Receiver<Command>) = mpsc::channel();
+//! let (evt_tx, evt_rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
+//! ```
+//!
+//! Unbounded in BOTH directions is what makes rule 4 possible, and it is a safety
+//! argument, not a convenience. A bounded event queue lets a slow UI block the
+//! engine inside `event_tx.send()` while that UI blocks inside its own
+//! `cmd_tx.send()` — ABBA, a deadlock with no lock anywhere in sight. A bounded
+//! command queue forces the other horn: block inside a frame, or drop a
+//! [`Command::Flush`], which is data loss. Unbounded makes `the queue was full so
+//! we dropped your SaveFailed` impossible by construction. Back-pressure is
+//! core's debounce, never the channel's, and tests/reentrancy.rs pins that
+//! argument with 10,000 unanswered events.
+//!
+//! # Ownership, so nobody has to wonder who joins
+//!
+//! * [`Gateway`] owns the command `Sender` and the `JoinHandle`.
+//! * The engine owns the command `Receiver` and ONE clone of the event `Sender`,
+//!   so when its loop ends [`EventRx`] reports Disconnected. That is how a caller
+//!   — and a test — proves the thread finished.
+//! * The caller owns [`EventRx`] and drains it on the UI thread.
+//!
+//! # The lifecycle asymmetry, deliberate and both tested
+//!
+//! [`Command::Shutdown`] is DRAIN AND EXIT: every command already queued behind
+//! it is handled, and its events emitted, before the loop breaks. It works while
+//! the caller still holds a live `Sender`.
+//!
+//! [`Gateway::drop`] is ABORT: the last `Sender` goes with it and the loop stops
+//! at Disconnected. Only the drop path joins — join blocks, and drop is where a
+//! caller has said it is done with the port. std mpsc still delivers
+//! already-queued commands and already-buffered events before it reports
+//! Disconnected, so `abort` never means `lose what you accepted`.
+//!
+//! Dropping the [`EventRx`] is a signal, not an error: the engine stops emitting
+//! and keeps serving commands until Disconnected. No panic, no log spam at a dead
+//! window.
+//!
+//! # The reentrancy trap
+//!
+//! A thread-local marks the engine thread when its loop starts, and
+//! [`Gateway::send`] and [`Gateway::initial_state`] `debug_assert!` against it.
+//! Engine code that re-entered the port would queue a command behind itself and
+//! then wait on its own queue — the second deadlock AGENTS.md names, in
+//! single-author form. It is a `debug_assert!` so the release build never pays a
+//! TLS read per send, which is exactly why tests/reentrancy.rs asserts the trap
+//! FIRES: an unarmed trap and correct code look identical from outside.
+//!
+//! One ownership note left, because [`StateDir`] is what makes it awkward:
+//! [`Gateway::start`] RECEIVES an already-resolved StateDir and never resolves
+//! one (D-STATE). The single `<exe_dir>\data` portable probe belongs to
+//! whoever launches the app; `api` does not call `resolve_state_dir`, does not read the
+//! environment, and does not look at the filesystem to find out where it lives.
+//! Which files the engine may touch after that is next slice's business; that it
+//! may not choose WHERE is this slice's.
+//!
+//! The tripwire for whoever comes next: a second thread, a lock around engine
+//! state, an `Instant` on a UI-visible type, or a `match` that decides something
+//! about the user's data — any of those and this has stopped being a port.
+
+// tempfile is a dev-dependency used by tests/reentrancy.rs. The lint is per
+// TARGET, and the lib's own test target links the dev-deps without naming them
+// — this is the documented opt-out, not a placeholder import.
+#[cfg(test)]
+use tempfile as _;
 
 mod command;
 mod dto;
+mod engine;
 mod event;
+mod gateway;
 
 pub use command::{Command, WindowHandle};
-pub use dto::{Rect, StateDir};
+pub use dto::{Rect, Session, StateDir};
+pub use engine::mark_current_thread_as_engine;
 pub use event::{Encoding, Event, FileMeta, LineEnding, RecentEntry, SaveError, SkipReason};
+pub use gateway::{EventRx, Gateway, InitialState, Settings};
 
 #[cfg(test)]
 mod tests {
