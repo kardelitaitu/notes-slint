@@ -191,13 +191,28 @@ jobs:
       # own step table (advisory and --quick-skippable), so the drift lock at 4c reports it
       # too; this step exists to give it its own cell and its own annotation.
       #
-      # Exit codes: 0 passed | 1 the app or its persistence is broken | 2 bad usage (no
-      # PowerShell to post WM_CLOSE with, or the probe could not be written) | 3 DECLINED,
-      # no desktop. Order matters: it MUST come after 3b, because with no exe built it
-      # prints close=NOBIN and exits 1, which would read as an app bug rather than as a
-      # missing artifact. And the step still ends exit $status although it is advisory - a
-      # step that always returned 0 would render a real shutdown failure as a green cell;
-      # continue-on-error is what keeps that red from turning the run red.
+      # Two mechanical rules carry the rest of this step. It MUST come after 3b: with no
+      # exe built, smoke prints close=NOBIN and exits 1, which reads as an app bug instead
+      # of a missing artifact. And it ends exit $status even though it is advisory: a step
+      # whose last command is an echo always returns 0, so a real shutdown failure would
+      # render as a green cell - continue-on-error is what keeps that red from turning the
+      # run red. What each code covers now is the table below, not folklore.
+      #
+      # The exit-code contract as of 5efde6b (smoke relocates foreign user state before it
+      # judges, and declines instead of failing when it cannot). Three of the four codes
+      # now mean more than one thing, so the arms below keep the readings apart - an
+      # infrastructure emergency must never be cited as a product bug:
+      #   0  passed, AND the user state it moved aside came back byte-identical
+      #   1  app or persistence failure, OR the harness damaged a user profile, OR no exe
+      #   2  the harness could not run at all (no PowerShell, probe unwritable, bad usage)
+      #   3  declined: no interactive desktop, OR foreign state on the session path
+      #
+      # What this step must not hide by filtering: it prints the stderr of the app it
+      # launches, so a developer machine can show "SettingsCorrupt / running on defaults"
+      # from a stale %APPDATA%\notes-gpui\settings.toml left behind by an earlier
+      # experiment. Leftover local state - not an app bug, not a red build, and not part of
+      # the smoke verdict, which is the exit code alone. So the log is tee-d whole and
+      # nothing here greps, filters, or fails on stderr text.
       - name: smoke — cargo run -p xtask -- smoke (advisory - needs a desktop session)
         id: xtask_smoke
         continue-on-error: true
@@ -209,12 +224,13 @@ jobs:
           cargo run -p xtask --quiet -- smoke 2>&1 | tee "$RUNNER_TEMP/xtask-smoke.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           case "$status" in
-            0) echo "smoke: the window appeared, WM_CLOSE shut the app down by itself, session.json was written." ;;
-            1) echo "::error::GRACEFUL SHUTDOWN OR PERSISTENCE BROKEN (smoke exit 1). Read the smoke: window=.../close=.../session=... line in the log above - close=FORCED means the app had to be killed, session=FAILED means nothing was persisted (the log lists every path searched), close=NOBIN means the exe from 3b was never built, which is a step-order problem and not an app bug." ;;
-            3) echo "::notice::smoke DECLINED - no interactive desktop on this runner. Not a failure; the check was not possible here." ;;
+            0) echo "smoke: PASS - a window appeared, WM_CLOSE shut the app down by itself, that run wrote session.json, and the user state the harness relocated came back byte-identical. Citable as written: graceful shutdown, real persistence, and a profile left exactly as found." ;;
+            1) echo "::error::SMOKE EXIT 1 - three unrelated readings share this code; separate them before citing it. Look at the smoke: window=.../close=.../session=... line and the SMOKE FAIL line above it. close=FORCED means the app had to be killed to stop it (shutdown bug). session=FAILED, with every path searched printed, means nothing was persisted (product bug). close=NOBIN means the exe from step 3b was never built (step order, not the app). But if the log says the relocated user state did not come back byte-identical, or could not restore it and names a temp path, then THE HARNESS DAMAGED A USER PROFILE - an infrastructure emergency: put that file back by hand and fix the harness before this row is read as the app failing to persist." ;;
+            3) echo "::notice::smoke DECLINED - either no interactive desktop, or something other than a session file occupies the state path (the log line says which, with ACLs). Not a failure; the check was not possible here." ;;
             *) echo "::error::SMOKE HARNESS FAILURE (exit $status) - no PowerShell to post WM_CLOSE with, or the probe could not be written. This is not an app failure." ;;
           esac
           exit $status
+
       # --- 4. architecture invariants (== the `cargo arch` alias) ------------
       # Replaces the six "cargo tree -p X -i Y | must be empty" probes in AGENTS.md,
       # evaluated from cargo metadata (crates/xtask/src/arch.rs). Exit codes:
