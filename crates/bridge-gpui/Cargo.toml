@@ -25,5 +25,12 @@ notes-api = { workspace = true }
 gpui = { workspace = true }
 # Only to read the HWND out of the window gpui created: HasWindowHandle is
 # implemented by gpui itself (src/window.rs), so this is the toolkit handle
+# Granted as the S1 FCR (root Cargo.toml line 32). Grapheme cluster boundaries for the
+# caret and for every replacement range: a UTF-16 unit index from the platform can land
+# between a base character and its combining mark, and slicing there is legal UTF-8 that
+# has separated something the user sees as one glyph. UnicodeSegmentation is used in
+# editor.rs only, and gpui has it as a DEV dependency, which is why the example can use
+# it without telling us.
+unicode-segmentation = { workspace = true }
 # accessor, not a route around the port. No windows-rs type appears in this crate.
 raw-window-handle = { workspace = true }

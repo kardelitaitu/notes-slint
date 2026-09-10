@@ -54,9 +54,12 @@
 //! also the only shape that satisfies "never block on a channel inside a GPUI
 //! frame".
 
-// S1 of the editor: the model and its input handler only. Nothing in main.rs uses
-// it yet - it does not paint until S2 - so the app behaves exactly as it did.
+// S2: the editor model paints and takes focus. It is still NOT wired to the port -
+// no Flush, no Loaded text - until S6, so it is a working surface with nothing
+// behind it, not a finished M2.
 mod editor;
+
+use editor::Editor;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -66,9 +69,9 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyWindowHandle, App, Application, AsyncApp, Bounds, Context, IntoElement, Pixels, Point,
-    Render, SharedString, Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBounds,
-    WindowOptions, div, px, rgb, size,
+    AnyWindowHandle, App, Application, AsyncApp, Bounds, Context, Entity, Focusable, IntoElement,
+    KeyBinding, Pixels, Point, Render, SharedString, Subscription, Task, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
 use notes_api::{
     Command, Encoding, Event, EventRx, FileMeta, Gateway, InitialState, LineEnding, RecentEntry,
@@ -318,6 +321,13 @@ struct Surface {
     /// Only to send `GeometryChanged` when the watch says the drag has settled.
     gateway: Rc<RefCell<Option<Gateway>>>,
     watch: Watch,
+    /// The editor surface (S2). Held as an entity because gpui renders an
+    /// `Entity<V>` where `V: Render`, and because that entity is what the IME input
+    /// handler is attached to during paint.
+    editor: Entity<Editor>,
+    /// Whether we have asked for the keyboard yet - first frame only, so that
+    /// focusing the editor cannot fight something the user clicks into later.
+    focus_requested: bool,
 }
 
 impl Surface {
@@ -326,6 +336,7 @@ impl Surface {
         stats: Rc<RefCell<Pump>>,
         gateway: Rc<RefCell<Option<Gateway>>>,
         window: Rc<RefCell<Option<AnyWindowHandle>>>,
+        editor: Entity<Editor>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut this = Self {
@@ -336,6 +347,8 @@ impl Surface {
             window,
             gateway,
             watch: Watch::default(),
+            editor,
+            focus_requested: false,
         };
         this.start_pump(cx);
         this
@@ -439,7 +452,15 @@ impl Surface {
 }
 
 impl Render for Surface {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The editor owns the keyboard from the first frame: a notes window that
+        // needs a click before it takes typing is not a notes window. One shot only,
+        // so it can never steal focus back from something added later.
+        if !self.focus_requested {
+            self.focus_requested = true;
+            let handle = Focusable::focus_handle(self.editor.read(cx), cx);
+            window.focus(&handle);
+        }
         // Nothing invented here: GPUI 0.2.2 has no `Label` widget (its own text
         // elements are in src/elements/text.rs - `impl Element for &'static str` at
         // :19, `impl IntoElement for String` at :77, and `impl Element for
@@ -453,7 +474,18 @@ impl Render for Surface {
             .flex_col()
             .bg(rgb(0x1f1f1f))
             .text_color(rgb(0xe6_e6_e6))
-            .child(div().flex_1())
+            // The editor above the status line, and the status line STAYS: every
+            // pump diagnostic and the smoke harness read that second row, so the
+            // layout is stacked rather than replaced. flex_1 gives the editor the
+            // space and the status bar its two lines back at the bottom.
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .text_size(px(15.0))
+                    .child(self.editor.clone()),
+            )
             .child(
                 div()
                     .flex_none()
@@ -722,6 +754,29 @@ fn main() {
         let subscriptions = Rc::clone(&subscriptions);
         let window_slot = Rc::clone(&window_slot);
         move |cx: &mut App| {
+            // The key map, in the examples shape (examples/input.rs:677-692), with
+            // the Windows modifiers rather than the mac ones the example carries, and
+            // the actions named through the module so `Copy` cannot shadow the trait
+            // of the same name. No word motion: the example has none, and guessing a
+            // word boundary for combining marks and emoji sequences is a slice of its
+            // own. `ctrl-c`/`ctrl-v`/`ctrl-x` are taken because the clipboard code is
+            // the three trivially-separable handlers, not because S5 is done.
+            cx.bind_keys([
+                KeyBinding::new("backspace", editor::Backspace, None),
+                KeyBinding::new("delete", editor::Delete, None),
+                KeyBinding::new("left", editor::Left, None),
+                KeyBinding::new("right", editor::Right, None),
+                KeyBinding::new("shift-left", editor::SelectLeft, None),
+                KeyBinding::new("shift-right", editor::SelectRight, None),
+                KeyBinding::new("home", editor::Home, None),
+                KeyBinding::new("end", editor::End, None),
+                KeyBinding::new("escape", editor::EscapeSelection, None),
+                KeyBinding::new("ctrl-a", editor::SelectAll, None),
+                KeyBinding::new("ctrl-c", editor::Copy, None),
+                KeyBinding::new("ctrl-x", editor::Cut, None),
+                KeyBinding::new("ctrl-v", editor::Paste, None),
+            ]);
+
             // STEP 2 - create the window AT the saved rect, before anything is
             // drawn. Only the bridge can: the port has no window type at all. The
             // root view owns the pump, so the wake route starts and stops with the
@@ -742,12 +797,18 @@ fn main() {
                 let gateway = Rc::clone(&gateway);
                 let window_slot = Rc::clone(&window_slot);
                 move |_, cx| {
+                    // The editor view, built before the root view so the root can
+                    // own it. Empty, unshaped, and not yet focused: focus is asked
+                    // for on the first render, and the first shape happens on that
+                    // same first paint - not here, and not at startup.
+                    let editor = cx.new(Editor::new);
                     cx.new(|cx| {
                         Surface::new(
                             Rc::clone(&events),
                             Rc::clone(&stats),
                             Rc::clone(&gateway),
                             Rc::clone(&window_slot),
+                            editor,
                             cx,
                         )
                     })

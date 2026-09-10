@@ -1,7 +1,12 @@
-//! The editor model, and the eight methods the platform IME calls on it. Slice S1.
+//! The editor model, its painting, and the eight methods the platform IME calls on it.
+//! Slices S1 (model) and S2 (paint, focus, keys, geometry).
 //!
-//! S1 is deliberately invisible: nothing here paints, nothing here talks to the port,
-//! and `main` does not construct an `Editor` yet. What S1 buys is the one thing every
+//! UNTIL S6 THIS WIDGET IS A DECORATION. It paints, it takes the keyboard, it answers
+//! the IME, and NONE of that reaches the port: no Flush, no autosave, no Loaded text,
+//! no file. Nobody should read M2 as done because text appears on screen - the text
+//! goes nowhere. That is the line S2 stops at and the line S6 erases.
+//!
+//! What S1 bought, and S2 now stands on, is the one fact that has quietly broken
 //! later slice stands on and the one thing that has quietly broken every hand-rolled
 //! editor attempt: **every range in `gpui::InputHandler` is in UTF-16 CODE UNITS, and
 //! a UTF-16 code unit index is not a byte index.** Handing `self.content[range]` a
@@ -18,14 +23,32 @@
 //! What is NOT here, by slice: painting and layout (S2), the line model (S3), the
 //! mouse (S4), the clipboard (S5), the flush to the port (S6), caret blink and
 //! read-only (S7), undo (S8).
-#![allow(dead_code)] // S1 has no painter and main.rs has no editor widget yet; S2 removes this line.
 
 use std::ops::Range;
 
-use gpui::UTF16Selection;
+use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, EntityInputHandler, FocusHandle, Focusable, Pixels, Point, Window,
+    App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, PaintQuad, Pixels, Point, Render, ShapedLine, SharedString, Style, TextRun,
+    UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, px, relative, rgb, size,
 };
+use unicode_segmentation::UnicodeSegmentation;
+/// A development probe, silent unless `NOTES_S2_PROBE` is set in the environment.
+///
+/// It exists because part of S2 is a claim about geometry - the rectangle handed to
+/// the IME tracks the caret - that is invisible in a screenshot and unreachable from
+/// a unit test without a window, because the caller is the text-services framework,
+/// not our code. With the variable set, what each geometry method answered and the x
+/// it was derived from go to stderr, the only channel a `windows_subsystem="windows"`
+/// binary has. Gated rather than permanent because an unconditional `eprintln!` in a
+/// paint path is a measurement artifact, not a feature; S3 deletes it with the layout
+/// rework.
+fn probe(what: impl AsRef<str>) {
+    if std::env::var_os("NOTES_S2_PROBE").is_some() {
+        eprintln!("notes-gpui: [s2] {}", what.as_ref());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // UTF-16 <-> UTF-8, the whole reason this file exists
@@ -137,42 +160,56 @@ pub(crate) fn range_from_utf16_outward(content: &str, range_utf16: &Range<usize>
         ..offset_from_utf16_ceil(content, range_utf16.end)
 }
 
-/// The largest byte offset `<= byte` that is a UTF-8 character boundary.
-///
-/// THIS IS THE HAND-WRITTEN HALF OF WHAT `unicode-segmentation` WOULD DO, and it is
-/// deliberately weaker: it finds CHARACTER boundaries, not GRAPHEME CLUSTER
-/// boundaries, because a cluster boundary needs the Unicode property tables and this
-/// crate has no dependency that carries them (see the FCR in the slice report: the
-/// workspace template does not list `unicode-segmentation`, and gpui has it only as a
-/// DEV dependency, so `examples/input.rs:11` can use it and we cannot).
-///
-/// Why that is enough for S1 and not enough for S4: slicing is the only place a wrong
-/// answer PANICS, and every slice in this file goes through a character boundary.
-/// Putting the caret between `e` and U+0301 does not panic - it looks wrong on screen
-/// and the user cannot see why - so the cluster snap belongs to the slice that moves
-/// the caret to a mouse point, where the grapheme table (or an explicit range list)
-/// must be added. It is one function, `snap_to_char_boundary`, and the note below is
-/// the seam.
-pub(crate) fn snap_to_char_boundary(content: &str, byte: usize) -> usize {
+/// The byte offset of the first grapheme boundary at or after `byte`.
+pub(crate) fn grapheme_boundary_after(content: &str, byte: usize) -> usize {
     let byte = byte.min(content.len());
-    if content.is_char_boundary(byte) {
-        return byte;
-    }
-    let mut candidate = byte;
-    while !content.is_char_boundary(candidate) {
-        // A continuation byte is 0b10xx_xxxx, so at most three steps back reaches the
-        // head of the sequence, and `is_char_boundary(0)` is always true - no underflow.
-        candidate -= 1;
-    }
-    candidate
+    content
+        .grapheme_indices(true)
+        .map(|(index, _)| index)
+        .find(|index| *index >= byte)
+        .unwrap_or(content.len())
 }
 
-/// Clamp a caller-supplied byte range into the content on character boundaries and
-/// make it ordered. Every index that arrives from the platform passes through here.
+/// The byte offset of the last grapheme boundary at or before `byte`.
+pub(crate) fn grapheme_boundary_before(content: &str, byte: usize) -> usize {
+    let byte = byte.min(content.len());
+    let mut last = 0usize;
+    for (index, _) in content.grapheme_indices(true) {
+        if index > byte {
+            break;
+        }
+        last = index;
+    }
+    last
+}
+
+/// Clamp a caller-supplied byte range onto GRAPHEME CLUSTER boundaries.
+///
+/// S1 shipped a hand-written version of this that could only find CHARACTER
+/// boundaries, because `unicode-segmentation` was not in the workspace template. The
+/// FCR was granted, so the tables are real now - and the test that recorded what the
+/// weaker version cost (`e` separated from its U+0301) is kept, renamed, and now
+/// asserts the corrected claim instead.
+///
+/// Two rules, and the difference between them is the point:
+///
+/// * a NON-empty range widens outwards, so a replacement always consumes whole
+///   clusters. Narrowing it instead would strand a combining mark with nothing to sit
+///   on: valid UTF-8, and a character the user can neither type nor delete.
+/// * a zero-width range - an insertion, a caret - snaps FORWARD to the next boundary.
+///   Widening a caret would turn it into a deletion, so one press of the right arrow
+///   inside `e` + U+0301 moves past the whole cluster rather than eating it.
+///
+/// Every grapheme boundary is also a character boundary, so no slice can panic.
 pub(crate) fn clamp_range(content: &str, range: &Range<usize>) -> Range<usize> {
-    let start = snap_to_char_boundary(content, range.start);
-    let end = snap_to_char_boundary(content, range.end.max(range.start));
-    start..end
+    if range.start == range.end {
+        let at = grapheme_boundary_after(content, range.start);
+        at..at
+    } else {
+        let start = grapheme_boundary_before(content, range.start);
+        let end = grapheme_boundary_after(content, range.end.max(range.start));
+        start..end.max(start)
+    }
 }
 
 /// The splice, as a pure function, so that "it cannot panic" is a claim a test can
@@ -315,6 +352,97 @@ impl TextState {
     /// Text for a UTF-16 range, reporting back what was actually read. A platform
     /// that asks for `2..3` of a single emoji is asking for half a surrogate pair;
     /// `actual_range` is how it learns the answer was the whole character.
+    /// Where the caret is: the end of the selection, unless it was dragged backwards.
+    pub(crate) fn cursor_offset(&self) -> usize {
+        if self.selection_reversed {
+            self.selected_range.start
+        } else {
+            self.selected_range.end
+        }
+    }
+
+    /// Collapse the selection to a caret at `offset`, snapped forward onto a grapheme
+    /// boundary so a caller can hand us an index from anywhere and we cannot end up
+    /// holding a position that would split a cluster if it became an insertion.
+    pub(crate) fn move_to(&mut self, offset: usize) {
+        let at = grapheme_boundary_after(&self.content, offset);
+        self.selected_range = at..at;
+        self.selection_reversed = false;
+    }
+
+    /// Grow the selection to `offset`, flipping which end is the head if the user
+    /// crossed over. Byte-for-byte the example's rule (examples/input.rs:186-196),
+    /// with the boundary snap added.
+    pub(crate) fn select_to(&mut self, offset: usize) {
+        let at = grapheme_boundary_after(&self.content, offset);
+        if self.selection_reversed {
+            self.selected_range.start = at;
+        } else {
+            self.selected_range.end = at;
+        }
+        if self.selected_range.end < self.selected_range.start {
+            self.selection_reversed = !self.selection_reversed;
+            self.selected_range = self.selected_range.end..self.selected_range.start;
+        }
+    }
+
+    /// Ctrl+A.
+    pub(crate) fn select_all(&mut self) {
+        self.selected_range = 0..self.content.len();
+        self.selection_reversed = false;
+    }
+
+    /// Escape: drop the selection, keep the caret where the head was, and leave the
+    /// composition ALONE - cancelling a selection is not cancelling an IME session.
+    pub(crate) fn clear_selection(&mut self) {
+        let caret = self.cursor_offset();
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+    }
+
+    /// The boundary the LEFT arrow goes to: the last cluster start STRICTLY before
+    /// `byte`. Strictly, because `byte` is usually already on a boundary - and the
+    /// clamping helper that snaps a range must be inclusive, so the two rules cannot
+    /// share one function. An inclusive left-arrow would be a key that does nothing.
+    pub(crate) fn previous_boundary(&self, byte: usize) -> usize {
+        let mut last = 0usize;
+        for (index, _) in self.content.grapheme_indices(true) {
+            if index >= byte {
+                break;
+            }
+            last = index;
+        }
+        last
+    }
+
+    /// The boundary the RIGHT arrow goes to: the first cluster start STRICTLY after
+    /// `byte`, or the end of the buffer.
+    pub(crate) fn next_boundary(&self, byte: usize) -> usize {
+        self.content
+            .grapheme_indices(true)
+            .map(|(index, _)| index)
+            .find(|index| *index > byte)
+            .unwrap_or(self.content.len())
+    }
+
+    /// The end of the first line: the only part S2 shapes. Multiline is S3.
+    pub(crate) fn first_line_end(&self) -> usize {
+        match self.content.find('\n') {
+            // Exclude the newline itself: gpui shape_line debug-asserts that its input
+            // has none (src/text_system.rs:372), and a shaped line would draw a box.
+            Some(index) => index,
+            None => self.content.len(),
+        }
+    }
+
+    /// The exact text that was shaped, so a cached layout can be checked against the
+    /// buffer it came from. This is a SUBSTRING from byte 0, which is what keeps the
+    /// byte indices S3 and S4 hand to `x_for_index` in the buffers own space.
+    pub(crate) fn first_line(&self) -> &str {
+        let end = self.first_line_end();
+        &self.content[..end]
+    }
+
     pub(crate) fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -339,29 +467,51 @@ pub(crate) struct Editor {
     /// `focus_handle` below, which is why it is a separate struct (`TextState`).
     state: TextState,
     focus_handle: FocusHandle,
+    /// The shaped line from the LAST PAINT, cached in `paint` and read by the two
+    /// geometry methods. Caching it in paint rather than shaping it on demand is what
+    /// keeps the IME answer and the pixels in agreement, and it is what the example
+    /// does (examples/input.rs:555-559, reading :404-415).
+    last_layout: Option<ShapedLine>,
+    /// The text that `last_layout` was shaped from. Compared by value rather than
+    /// assumed equal, because the shaped text is a first-line SUBSTRING of the buffer
+    /// - see `display_desynced`.
+    last_layout_text: String,
+    last_bounds: Option<Bounds<Pixels>>,
 }
 
 impl Editor {
     /// The context's `focus_handle()` is `App::focus_handle` (gpui src/app.rs:2029)
     /// reached through `Context`'s deref; the example builds a `TextInput` the same way
     /// (examples/input.rs:703-704).
+    /// No font, no shaping, no layout: S1/S2 construct cheap and shape on first paint
+    /// (the cold-start budget, whitepaper section 2). This is the whole reason
+    /// `last_layout` starts empty.
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         Self {
             state: TextState::default(),
             focus_handle: cx.focus_handle(),
+            last_layout: None,
+            last_layout_text: String::new(),
+            last_bounds: None,
         }
     }
 
-    #[allow(dead_code)] // S2 onward
+    #[allow(dead_code)] // S3 onward: the buffer arrives from the port in S6
     pub(crate) fn with_content(content: String, cx: &mut Context<Self>) -> Self {
         Self {
             state: TextState::new(content),
             focus_handle: cx.focus_handle(),
+            last_layout: None,
+            last_layout_text: String::new(),
+            last_bounds: None,
         }
     }
 
-    pub(crate) fn state(&self) -> &TextState {
-        &self.state
+    /// True when the cached layout no longer describes what we would paint. A stale
+    /// layout is not a crash waiting to happen, it is a WRONG IME RECT waiting to
+    /// happen, so both geometry methods check this instead of trusting the cache.
+    fn display_desynced(&self) -> bool {
+        self.last_layout_text != self.state.first_line()
     }
 
     /// What S6 will refuse to flush while this is `Some`: an uncommitted composition
@@ -443,40 +593,470 @@ impl EntityInputHandler for Editor {
             .replace_and_mark(range, new_text, new_selected_range);
         cx.notify();
     }
-
-    /// PLACEHOLDER UNTIL S2 HAS LAYOUT, and deliberately returning `None`.
+    /// WHERE THE IME CANDIDATE WINDOW GOES. Real from S2, and the reason the layout is
+    /// cached in paint: the platform asks this between frames, so the only honest
+    /// source is the line that was actually drawn.
     ///
-    /// The platform asks where a range of text is so it can put the IME candidate
-    /// window there. The example answers from `self.last_layout` (examples/input.rs
-    /// :352-371), which is the shaped line its `paint` recorded; there is no layout in
-    /// S1, so the honest answer is "I do not know yet", which lets the OS place the
-    /// window where it always puts one. A fabricated rectangle would be worse than
-    /// useless: the candidate list would sit over the wrong text and it would look like
-    /// a layout bug in S2 rather than a lie told here. When `TextLayout` lands, this
-    /// becomes: convert with `range_from_utf16`, then corners from the layouts x at the
-    /// two indices, inside `element_bounds`.
+    /// The x coordinates come from the cached layout (byte indices, which is what
+    /// `x_for_index` takes - the buffer and the shaped line agree on them because the
+    /// shaped text is a substring from byte 0). The frame comes from `element_bounds`,
+    /// the callers own idea of where the field is, rather than from the cached bounds,
+    /// so a resize in flight cannot make the candidate list lag the window.
+    ///
+    /// If the cache does not describe the current buffer, the answer is `None`: a
+    /// rectangle built from a stale layout is not a rough guess, it is a lie the
+    /// candidate window will sit on top of.
     fn bounds_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
-        _element_bounds: Bounds<Pixels>,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        None
+        let layout = self.last_layout.as_ref()?;
+        if self.display_desynced() {
+            probe("bounds_for_range: no answer, the cached layout is stale");
+            return None;
+        }
+        let line_len = layout.text.len();
+        let range = clamp_range(
+            &self.state.content,
+            &range_from_utf16(&self.state.content, &range_utf16),
+        );
+        let start = range.start.min(line_len);
+        let end = range.end.min(line_len).max(start);
+        let left = layout.x_for_index(start);
+        let right = layout.x_for_index(end);
+        probe(format!(
+            "bounds_for_range units {range_utf16:?} -> bytes {start}..{end}, x {:.1}..{:.1}",
+            f32::from(left),
+            f32::from(right)
+        ));
+        Some(Bounds::from_corners(
+            point(element_bounds.left() + left, element_bounds.top()),
+            point(element_bounds.left() + right, element_bounds.bottom()),
+        ))
     }
 
-    /// PLACEHOLDER UNTIL S2 HAS LAYOUT, same reasoning: without a shaped line there is
-    /// no honest answer to "which character is at this pixel". Returns `None` (the
-    /// platform treats it as "no drag-to-position information") rather than guessing a
-    /// byte index from the x coordinate, which for a CJK or emoji buffer is a cursor in
-    /// the wrong place. Becomes: localize the point, `index_for_x`, `offset_to_utf16`.
+    /// WHICH CHARACTER IS UNDER THIS PIXEL, used by drag-to-position. Real from S2,
+    /// and this is where the assert the plan decided to keep lives - see the comment
+    /// on the check below.
     fn character_index_for_point(
         &mut self,
-        _point: Point<Pixels>,
+        point: Point<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
+        let line_point = self.last_bounds?.localize(&point)?;
+        let layout = self.last_layout.as_ref()?;
+        // examples/input.rs:383 has `assert_eq!(last_layout.text, self.content)` here
+        // - a plain assert, in the path a keystroke takes. The invariant is right and
+        // is kept: a cached layout that does not describe the buffer would return a
+        // character index for text that is no longer there. The FAILURE MODE is what
+        // changed. A notes app must not abort because a frame was stale, so a release
+        // build returns None (the platform loses drag-to-position for that one call)
+        // and a debug build still panics, loudly, with both strings named, at the
+        // exact frame the cache and the buffer diverged.
+        debug_assert!(
+            !self.display_desynced(),
+            "editor: cached layout {:?} does not describe the buffer's first line {:?}",
+            self.last_layout_text,
+            self.state.first_line()
+        );
+        if self.display_desynced() {
+            probe("character_index_for_point: no answer, the cached layout is stale");
+            return None;
+        }
+        let utf8 = layout.index_for_x(point.x - line_point.x)?;
+        let units = offset_to_utf16(&self.state.content, utf8);
+        probe(format!(
+            "character_index_for_point x={:.1} -> byte {utf8} -> unit {units}",
+            f32::from(point.x)
+        ));
+        Some(units)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keys: the actions a single-line editor needs, and the handlers for them
+// ---------------------------------------------------------------------------
+
+// Local action names, in the examples own style (examples/input.rs:13-30). These are
+// UI verbs, not port vocabulary: nothing here crosses the seam.
+actions!(
+    notes_editor,
+    [
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        SelectLeft,
+        SelectRight,
+        SelectAll,
+        Home,
+        End,
+        EscapeSelection,
+        Copy,
+        Cut,
+        Paste,
+    ]
+);
+
+/// Word motion is NOT bound: the example has no Ctrl+Left/Right either, so there is no
+/// reference for where a word boundary is once combining marks and emoji sequences are
+/// involved, and a word motion guessed here would be the one thing in this file that
+/// quietly disagrees with the caret. It needs the same `grapheme_*` treatment plus a
+/// letter/extended set; that is a slice of its own.
+impl Editor {
+    /// Every handler ends in the SAME door the IME uses - `TextState::replace` -
+    /// rather than a second splice path. Two ways to change the buffer is two ways to
+    /// disagree about the selection.
+    fn left(&mut self, _: &Left, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.selected_range.is_empty() {
+            let at = self.state.previous_boundary(self.state.cursor_offset());
+            self.state.move_to(at);
+        } else {
+            let at = self.state.selected_range.start;
+            self.state.move_to(at);
+        }
+        cx.notify();
+    }
+
+    fn right(&mut self, _: &Right, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.selected_range.is_empty() {
+            let at = self.state.next_boundary(self.state.cursor_offset());
+            self.state.move_to(at);
+        } else {
+            let at = self.state.selected_range.end;
+            self.state.move_to(at);
+        }
+        cx.notify();
+    }
+
+    fn select_left(&mut self, _: &SelectLeft, _window: &mut Window, cx: &mut Context<Self>) {
+        let at = self.state.previous_boundary(self.state.cursor_offset());
+        self.state.select_to(at);
+        cx.notify();
+    }
+
+    fn select_right(&mut self, _: &SelectRight, _window: &mut Window, cx: &mut Context<Self>) {
+        let at = self.state.next_boundary(self.state.cursor_offset());
+        self.state.select_to(at);
+        cx.notify();
+    }
+
+    fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.select_all();
+        cx.notify();
+    }
+
+    fn home(&mut self, _: &Home, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.move_to(0);
+        cx.notify();
+    }
+
+    fn end(&mut self, _: &End, _window: &mut Window, cx: &mut Context<Self>) {
+        let len = self.state.content.len();
+        self.state.move_to(len);
+        cx.notify();
+    }
+
+    fn escape(&mut self, _: &EscapeSelection, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.clear_selection();
+        cx.notify();
+    }
+
+    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.selected_range.is_empty() {
+            let at = self.state.previous_boundary(self.state.cursor_offset());
+            self.state.select_to(at);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.selected_range.is_empty() {
+            let at = self.state.next_boundary(self.state.cursor_offset());
+            self.state.select_to(at);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    /// Clipboard, by the examples route (examples/input.rs:131-153): three handlers,
+    /// nothing else. S2 takes them because they are that separable; S5 owns the
+    /// guarantees. Note the flatten below - it is a SINGLE-LINE field being honest,
+    /// and S3 has to delete it. Paste also goes through `replace_text_in_range`, so a
+    /// paste cannot land mid-cluster by construction.
+    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            let one_line = text.replace('\n', " ");
+            self.replace_text_in_range(None, &one_line, window, cx);
+        }
+    }
+
+    fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.selected_range.is_empty() {
+            let selected = self.state.content[self.state.selected_range.clone()].to_string();
+            cx.write_to_clipboard(ClipboardItem::new_string(selected));
+        }
+    }
+
+    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.selected_range.is_empty() {
+            let selected = self.state.content[self.state.selected_range.clone()].to_string();
+            cx.write_to_clipboard(ClipboardItem::new_string(selected));
+            self.replace_text_in_range(None, "", window, cx);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The paint: one shaped line, the caret, and the composition underlined
+// ---------------------------------------------------------------------------
+
+/// What prepaint worked out and paint draws, so nothing is shaped twice and the
+/// quads are painted from the SAME line the caret position came from.
+pub(crate) struct PrepaintState {
+    line: Option<ShapedLine>,
+    /// The text `line` was shaped from, carried to `paint` so it can be cached on the
+    /// editor next to the layout.
+    shaped: String,
+    cursor: Option<PaintQuad>,
+    selection: Option<PaintQuad>,
+}
+
+/// The editor element. Copy of the examples shape (examples/input.rs:388-562):
+/// request a full-width, one-line-high box, shape in prepaint, and in paint hand the
+/// bounds to the IME, draw selection, glyphs, caret, then cache.
+pub(crate) struct EditorElement {
+    input: Entity<Editor>,
+}
+
+impl IntoElement for EditorElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for EditorElement {
+    type RequestLayoutState = ();
+    type PrepaintState = PrepaintState;
+
+    fn id(&self) -> Option<ElementId> {
         None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    /// The only shaping in the app, and it happens HERE - first paint, not startup
+    /// (whitepaper section 2: cold start is a budget).
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let input = self.input.read(cx);
+        let display = input.state.first_line().to_string();
+        let selected_range = input.state.selected_range.clone();
+        let cursor = input.state.cursor_offset();
+        let marked_range = input.state.marked_range.clone();
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+
+        // Runs split at the composition boundaries so the marked text can be
+        // underlined: before it, the marked part, after it. Empty runs are filtered
+        // out, because a zero-length run is what makes gpui draw a stray underline.
+        let run = TextRun {
+            len: display.len(),
+            font: style.font(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = match marked_range {
+            Some(marked) => {
+                let marked = clamp_range(&display, &marked);
+                vec![
+                    TextRun {
+                        len: marked.start,
+                        ..run.clone()
+                    },
+                    TextRun {
+                        len: marked.end - marked.start,
+                        underline: Some(UnderlineStyle {
+                            color: Some(run.color),
+                            thickness: px(1.0),
+                            wavy: false,
+                        }),
+                        ..run.clone()
+                    },
+                    TextRun {
+                        len: display.len() - marked.end,
+                        ..run
+                    },
+                ]
+                .into_iter()
+                .filter(|run| run.len > 0)
+                .collect()
+            }
+            None => vec![run],
+        };
+
+        let line = window.text_system().shape_line(
+            SharedString::from(display.clone()),
+            font_size,
+            &runs,
+            None,
+        );
+
+        let cursor_pos = line.x_for_index(cursor.min(display.len()));
+        let (selection, cursor_quad) = if selected_range.is_empty() {
+            (
+                None,
+                Some(fill(
+                    Bounds::new(
+                        point(bounds.left() + cursor_pos, bounds.top()),
+                        size(px(2.), bounds.bottom() - bounds.top()),
+                    ),
+                    rgb(0x0033_99ff),
+                )),
+            )
+        } else {
+            (
+                Some(fill(
+                    Bounds::from_corners(
+                        point(
+                            bounds.left()
+                                + line.x_for_index(selected_range.start.min(display.len())),
+                            bounds.top(),
+                        ),
+                        point(
+                            bounds.left() + line.x_for_index(selected_range.end.min(display.len())),
+                            bounds.bottom(),
+                        ),
+                    ),
+                    rgb(0x2d_4a_6b),
+                )),
+                None,
+            )
+        };
+        PrepaintState {
+            line: Some(line),
+            shaped: display,
+            cursor: cursor_quad,
+            selection,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus_handle = self.input.read(cx).focus_handle.clone();
+        // This call is what makes the two geometry methods above answerable at all:
+        // it registers this element as the windows input target for the entity.
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.input.clone()),
+            cx,
+        );
+        if let Some(selection) = prepaint.selection.take() {
+            window.paint_quad(selection);
+        }
+        let Some(line) = prepaint.line.take() else {
+            return;
+        };
+        // A failed paint is a blank line for one frame, not an aborted editor.
+        let _ = line.paint(bounds.origin, window.line_height(), window, cx);
+        if focus_handle.is_focused(window)
+            && let Some(cursor) = prepaint.cursor.take()
+        {
+            window.paint_quad(cursor);
+        }
+        let shaped = std::mem::take(&mut prepaint.shaped);
+        let caret = self.input.read(cx).state.cursor_offset();
+        // The same expression bounds_for_range evaluates, from the same line object,
+        // so the probe is evidence about the geometry answer and not about a copy of
+        // the arithmetic.
+        probe(format!(
+            "paint shaped={:?} caret_byte={caret} caret_x={:.1}",
+            shaped,
+            f32::from(line.x_for_index(caret.min(shaped.len())))
+        ));
+        // And here the SAME method the platform calls, called with the arguments the
+        // platform would give it, from inside a real frame. Nothing else available
+        // from a script proves this: without a composition in progress Windows never
+        // asks, so a live run shows zero calls. The caret x in the line above and the
+        // rect x here come from one layout object, which is the claim being made.
+        let units = offset_to_utf16(&self.input.read(cx).state.content, caret);
+        let answered = self.input.update(cx, |editor, cx| {
+            editor.bounds_for_range(units..units, bounds, window, cx)
+        });
+        match answered {
+            Some(rect) => probe(format!(
+                "bounds_for_range(0-width at unit {units}) -> x={:.1} width={:.1} height={:.1}",
+                f32::from(rect.origin.x),
+                f32::from(rect.size.width),
+                f32::from(rect.size.height)
+            )),
+            None => probe(format!("bounds_for_range(0-width at unit {units}) -> None")),
+        }
+        self.input.update(cx, |input, _cx| {
+            input.last_bounds = Some(bounds);
+            input.last_layout_text = shaped;
+            input.last_layout = Some(line);
+        });
+    }
+}
+
+impl Render for Editor {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .key_context("NotesEditor")
+            .track_focus(&self.focus_handle(cx))
+            .size_full()
+            .child(EditorElement { input: cx.entity() })
+            .on_action(cx.listener(Self::left))
+            .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::select_left))
+            .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::home))
+            .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::escape))
+            .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::paste))
     }
 }
 
@@ -647,22 +1227,103 @@ mod tests {
     }
 
     /// A range that falls between a base character and its combining mark, or between
-    /// an emoji and its variation selector. It cannot panic and cannot produce invalid
-    /// UTF-8. Note honestly what it does instead: it separates the cluster, because a
-    /// cluster boundary needs Unicode tables this crate does not have (see the
-    /// unicode-segmentation FCR). snap_to_char_boundary is the one function that
-    /// changes when that dependency lands, and S4 is where it starts being called.
+    /// an emoji and its variation selector: a legal CHARACTER boundary that is not a
+    /// cluster boundary. This is the case S1 could only document as its known cost, so
+    /// the test stayed and the expectation moved with the fix.
     #[test]
-    fn a_replacement_that_splits_a_grapheme_cluster_is_valid_utf8_and_says_so() {
+    fn an_insertion_between_a_base_and_its_mark_lands_past_the_whole_cluster() {
+        // S1 recorded the opposite of this as its known cost: with a character
+        // boundary the only rule, the insertion below separated `e` from its acute -
+        // valid UTF-8, and a mark belonging to nothing. The dependency is in now, so
+        // the test is kept, renamed, and INVERTED: a test that records a fixed bug is
+        // the regression guard for the fix, and deleting it deletes the memory.
         let mut state = TextState::new("e\u{0301}".to_string());
         state.replace(Some(1..1), "-X-");
-        assert_eq!(state.content, "e-X-\u{0301}", "the mark ended up detached");
-        assert!(std::str::from_utf8(state.content.as_bytes()).is_ok());
+        assert_eq!(
+            state.content, "e\u{0301}-X-",
+            "the mark must not be stranded"
+        );
+        assert_eq!(state.selected_range, 6..6, "caret after the insertion");
 
+        // One emoji plus its variation selector is ONE cluster, and unit 2 is a legal
+        // CHARACTER boundary inside it. A caret must not cut it either.
         let mut state = TextState::new("\u{1F600}\u{FE0F}".to_string());
         state.replace(Some(2..2), "_X_");
-        assert!(state.content.starts_with('\u{1F600}'));
+        assert_eq!(state.content, "\u{1F600}\u{FE0F}_X_");
         assert!(std::str::from_utf8(state.content.as_bytes()).is_ok());
+    }
+
+    /// The other direction of the same rule: a NON-empty range widens outwards, so
+    /// replacing the base of a cluster takes the cluster. Stranding the mark is the
+    /// failure, not deleting more than was asked - and the user cannot see the
+    /// difference, but a buffer full of orphan accents is unrecoverable.
+    #[test]
+    fn replacing_the_base_of_a_cluster_takes_the_whole_cluster() {
+        let mut state = TextState::new("e\u{0301}z".to_string());
+        state.replace(Some(0..1), "X");
+        assert_eq!(state.content, "Xz", "the acute went with its base");
+
+        let mut state = TextState::new("\u{1F600}\u{FE0F}z".to_string());
+        state.replace(Some(0..2), "X");
+        assert_eq!(state.content, "Xz", "the selector went with its emoji");
+    }
+
+    /// Caret motion, by cluster. This is the rule S4 will hang the mouse on, and it is
+    /// why the motion helpers are STRICT where the clamp helper is inclusive: at a
+    /// boundary, an inclusive search for the previous one returns the same place, i.e.
+    /// a left arrow that does nothing.
+    #[test]
+    fn caret_motion_steps_by_cluster_not_by_byte_or_unit() {
+        // a | emoji | e+acute  =  bytes 0, 1..5, 5..8
+        let state = TextState::new("a\u{1F600}e\u{0301}".to_string());
+        assert_eq!(state.next_boundary(0), 1, "one ascii char");
+        assert_eq!(state.next_boundary(1), 5, "the whole emoji in one step");
+        assert_eq!(state.next_boundary(5), 8, "base and mark in one step");
+        assert_eq!(state.next_boundary(8), 8, "and it stops at the end");
+        assert_eq!(state.previous_boundary(8), 5, "back over the e+acute");
+        assert_eq!(state.previous_boundary(5), 1, "back over the emoji");
+        assert_eq!(
+            state.previous_boundary(6),
+            5,
+            "from mid-cluster, back to its start"
+        );
+        assert_eq!(state.previous_boundary(0), 0, "and it stops at the start");
+
+        let mut state = TextState::new("a\u{1F600}e\u{0301}".to_string());
+        state.move_to(0);
+        for _ in 0..4 {
+            let at = state.next_boundary(state.cursor_offset());
+            state.move_to(at);
+        }
+        assert_eq!(state.cursor_offset(), 8, "four steps walk the whole buffer");
+        for _ in 0..4 {
+            let at = state.previous_boundary(state.cursor_offset());
+            state.move_to(at);
+        }
+        assert_eq!(
+            state.cursor_offset(),
+            0,
+            "and back again, three clusters deep"
+        );
+
+        // `new` puts the caret at the END of the buffer - which is the loading case,
+        // a file opens with the caret after its last character - so walk to 0 first.
+        let mut state = TextState::new("e\u{0301}z".to_string());
+        state.move_to(0);
+        assert_eq!(state.cursor_offset(), 0, "and the snap at 0 stays at 0");
+        state.select_to(state.next_boundary(0));
+        assert_eq!(
+            state.selected_range,
+            0..3,
+            "shift-right selects the whole cluster, mark included"
+        );
+        assert!(!state.selection_reversed, "and forward stays forward");
+        assert!(state.content.is_char_boundary(state.selected_range.end));
+        state.select_all();
+        assert_eq!(state.selected_range, 0..4);
+        state.clear_selection();
+        assert_eq!(state.selected_range, 4..4, "escape drops to the head");
+        assert_eq!(state.content, "e\u{0301}z", "and touches nothing");
     }
 
     /// (c) An IME session and a fast typist must not disagree by one byte. The
