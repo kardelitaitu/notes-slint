@@ -1,5 +1,10 @@
 //! Where the window is, and where it can be put. Reading and writing a rect, and
 //! reporting the work area a window should stay inside - reported, never enforced.
+//!
+//! Every read here (GetWindowRect, GetWindowPlacement, the MonitorFrom* and
+//! GetMonitorInfoW queries) takes no SWP_ flags: reads do not marshal across input
+//! queues, so SWP_ASYNCWINDOWPOS - which the two writing seams carry - has no read
+//! path to appear on.
 
 use ::windows::Win32::Foundation::{POINT, RECT};
 use ::windows::Win32::Graphics::Gdi::{
@@ -7,18 +12,25 @@ use ::windows::Win32::Graphics::Gdi::{
     MONITORINFOEXW, MonitorFromPoint, MonitorFromRect, MonitorFromWindow,
 };
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowPlacement, GetWindowRect, SET_WINDOW_POS_FLAGS, SWP_NOACTIVATE, SWP_NOZORDER,
-    SetWindowPos, WINDOWPLACEMENT,
+    GetWindowPlacement, GetWindowRect, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOZORDER, SetWindowPos, WINDOWPLACEMENT,
 };
 
 use super::{to_hwnd, win32_error};
 use crate::{FrameRect, PlatformError, PlatformResult};
 
-/// `SWP_NOZORDER | SWP_NOACTIVATE`: placing a window must not change the z-order
-/// (that is the topmost seam) and must not steal focus. Origin and extent are both
-/// applied, so no NOMOVE/NOSIZE bit belongs here.
+/// `SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS`: placing a window must not
+/// change the z-order (that is the topmost seam) and must not steal focus. Origin
+/// and extent are both applied, so no NOMOVE/NOSIZE bit belongs here.
+///
+/// `SWP_ASYNCWINDOWPOS` is the load-bearing bit: without it, a `SetWindowPos`
+/// whose caller and window are attached to different input queues SENDS
+/// `WM_WINDOWPOSCHANGING`/`WM_WINDOWPOSCHANGED` and the caller BLOCKS until the
+/// thread that owns the window pumps - which can be forever. With it, the call
+/// returns before the move has landed; the caller obligation that follows is
+/// documented on [`crate::WindowBackend::set_frame_rect`].
 const PLACEMENT_FLAGS: SET_WINDOW_POS_FLAGS =
-    SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0);
+    SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0 | SWP_ASYNCWINDOWPOS.0);
 
 /// The Win32 corner-based rect, as the origin-and-extent rect of this crate.
 ///
@@ -124,6 +136,10 @@ pub fn work_area_for_rect(rect: FrameRect) -> PlatformResult<(FrameRect, u32)> {
 
 /// Moves and resizes `handle` to `r`, after `r.scaled(scale)` - see
 /// [`crate::WindowBackend::set_frame_rect`].
+///
+/// Issued with `SWP_ASYNCWINDOWPOS` (see [`PLACEMENT_FLAGS`]): this returns
+/// before the move has landed, so a rect read straight back may still be the
+/// pre-move rect.
 pub fn set_frame_rect(handle: isize, r: FrameRect, scale: f32) -> PlatformResult<()> {
     let hwnd = to_hwnd(handle)?;
     let placed = r.scaled(scale);
@@ -132,7 +148,9 @@ pub fn set_frame_rect(handle: isize, r: FrameRect, scale: f32) -> PlatformResult
     // meantime is an error rather than a write into someone else's window; the four
     // coordinates are i32 values rather than pointers; and `None` is the documented
     // null insert-after handle, only meaningful because PLACEMENT_FLAGS carries
-    // SWP_NOZORDER. No memory is shared with Win32 in this call.
+    // SWP_NOZORDER. SWP_ASYNCWINDOWPOS changes only liveness - the call posts the
+    // move instead of blocking on the owner's pump - never what is written. No
+    // memory is shared with Win32 in this call.
     unsafe {
         SetWindowPos(
             hwnd,
@@ -212,17 +230,24 @@ mod tests {
     use ::windows::Win32::Graphics::Gdi::HMONITOR;
     use ::windows::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-        SM_XVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
+        SM_XVIRTUALSCREEN, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER,
     };
 
     #[test]
-    fn placement_touches_neither_z_order_nor_activation() {
+    fn placement_touches_nothing_else_and_never_blocks_the_caller() {
         // A dropped SWP_NOZORDER un-pins the window as a side effect of a move; a
-        // dropped SWP_NOACTIVATE steals focus. Both are invisible in review.
-        let expected = SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0);
+        // dropped SWP_NOACTIVATE steals focus; a missing SWP_ASYNCWINDOWPOS parks
+        // the calling thread inside user32 until the window's owner pumps - which
+        // is a reproduced hang, not a hypothetical. All three are invisible in
+        // review, so the exact combination is pinned: an assertion about the code,
+        // not about timing. The reads above take no flags at all, so there is no
+        // read path for the async bit to leak onto.
+        let expected =
+            SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0 | SWP_ASYNCWINDOWPOS.0);
         assert_eq!(PLACEMENT_FLAGS, expected);
-        assert!(PLACEMENT_FLAGS.contains(SWP_NOZORDER));
-        assert!(PLACEMENT_FLAGS.contains(SWP_NOACTIVATE));
+        for flag in [SWP_NOZORDER, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS] {
+            assert!(PLACEMENT_FLAGS.contains(flag), "missing {flag:?}");
+        }
     }
 
     #[test]

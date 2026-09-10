@@ -28,6 +28,24 @@ seam, not a policy engine. What it deliberately does *not* own:
   manifest and a second `windows` feature). Where a scale matters it is a parameter
   the caller supplies.
 
+Both seams that change a window - [`WindowBackend::set_frame_rect`] and
+[`WindowBackend::set_topmost`] - issue `SetWindowPos` with `SWP_ASYNCWINDOWPOS`,
+so they return before the change has landed instead of blocking the calling
+thread until the window's owner pumps (without the flag, a cross-input-queue
+call blocks exactly that way, indefinitely - the caller can sit inside user32
+while the owner thread waits for the caller). The obligation that creates is
+documented on `set_frame_rect`: never read a rect straight after issuing a move
+and persist what you read - that stores the PRE-MOVE value; the port measures
+for persistence in its own session flush tick instead.
+
+What stays untested here, and which layer must test it: that an async change
+actually lands. A unit test cannot assert a landing without a real window whose
+owning thread is parked, so it belongs to a live run - `api` restoring on a real
+window while the UI thread is busy. The unit tests instead pin the flag bits on
+both writing seams (an assertion about the code, not about timing); every read
+in the Win32 module takes no flags at all, so there is no read path for the bit
+to leak onto.
+
 ## Layout
 
 - `geometry` - `FrameRect`, the crate's one rectangle type, in one documented unit.
@@ -101,6 +119,10 @@ pub enum PlatformError {
 pub trait WindowBackend: Send {
     /// Raises the window above every other window (`on`) or puts it back.
     /// Moves nothing and resizes nothing.
+    ///
+    /// Issued with `SWP_ASYNCWINDOWPOS`: this returns before the reband has
+    /// landed - see [`WindowBackend::set_frame_rect`] for the caller obligation
+    /// that follows from that.
     fn set_topmost(&mut self, handle: isize, on: bool) -> PlatformResult<()>;
 
     /// The window frame rectangle, in the unit `FrameRect` documents.
@@ -127,6 +149,12 @@ pub trait WindowBackend: Send {
     /// space". There is no move-only or size-only variant, because choosing to keep
     /// one dimension is a decision: read `frame_rect` and copy the part to preserve.
     /// Z-order and activation are never touched.
+    ///
+    /// The move is issued with `SWP_ASYNCWINDOWPOS`: this returns BEFORE the move
+    /// has landed. Never read a rect immediately after issuing a move and persist
+    /// what you read - that stores the PRE-MOVE value, and a later restore then
+    /// comes back wrong; measure for persistence in the port's own session flush
+    /// tick, never straight after this call.
     fn set_frame_rect(&mut self, handle: isize, r: FrameRect, scale: f32) -> PlatformResult<()>;
 
     /// The primary monitor's *work* area: its bounds minus whatever a reserved edge
