@@ -135,7 +135,7 @@ pub fn save_session_bytes(dir: &Path, bytes: &[u8]) -> Result<(), SaveError> {
 /// sibling temp, write, flush, fsync, rename over the target; on any failure
 /// remove the temp and classify the error. Never truncates the target.
 pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError> {
-    let file_name = target
+    let _file_name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| SaveError::InvalidPath("the path has no file name component".to_owned()))?;
@@ -152,10 +152,10 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError>
     // path (policy Allowed) is exactly a writable path; a local
     // re-derivation here is the drift the sharing exists to prevent.
     if !crate::path_policy::under_extended_prefix(target)
-        && crate::path_policy::final_component_is_stripped(&file_name)
+        && crate::path_policy::any_component_is_stripped(target)
     {
         return Err(SaveError::InvalidPath(
-            "the file name ends with '.' or a space, which Windows strips — the file written would not be the one named; rename the target"
+            "a component of the path ends with '.' or a space, which Windows strips — the file written would not be the one named; rename the target"
                 .to_owned(),
         ));
     }

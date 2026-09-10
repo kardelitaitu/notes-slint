@@ -34,6 +34,17 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+/// All scratch probes share one root and each begins by wiping it, so they
+/// are serialised: two probes running in parallel would delete each other's
+/// rows (measured as flaky failures, not product findings).
+fn scratch_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
 
 use serde as _;
 use serde_json as _;
@@ -278,6 +289,7 @@ fn print_rows(title: &str, rows: &[Row]) {
 /// real, with the directory itself as the witness of where the bytes landed.
 #[test]
 fn policy_table_vs_real_win32() -> Result<(), Box<dyn Error>> {
+    let _scratch = scratch_lock();
     init_scratch()?;
     let mut rows: Vec<Row> = Vec::new();
     let mut i = 0usize;
@@ -446,6 +458,7 @@ fn policy_table_vs_real_win32() -> Result<(), Box<dyn Error>> {
 #[test]
 #[ignore = "BLOCKER-1 corollary: the bare one-letter form 'a:secret.notes' is Allowed as drive-A-relative, not judged a stream -- the same drive-relative hole as BLOCKER-1"]
 fn one_letter_name_with_a_colon_is_a_stream_not_a_drive() -> Result<(), Box<dyn Error>> {
+    let _scratch = scratch_lock();
     init_scratch()?;
     let dir = row_dir(95)?;
     let base = dir.join("a");
@@ -651,8 +664,8 @@ fn drive_relative_child() -> Result<(), Box<dyn Error>> {
 /// to "sub.\x.notes" lands in "sub\x.notes", policy-Allowed named one file and
 /// wrote another -- and save_document reports Ok for both.
 #[test]
-#[ignore = "BLOCKER-2: a MIDDLE component ending in a dot silently redirects the save -- policy Allowed, save_document Ok, bytes land in the stripped spelling while the real sub. document keeps its own bytes; final_component_is_stripped reads the last component only"]
 fn stripped_middle_component_shadows_a_real_dot_directory() -> Result<(), Box<dyn Error>> {
+    let _scratch = scratch_lock();
     init_scratch()?;
     let dir = row_dir(92)?;
     let plain = dir.join("sub");
@@ -685,13 +698,18 @@ fn stripped_middle_component_shadows_a_real_dot_directory() -> Result<(), Box<dy
         String::from_utf8_lossy(&in_dot)
     );
     println!("  the two spellings share one identity key? {same_identity}");
+    // BLOCKER-2, fixed: the policy must NAME the redirect and the save
+    // engine must REFUSE it. The raw fs::write above stays as the Win32
+    // witness -- it still lands in sub\x.notes, which is exactly why the
+    // app-level refusal is required (Win32 will always be this shape).
+    assert_eq!(
+        verdict, "StrippedName",
+        "the middle-dot redirect must be named by the policy, got {verdict}"
+    );
     assert!(
-        !(wrote == "Ok" && !String::from_utf8_lossy(&in_dot).contains("HAZARD-MIDDLE")),
-        "BLOCKER: writing to a path whose MIDDLE component ends in a dot returned {wrote} with \
-         verdict {verdict} and save_document said {saved}, but the bytes went to sub{BS}x.notes \
-         (now {:?}) while the real sub. document kept its own bytes -- final_component_is_stripped \
-         looks at the last component only, so both the policy and the save engine miss it.",
-        String::from_utf8_lossy(&in_plain)
+        saved.starts_with("Err("),
+        "BLOCKER-2 regression: save_document answered {saved} for a middle-dot path -- \
+         the app reported success for a file it did not write"
     );
     Ok(())
 }
@@ -701,6 +719,7 @@ fn stripped_middle_component_shadows_a_real_dot_directory() -> Result<(), Box<dy
 #[test]
 #[ignore = r"MAJOR-4: the extended-prefix carve-out writes a trailing-dot name that no plain spelling, the file dialog or Explorer can reopen -- a note nobody can open is a lost note (d58a70d decision coming due)"]
 fn extended_prefix_trailing_dot_is_a_file_no_plain_name_reaches() -> Result<(), Box<dyn Error>> {
+    let _scratch = scratch_lock();
     init_scratch()?;
     let dir = row_dir(93)?;
     let d = dir.to_string_lossy().into_owned();
@@ -750,6 +769,7 @@ fn extended_prefix_trailing_dot_is_a_file_no_plain_name_reaches() -> Result<(), 
 /// same "the name you see is not the file you get" class in user terms.
 #[test]
 fn invisible_names_reach_the_menu_verbatim() -> Result<(), Box<dyn Error>> {
+    let _scratch = scratch_lock();
     init_scratch()?;
     let dir = row_dir(96)?;
     let r = rtl();
@@ -800,6 +820,7 @@ fn invisible_names_reach_the_menu_verbatim() -> Result<(), Box<dyn Error>> {
 /// spelling of a name must not become a second document.
 #[test]
 fn case_only_difference_is_one_file_and_one_identity() -> Result<(), Box<dyn Error>> {
+    let _scratch = scratch_lock();
     init_scratch()?;
     let dir = row_dir(90)?;
     let lower = dir.join("notes.notes");
@@ -858,6 +879,7 @@ fn case_only_difference_is_one_file_and_one_identity() -> Result<(), Box<dyn Err
 #[test]
 #[ignore = "MAJOR-3: one real file occupies two recent slots -- 'notes' and 'notes.' get different identity keys because a refused spelling is keyed lexically instead of as the OS would write it"]
 fn refused_spelling_of_an_existing_file_splits_the_recent_list() -> Result<(), Box<dyn Error>> {
+    let _scratch = scratch_lock();
     init_scratch()?;
     let dir = row_dir(91)?;
     let real = dir.join("notes");
@@ -897,6 +919,7 @@ fn refused_spelling_of_an_existing_file_splits_the_recent_list() -> Result<(), B
 /// blamed on the manifest.
 #[test]
 fn long_path_round_trip_plain_vs_extended() -> Result<(), Box<dyn Error>> {
+    let _scratch = scratch_lock();
     init_scratch()?;
     let dir = row_dir(94)?;
     let mut deep = dir.clone();
@@ -976,6 +999,7 @@ fn core_does_not_create_the_state_dir() -> Result<(), Box<dyn Error>> {
 #[test]
 #[ignore = "RACES the sibling probes: it deletes the scratch root they are writing into when the target runs in parallel; it passes standalone -- cargo test -p notes-core --test path_hazards probe_scratch_is_cleanable -- --exact -- test-threads=1 or a private root lifts it"]
 fn probe_scratch_is_cleanable() -> Result<(), Box<dyn Error>> {
+    let _scratch = scratch_lock();
     let root = scratch();
     remove_hard(&root);
     let left = fs::symlink_metadata(&root).is_ok();

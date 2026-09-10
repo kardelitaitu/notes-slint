@@ -16,7 +16,7 @@
 //! save::atomic_write and session::ensure_state_dir; it reads metadata,
 //! never writes.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::save::SaveError;
 
@@ -119,20 +119,53 @@ pub fn path_policy(path: &Path) -> PathVerdict {
     if after_drive.contains(':') {
         return PathVerdict::StreamName;
     }
-    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-        // A root, a bare drive ("C:"), or "..": no final component to judge,
-        // and none of the hazards live in the prefix.
-        return PathVerdict::Allowed;
-    };
-    // Classic DOS devices, extensionless. With an extension modern Windows
-    // makes an ordinary file (the tester's probe created and read back
-    // CON.notes), so only the bare stem is refused — stated honestly, not
-    // defensively. COM10+ was never in the reserved set.
-    if is_dos_device(&name) {
+    // The final RAW component is "." or "..": std's Components folds both
+    // away, so they are judged from the raw spelling. Win32 answers
+    // PermissionDenied for a write under either — the name on disk would
+    // not be the name spelled, the same lie class as the strip rule.
+    if body
+        .split(['\\', '/'])
+        .last()
+        .is_some_and(|last| last == "." || last == "..")
+    {
+        return PathVerdict::StrippedName;
+    }
+    // The per-component view (BLOCKER-2, measured): Win32 applies its name
+    // rules on EVERY step of the way down, not only at the end —
+    // "sub.\x.notes" writes "sub\x.notes" while the app names "sub.\x.notes".
+    let normals: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    // A device stem as a NON-final component ("<dir>\CON\x.notes"): the
+    // traversal cannot resolve, so the name cannot be written as spelled.
+    if normals[..normals.len().saturating_sub(1)]
+        .iter()
+        .any(|c| is_dos_device(c))
+    {
         return PathVerdict::ReservedDevice;
     }
-    // Trailing dot/space mangling — skipped under the extended prefix.
-    if !extended && final_component_is_stripped(&name) {
+    let Some(name) = normals.last() else {
+        // A root or a bare drive ("C:"): no component to judge, and none of
+        // the hazards live in the prefix.
+        return PathVerdict::Allowed;
+    };
+    // Classic DOS devices, extensionless, as the FINAL component. Measured
+    // on this build: std CAN create and reopen "CON.notes" (it auto-prefixes
+    // the device path), while an independent "cmd /c echo > CON" witness
+    // created NOTHING — so an extended name is Allowed and only the bare
+    // stem is refused. The rule is the INTEROP call (every other tool sees
+    // nothing, not even a file), not impossibility. COM10+ was never in the
+    // reserved set.
+    if is_dos_device(name) {
+        return PathVerdict::ReservedDevice;
+    }
+    // Trailing dot/space mangling — EVERY component, skipped under the
+    // extended prefix (see StrippedName for that carve-out).
+    if !extended && normals.iter().any(|n| final_component_is_stripped(n)) {
         return PathVerdict::StrippedName;
     }
     PathVerdict::Allowed
@@ -154,6 +187,20 @@ fn drive_separator(s: &str) -> Option<usize> {
 /// and this policy can never disagree about what a stripped name is.
 pub(crate) fn final_component_is_stripped(name: &str) -> bool {
     name.ends_with('.') || name.ends_with(' ')
+}
+
+/// The per-PATH strip rule (BLOCKER-2), shared with save::atomic_write:
+/// EVERY component is judged, because Win32 strips a trailing dot or space
+/// from every directory component on the way down — "sub.\x.notes" writes
+/// "sub\x.notes" while the app names "sub.\x.notes". Policy and the save
+/// engine both call this, so they cannot drift again.
+pub(crate) fn any_component_is_stripped(path: &Path) -> bool {
+    path.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .any(|n| final_component_is_stripped(&n))
 }
 
 /// True when the path sits under the \\\\?\\ extended-length prefix, where
@@ -243,7 +290,6 @@ mod tests {
             "relative/dir/x.txt",
             r"C:\x.notes", // the drive colon is the naive-implementation trap
             "C:",
-            "..",
             "/usr/local/x.notes",
             "CON.notes", // modern Windows: an ordinary file (probe-verified)
             "COM10",     // never in the reserved set
@@ -336,8 +382,15 @@ mod tests {
         const POLICY: &str = include_str!("path_policy.rs");
         // save calls THE shared helper for both halves of the decision.
         assert!(
-            SAVE.contains("path_policy::final_component_is_stripped(&file_name)"),
-            "save::atomic_write must call the shared helper — an inline fork is the drift this pin exists to catch"
+            SAVE.contains("path_policy::any_component_is_stripped(target)"),
+            "save::atomic_write must judge EVERY component through the shared helper — an inline fork is the drift this pin exists to catch"
+        );
+        assert_eq!(
+            POLICY
+                .matches(concat!("pub(crate) fn any", "_component_is_stripped"))
+                .count(),
+            1,
+            "exactly one definition of the per-path strip rule"
         );
         assert!(
             SAVE.contains("path_policy::under_extended_prefix(target)"),
@@ -395,6 +448,11 @@ mod tests {
             // COM0/LPT0 were never reserved (were OVER-REJECTED once).
             ("COM0", PathVerdict::Allowed),
             ("LPT0", PathVerdict::Allowed),
+            // BLOCKER-2 siblings: the rules hold on EVERY component.
+            (r"C:\CON\x.notes", PathVerdict::ReservedDevice),
+            (r"C:\x\sub.\x.notes", PathVerdict::StrippedName),
+            (r"C:\x\notes\.", PathVerdict::StrippedName),
+            (r"C:\x\notes\..", PathVerdict::StrippedName),
             // The carve-outs that must SURVIVE these fixes.
             (r"\\?\C:\a.notes.", PathVerdict::Allowed),
             (r"\\?\\dir\x.notes", PathVerdict::Allowed), // rooted verbatim form
