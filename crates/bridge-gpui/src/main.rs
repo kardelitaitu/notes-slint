@@ -819,6 +819,10 @@ fn main() {
                 KeyBinding::new("ctrl-c", editor::Copy, None),
                 KeyBinding::new("ctrl-x", editor::Cut, None),
                 KeyBinding::new("ctrl-v", editor::Paste, None),
+                KeyBinding::new("pageup", editor::PageUp, None),
+                KeyBinding::new("pagedown", editor::PageDown, None),
+                KeyBinding::new("shift-pageup", editor::SelectPageUp, None),
+                KeyBinding::new("shift-pagedown", editor::SelectPageDown, None),
             ]);
 
             // STEP 2 - create the window AT the saved rect, before anything is

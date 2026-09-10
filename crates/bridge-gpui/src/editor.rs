@@ -30,9 +30,9 @@ use gpui::prelude::*;
 use gpui::{
     App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-    Window, actions, div, fill, point, px, relative, rgb, size,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun,
+    UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, px, relative, rgb, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 /// A development probe, silent unless `NOTES_S2_PROBE` is set in the environment.
@@ -390,6 +390,12 @@ impl TextState {
         let at = grapheme_boundary_after(&self.content, offset);
         self.selected_range = at..at;
         self.selection_reversed = false;
+        // Any caret MOTION commits the composition in the only sense this model has: the
+        // characters stay, the "uncommitted" flag goes. Without this, click away from an
+        // unfinished IME session leaves `marked_range` pointing at text the user has
+        // left behind, the next keystroke replaces THAT instead of inserting at the
+        // caret, and S6 would refuse to flush on a composition that no longer exists.
+        self.marked_range = None;
     }
 
     /// Collapse the selection to a caret at `offset`, snapped forward onto a grapheme
@@ -415,6 +421,65 @@ impl TextState {
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
         self.desired_column = Some(self.column_of(self.cursor_offset()));
+        // Same rule as `caret_to`: a selection by mouse or shift-key commits the mark.
+        self.marked_range = None;
+    }
+
+    /// The word a byte sits in, for a double click. Clusters, not chars and not bytes,
+    /// because a word boundary that falls inside `e` + U+0301 is the S1 bug class and
+    /// this is the one place in the file that walks forward cluster by cluster.
+    ///
+    /// A word is a run of clusters that are all whitespace, or all alphanumeric, or all
+    /// neither; a line feed is whitespace and so always ends the run, which is what
+    /// makes a double click never reach past its own line. Empty input yields the empty
+    /// range at 0 rather than a panic, because this is called from a click handler.
+    pub(crate) fn word_range_at(&self, byte: usize) -> Range<usize> {
+        let clusters: Vec<(usize, &str)> = self.content.grapheme_indices(true).collect();
+        if clusters.is_empty() {
+            return 0..0;
+        }
+        let class = |s: &str| -> u8 {
+            match s.chars().next() {
+                None => 2,
+                Some(c) if c.is_whitespace() => 2,
+                Some(c) if c.is_alphanumeric() => 1,
+                Some(_) => 3,
+            }
+        };
+        let mut at = 0usize;
+        for (index, (start, _)) in clusters.iter().enumerate() {
+            if *start > byte {
+                break;
+            }
+            at = index;
+        }
+        let wanted = class(clusters[at].1);
+        let mut first = at;
+        while first > 0 && class(clusters[first - 1].1) == wanted {
+            first -= 1;
+        }
+        let mut last = at;
+        while last + 1 < clusters.len() && class(clusters[last + 1].1) == wanted {
+            last += 1;
+        }
+        let start = clusters[first].0;
+        let end = start
+            + clusters[first..=last]
+                .iter()
+                .map(|(_, s)| s.len())
+                .sum::<usize>();
+        start..end
+    }
+
+    /// Select a range and put the head at its end - the double and triple click door,
+    /// which must leave a caret that extends in the right direction if the user then
+    /// shift-arrows.
+    pub(crate) fn select_range(&mut self, range: Range<usize>) {
+        let range = clamp_range(&self.content, &range);
+        self.selected_range = range.clone();
+        self.selection_reversed = false;
+        self.desired_column = Some(self.column_of(range.end));
+        self.marked_range = None;
     }
 
     /// Ctrl+A.
@@ -623,6 +688,9 @@ pub(crate) struct Editor {
     /// The caret line the last painted frame showed. The caret rule compares against
     /// this; the wheel never writes it, which is the whole reason a scroll survives.
     caret_line_shown: Option<usize>,
+    /// Set by a button-down, cleared by the matching up. The drag is the model's idea,
+    /// not gpui's: the Div only reports that the mouse moved while this was true.
+    dragging: bool,
 }
 
 impl Editor {
@@ -642,6 +710,7 @@ impl Editor {
             shape_us: 0,
             viewport_h: px(0.0),
             caret_line_shown: None,
+            dragging: false,
         }
     }
 
@@ -656,6 +725,7 @@ impl Editor {
             shape_us: 0,
             viewport_h: px(0.0),
             caret_line_shown: None,
+            dragging: false,
         }
     }
 
@@ -700,25 +770,39 @@ impl Editor {
     /// that is pure UI state - and the port must not own one, because api routes and
     /// translates and decides nothing (AGENTS.md).
     ///
-    /// A `Lines` delta is worth a whole row of this font, which is what a wheel means to
-    /// a user. Clamped to the content, and it does NOT move the caret: a wheel is not an
-    /// edit, and a caret that jumps on scroll is a bug users report.
+    /// A notch of the wheel is worth this many LINES. The Windows default is three wheel
+    /// lines per notch and that is the number a user feels on every other window on the
+    /// machine, so it is the number this app uses - not the 120 units / 5 rows gpui
+    /// reports here (measured: `wheel raw=-120.0` against `row=24.0`).
+    ///
+    /// The real value lives in `SystemParametersInfo(SPI_GETWHEELSCROLLLINES)`, which
+    /// this crate cannot read without a platform seam, and the seam is deliberately not
+    /// added for one constant: a per-user setting that only the wheel honours is not
+    /// worth widening the port. This is the line to change when that seam exists.
+    ///
+    /// A `Lines` delta is taken as notches on the same scale, which is an assumption on
+    /// the platform we do not ship; named rather than hidden.
     fn scroll_by(&mut self, delta: &ScrollDelta, cx: &mut Context<Self>) {
+        const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
+        const WHEEL_UNITS_PER_NOTCH: f32 = 120.0;
         let row = self
             .frames
             .first()
             .map_or(0.0, |frame| f32::from(frame.bounds.size.height));
-        let raw = match delta {
-            ScrollDelta::Lines(point) => point.y * row,
-            ScrollDelta::Pixels(point) => f32::from(point.y),
+        let lines = match delta {
+            ScrollDelta::Lines(point) => point.y * WHEEL_LINES_PER_NOTCH,
+            ScrollDelta::Pixels(point) => {
+                f32::from(point.y) / WHEEL_UNITS_PER_NOTCH * WHEEL_LINES_PER_NOTCH
+            }
         };
+        let raw = lines * row;
         let content = row * self.frames.len().max(1) as f32;
         let max = (content - f32::from(self.viewport_h)).max(0.0);
         // The platform reports scroll-down as positive y and the offset is measured the
         // other way, so the sign flips exactly once, here.
         let next = (f32::from(self.scroll_y) + raw).clamp(0.0, max);
         probe(format!(
-            "wheel raw={raw:.1} offset_before={:.1} offset_after={next:.1} row={row:.1}",
+            "wheel raw={raw:.1} lines={lines:.1} offset_before={:.1} offset_after={next:.1} row={row:.1}",
             f32::from(self.scroll_y)
         ));
         if next != f32::from(self.scroll_y) {
@@ -727,28 +811,106 @@ impl Editor {
         }
     }
 
-    /// CLICK TO CARET, and the shift-click that extends. It goes through the same
-    /// `move_to`/`select_to` as every keyboard motion, so a click cannot land
-    /// mid-cluster - the boundary snap is in the state, not re-implemented here.
-    fn position_caret(&mut self, point: Point<Pixels>, shift: bool, cx: &mut Context<Self>) {
+    /// The byte under a pixel point, with the two clamps S4 established: below the last
+    /// line is the last line, past the end of a line is that line's end.
+    fn byte_at(&self, point: Point<Pixels>) -> Option<usize> {
+        let frame = self.frame_at(point.y)?;
+        let x = point.x - frame.bounds.left();
+        let utf8 = frame.line.index_for_x(x).unwrap_or(frame.text.len());
+        Some((frame.bytes.start + utf8).min(frame.bytes.end))
+    }
+
+    /// CLICK, SHIFT-CLICK, DOUBLE, TRIPLE, and the DRAG.
+    ///
+    /// `click_count` is gpui's own, not a guess: `MouseDownEvent::click_count` at
+    /// src/interactive.rs:104, and on this platform it is maintained by gpui's click
+    /// state machine at src/platform/windows/events.rs:459-467 (`click_state.update(
+    /// button, physical_point)` feeding the event), because the Windows backend does not
+    /// forward WM_LBUTTONDBLCLK as a separate kind - it counts.
+    ///
+    /// Everything still leaves through `move_to`/`select_to`/`select_range`, so the snap
+    /// onto a grapheme boundary is in one place and a click cannot land mid-cluster.
+    fn position_caret(
+        &mut self,
+        point: Point<Pixels>,
+        shift: bool,
+        click_count: usize,
+        cx: &mut Context<Self>,
+    ) {
         probe(format!(
-            "caret_point x={:.1} y={:.1} shift={shift}",
+            "caret_point x={:.1} y={:.1} shift={shift} clicks={click_count}",
             f32::from(point.x),
             f32::from(point.y)
         ));
-        let Some(frame) = self.frame_at(point.y) else {
+        let Some(byte) = self.byte_at(point) else {
             return;
         };
-        let x = point.x - frame.bounds.left();
-        // Past the end of the line's glyphs is that line's end - the second of the two
-        // rules, and it falls out of `unwrap_or` because `index_for_x` has nothing to
-        // report beyond the text it shaped.
-        let utf8 = frame.line.index_for_x(x).unwrap_or(frame.text.len());
-        let byte = (frame.bytes.start + utf8).min(frame.bytes.end);
         if shift {
+            // A shift-click extends whatever the last gesture made, including a word.
             self.state.select_to(byte);
+        } else if click_count >= 3 {
+            let line = self.state.line_range_at(byte);
+            self.state.select_range(line);
+        } else if click_count == 2 {
+            let word = self.state.word_range_at(byte);
+            self.state.select_range(word);
         } else {
             self.state.move_to(byte);
+        }
+        cx.notify();
+    }
+
+    /// DRAG SELECT. A button-down already carries the point, so all the drag needs on
+    /// top of `position_caret` is one bool: gpui gives `on_mouse_move` to the Div while
+    /// the button is held, and the model decides what that means. Direction comes free
+    /// from `select_to`, which flips `selection_reversed` when the head crosses the
+    /// anchor - so dragging up leaves the caret at the TOP, which is the half of
+    /// direction-awareness the clipboard reads.
+    fn begin_drag(
+        &mut self,
+        point: Point<Pixels>,
+        shift: bool,
+        click_count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.dragging = true;
+        self.position_caret(point, shift, click_count, cx);
+    }
+
+    fn extend_drag(&mut self, point: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.dragging {
+            return;
+        }
+        let Some(byte) = self.byte_at(point) else {
+            return;
+        };
+        if byte != self.state.cursor_offset() {
+            self.state.select_to(byte);
+            cx.notify();
+        }
+    }
+
+    fn end_drag(&mut self) {
+        self.dragging = false;
+    }
+
+    /// PAGE MOTION. A page is the element's own height in rows, not a magic line count,
+    /// so it follows the window when the window is resized and needs no constant.
+    fn page(&mut self, pages: isize, shift: bool, cx: &mut Context<Self>) {
+        let row = f32::from(
+            self.frames
+                .first()
+                .map_or(px(0.0), |frame| frame.bounds.size.height),
+        );
+        if row <= 0.0 {
+            return;
+        }
+        let rows = ((f32::from(self.viewport_h) / row).floor() as isize).max(1);
+        let delta = rows * pages;
+        if shift {
+            self.state.select_vertical(delta);
+        } else {
+            self.state.move_vertical(delta);
         }
         cx.notify();
     }
@@ -945,6 +1107,10 @@ actions!(
         EscapeSelection,
         SelectUp,
         SelectDown,
+        PageUp,
+        PageDown,
+        SelectPageUp,
+        SelectPageDown,
         Newline,
         Up,
         Down,
@@ -1037,6 +1203,29 @@ impl Editor {
         cx.notify();
     }
 
+    /// A page is the element's own height in rows, so `page` is the only place that
+    /// knows what a page is - no magic line count, and it follows a resized window.
+    fn page_up(&mut self, _: &PageUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.page(-1, false, cx);
+    }
+
+    fn page_down(&mut self, _: &PageDown, _window: &mut Window, cx: &mut Context<Self>) {
+        self.page(1, false, cx);
+    }
+
+    fn select_page_up(&mut self, _: &SelectPageUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.page(-1, true, cx);
+    }
+
+    fn select_page_down(
+        &mut self,
+        _: &SelectPageDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.page(1, true, cx);
+    }
+
     /// Enter is an edit like every other one: through the same splice, which is why it
     /// cannot split a cluster and why a marked composition is handled here exactly as it
     /// is everywhere else.
@@ -1076,6 +1265,11 @@ impl Editor {
         }
     }
 
+    /// Copy puts the buffer's OWN bytes on the clipboard: LF between the lines, no
+    /// carriage return, no flatten. That is the half of the do-no-harm rule (whitepaper
+    /// section 4.5) that lives here - the file's original ending, CRLF or lone CR, is
+    /// restored at the SAVE layer by core, which is the only place that knows what the
+    /// file was. The bridge never sees an encoding and never adds a `\r`.
     fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.state.selected_range.is_empty() {
             let selected = self.state.content[self.state.selected_range.clone()].to_string();
@@ -1210,6 +1404,7 @@ impl Element for EditorElement {
         let mut frame_text = String::new();
         let mut shown_line: Option<usize> = None;
         let mut sel_probe = (0usize, 0usize);
+        let mut focused_probe = false;
         let mut caret_probe = 0usize;
         // The whole prepaint, timed: shape_us alone cannot show the rebuild cost, which
         // is what the quadratic first draft of the cache was. This is the number the
@@ -1354,6 +1549,24 @@ impl Element for EditorElement {
                     rgb(0x0033_99ff),
                 ));
             }
+            // FOCUSED OR NOT. A grey bar, not a live blue selection, when the view does
+            // not have focus - what Windows itself does, and the reason a selection in a
+            // background window must not look like the thing you are editing.
+            //
+            // There is no focus/blur EVENT to subscribe to in 0.2.2 as far as I can find
+            // (`on_focus_changed`, `FocusEvent`, `on_blur` are absent from window.rs,
+            // app.rs, interactive.rs and elements/div.rs; the only `Blur` in window.rs is
+            // a doc comment at :1406 on the window-level blur). What exists is the query
+            // `FocusHandle::is_focused`, already the door the caret uses, so the unfocused
+            // look is derived per frame rather than pushed - which is also why the probe
+            // prints `focused=`: if a focus change ever fails to produce a frame, this
+            // line is where that shows up.
+            let selection_colour = if input.focus_handle.is_focused(window) {
+                rgb(0x2d_4a_6b)
+            } else {
+                rgb(0x3f_3f_3f)
+            };
+            focused_probe = input.focus_handle.is_focused(window);
             if !selection.is_empty() {
                 for frame in &frames {
                     // VIEWPORT CLIP: a selection across 400 lines would draw 400 quads,
@@ -1383,7 +1596,7 @@ impl Element for EditorElement {
                                 frame.bounds.bottom(),
                             ),
                         ),
-                        rgb(0x2d_4a_6b),
+                        selection_colour,
                     ));
                 }
             }
@@ -1391,7 +1604,7 @@ impl Element for EditorElement {
         });
         let prepaint_us = began.elapsed().as_micros();
         probe(format!(
-            "prepaint lines={} h={:.1} caret={caret_probe} sel={:?}..{:?} scroll={:.1} caret_line={caret_line} shape_us={shape_us} prepaint_us={prepaint_us}",
+            "prepaint lines={} h={:.1} caret={caret_probe} sel={:?}..{:?} focused={focused_probe} scroll={:.1} caret_line={caret_line} shape_us={shape_us} prepaint_us={prepaint_us}",
             frames.len(),
             f32::from(bounds.size.height),
             sel_probe.0,
@@ -1427,6 +1640,7 @@ impl Element for EditorElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
+        let quad_count = prepaint.selections.len();
         for selection in prepaint.selections.drain(..) {
             window.paint_quad(selection);
         }
@@ -1466,8 +1680,9 @@ impl Element for EditorElement {
             input.viewport_h = bounds.size.height;
             input.caret_line_shown = prepaint.shown_line.take();
         });
+        let focused_out = self.input.read(cx).focus_handle.is_focused(window);
         probe(format!(
-            "paint lines={count} visible={visible} scroll={:.1} shape_us={shape_us}",
+            "paint lines={count} visible={visible} quads={quad_count} focused={focused_out} scroll={:.1} shape_us={shape_us}",
             f32::from(scroll_probe)
         ));
     }
@@ -1476,6 +1691,8 @@ impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let wheel_target = cx.entity();
         let click_target = cx.entity();
+        let move_target = cx.entity();
+        let up_target = cx.entity();
         div()
             .key_context("NotesEditor")
             .track_focus(&self.focus_handle(cx))
@@ -1487,9 +1704,26 @@ impl Render for Editor {
                 MouseButton::Left,
                 move |event: &MouseDownEvent, _window, cx| {
                     let shift = event.modifiers.shift;
+                    let clicks = event.click_count;
                     click_target.update(cx, |editor, cx| {
-                        editor.position_caret(event.position, shift, cx)
+                        editor.begin_drag(event.position, shift, clicks, cx);
                     });
+                },
+            )
+            .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
+                // `pressed_button` says a button is down; the model's flag says the drag
+                // BEGAN in this editor. Both, because a drag that starts in the status bar
+                // and enters the text must not select, and one that leaves the window must
+                // keep selecting until the button is released.
+                if event.pressed_button == Some(MouseButton::Left) {
+                    let position = event.position;
+                    move_target.update(cx, |editor, cx| editor.extend_drag(position, cx));
+                }
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                move |_event: &MouseUpEvent, _window, cx| {
+                    up_target.update(cx, |editor, _cx| editor.end_drag());
                 },
             )
             .child(EditorElement { input: cx.entity() })
@@ -1511,6 +1745,10 @@ impl Render for Editor {
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_up))
             .on_action(cx.listener(Self::select_down))
+            .on_action(cx.listener(Self::page_up))
+            .on_action(cx.listener(Self::page_down))
+            .on_action(cx.listener(Self::select_page_up))
+            .on_action(cx.listener(Self::select_page_down))
     }
 }
 
@@ -2102,5 +2340,158 @@ mod tests {
             15,
             "and down still means column five - one rule, two doors"
         );
+    }
+    /// S5, item 2: a double click selects a WORD, and the two rules that matter are that
+    /// the run is made of clusters (never half of an `e` + U+0301) and that a line feed
+    /// always ends it (a double click must never reach into the next line).
+    #[test]
+    fn a_double_click_selects_a_word_and_never_a_line_or_a_half_cluster() {
+        // Bytes: `one`=0..3, space=3, `beta`=4..8, \n=8, then `t`=9 `h`=10 `r`=11 and
+        // `e`+U+0301 as ONE cluster at 12..15, `s`=15..16, space=16, `x`=17. So the word
+        // the mark sits in is the whole alphanumeric run - 9..17 - which is exactly what
+        // "never splits a cluster" costs and why the test says so out loud.
+        let state = TextState::new("one beta\nthree\u{301}s x".to_string());
+        assert_eq!(
+            state.word_range_at(1),
+            0..3,
+            "inside 'one' is the whole of 'one'"
+        );
+        assert_eq!(
+            state.word_range_at(5),
+            4..8,
+            "'beta' stops at the line feed rather than running on"
+        );
+        assert_eq!(
+            state.word_range_at(14),
+            9..17,
+            "a click on the combining mark takes its base, its word, and nothing more"
+        );
+        let run = state.word_range_at(10);
+        assert_eq!(run, 9..17, "the same run from another byte inside it");
+        assert_eq!(&state.content[run.clone()], "three\u{301}s");
+        assert!(
+            !state.content[run].contains('\n'),
+            "a word never crosses a line"
+        );
+        assert_eq!(
+            state.word_range_at(16),
+            9..17,
+            "byte 16 is past the 's', and the cluster to its left still owns it - the word"
+        );
+        assert_eq!(
+            state.word_range_at(17),
+            17..18,
+            "a click ON the space takes the whitespace run, not the words either side"
+        );
+        assert_eq!(state.word_range_at(8), 8..9, "a line feed is its own run");
+    }
+
+    /// S5, item 4, the IME-integrity rule: a caret motion, a drag or a word/line
+    /// selection COMMITS an open composition. The characters stay - `replace_and_mark`
+    /// already spliced them in - but the uncommitted flag has to go, or the next
+    /// keystroke replaces text the user clicked away from and S6 refuses to flush over a
+    /// composition that no longer exists.
+    #[test]
+    fn any_motion_commits_an_open_composition() {
+        let mut state = TextState::new(String::new());
+        state.replace_and_mark(None, "nihao", None);
+        assert_eq!(state.marked_range, Some(0..5), "marked while composing");
+        state.move_to(2);
+        assert_eq!(
+            state.marked_range, None,
+            "a click commits: the bytes stay, the mark goes"
+        );
+        assert_eq!(state.content, "nihao", "committing is not deleting");
+        state.replace_and_mark(None, "x", None);
+        state.select_to(1);
+        assert_eq!(state.marked_range, None, "a drag commits too");
+        state.replace_and_mark(None, "y", None);
+        state.select_range(0..2);
+        assert_eq!(state.marked_range, None, "and so does a double click");
+    }
+
+    /// S5, item 1: the drag's direction. `select_to` is the whole mechanism - it flips
+    /// which end is the head when the pointer crosses the anchor - so a drag UP leaves
+    /// the caret at the TOP, which is what the reversed flag in selected_text_range
+    /// reports and what S6 will hand the clipboard.
+    #[test]
+    fn dragging_up_leaves_the_caret_at_the_top() {
+        let mut down = TextState::new("abcdefghij\nklmnopqrst\nuvwxyz".to_string());
+        down.move_to(3);
+        down.select_to(23);
+        assert_eq!(down.selected_range, 3..23, "drag down");
+        assert!(!down.selection_reversed, "head at the end");
+        assert_eq!(down.cursor_offset(), 23);
+        let mut up = TextState::new("abcdefghij\nklmnopqrst\nuvwxyz".to_string());
+        up.move_to(23);
+        up.select_to(3);
+        assert_eq!(up.selected_range, 3..23, "a drag up selects the same bytes");
+        assert!(up.selection_reversed, "with the head at the top");
+        assert_eq!(
+            up.cursor_offset(),
+            3,
+            "and that is where the caret is - the rule the clipboard reads"
+        );
+        assert!(
+            up.selected_text_range().reversed,
+            "and it reaches the platform"
+        );
+    }
+
+    /// S5, item 3: the clipboard keeps newlines in BOTH directions. Copy reads the
+    /// buffer's own bytes (LF inside, always), and the platform's own read of a range
+    /// spanning lines reports the line feeds too - the flatten at
+    /// examples/input.rs:133 is a fork bug, not a convention.
+    #[test]
+    fn a_multi_line_selection_keeps_its_newlines_both_ways() {
+        let mut state = TextState::new("first\nsecond\nthird".to_string());
+        state.selected_range = 0..18;
+        let copied = state.content[state.selected_range.clone()].to_string();
+        assert_eq!(copied, "first\nsecond\nthird");
+        assert_eq!(
+            copied.matches('\n').count(),
+            2,
+            "two line feeds, not two spaces"
+        );
+        assert!(
+            !copied.contains('\r'),
+            "and no carriage return on the way out"
+        );
+        let utf16 = range_to_utf16(&state.content, &(0..18));
+        let mut adjusted = None;
+        let read = state.text_for_range(utf16, &mut adjusted);
+        assert_eq!(
+            read.as_deref(),
+            Some("first\nsecond\nthird"),
+            "the IME read keeps them as well"
+        );
+    }
+
+    /// S5, item 4: with a selection there is one, the selection is what a keystroke,
+    /// a paste and a delete all act on - including a right-to-left selection, which is
+    /// the same range with a different head.
+    #[test]
+    fn typing_pasting_and_deleting_all_replace_the_selection() {
+        let mut type_over = TextState::new("keep-drop-keep".to_string());
+        type_over.selected_range = 5..9;
+        type_over.replace(None, "X");
+        assert_eq!(type_over.content, "keep-X-keep");
+        assert!(type_over.marked_range.is_none());
+        assert_eq!(type_over.cursor_offset(), 6, "caret after what was typed");
+
+        let mut paste_over = TextState::new("aaa\nbbb\nccc".to_string());
+        paste_over.selected_range = 4..7;
+        paste_over.replace(None, "ZZ");
+        assert_eq!(paste_over.content, "aaa\nZZ\nccc");
+
+        let mut reversed = TextState::new("0123456789".to_string());
+        reversed.selected_range = 2..7;
+        reversed.selection_reversed = true;
+        reversed.replace(None, "");
+        assert_eq!(
+            reversed.content, "01789",
+            "backspace over a right-to-left run"
+        );
+        assert!(!reversed.selection_reversed, "the head is now the caret");
     }
 }
