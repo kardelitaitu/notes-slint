@@ -280,6 +280,14 @@ fn lexical_normalisation(path: &Path) -> PathBuf {
 /// The parent folders of the path, NEAREST first, as display strings. Pure:
 /// component inspection only — no canonicalisation, no filesystem.
 fn parent_chain(path: &Path) -> Vec<String> {
+    // A drive-RELATIVE path ("C:notes.notes") has a prefix but no root: its
+    // "parent" is the per-drive CWD, which a menu label must never invent
+    // (BLOCKER-1) — the label falls back to the bare name.
+    let drive_relative =
+        matches!(path.components().next(), Some(Component::Prefix(_))) && !path.has_root();
+    if drive_relative {
+        return Vec::new();
+    }
     let comps: Vec<String> = path
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())

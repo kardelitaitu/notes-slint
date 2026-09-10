@@ -92,6 +92,7 @@ fn verdict_str(v: PathVerdict) -> &'static str {
         PathVerdict::UnboundedNetwork => "UnboundedNetwork",
         PathVerdict::ReservedDevice => "ReservedDevice",
         PathVerdict::StreamName => "StreamName",
+        PathVerdict::DriveRelative => "DriveRelative",
         PathVerdict::StrippedName => "StrippedName",
     }
 }
@@ -456,7 +457,6 @@ fn policy_table_vs_real_win32() -> Result<(), Box<dyn Error>> {
 /// is an ALTERNATE DATA STREAM on the file "a". drive_separator() accepts any
 /// ASCII letter before the colon, so the stream rule never fires for these.
 #[test]
-#[ignore = "BLOCKER-1 corollary: the bare one-letter form 'a:secret.notes' is Allowed as drive-A-relative, not judged a stream -- the same drive-relative hole as BLOCKER-1"]
 fn one_letter_name_with_a_colon_is_a_stream_not_a_drive() -> Result<(), Box<dyn Error>> {
     let _scratch = scratch_lock();
     init_scratch()?;
@@ -539,13 +539,12 @@ fn one_letter_name_with_a_colon_is_a_stream_not_a_drive() -> Result<(), Box<dyn 
 /// Each write runs in a child of this test binary with its own CWD, because
 /// set_current_dir in-process would race the rest of the suite.
 #[test]
-#[ignore = "BLOCKER-1: a drive-relative name is Allowed, so one name resolves against the per-drive CWD -- two working directories, two different files and two identity keys under one document title"]
 fn drive_relative_name_lands_where_the_cwd_says() -> Result<(), Box<dyn Error>> {
-    let root = init_scratch()?;
+    // A PRIVATE root: the child process writes from its own CWD outside the
+    // scratch lock, so a shared root would race the sibling probes' wipes.
+    let root = tempfile::tempdir()?.path().to_path_buf();
     let a = root.join("cwdA");
     let b = root.join("cwdB");
-    remove_hard(&a);
-    remove_hard(&b);
     fs::create_dir_all(&a)?;
     fs::create_dir_all(&b)?;
     let drive = root

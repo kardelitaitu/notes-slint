@@ -51,6 +51,13 @@ pub enum PathVerdict {
     /// trailing-dot bug. The ONE legitimate colon is the drive separator;
     /// any colon after it is a stream.
     StreamName,
+    /// A drive-relative name ("C:notes.notes", "a:b.notes"): Win32 resolves
+    /// it against the PER-DRIVE current directory — process state a
+    /// name-only policy cannot see — so one name can mean two different
+    /// files at two different times, and Path::join with such a component
+    /// REPLACES the target wholesale. The app must never hold a name it
+    /// cannot honestly resolve (BLOCKER-1, measured with two child CWDs).
+    DriveRelative,
     /// The final component ends with '.' or ' ': Win32 strips both from the
     /// final component, so "a.notes." writes "a.notes" while the app reports
     /// Ok for a path that does not exist. One shared implementation with the
@@ -116,6 +123,18 @@ pub fn path_policy(path: &Path) -> PathVerdict {
         Some(n) => &body[n + 1..],
         None => body,
     };
+    // A drive RELATIVE name ("C:notes.notes", "a:b.notes"): a drive colon
+    // with more name after it and NO separator anywhere. Win32 resolves it
+    // against the per-drive current directory — process state this name-only
+    // policy cannot see — so the name cannot be honoured honestly
+    // (BLOCKER-1, measured: two child CWDs, two different files).
+    if drive_separator(body).is_some()
+        && !after_drive.is_empty()
+        && !after_drive.contains('\\')
+        && !after_drive.contains('/')
+    {
+        return PathVerdict::DriveRelative;
+    }
     if after_drive.contains(':') {
         return PathVerdict::StreamName;
     }
@@ -448,6 +467,10 @@ mod tests {
             // COM0/LPT0 were never reserved (were OVER-REJECTED once).
             ("COM0", PathVerdict::Allowed),
             ("LPT0", PathVerdict::Allowed),
+            // BLOCKER-1: drive-relative names are refused, and the bare
+            // one-letter+colon corollary with them.
+            (r"C:notes.notes", PathVerdict::DriveRelative),
+            (r"a:b.notes", PathVerdict::DriveRelative),
             // BLOCKER-2 siblings: the rules hold on EVERY component.
             (r"C:\CON\x.notes", PathVerdict::ReservedDevice),
             (r"C:\x\sub.\x.notes", PathVerdict::StrippedName),
