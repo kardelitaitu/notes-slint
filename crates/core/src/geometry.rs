@@ -92,6 +92,13 @@ impl Rect {
     /// * min_visible is capped at the rect and work-area extents, so it can
     ///   never move a fully visible rect, and the result is never empty for
     ///   a non-empty input.
+    ///
+    /// Callers: pass the work area of the monitor the rect belongs to (a
+    /// nearest-monitor lookup by overlap), never blindly the primary — a
+    /// rect sitting fully on a still-present SECONDARY monitor has zero
+    /// overlap with the primary and would be yanked across screens. When no
+    /// monitor matches (the saved one is truly gone), the nearest monitor's
+    /// work area is the fallback.
     pub fn clamped_to(self, work_area: Rect, min_visible: u32) -> Rect {
         let x = clamp_axis(
             i64::from(self.x),
@@ -123,10 +130,12 @@ impl Rect {
     /// instead of overflowing. For example x = -3 and w = 3 at 0.5 become -2
     /// and 2 (the .5 rounds away from zero).
     ///
-    /// Scaling by an integer factor and then by its reciprocal is lossless:
-    /// r.scaled(2.0).and_then(|s| s.scaled(0.5)) == Some(r) exactly, because
-    /// the intermediate values are exact integers and x2 / x0.5 are exact
-    /// operations in binary floating point.
+    /// Scale then un-scale: exact for power-of-two factors at ANY magnitude
+    /// (x2 then x0.5 are pure binary exponent shifts — nothing to round), and
+    /// exact for other factors only while magnitudes stay well under ~8
+    /// million px, because an f32 reciprocal carries ~6e-8 relative error.
+    /// Beyond that the un-scale is approximately correct with the documented
+    /// rounding (measured: x = -134217728 drifts 4 px through x3 then x1/3).
     pub fn scaled(self, factor: f32) -> Option<Rect> {
         if !factor.is_finite() || factor <= 0.0 {
             return None;
@@ -217,6 +226,29 @@ mod tests {
         let persisted_after_first = initial.clamped_to(work_area, min_visible);
         let persisted_after_second = persisted_after_first.clamped_to(work_area, min_visible);
         (persisted_after_first, persisted_after_second)
+    }
+
+    #[test]
+    fn two_launches_are_stable_after_a_scale_change() {
+        // The product promise covers "scaling has changed": launch 1 scales
+        // the saved rect to the new DPI and clamps it into the work area;
+        // every later launch must be a fixed point at that scale — zero
+        // drift, exactly like the same-scale case.
+        let area = Rect::new(0, 0, 1920, 1040);
+        let saved = Rect::new(100, 100, 800, 600);
+        let Some(scaled) = saved.scaled(1.5) else {
+            panic!("1.5 is finite and positive; scaled cannot fail");
+        };
+        let (first, second) = launch_twice(scaled, area, 100);
+        assert_eq!(
+            first, second,
+            "zero drift across launches after the 1.5x scale change"
+        );
+        // 1200x900 at 1.5x hangs 10 px off the bottom edge — still visible
+        // enough (890 px >= min_visible 100), so the position is kept, and
+        // kept again on the next launch.
+        assert_eq!(first, Rect::new(150, 150, 1200, 900));
+        assert!(first.intersects(area));
     }
 
     #[test]
@@ -382,6 +414,31 @@ mod tests {
         assert_eq!(r.scaled(2.0).and_then(|s| s.scaled(0.5)), Some(r));
         let r3 = Rect::new(-999, 1002, 900, 603);
         assert_eq!(r3.scaled(3.0).and_then(|s| s.scaled(1.0 / 3.0)), Some(r3));
+    }
+
+    #[test]
+    fn scaled_round_trip_limit_is_pinned_not_folklore() {
+        // Power-of-two factors stay exact at ANY magnitude: x2 then x0.5 are
+        // binary exponent shifts with nothing to round.
+        let wide = Rect::new(-134_217_728, 134_217_727, 800, 600);
+        assert_eq!(wide.scaled(2.0).and_then(|s| s.scaled(0.5)), Some(wide));
+        // Small magnitudes: the f32 reciprocal of 3 (~6e-8 relative error)
+        // still lands back on the exact pixel.
+        let small = Rect::new(-4_000_000, 4_000_000, 800, 600);
+        assert_eq!(
+            small.scaled(3.0).and_then(|s| s.scaled(1.0 / 3.0)),
+            Some(small)
+        );
+        // Crossover (measured): at ~1.3e8 px the reciprocal's error exceeds
+        // half a pixel — x3 then x1/3 drifts by 4 px. This pins the limit the
+        // doc claims: exact only for powers of two or magnitudes far below
+        // ~8 million px. If this ever round-trips exactly again, widen the
+        // doc claim in the same change.
+        assert_ne!(
+            wide.scaled(3.0).and_then(|s| s.scaled(1.0 / 3.0)),
+            Some(wide),
+            "x3 then x1/3 at ~1.3e8 px is documented as approximately correct"
+        );
     }
 
     #[test]

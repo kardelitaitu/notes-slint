@@ -14,7 +14,7 @@ pub struct StateDir(pub PathBuf);
 /// The rule:
 ///
 /// * PORTABLE — state lives next to the executable: <exe_dir>/data. A caller
-///   lands on this branch in either of two ways:
+///   lands on this branch in any of three ways:
 ///   1. the environment has no per-user roaming profile (appdata is None),
 ///      so there is nowhere else to put state;
 ///   2. the caller probed <exe_dir>/data with a single Path::exists() and
@@ -23,15 +23,21 @@ pub struct StateDir(pub PathBuf);
 ///      the finding by passing appdata = None. This split is the documented
 ///      caller contract: crates/api and the bridge own the one exists()
 ///      probe and pass appdata = None for a portable deployment.
+///   3. appdata is present but EMPTY. An empty path would resolve the state
+///      dir CWD-relative ("notes-gpui" wherever the launcher ran), so a
+///      one-word change in the launcher could silently redirect user state;
+///      core treats it as no profile at all (a lexical check — still pure).
 /// * INSTALLED — state lives in the per-user roaming profile:
-///   <appdata>/notes-gpui (on Windows %APPDATA%\notes-gpui).
+///   <appdata>/notes-gpui (on Windows %APPDATA%\notes-gpui). appdata must
+///   be non-empty to count as a usable profile.
 ///
 /// The caller-side decision, for reference:
 ///
 /// ```no_run
 /// # let exe_dir = std::path::Path::new("C:/apps/notes");
 /// # let appdata = Some(std::path::Path::new("C:/Users/u/AppData/Roaming"));
-/// let state = if exe_dir.join("data").exists() || appdata.is_none() {
+/// let usable_appdata = appdata.filter(|p| !p.as_os_str().is_empty());
+/// let state = if exe_dir.join("data").exists() || usable_appdata.is_none() {
 ///     notes_core::resolve_state_dir(exe_dir, None) // portable
 /// } else {
 ///     notes_core::resolve_state_dir(exe_dir, appdata) // installed
@@ -44,11 +50,15 @@ pub struct StateDir(pub PathBuf);
 /// either input does not produce a doubled separator).
 pub fn resolve_state_dir(exe_dir: &Path, appdata: Option<&Path>) -> StateDir {
     match appdata {
-        // Portable: no roaming profile, or the caller found the portable
-        // "data" marker next to the exe (see the probe in the doc comment).
-        None => StateDir(exe_dir.join("data")),
-        // Installed: per-user roaming profile, namespaced for the app.
-        Some(appdata) => StateDir(appdata.join("notes-gpui")),
+        // Installed: a USABLE roaming profile. An empty path does not count:
+        // appdata = "" would resolve state CWD-relative ("notes-gpui" next
+        // to wherever the launcher ran), so a one-word launcher change could
+        // silently redirect user state.
+        Some(appdata) if !appdata.as_os_str().is_empty() => StateDir(appdata.join("notes-gpui")),
+        // Portable: no roaming profile at all, the caller-found "data"
+        // marker (the caller passes None — see the probe in the doc
+        // comment), or an empty appdata path, treated as no profile at all.
+        _ => StateDir(exe_dir.join("data")),
     }
 }
 
@@ -89,6 +99,12 @@ mod tests {
         assert_eq!(trailing.0, Path::new("C:/apps/notes").join("data"));
         let upper = resolve_state_dir(Path::new("C:/APPS/NOTES"), None);
         assert_eq!(upper.0, Path::new("C:/APPS/NOTES").join("data"));
+
+        // 5. Empty APPDATA is treated as absent: an empty path would make the
+        //    state dir CWD-relative, silently redirecting user state. The
+        //    check is lexical — core stays pure (no fs, no env).
+        let empty_appdata = resolve_state_dir(Path::new("C:/apps/notes"), Some(Path::new("")));
+        assert_eq!(empty_appdata.0, Path::new("C:/apps/notes").join("data"));
     }
 
     /// Pure determinism: identical inputs give identical outputs, every call.
@@ -101,6 +117,7 @@ mod tests {
                 Some(Path::new("C:/Users/u/AppData/Roaming")),
             ),
             (Path::new(""), Some(Path::new(""))),
+            (Path::new("C:/apps/notes"), Some(Path::new(""))),
         ];
         for (exe_dir, appdata) in cases {
             assert_eq!(
