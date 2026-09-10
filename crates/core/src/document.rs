@@ -379,7 +379,8 @@ mod tests {
         assert_eq!(d.should_flush(5, true), Some(Skip::Clean));
         // New work above the saved revision proceeds again.
         d.note_revision(6);
-        assert_eq!(d.should_flush(6, true), None);
+        d.apply_edit(); // revision 7, dirty
+        assert_eq!(d.should_flush(7, true), None, "new work proceeds");
     }
 
     #[test]
