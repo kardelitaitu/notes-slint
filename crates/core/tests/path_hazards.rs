@@ -823,8 +823,7 @@ fn invisible_names_reach_the_menu_verbatim() -> Result<(), Box<dyn Error>> {
         "a raw invisible or bidi control reached a menu label: {visible:?}"
     );
     assert!(
-        labels.iter().any(|l| l.contains("[RTL]"))
-            && labels.iter().any(|l| l.contains("[ZWSP]")),
+        labels.iter().any(|l| l.contains("[RTL]")) && labels.iter().any(|l| l.contains("[ZWSP]")),
         "the controls must be visibly substituted, got {visible:?}"
     );
     assert_eq!(
