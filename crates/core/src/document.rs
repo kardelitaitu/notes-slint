@@ -131,6 +131,18 @@ impl Document {
         self.armed = true;
     }
 
+    /// Records the caller's (bridge-owned) revision for this document: the
+    /// port's Command::Flush carries the revision, and the BRIDGE owns the
+    /// revision space, so this is how core is told where the document
+    /// stands. Monotonicity rule (D11): a LOWER revision never rewinds the
+    /// counter — the internal value only ever moves up — and it therefore
+    /// never un-saves a document (saved_revision only ever moves at
+    /// mark_saved, and the counter it is anchored to cannot go backwards).
+    /// This is an observation, not an edit: the dirty flag is untouched.
+    pub fn note_revision(&mut self, revision: u64) {
+        self.revision = self.revision.max(revision);
+    }
+
     /// Records a completed Save As to path (the bridge did the I/O): the NEW
     /// path is armed (ADR-0001 requirement 4) and the document is clean at
     /// the current revision.
@@ -161,10 +173,12 @@ impl Document {
         None
     }
 
-    /// The flush decision for a debounced autosave that observed the document
-    /// at revision: a flush at or below the last saved revision is STALE and
-    /// skips as Clean — no write, no error — regardless of the other state.
-    /// Otherwise the same fixed order as should_autosave applies.
+    /// THE single D11 gate for debounced autosave: a flush that observed the
+    /// document at revision is STALE when that revision is at or below the
+    /// last saved one — Clean, no write, no error, no event spam — regardless
+    /// of the other state. Otherwise the same fixed order as should_autosave
+    /// applies. Pair with note_revision when the bridge owns the revision
+    /// space (Command::Flush carries it).
     pub fn should_flush(&self, revision: u64, autosave_enabled: bool) -> Option<Skip> {
         if revision <= self.saved_revision {
             return Some(Skip::Clean);
@@ -333,6 +347,63 @@ mod tests {
         assert_eq!(d.should_flush(0, true), Some(Skip::Clean));
         // A current flush proceeds.
         assert_eq!(d.should_flush(2, true), None);
+    }
+
+    #[test]
+    fn note_revision_adopts_the_bridge_space_monotonically() {
+        // The bridge owns the revision space (Command::Flush carries it);
+        // note_revision is how core is told. It adopts upwards and never
+        // rewinds on a stale note.
+        let mut d = native();
+        d.note_revision(10);
+        assert_eq!(d.revision(), 10);
+        d.note_revision(12);
+        assert_eq!(d.revision(), 12);
+        d.note_revision(11); // a stale, lower note
+        assert_eq!(d.revision(), 12, "a lower revision never rewinds");
+        // An observation, not an edit: dirtiness is untouched.
+        assert!(!d.is_dirty());
+        assert_eq!(d.should_autosave(true), Some(Skip::Clean));
+    }
+
+    #[test]
+    fn a_rewind_attempt_cannot_unsave_a_document() {
+        let mut d = native();
+        d.note_revision(5);
+        d.mark_saved(); // saved at the bridge's revision 5
+        d.note_revision(3); // a stale note trying to drag the counter back
+        assert_eq!(d.revision(), 5, "the counter never rewinds");
+        assert_eq!(d.saved_revision, 5, "the saved state is not un-saved");
+        // Flushes at or below the saved revision stay stale-Clean.
+        assert_eq!(d.should_flush(3, true), Some(Skip::Clean));
+        assert_eq!(d.should_flush(5, true), Some(Skip::Clean));
+        // New work above the saved revision proceeds again.
+        d.note_revision(6);
+        assert_eq!(d.should_flush(6, true), None);
+    }
+
+    #[test]
+    fn d33_the_stale_flush_gate_fails_if_deleted() {
+        // D33: this test exists to fail if the `revision <= saved_revision`
+        // early return is removed from should_flush. A DIRTY document whose
+        // last saved revision is high: without the gate, should_autosave
+        // would happily proceed; with it, the stale flush is Clean.
+        let mut d = native();
+        d.note_revision(10);
+        d.mark_saved(); // saved at 10
+        d.apply_edit(); // dirty at 11
+        assert!(d.is_dirty());
+        assert_eq!(
+            d.should_flush(9, true),
+            Some(Skip::Clean),
+            "stale: gate required"
+        );
+        assert_eq!(
+            d.should_flush(10, true),
+            Some(Skip::Clean),
+            "at-saved: stale"
+        );
+        assert_eq!(d.should_flush(11, true), None, "current work proceeds");
     }
 
     #[test]
