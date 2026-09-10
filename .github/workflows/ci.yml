@@ -1,0 +1,193 @@
+# CI gate for notes-gpui.
+#
+# Purpose: make AGENTS.md's "each invariant is enforced by CI" a true statement. Every
+# command below is the manager's hand-run gate, encoded as measured — nothing here is a
+# redesign of it. Local aliases exist (.cargo/config.toml: `cargo gate`, `cargo arch`,
+# `cargo xtask`) and the literal commands are spelled out instead, so a failing step log
+# reads as the same string you would type by hand.
+#
+# Deliberate omissions — each absent thing is a decision, not a gap:
+#   * release packaging, MSIX/MSI  -> MSIX is ruled out on technical grounds (whitepaper SS7);
+#                                     win-portable / win-install builds are M5 work.
+#   * code signing                 -> no certificate exists; nothing to sign before M5.
+#   * artifact upload              -> this file's whole job is a verdict, not a build product.
+#   * codecov / coverage           -> a coverage number would become a target, not a signal.
+#   * nightly or MSRV matrix       -> one toolchain: rust-toolchain.toml (channel = stable).
+#                                     No setup-toolchain pin here on purpose — a patch pin would
+#                                     fight rust-toolchain.toml and force a rustup download.
+#   * ubuntu build of platform/bridge -> see core-portable below; excluded on purpose.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# Verification, not deployment: the gate needs a read-only checkout token.
+permissions:
+  contents: read
+
+# ~441 crates in the dependency graph: never finish a build for a superseded commit.
+# cancel-in-progress is per-ref, so a new push or a new push to the same PR supersedes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ===========================================================================
+  # THE GATE. Windows-first app and crates/platform is cfg(windows), so the job
+  # that decides "is M1 still standing?" must run on windows-latest.
+  # ===========================================================================
+  gate:
+    name: gate / windows
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # v2 derives its key from Cargo.lock + toolchain + OS/arch itself. No bespoke key invented.
+      - uses: Swatinem/rust-cache@v2
+
+      # --- 1. formatting (rustfmt defaults, AGENTS.md "Code conventions") ----
+      - name: fmt — cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+      # --- 2. lints -----------------------------------------------------------
+      # notes-bridge-gpui is excluded because gpui is pinned to =0.2.2 and its
+      # diagnostics are upstream's; the bridge is checked in bridge-gpui-advisory.
+      - name: clippy — cargo clippy --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings
+
+      # --- 3. tests (== the `cargo gate` alias) ------------------------------
+      - name: test — cargo test --workspace --exclude notes-bridge-gpui
+        run: cargo test --workspace --exclude notes-bridge-gpui
+
+      # --- 4. architecture invariants (== the `cargo arch` alias) ------------
+      # Replaces the six "cargo tree -p X -i Y | must be empty" probes in AGENTS.md,
+      # evaluated from cargo metadata (crates/xtask/src/arch.rs). Exit codes:
+      #   0 clean | 1 a layering rule was violated | 2 the check itself could not run.
+      # Each violation prints "ARCH VIOLATION: <pkg> ... [rule: <rule-id>]" and is
+      # re-emitted below as an annotation, so a failure names the rule id.
+      - name: arch — cargo run -p xtask -- check-arch
+        id: arch
+        shell: bash
+        run: |
+          # Actions runs shell: bash on Windows as "bash -e" WITHOUT pipefail, so a
+          # failing cargo behind "| tee" would otherwise read as tee success.
+          set -o pipefail
+          status=0
+          cargo run -p xtask -- check-arch 2>&1 | tee "$RUNNER_TEMP/check-arch.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # One annotation per violated rule id, taken straight from check-arch's output.
+          while IFS= read -r line; do
+            echo "::error::$line"
+          done < <(grep -o 'ARCH VIOLATION: .*' "$RUNNER_TEMP/check-arch.log" || true)
+          case $status in
+            0) echo "check-arch: clean — the layering rules in AGENTS.md hold." ;;
+            1) echo "::error::LAYERING RULE VIOLATED (check-arch exit 1). The rule ids are in the ARCH VIOLATION lines above; the rule table lives in crates/xtask/src/arch.rs." ;;
+            *) echo "::error::CHECK HARNESS FAILURE (check-arch exit $status) — the check itself could not run (workspace root / cargo metadata). This is not an architecture violation." ;;
+          esac
+          exit $status
+
+      # --- 5. docs placement validator ---------------------------------------
+      # Its OWN step, never chained with a cargo command, and it runs even when a step
+      # above failed: a docs edit landing mid-run must not red-fail a code gate, and a
+      # red code gate must not mask a misplaced markdown file. Two verdicts, two names.
+      # Measured green at 23 markdown files in the working tree (the 24th a local run
+      # scans is a manager-*-journal.md: gitignored, so a CI checkout never contains it).
+      # CI sees only COMMITTED markdown, and the section anchors are global across the
+      # plan set: if a docs/*.md that OWNS a section is uncommitted, every file citing it
+      # reports a dangling reference. Before believing a red here, check
+      # `git ls-files "*.md"` against the working-tree count.
+      - name: docs — .agents/skills/doc-management/scripts/check-docs.ps1
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File .agents/skills/doc-management/scripts/check-docs.ps1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error::check-docs.ps1 exited $LASTEXITCODE - a markdown file is misplaced, or a front-matter / section reference is broken. The findings above name each file. Docs verdict only: no cargo command ran in this step."
+          }
+          exit $LASTEXITCODE
+
+  # ===========================================================================
+  # ADVISORY — NOT A GATE.
+  # gpui =0.2.2 compiles today (measured: `cargo check -p notes-bridge-gpui`, exit 0,
+  # ~1m56s cold), but M2 is the milestone where an upstream GPUI break must not stop
+  # M1 verification. So this job's red never turns the run red, and the only output
+  # that matters is the one-line summary below.
+  # ===========================================================================
+  bridge-gpui-advisory:
+    name: bridge-gpui / advisory (never gates)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check — cargo check -p notes-bridge-gpui
+        id: gpui
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          cargo check -p notes-bridge-gpui 2>&1 | tee "$RUNNER_TEMP/gpui-check.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit $status
+
+      # Runs on either outcome (the step above is allowed to fail) and prints exactly
+      # one line, so the advisory is legible without scrolling a 441-crate build log.
+      - name: summary — one-line gpui compile status
+        if: always()
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/gpui-check.log"
+          status="${{ steps.gpui.outputs.status }}"
+          status=${status:-not-run}
+          if [ ! -f "$log" ]; then
+            echo "gpui-bridge: NO RESULT (check step did not run; status=$status) — advisory only, the M1 gate is unaffected."
+            exit 0
+          fi
+          errs=$(grep -c '^error' "$log" || true)
+          warns=$(grep -c '^warning' "$log" || true)
+          if [ "$status" = "0" ]; then
+            echo "gpui-bridge: GREEN — cargo check -p notes-bridge-gpui exit 0, ${errs:-0} error lines, ${warns:-0} warning lines. Advisory job; the M1 gate does not depend on it."
+          else
+            first=$(grep -m1 '^error' "$log" || true)
+            echo "::warning::gpui-bridge: RED — cargo check -p notes-bridge-gpui exit ${status}, ${errs:-?} error lines; first: ${first:-none captured}. M1 gate unaffected by design; M2 owns GPUI breakage."
+          fi
+
+  # ===========================================================================
+  # CROSS-PLATFORM HONESTY FOR THE PURE CORE — read this before "fixing" it.
+  # notes-core carries zero cfg(windows), and rules core-is-pure / core-no-os forbid UI
+  # toolkits and OS FFI anywhere in its closure, so on Linux it must still compile and
+  # its tests must still pass. If this job goes red while the Windows gate is green,
+  # that is a real defect in core (a platform assumption leaked in), not a difference
+  # between operating systems.
+  #
+  # crates/platform and crates/bridge-gpui are NOT built here ON PURPOSE — windows 0.61
+  # and gpui are Windows-side concerns for this milestone (mac/linux land in M6-M8,
+  # whitepaper SS6 / SS9). Not forgotten: see the deliberate-omissions note at the top.
+  # `cargo arch` and check-docs.ps1 are not repeated here either: arch is metadata-only
+  # and already gated on Windows, and check-docs.ps1's skip-list regex assumes '\' path
+  # separators, so the docs verdict belongs to the Windows job and that job only.
+  # ===========================================================================
+  core-portable:
+    name: core-portable / ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy — cargo clippy -p notes-core -p xtask --all-targets -- -D warnings
+        run: cargo clippy -p notes-core -p xtask --all-targets -- -D warnings
+
+      - name: test — cargo test -p notes-core -p xtask
+        run: cargo test -p notes-core -p xtask
