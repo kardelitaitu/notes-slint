@@ -26,6 +26,10 @@ tempfile = "3"
 # 3fe7722: with default-features on, notes-gpui.exe does not link.
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
 raw-window-handle = "0.6"
+# Granted by FCR at S1 (bridge editor). Needed for grapheme-cluster boundaries in the caret-to-point mapping
+# (slice S4) and for a caret that does not split a combining sequence. Verified present in the offline
+# registry cache (1.12.0 and 1.13.3) so it resolves with --offline, which CI depends on.
+unicode-segmentation = "1"
 windows = { version = "0.61", features = ["Win32_Foundation","Win32_UI_WindowsAndMessaging","Win32_UI_Shell","Win32_Graphics_Gdi"] }
 
 [workspace.lints.rust]
