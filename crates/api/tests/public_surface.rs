@@ -14,6 +14,8 @@ use std::path::Path;
 // and never used, which is the whole point of the file - a bridge needs nothing
 // from it. The unused-crate-dependencies lint is per target, so it is told.
 use notes_core as _;
+// Named for the same per-target lint; this file uses none of it.
+use thiserror as _;
 
 use notes_api::{
     Command, Encoding, Event, FileMeta, Gateway, InitialState, LineEnding, LoadError, RecentEntry,
@@ -152,7 +154,7 @@ fn the_rendering_vocabulary_is_public_and_carries_its_copy() {
         exists: false,
     };
     let event = Event::RecentsUpdated(vec![entry]);
-    assert!(matches!(&event, Event::RecentsUpdated(list) if list[0].exists == false));
+    assert!(matches!(&event, Event::RecentsUpdated(list) if !list[0].exists));
     assert!(
         !format!("{event:?}").is_empty(),
         "a bridge can log what it was told"

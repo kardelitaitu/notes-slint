@@ -78,6 +78,19 @@ const SESSION_JSON: &str = concat!(
     r#""path":"DECOY-NOTES.md"}"#
 );
 
+/// A stored session pointing at a directory that cannot exist, so every flush is
+/// a real write attempt that must fail. [`shutdown_drains_commands_queued_behind_it`]
+/// needs it: since M9 a flush with NO document at all answers
+/// [`Event::AutosaveSkipped`] (a brand-new note is not an error), which carries no
+/// revision - and the revision is the only way that test can see ORDER without
+/// reaching into engine internals. An unreachable path keeps the assertion it was
+/// written to make instead of quietly turning it into a count of nothing.
+const DRAIN_SESSION_JSON: &str = concat!(
+    r#"{"rect":{"x":0,"y":0,"w":640,"h":480},"#,
+    r#""monitor_id":0,"scale_factor":1.0,"maximized":false,"pinned":false,"#,
+    r#""path":"no-such-dir/queued.notes"}"#
+);
+
 /// 1. The trap fires when the port is called from an engine thread.
 ///
 /// [`mark_current_thread_as_engine`] is the same arming the real engine thread
@@ -144,8 +157,14 @@ fn reentrancy_trap_fires_when_the_port_is_called_from_the_engine_thread() {
 /// 2. Shutdown drains: everything queued behind it is still carried out.
 #[test]
 fn shutdown_drains_commands_queued_behind_it() {
-    // No `mut`: on this toolchain Receiver::recv takes &self.
-    let (gateway, rx) = Gateway::start(StateDir(empty_dir()), Settings::default());
+    let dir = empty_dir();
+    fs::write(dir.join("session.json"), DRAIN_SESSION_JSON).expect("write session.json");
+    // No [`mut`]: on this toolchain Receiver::recv takes &self.
+    let (gateway, rx) = Gateway::start(StateDir(dir.clone()), Settings::default());
+    assert!(
+        dir.join("session.json").exists(),
+        "the fixture must be the file the engine actually read",
+    );
 
     // SetPinned changes state silently, so the counted batch is Flushes — one
     // event each — and the pin goes in first to prove the engine is warm.
@@ -302,8 +321,8 @@ fn startup_state_reads_the_state_files_and_never_the_note() {
         Some(Path::new("DECOY-NOTES.md")),
         "the stored path is REPORTED and not opened"
     );
-    assert_eq!(
-        initial.autosave_enabled, false,
+    assert!(
+        !initial.autosave_enabled,
         "settings.toml owns the toggle; the caller's default could not override it"
     );
 
@@ -374,7 +393,16 @@ fn a_slow_consumer_never_blocks_the_producer() {
 
     let mut answered = 0usize;
     while let Ok(event) = rx.recv() {
-        if matches!(event, Event::SaveFailed { .. }) {
+        // One answer per flush. Since M9 that answer is a SKIP, not a failure -
+        // there is no document here at all, and a new note is not an error. It is
+        // also the better probe for THIS test: it costs no I/O, so 10 000 of them
+        // measure the queue rather than the disk.
+        if matches!(
+            event,
+            Event::AutosaveSkipped {
+                reason: notes_api::SkipReason::NeedsPath
+            }
+        ) {
             answered += 1;
         }
     }

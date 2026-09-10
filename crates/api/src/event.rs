@@ -184,6 +184,22 @@ pub enum SaveError {
     /// value here is a fact somebody else decided.
     #[error("this note has not been saved to a file yet")]
     NoTarget,
+    /// The target is a symlink, junction or other reparse point, so replacing it
+    /// would orphan the real file behind it while the app reported success
+    /// (OneDrive and other sync clients materialise files this way). The [`String`]
+    /// is core's own sentence, naming the link and, where it resolved, the target -
+    /// the reason this one variant carries text is that those two paths ARE the
+    /// diagnosis, and no enum field could hold them for an arbitrary file.
+    #[error("{0} is a link; save to the real file instead")]
+    ReparsePoint(String),
+    /// The path can never be written as named: no file-name component, or a name
+    /// Windows would silently alter - it strips trailing dots and spaces from the
+    /// final component, so saving "a.notes." puts the bytes in "a.notes" while the
+    /// app reports Ok for a path that does not exist (0db0b69's second data-loss
+    /// fix). The [`String`] is core's sentence naming WHICH rule broke, kept
+    /// rather than laundered into [`Other`] (D29/D36: add the variant).
+    #[error("the path is not a usable file location: {0}")]
+    InvalidPath(String),
     /// Anything else. Carries the OS text, because inventing a friendly string
     /// for an unknown failure hides the one clue the user has.
     #[error("{0}")]
@@ -723,5 +739,19 @@ mod honesty_tests {
             "an unknown failure must not look like the missing-target case"
         );
         assert_ne!(SaveError::NoTarget, SaveError::NotFound);
+        // 0db0b69's two new core reasons are mapped, not laundered.
+        assert_eq!(
+            SaveError::InvalidPath("the path has no file name component".to_string()).to_string(),
+            "the path is not a usable file location: the path has no file name component"
+        );
+        assert_eq!(
+            SaveError::ReparsePoint("C:/one/a.notes".to_string()).to_string(),
+            "C:/one/a.notes is a link; save to the real file instead"
+        );
+        assert_ne!(
+            SaveError::ReparsePoint("x".to_string()).to_string(),
+            SaveError::Other("x".to_string()).to_string(),
+            "a link is actionable advice, not an unclassified failure"
+        );
     }
 }

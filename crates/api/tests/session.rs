@@ -742,12 +742,12 @@ fn the_toggle_and_the_recents_list_survive_a_restart_and_a_vanished_file() {
 
     let mut again = Harness::at(root.clone(), Settings::default());
     let other = again.file("second.notes", b"second");
-    again.open(&other);
-    assert_eq!(
-        again.flush_skipped("typed", 1),
-        SkipReason::AutosaveDisabled,
-        "settings.toml owned the toggle across the restart, not the caller's default"
-    );
+    // Opened by hand rather than through the `open` helper: that helper waits for
+    // `Loaded` and DISCARDS everything else on the way, and the list this test
+    // asserts on arrives in the same burst. Every later helper call would eat it.
+    again.send(Command::Open {
+        path: other.clone(),
+    });
     let list = match again.until(
         "RecentsUpdated with both files",
         |ev| matches!(ev, Event::RecentsUpdated(entries) if entries.len() >= 2),
@@ -763,6 +763,14 @@ fn the_toggle_and_the_recents_list_survive_a_restart_and_a_vanished_file() {
         .iter()
         .find(|entry| entry.path == doomed)
         .expect("a vanished recent is kept, not silently deleted (features.md 4.4)");
-    assert!(!vanished.exists, "and it is greyed out");
+    assert!(!vanished.exists, "and it is greyed out, not dropped");
     assert!(list.len() <= 10, "D13 cap");
+    // The toggle has to survive too, and it is checked last on purpose: this is the
+    // same engine and the same one read, so a skip here can only have come from
+    // settings.toml - the caller passed the default, which is autosave ON.
+    assert_eq!(
+        again.flush_skipped("typed", 2),
+        SkipReason::AutosaveDisabled,
+        "settings.toml owned the toggle across the restart, not the caller's default"
+    );
 }

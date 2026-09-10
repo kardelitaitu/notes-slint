@@ -24,6 +24,7 @@ use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use notes_core::save::IoStep;
 use notes_core::session::write_session;
 use notes_core::settings::{SETTINGS_FILE_NAME, write_settings};
 use notes_core::{
@@ -853,16 +854,37 @@ fn api_save_error(err: CoreSaveError, encoding: TextEncoding) -> SaveError {
         CoreSaveError::Locked => SaveError::Locked,
         CoreSaveError::NotFound => SaveError::NotFound,
         CoreSaveError::Unencodable => SaveError::Unencodable(api_encoding(encoding)),
+        CoreSaveError::InvalidPath(detail) => SaveError::InvalidPath(detail),
+        // 0db0b69: a link is not a file location the app may replace. The reason
+        // arrives as TEXT from core because it names the link and its target, which
+        // are facts about this path and this moment - exactly the pair of fields the
+        // rest of this enum keeps payload-free for. Handing it to Other would read as
+        // "unclassified" in the UI and hide the one instruction that helps ("save to
+        // the real file instead"), so the port has a variant for it now (D29/D36:
+        // add the variant, do not squash it).
+        CoreSaveError::ReparsePoint(detail) => SaveError::ReparsePoint(detail),
         other => SaveError::Other(other.to_string()),
     }
 }
 
 /// session.json failing is reported through the save vocabulary because that is
-/// what it is - a write that did not happen. Missing/corrupt are read-side states
-/// of a file the engine is writing, so they arrive as Other with core's copy.
+/// what it is - a write that did not happen.
+///
+/// 0db0b69 made [`SessionError::Save`] transparent, carrying core's classified
+/// [`SaveError`] instead of an [`io::Error::other`] round trip. That is a
+/// fidelity fix and this map follows it: the classified variant is mapped 1:1, so
+/// nothing becomes a string on the way to the UI. The [`Io`] arm stays because
+/// core can still surface a raw io error from the read side of the same call, and
+/// the step it reports is the write the engine attempted - [`IoStep::Write`], the
+/// step whose codes mean "the disk refused" rather than "the link is held".
+/// Missing and Corrupt are read-side states of a file the engine is writing, so
+/// they arrive as Other with core's own copy rather than an invented one.
 fn api_session_error(err: &SessionError) -> SaveError {
     match err {
-        SessionError::Io(io_err) => api_save_error(classify_io_error(io_err), TextEncoding::Utf8),
+        SessionError::Save(save_err) => api_save_error(save_err.clone(), TextEncoding::Utf8),
+        SessionError::Io(io_err) => {
+            api_save_error(classify_io_error(io_err, IoStep::Write), TextEncoding::Utf8)
+        }
         other => SaveError::Other(other.to_string()),
     }
 }
@@ -873,7 +895,9 @@ fn load_error_from_io(err: &std::io::Error) -> LoadError {
     match err.kind() {
         ErrorKind::NotFound => LoadError::NotFound,
         ErrorKind::PermissionDenied => LoadError::PermissionDenied,
-        _ => match classify_io_error(err) {
+        // A READ, so the steps that matter are Stat and Open-of-an-existing-file:
+        // sharing violations and access denials on a path we only wanted to look at.
+        _ => match classify_io_error(err, IoStep::Stat) {
             CoreSaveError::Locked => LoadError::Locked,
             CoreSaveError::NotFound => LoadError::NotFound,
             CoreSaveError::PermissionDenied => LoadError::PermissionDenied,
@@ -965,7 +989,10 @@ mod tests {
             cmd_rx,
             event_tx,
             StateDir(PathBuf::from("unused-in-these-tests")),
-            Session::default(),
+            Session {
+                path: Some(PathBuf::from("no-such-dir/queued.notes")),
+                ..Session::default()
+            },
             Settings::default(),
         );
         (engine, cmd_tx, event_rx)
@@ -1083,7 +1110,10 @@ mod tests {
             cmd_rx,
             event_tx,
             StateDir(PathBuf::from("unused-in-these-tests")),
-            Session::default(),
+            Session {
+                path: Some(PathBuf::from("no-such-dir/queued.notes")),
+                ..Session::default()
+            },
             Settings::default(),
         )
     }
