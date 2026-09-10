@@ -54,6 +54,10 @@
 //! also the only shape that satisfies "never block on a channel inside a GPUI
 //! frame".
 
+// S1 of the editor: the model and its input handler only. Nothing in main.rs uses
+// it yet - it does not paint until S2 - so the app behaves exactly as it did.
+mod editor;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
