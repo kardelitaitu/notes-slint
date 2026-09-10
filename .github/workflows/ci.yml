@@ -55,18 +55,120 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # --- 1. formatting (rustfmt defaults, AGENTS.md "Code conventions") ----
+      # "--all" means every workspace member, notes-bridge-gpui included: the bridge is
+      # ALREADY format-gated here, so it needs no duplicate fmt step further down.
       - name: fmt — cargo fmt --all -- --check
         run: cargo fmt --all -- --check
 
       # --- 2. lints -----------------------------------------------------------
-      # notes-bridge-gpui is excluded because gpui is pinned to =0.2.2 and its
-      # diagnostics are upstream's; the bridge is checked in bridge-gpui-advisory.
+      # notes-bridge-gpui is excluded from THIS invocation only because gpui is pinned to
+      # =0.2.2: one upstream deprecation would fail the workspace run for every crate at
+      # once, and the exclusion keeps the verdict attributable. It is NOT a loophole - the
+      # bridge is linted by its own named step below (3c), same -D warnings, its own
+      # red/green. See 3b/3c for which bridge checks gate and which do not.
       - name: clippy — cargo clippy --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings
         run: cargo clippy --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings
 
       # --- 3. tests (== the `cargo gate` alias) ------------------------------
       - name: test — cargo test --workspace --exclude notes-bridge-gpui
         run: cargo test --workspace --exclude notes-bridge-gpui
+
+      # --- 3b/3c. THE BRIDGE: which checks gate, and which deliberately do not -
+      # One place, so nobody re-decides this per-file. notes-bridge-gpui is no longer a
+      # stub: it carries build.rs + app.manifest and produces notes-gpui.exe, the shipped
+      # artifact. An allow-fail advisory on that is a route for a link break to reach
+      # master, so the split is:
+      #   FMT     GATES  - and always did: step 1 is "cargo fmt --all", which covers every
+      #                    workspace member including this one. Deliberately no second fmt
+      #                    step here; a duplicate would only invite them to disagree.
+      #   BUILD   GATES  - step 3b below. "cargo check" never links, so the real failure we
+      #                    already hit (gpui's "windows-manifest" default feature embedding
+      #                    a second RT_MANIFEST id=1 beside ours -> rust-lld refuses) is
+      #                    invisible to a check-only gate, as is a version-pin divergence
+      #                    on gpui =0.2.2 or an API break that bites only at link time.
+      #   CLIPPY  GATES  - step 3c below, its OWN named step, --all-targets -D warnings.
+      #   TEST    DOES NOT GATE - it stays advisory, in bridge-gpui-advisory. There are no
+      #                    GUI tests to run yet, and a headless runner may not be able to
+      #                    create a window at all: a red there means either "the app broke"
+      #                    or "this machine has no desktop session", and a gate that cannot
+      #                    tell those apart is noise that gets ignored. Advisory keeps the
+      #                    signal without the false alarm.
+      #
+      # Where this was measured (a promotion nobody ran is a lie): a clean worktree of
+      # HEAD 80c3d7d on windows-latest-equivalent, commands exactly as they appear below -
+      #   cargo build  -p notes-bridge-gpui --bin notes-gpui          -> exit 0 (1m13s, exe linked)
+      #   cargo clippy -p notes-bridge-gpui --all-targets -- -D warnings -> exit 0 (1m31s)
+      #   cargo fmt --all -- --check                                  -> exit 0 (covers the bridge)
+      # The SHARED working tree is red for the first two right now, and that is a transient
+      # owned by other workers, not a reason to leave the lane advisory: gateway.rs
+      # (committed) does not yet match the uncommitted Engine::new arity in crates/api and
+      # the uncommitted Settings::load change in crates/core. A CI run only ever sees
+      # committed state, so the gate would be green on this commit. If it is still red once
+      # those two land, steps 3b/3c are the honest place to look - fix the link, do not
+      # re-demote these to allow-fail.
+      #
+      # future-incompat-report.frequency=never, on these two bridge steps and nowhere else:
+      # gpui's graph pulls proc-macro-error2 v2.0.1, whose future-incompat footer cargo
+      # reprints on every invocation that actually compiles something (it is in both
+      # measured runs above), and nothing in this repo can clear it. The scope is narrow by
+      # design - this is NOT a warning suppression:
+      #   * it hides that FOOTER ONLY. -D warnings still turns every rustc/clippy
+      #     diagnostic in the same invocation into an error, and no step here pipes output
+      #     through a filter, a "|| true", or a grep that could eat a real message; the
+      #     greps below only ADD annotations, they never change the exit status.
+      #   * it is a per-command --config flag, not a [future-incompat-report] entry in
+      #     .cargo/config.toml, so it cannot leak into a developer run or another step.
+      #   * the condition cannot rot unseen: bridge-gpui-advisory compiles the same graph
+      #     at cargo's DEFAULT frequency, so the footer still prints once per run in a job
+      #     that gates nothing, and "cargo report future-incompatibilities --id 1" shows it
+      #     on demand. If a SECOND package ever joins that footer, that is new information
+      #     and this suppression should be revisited, not inherited silently.
+      #
+      # --- 3b. the bridge LINKS ------------------------------------------------
+      - name: bridge — cargo build -p notes-bridge-gpui --bin notes-gpui (the exe must link)
+        id: bridge
+        shell: bash
+        run: |
+          # Actions runs "shell: bash" on Windows as "bash -e" WITHOUT pipefail: without
+          # this line, a cargo failure behind "| tee" reads as tee's success and a red
+          # check prints green. Every piped bash step below carries it for that reason.
+          set -o pipefail
+          status=0
+          cargo --config 'future-incompat-report.frequency="never"' build -p notes-bridge-gpui --bin notes-gpui 2>&1 | tee "$RUNNER_TEMP/bridge-build.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # Annotate the first errors so the cause is visible without scrolling a long log.
+          while IFS= read -r line; do
+            echo "::error::$line"
+          done < <(grep -E '^error' "$RUNNER_TEMP/bridge-build.log" | head -12 || true)
+          if [ "$status" = "0" ]; then
+            echo "bridge build: notes-gpui.exe linked."
+          else
+            echo "::error::BRIDGE BUILD FAILED (exit $status) - notes-gpui.exe did not link, or a dependency did not compile. If the log shows rust-lld and a duplicate resource, that is the RT_MANIFEST id=1 clash: set default-features = false for gpui in the ROOT Cargo.toml (the bridge inherits it on purpose - see crates/bridge-gpui/Cargo.toml), do not weaken this step."
+          fi
+          exit $status
+
+      # --- 3c. the bridge is linted too ----------------------------------------
+      # Separate step, separate name, so "clippy broke" and "the link broke" are two
+      # different red cells - one merged step would hide which check broke.
+      - name: clippy (bridge) — cargo clippy -p notes-bridge-gpui --all-targets -- -D warnings
+        id: bridge_clippy
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          cargo --config 'future-incompat-report.frequency="never"' clippy -p notes-bridge-gpui --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/bridge-clippy.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # rustc/clippy diagnostics start at column 0; the leading anchor keeps source
+          # snippets quoted inside a diagnostic from being annotated as if they were one.
+          while IFS= read -r line; do
+            echo "::error::$line"
+          done < <(grep -E '^(error|warning)(\[[0-9A-Za-z-]+\])?:' "$RUNNER_TEMP/bridge-clippy.log" | head -12 || true)
+          if [ "$status" = "0" ]; then
+            echo "clippy (bridge): clean at -D warnings."
+          else
+            echo "::error::CLIPPY FAILED ON THE BRIDGE (exit $status) - a lint, or a real compile error, under -D warnings. The crate names in the annotations above say which."
+          fi
+          exit $status
 
       # --- 4. architecture invariants (== the `cargo arch` alias) ------------
       # Replaces the six "cargo tree -p X -i Y | must be empty" probes in AGENTS.md,
@@ -126,6 +228,43 @@ jobs:
           esac
           exit $status
 
+      # --- 4c. drift lock: run the developer command itself -------------------
+      # "cargo xtask check" (== cargo run -p xtask -- check) runs fmt, clippy, test,
+      # check-arch and fixtures verify, printing one verdict row per step, with the
+      # bridge check and the docs validator as ADVISORY rows that never gate. The
+      # explicit steps above stay: a named step points at one gate in the Actions UI.
+      # This step is what stops the two lists drifting apart - if the developer command
+      # grows a check, CI grows it in the same run. Full, not --quick: --quick skips
+      # clippy and test, i.e. exactly the coverage a drift check must not lose. Cheap,
+      # because target/ is warm from the steps above - this is re-verification, not a
+      # second cold build. Exit 1 = a gate row failed, 2 = a gate row could not run.
+      # What this step may name: only subcommands that exist at HEAD - check, check-arch,
+      # fixtures verify (crates/xtask/src/main.rs). FOLLOW-UP, deliberately not in this
+      # commit: a deps-hygiene subcommand ("cargo xtask deps") is landing in crates/xtask
+      # right now and is not wired at HEAD, so nothing here references it - naming it would
+      # break this step for every run until that worker lands. Whoever lands it adds the row
+      # to xtask's step table (crates/xtask/src/check.rs); this drift step then runs it in
+      # CI on the same commit, and a named step for its own verdict should land with it.
+      - name: drift — cargo run -p xtask -- check (the AGENTS.md gate as one command)
+        id: xtask_check
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          cargo run -p xtask -- check 2>&1 | tee "$RUNNER_TEMP/xtask-check.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # xtask prints "<== [name] OUTCOME" per step; annotate the failing ones only
+          # (advisory rows are excluded: they are reported, they do not gate).
+          while IFS= read -r line; do
+            echo "::error::$line"
+          done < <(grep -E '^<== \[' "$RUNNER_TEMP/xtask-check.log" | grep -Ev 'PASS|SKIPPED|advisory' | head -10 || true)
+          if [ "$status" = "0" ]; then
+            echo "xtask check: every gate row PASS."
+          else
+            echo "::error::cargo xtask check exited $status - see the verdict table above (1 = a gate row failed, 2 = a gate row could not run). Advisory rows (bridge check, docs validator) never cause this."
+          fi
+          exit $status
+
       # --- 5. docs placement validator ---------------------------------------
       # Its OWN step, never chained with a cargo command, and it runs even when a step
       # above failed: a docs edit landing mid-run must not red-fail a code gate, and a
@@ -147,14 +286,23 @@ jobs:
           exit $LASTEXITCODE
 
   # ===========================================================================
-  # ADVISORY — NOT A GATE.
-  # gpui =0.2.2 compiles today (measured: `cargo check -p notes-bridge-gpui`, exit 0,
-  # ~1m56s cold), but M2 is the milestone where an upstream GPUI break must not stop
-  # M1 verification. So this job's red never turns the run red, and the only output
-  # that matters is the one-line summary below.
+  # ADVISORY — NOT A GATE, and now deliberately small.
+  # The bridge's fmt, build and clippy were PROMOTED into the gate above (steps 1, 3b,
+  # 3c): it stopped being a stub, it links notes-gpui.exe, and an allow-fail job on a
+  # linkable artifact is how a link break reaches master. What is left here is the one
+  # bridge check that must not gate — its test run:
+  #   * there are no GUI tests yet (crates/bridge-gpui holds only src/main.rs), and
+  #   * a headless runner may not be able to create a window at all,
+  # so a red here means either "the app broke" or "this machine has no desktop
+  # session", and only one of those is actionable. A gate that cannot tell them apart
+  # is noise; an advisory is a signal. Nothing in this job can turn the run red.
+  # It also has a side benefit worth keeping: it compiles the same gpui graph at
+  # cargo's DEFAULT future-incompat frequency, so the proc-macro-error2 note that the
+  # gate's two bridge steps suppress still prints once per run, where nobody has to
+  # read it to make a verdict.
   # ===========================================================================
   bridge-gpui-advisory:
-    name: bridge-gpui / advisory (never gates)
+    name: bridge-gpui / advisory (tests only; never gates)
     runs-on: windows-latest
     continue-on-error: true
     timeout-minutes: 30
@@ -162,36 +310,41 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
 
-      - name: check — cargo check -p notes-bridge-gpui
+      # Its OWN step: "cargo test" also compiles, so merging it with the summary below
+      # would hide which of the two - a build break or a test/window failure - happened.
+      # --no-fail-fast: with no test suite yet, the value here is the full list of
+      # whatever does exist, not the first failure.
+      - name: test — cargo test -p notes-bridge-gpui (advisory - may need a desktop session)
         id: gpui
         shell: bash
+        timeout-minutes: 15
         run: |
           set -o pipefail
           status=0
-          cargo check -p notes-bridge-gpui 2>&1 | tee "$RUNNER_TEMP/gpui-check.log" || status=$?
+          cargo test -p notes-bridge-gpui --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/gpui-test.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           exit $status
 
       # Runs on either outcome (the step above is allowed to fail) and prints exactly
       # one line, so the advisory is legible without scrolling a 441-crate build log.
-      - name: summary — one-line gpui compile status
+      - name: summary — one-line bridge test status
         if: always()
         shell: bash
         run: |
-          log="$RUNNER_TEMP/gpui-check.log"
+          log="$RUNNER_TEMP/gpui-test.log"
           status="${{ steps.gpui.outputs.status }}"
           status=${status:-not-run}
           if [ ! -f "$log" ]; then
-            echo "gpui-bridge: NO RESULT (check step did not run; status=$status) — advisory only, the M1 gate is unaffected."
+            echo "gpui-bridge: NO RESULT (test step did not run; status=$status) — advisory only, the gate is unaffected."
             exit 0
           fi
           errs=$(grep -c '^error' "$log" || true)
-          warns=$(grep -c '^warning' "$log" || true)
+          passed=$(grep -cE '^test [^ ]+ \.\.\. ok$' "$log" || true)
           if [ "$status" = "0" ]; then
-            echo "gpui-bridge: GREEN — cargo check -p notes-bridge-gpui exit 0, ${errs:-0} error lines, ${warns:-0} warning lines. Advisory job; the M1 gate does not depend on it."
+            echo "gpui-bridge: GREEN — cargo test -p notes-bridge-gpui exit 0, ${passed:-0} tests passed, ${errs:-0} error lines. Advisory job; the gate does not depend on it."
           else
-            first=$(grep -m1 '^error' "$log" || true)
-            echo "::warning::gpui-bridge: RED — cargo check -p notes-bridge-gpui exit ${status}, ${errs:-?} error lines; first: ${first:-none captured}. M1 gate unaffected by design; M2 owns GPUI breakage."
+            first=$(grep -m1 -E '^(error|panic)' "$log" || true)
+            echo "::warning::gpui-bridge: RED — cargo test -p notes-bridge-gpui exit ${status}, ${errs:-?} error lines; first: ${first:-none captured}. Ambiguous by design (broken code vs. no window on a headless runner), which is why it is advisory. The gate's bridge steps (fmt/build/clippy) carry the real verdict."
           fi
 
   # ===========================================================================
