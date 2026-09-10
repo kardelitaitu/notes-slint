@@ -134,6 +134,13 @@ pub fn save_session_bytes(dir: &Path, bytes: &[u8]) -> Result<(), SaveError> {
 /// The D12/D23 tail: sweep stale temps of this target, create an exclusive
 /// sibling temp, write, flush, fsync, rename over the target; on any failure
 /// remove the temp and classify the error. Never truncates the target.
+///
+/// THE EQUIVALENCE (enforced here, not advisory): a path this function
+/// writes has verdict Allowed from path_policy, and a verdict other than
+/// Allowed is a typed refusal before any I/O. This holds for every caller —
+/// documents, session.json and settings.toml funnel through atomic_write —
+/// so "path_policy Allowed <=> save_document writes" is a property of the
+/// crate, checked by pin, not a claim in a comment.
 pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError> {
     let _file_name = target
         .file_name()
@@ -157,6 +164,21 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError>
             "a component of the path ends with '.' or a space, which Windows strips — the file written would not be the one named; rename the target"
                 .to_owned(),
         ));
+    }
+    // THE HEADLINE INVARIANT: path_policy Allowed <=> atomic_write writes.
+    // Every writer funnels through here (documents, session, settings), so
+    // this one check makes the equivalence real for all three. Nothing may
+    // reach the filesystem under a refused verdict: a drive-relative name
+    // would land in a per-drive CWD (BLOCKER-1 through the front door), a
+    // network share would stall the single-threaded engine on an unreachable
+    // host, a device name would open hardware. The verdict is named in the
+    // message because the UI renders SaveError::Display verbatim.
+    let verdict = crate::path_policy::path_policy(target);
+    if verdict != crate::path_policy::PathVerdict::Allowed {
+        return Err(SaveError::InvalidPath(format!(
+            "the name-only policy refuses this path ({verdict:?}): {} — the app will not write a file it cannot name honestly",
+            target.display()
+        )));
     }
     crate::path_policy::refuse_reparse_point(target)?;
     // M3: the read-only pre-flight lives HERE so every caller — documents,
@@ -693,6 +715,26 @@ mod tests {
         assert!(dated.exists(), "a dated backup must never be swept");
         assert!(partless.exists(), "a .part-less name is not our temp");
         Ok(())
+    }
+
+    /// D33, through the PUBLIC save API — the test that would have caught
+    /// the blocker today: a drive-relative name must be REFUSED by the
+    /// policy, never silently resolved against the per-drive current
+    /// directory (BLOCKER-1 re-entering through the front door). The
+    /// refusal names the verdict because the UI renders Display verbatim.
+    #[test]
+    fn drive_relative_name_is_refused_by_the_save_path() {
+        let Err(e) = save_document(
+            Path::new("C:drvrel.notes"),
+            "x",
+            det(TextEncoding::Utf8, false),
+        ) else {
+            panic!("a drive-relative name must be refused, not written to the per-drive CWD");
+        };
+        assert!(
+            matches!(e, SaveError::InvalidPath(ref msg) if msg.contains("DriveRelative")),
+            "the refusal must name the verdict for the UI: {e:?}"
+        );
     }
 
     /// B2 (trailing names): Win32 strips trailing dots and spaces from the

@@ -438,6 +438,35 @@ mod tests {
         }
     }
 
+    /// THE HEADLINE PIN: the equivalence "path_policy Allowed <=> save
+    /// writes" is enforced by a real CALL in atomic_write, not by a comment.
+    /// The needle is the exact two-line call shape — a comment cannot
+    /// produce it without being written to look like the call, which is
+    /// deliberate drift, not an accident. The verdict set itself is pinned
+    /// by the hostile tables on both sides of the seam.
+    #[test]
+    fn the_save_path_consults_the_whole_verdict_set() {
+        const SAVE: &str = include_str!("save.rs");
+        const POLICY: &str = include_str!("path_policy.rs");
+        assert!(
+            SAVE.contains(concat!(
+                "let verdict = crate::path_policy::path_policy(target);\n",
+                "    if verdict != crate::path_policy::PathVerdict::Allowed {"
+            )),
+            "atomic_write must consult path_policy on the write path — the equivalence is a call, not a comment"
+        );
+        assert_eq!(
+            POLICY
+                .matches(concat!(
+                    "pub fn path_policy(path: &",
+                    "Path) -> PathVerdict"
+                ))
+                .count(),
+            1,
+            "exactly one definition of THE predicate"
+        );
+    }
+
     /// The reviewer's hostile-input table, kept as a fact sheet: every input
     /// that once slipped through a hole, and the verdict that now names it.
     /// Run against the pure predicate — no filesystem, no elevation — which

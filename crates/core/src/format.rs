@@ -83,8 +83,9 @@ pub fn is_notes_path(path: &Path) -> bool {
     // Agreement rule (one policy, not two half-rules): a path core would
     // refuse to open or save — a stream, a device, a stripped name, a
     // network share — is not a .notes document no matter its extension.
-    // This is what closes the "a.notes." disagreement: the engine refuses
-    // the save, so the app can never hold the stripped name open.
+    // This is what closes the "a.notes." disagreement, and it is ENFORCED
+    // on both sides: the engine consults path_policy before arming, and
+    // save::atomic_write refuses any non-Allowed verdict before it writes.
     crate::path_policy::path_policy(path) == crate::path_policy::PathVerdict::Allowed
         && path
             .extension()
