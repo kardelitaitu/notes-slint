@@ -159,7 +159,7 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError>
                 .to_owned(),
         ));
     }
-    refuse_reparse_point(target)?;
+    crate::path_policy::refuse_reparse_point(target)?;
     // M3: the read-only pre-flight lives HERE so every caller — documents,
     // sessions, settings — gets the same ReadOnly diagnosis. A denied ACL is
     // not distinguishable at this point (both it and the attribute surface
@@ -255,37 +255,6 @@ fn is_our_temp(file_name: &str, prefix: &str) -> bool {
         && parts[2]
             .parse::<u32>()
             .is_ok_and(|attempt| attempt < MAX_TEMP_ATTEMPTS)
-}
-
-/// B2: refuse to rename over a symlink, junction or any other reparse point
-/// (OneDrive and sync clients). Replacing one destroys the link and orphans
-/// the real file behind it while the app reports success. The error names
-/// the link and, where it could be resolved, the real target.
-fn refuse_reparse_point(target: &Path) -> Result<(), SaveError> {
-    let Ok(meta) = std::fs::symlink_metadata(target) else {
-        return Ok(()); // no target yet: the rename will create it
-    };
-    #[cfg(windows)]
-    let is_reparse = {
-        use std::os::windows::fs::MetadataExt;
-        // FILE_ATTRIBUTE_REPARSE_POINT catches symlinks, junctions and cloud
-        // placeholders. std only — no windows crate (core-no-os).
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    };
-    #[cfg(not(windows))]
-    let is_reparse = meta.file_type().is_symlink();
-    if is_reparse {
-        let real = std::fs::read_link(target)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "an unresolvable target".to_owned());
-        return Err(SaveError::ReparsePoint(format!(
-            "{} is a link to {} — the app will not replace links; save to the real file instead",
-            target.display(),
-            real
-        )));
-    }
-    Ok(())
 }
 
 /// D12: best-effort sweep of crashed saves' temps for THIS target. A file is

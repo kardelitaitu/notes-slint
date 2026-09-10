@@ -9,8 +9,16 @@
 //! Every rule names the Win32 behaviour it defends against. The predicate is
 //! total and conservative: when the name alone cannot prove danger, the
 //! verdict is Allowed and the filesystem call answers normally.
+//!
+//! Guest, by decision of the state-dir review: the B2 reparse-point
+//! predicate lives HERE, because link safety is POLICY — what a path may
+//! be followed through. It is defined once and consumed by both
+//! save::atomic_write and session::ensure_state_dir; it reads metadata,
+//! never writes.
 
 use std::path::Path;
+
+use crate::save::SaveError;
 
 /// The decision for a path, from the NAME ALONE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +172,47 @@ pub(crate) fn under_extended_prefix(path: &Path) -> bool {
 fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
     let b = s.as_bytes();
     b.len() >= prefix.len() && b[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+/// THE reparse-point predicate (B2), defined once: Windows reads the
+/// FILE_ATTRIBUTE_REPARSE_POINT bit, which catches symlinks, junctions and
+/// cloud placeholders through std alone (no windows crate — core-no-os);
+/// other platforms use std's symlink classification.
+pub(crate) fn metadata_is_reparse(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    let is_reparse = {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT catches symlinks, junctions and cloud
+        // placeholders. std only — no windows crate (core-no-os).
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse = meta.file_type().is_symlink();
+    is_reparse
+}
+
+/// B2: refuse to rename over (or create through) a symlink, junction or any
+/// other reparse point (OneDrive and sync clients). Replacing one destroys
+/// the link and orphans the real file behind it while the app reports
+/// success. The error names the link and, where it could be resolved, the
+/// real target. A MISSING target is not a link: Ok — the rename will
+/// create it.
+pub(crate) fn refuse_reparse_point(target: &Path) -> Result<(), SaveError> {
+    let Ok(meta) = std::fs::symlink_metadata(target) else {
+        return Ok(()); // no target yet: the rename will create it
+    };
+    if metadata_is_reparse(&meta) {
+        let real = std::fs::read_link(target)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "an unresolvable target".to_owned());
+        return Err(SaveError::ReparsePoint(format!(
+            "{} is a link to {} — the app will not replace links; save to the real file instead",
+            target.display(),
+            real
+        )));
+    }
+    Ok(())
 }
 
 /// The classic MS-DOS device names. Modern Windows keeps the bare stem
@@ -355,5 +404,39 @@ mod tests {
         for (p, expected) in cases {
             assert_eq!(v(Path::new(p)), *expected, "{p}");
         }
+    }
+
+    /// The B2 reparse predicate is defined ONCE here and both consumers
+    /// call it: save::atomic_write (rename refusal) and
+    /// session::ensure_state_dir (creation refusal). Behaviour tests alone
+    /// cannot pin this — a fork passes them all — so the pin is
+    /// source-level, exactly like the stripped-name pin.
+    #[test]
+    fn the_reparse_predicate_is_defined_once_and_shared() {
+        const SAVE: &str = include_str!("save.rs");
+        const SESSION: &str = include_str!("session.rs");
+        const POLICY: &str = include_str!("path_policy.rs");
+        assert!(
+            SAVE.contains("path_policy::refuse_reparse_point(target)"),
+            "the save engine must refuse through the shared predicate"
+        );
+        assert!(
+            SESSION.contains("path_policy::metadata_is_reparse"),
+            "ensure_state_dir must judge through the shared predicate"
+        );
+        assert_eq!(
+            POLICY
+                .matches(concat!("pub(crate) fn metadata", "_is_reparse"))
+                .count(),
+            1,
+            "exactly one definition of the reparse fact"
+        );
+        assert_eq!(
+            POLICY
+                .matches(concat!("pub(crate) fn refuse", "_reparse_point"))
+                .count(),
+            1,
+            "exactly one definition of the refusal"
+        );
     }
 }

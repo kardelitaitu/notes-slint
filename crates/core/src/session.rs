@@ -69,6 +69,21 @@ pub enum SessionError {
     Save(#[from] crate::save::SaveError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// Something that is NOT a directory sits where the state directory
+    /// belongs — a plain file, which the fresh-install probe really found
+    /// on a real machine. The error names the path.
+    #[error("the state path is not a directory: {0}")]
+    NotADirectory(PathBuf),
+    /// A symlink, junction or other reparse point sits on the state path:
+    /// REFUSED by the same B2 predicate the save engine refuses its rename
+    /// with — replacing a link orphans the real directory behind it.
+    #[error("the state path is a link: {0} — the app does not create through or replace links")]
+    Symlink(PathBuf),
+    /// The directory exists but cannot be written (an inherited read-only
+    /// ACL profile, measured on real machines). Detected by the startup
+    /// probe — not at shutdown, when the first save failure is invisible.
+    #[error("the state directory is not writable: {0}")]
+    NotWritable(PathBuf),
 }
 
 /// Reads the session from a StateDir. Returns SessionError::Missing when
@@ -115,6 +130,74 @@ pub fn write_session(dir: &Path, s: &Session) -> Result<(), SessionError> {
     // fidelity is the contract the UI renders.
     crate::save::atomic_write(&dir.join(FILE_NAME), &bytes)?;
     Ok(())
+}
+
+/// Creates — or proves usable — the state directory the app persists into.
+/// CORE owns this rule: the port had grown its own copy, which duplicated
+/// the B2 link refusal and re-derived "is this a directory"; std::fs on
+/// this very directory is core's everyday vocabulary already (read_session,
+/// atomic_write, write_settings), so the honest home is here and the
+/// port's block becomes routing.
+///
+/// The answers, in order, each with its own test:
+/// * absent -> create_dir_all (a missing grandparent is not a surprise);
+/// * present directory -> Ok, idempotent, nothing clobbered;
+/// * a non-directory on the path -> NotADirectory, naming the path;
+/// * a symlink/junction/reparse point -> refused by the SAME predicate the
+///   save engine refuses its rename with (one definition, pinned by test);
+/// * present but not writable -> NotWritable, by a create-and-delete probe
+///   with the same semantics the port used (a uniquely named file), so an
+///   ACL failure surfaces at startup. Cost: one create + one delete, the
+///   same order as the port's measured 241µs — noise against the
+///   cold-start budget, and it buys a failure the user can be told about.
+pub fn ensure_state_dir(dir: &Path) -> Result<(), SessionError> {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir).map_err(SessionError::Io)?;
+        }
+        Err(e) => return Err(SessionError::Io(e)),
+        Ok(meta) => judge_state_dir_metadata(dir, &meta)?,
+    }
+    probe_writable(dir)
+}
+
+/// The PURE half of the decision, separable from the creating: given the
+/// symlink metadata of a path, is it a usable state directory? No creating,
+/// no probing — the verdict falls out of the metadata alone, so it tests
+/// without writing anything. The link check is THE shared B2 predicate.
+fn judge_state_dir_metadata(path: &Path, meta: &std::fs::Metadata) -> Result<(), SessionError> {
+    if crate::path_policy::metadata_is_reparse(meta) {
+        return Err(SessionError::Symlink(path.to_path_buf()));
+    }
+    if !meta.is_dir() {
+        return Err(SessionError::NotADirectory(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// The writability probe, SAME semantics the port used: create and delete a
+/// uniquely named file inside the directory. The failure it detects — a
+/// read-only ACL profile — would otherwise surface at shutdown, when nobody
+/// can see it.
+fn probe_writable(dir: &Path) -> Result<(), SessionError> {
+    let probe = dir.join(format!(
+        ".state-write-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    match std::fs::File::create(&probe) {
+        Ok(f) => {
+            drop(f);
+            // Best effort: a probe we could create we can normally delete;
+            // a leftover would be a hidden dotfile, never user data.
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(_) => Err(SessionError::NotWritable(dir.to_path_buf())),
+    }
 }
 
 #[cfg(test)]
@@ -302,5 +385,164 @@ mod tests {
         assert!(!d.maximized);
         assert!(!d.pinned);
         assert_eq!(d.path, None);
+    }
+
+    #[test]
+    fn absent_state_dir_is_created_even_with_a_missing_grandparent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("grand").join("state");
+        ensure_state_dir(&state)?;
+        assert!(
+            state.is_dir(),
+            "create_dir_all covers the missing grandparent"
+        );
+        // Idempotent: the second call is Ok and changes nothing.
+        ensure_state_dir(&state)?;
+        Ok(())
+    }
+
+    #[test]
+    fn present_state_dir_is_ok_and_clobbers_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state)?;
+        std::fs::write(state.join("keep.txt"), b"kept")?;
+        ensure_state_dir(&state)?;
+        assert_eq!(
+            std::fs::read(state.join("keep.txt"))?,
+            b"kept",
+            "never clobbers anything"
+        );
+        Ok(())
+    }
+
+    /// D33: a plain file on the state path (the fresh-install probe found
+    /// this for real) must be refused BY NAME. This test fails without the
+    /// not-a-directory check: the file would fall through to the writability
+    /// probe and come back as an unlabelled io error instead.
+    #[test]
+    fn a_file_on_the_state_path_is_refused_by_name() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state");
+        std::fs::write(&state, b"a plain file")?;
+        let Err(e) = ensure_state_dir(&state) else {
+            panic!("a file where the state dir belongs must be refused");
+        };
+        assert!(
+            matches!(&e, SessionError::NotADirectory(p) if p == &state),
+            "the error must name the path, got {e:?}"
+        );
+        // And the file is untouched: never clobbered, never rewritten (D12).
+        assert_eq!(std::fs::read(&state)?, b"a plain file");
+        Ok(())
+    }
+
+    /// D33: a link on the state path must be refused by THE SAME predicate
+    /// the save engine refuses its rename with (one definition — the
+    /// include_str! pin in path_policy tests proves the sharing). A junction
+    /// is used because creating one needs no privilege, so this proof runs
+    /// on any Windows host (the save engine's own B2 test relies on this).
+    #[test]
+    #[cfg(windows)]
+    fn symlinked_state_dir_is_refused_by_the_shared_predicate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("real-state");
+        std::fs::create_dir_all(&real)?;
+        let link = dir.path().join("state");
+        // mklink /J (a directory junction) needs no privilege, unlike file
+        // symlinks — the same mechanism the save engine's B2 proof uses.
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()?;
+        assert!(made.status.success(), "mklink /J failed: {:?}", made.stderr);
+        assert!(
+            std::fs::symlink_metadata(&link)?.file_type().is_symlink(),
+            "std classifies a junction as a reparse point on this toolchain"
+        );
+        let Err(e) = ensure_state_dir(&link) else {
+            panic!("a junction on the state path must be refused");
+        };
+        assert!(matches!(e, SessionError::Symlink(_)), "got {e:?}");
+        Ok(())
+    }
+
+    /// A directory that exists but cannot be written (the read-only ACL
+    /// profile measured on real machines: RX-only inheritance) is refused
+    /// AT STARTUP by the writability probe. Windows-only: the deny is made
+    /// with icacls (std has no ACL vocabulary — core-no-os) and removed
+    /// again so the tempdir cleans up.
+    #[test]
+    #[cfg(windows)]
+    fn unwritable_state_dir_is_refused_at_startup() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state)?;
+        let denied = std::process::Command::new("icacls")
+            .arg(&state)
+            .args(["/deny", "Everyone:(OI)(CI)(W)"])
+            .output()?;
+        assert!(
+            denied.status.success(),
+            "icacls deny failed: {}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+        let result = ensure_state_dir(&state);
+        let _ = std::process::Command::new("icacls")
+            .arg(&state)
+            .args(["/remove:d", "Everyone"])
+            .output();
+        let Err(e) = result else {
+            panic!("an unwritable state dir must be refused at startup");
+        };
+        assert!(matches!(e, SessionError::NotWritable(_)), "got {e:?}");
+        Ok(())
+    }
+
+    /// The probe's cost, stated for the cold-start budget: one create and
+    /// one delete, the same shape the port measured at 241µs. The assert is
+    /// a generous regression gate (CI filesystem jitter); the eprintln is
+    /// the honest number (visible with --nocapture).
+    #[test]
+    fn the_writability_probe_costs_startup_noise() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state)?;
+        let runs = 100;
+        let start = std::time::Instant::now();
+        for _ in 0..runs {
+            probe_writable(&state)?;
+        }
+        let per = start.elapsed() / runs;
+        eprintln!("writability probe: {per:?} per call");
+        assert!(per.as_millis() < 10, "probe regressed: {per:?}");
+        Ok(())
+    }
+
+    /// The pure half is separable: the judge decides from metadata ALONE —
+    /// no creating, no probing — so the verdict is checkable without any
+    /// write hitting the disk.
+    #[test]
+    fn the_pure_judge_decides_from_metadata_alone() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("d");
+        std::fs::create_dir_all(&real)?;
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x")?;
+        assert!(
+            judge_state_dir_metadata(&real, &std::fs::symlink_metadata(&real)?).is_ok(),
+            "a real directory is usable"
+        );
+        assert!(
+            matches!(
+                judge_state_dir_metadata(&file, &std::fs::symlink_metadata(&file)?),
+                Err(SessionError::NotADirectory(_))
+            ),
+            "a plain file is not a directory"
+        );
+        Ok(())
     }
 }

@@ -36,7 +36,7 @@ pub use save::{
     SaveError, SaveOutcome, classify_io_error, save_document, save_document_revision,
     save_session_bytes,
 };
-pub use session::{Session, SessionError};
+pub use session::{Session, SessionError, ensure_state_dir};
 pub use settings::{Settings, SettingsError, read_settings, write_settings};
 
 /// Crate-wide error for I/O-reachable operations. The UI has to be able to
