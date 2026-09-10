@@ -108,7 +108,12 @@ pub enum DecodeError {
     #[error("unsupported ansi codepage {0}")]
     UnsupportedCodepage(u16),
     #[error("unterminated utf-16 sequence at byte {byte_offset}")]
-    UnterrogateUtf16 {
+    /// A UTF-16 code-unit sequence that ends mid-unit, or an unpaired
+    /// surrogate — a high surrogate with no low one after it, or a low
+    /// surrogate with no high one before it, wherever it occurs in the
+    /// input (not only at its end). byte_offset names the first byte of
+    /// the offending code unit.
+    UnterminatedUtf16 {
         /// Offset of the first byte of the offending UTF-16 code unit (an
         /// unpaired surrogate, or the truncated final unit).
         byte_offset: usize,
@@ -364,7 +369,7 @@ fn utf16_str(bytes: &[u8], be: bool, bom: bool) -> Result<String, DecodeError> {
         bytes
     };
     if body.len() % 2 != 0 {
-        return Err(DecodeError::UnterrogateUtf16 {
+        return Err(DecodeError::UnterminatedUtf16 {
             byte_offset: body.len() - 1,
         });
     }
@@ -387,11 +392,11 @@ fn utf16_str(bytes: &[u8], be: bool, bom: bool) -> Result<String, DecodeError> {
                 i += 2;
                 scalar
             } else {
-                return Err(DecodeError::UnterrogateUtf16 { byte_offset: i * 2 });
+                return Err(DecodeError::UnterminatedUtf16 { byte_offset: i * 2 });
             }
         } else if (0xDC00..=0xDFFF).contains(&u) {
             // Unpaired low surrogate first: refuse, never replace.
-            return Err(DecodeError::UnterrogateUtf16 { byte_offset: i * 2 });
+            return Err(DecodeError::UnterminatedUtf16 { byte_offset: i * 2 });
         } else {
             i += 1;
             u32::from(u)
@@ -399,7 +404,7 @@ fn utf16_str(bytes: &[u8], be: bool, bom: bool) -> Result<String, DecodeError> {
         // The ranges above are valid scalars by construction; the typed
         // fallback keeps this total instead of trusting that blindly.
         let Some(ch) = char::from_u32(ch) else {
-            return Err(DecodeError::UnterrogateUtf16 { byte_offset: i * 2 });
+            return Err(DecodeError::UnterminatedUtf16 { byte_offset: i * 2 });
         };
         out.push(ch);
     }
@@ -652,17 +657,17 @@ mod tests {
         let Err(e) = decode(&[0x41, 0x00, 0x00, 0xD8], d) else {
             panic!("lone high surrogate must fail");
         };
-        assert_eq!(e, DecodeError::UnterrogateUtf16 { byte_offset: 2 });
+        assert_eq!(e, DecodeError::UnterminatedUtf16 { byte_offset: 2 });
         // An unpaired LOW surrogate first: error at byte 0.
         let Err(e) = decode(&[0x00, 0xDC, 0x41, 0x00], d) else {
             panic!("unpaired low surrogate must fail");
         };
-        assert_eq!(e, DecodeError::UnterrogateUtf16 { byte_offset: 0 });
+        assert_eq!(e, DecodeError::UnterminatedUtf16 { byte_offset: 0 });
         // A truncated final unit (odd byte count): error at its start.
         let Err(e) = decode(&[0x41, 0x00, 0xD8], d) else {
             panic!("truncated utf-16 unit must fail");
         };
-        assert_eq!(e, DecodeError::UnterrogateUtf16 { byte_offset: 2 });
+        assert_eq!(e, DecodeError::UnterminatedUtf16 { byte_offset: 2 });
     }
 
     #[test]
