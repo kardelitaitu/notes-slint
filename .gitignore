@@ -1,10 +1,13 @@
 /target
 /dist
 **/*.rs.bk
-Cargo.lock
+!/Cargo.lock
 !.cargo/config.toml
 
 /packaging/**/out
 node_modules/
 .DS_Store
 Thumbs.db
+
+# agent working memory — never documentation, never committed
+manager-*-journal.md
