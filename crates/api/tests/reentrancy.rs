@@ -8,7 +8,7 @@
 //! 2. Shutdown is DRAIN AND EXIT, not "drop the queue and hope";
 //! 3. dropping the Gateway is ABORT, and buffered events survive it;
 //! 4. a closed EventRx stops the events, not the engine;
-//! 5. initial_state() reads session.json and nothing else;
+//! 5. startup_state() reads session.json and nothing else;
 //! 6. a consumer that never reads cannot block a producer — the unbounded-queue
 //!    invariant, and therefore the ABBA-deadlock alarm.
 //!
@@ -93,26 +93,38 @@ const SESSION_JSON: &str = concat!(
 #[cfg(debug_assertions)]
 #[test]
 fn reentrancy_trap_fires_when_the_port_is_called_from_the_engine_thread() {
-    let (gateway, _rx) = Gateway::start(StateDir(empty_dir()), Settings::default());
+    let (mut gateway, _rx) = Gateway::start(StateDir(empty_dir()), Settings::default());
 
     // Control first: the identical call OFF an engine thread must not panic.
     // Without this, a panic from anything at all would make the test pass.
-    gateway.send(Command::SetAutosave(true));
-    assert!(gateway.initial_state().autosave_enabled);
+    let _ = gateway.send(Command::SetAutosave(true));
+    assert!(
+        gateway
+            .startup_state()
+            .expect("first call")
+            .autosave_enabled
+    );
 
     let child = thread::spawn(move || {
         let _armed = mark_current_thread_as_engine();
         let sent = panic::catch_unwind(AssertUnwindSafe(|| {
             gateway.send(Command::SetAutosave(false))
         }));
-        let state = panic::catch_unwind(AssertUnwindSafe(|| gateway.initial_state()));
-        // The Gateway is dropped here, on a thread that is (falsely) marked as an
-        // engine thread: Drop joins the REAL engine thread, not this one, which is
-        // the difference between a join and a self-join.
-        drop(gateway);
-        (sent.is_err(), state.is_err())
+        let state = panic::catch_unwind(AssertUnwindSafe(|| gateway.startup_state()));
+        // REVIEWER ITEM 2: Drop is now guarded too. This thread is only FALSELY
+        // marked as an engine thread - which is exactly the point. A Gateway
+        // released on a real engine thread would join itself, panic inside a
+        // destructor, and abort the process; the assert cannot tell the two
+        // apart, and it does not need to. Caught here because a panic in a
+        // spawned thread would otherwise just fail the join below.
+        let dropped = panic::catch_unwind(AssertUnwindSafe(|| drop(gateway)));
+        // Nothing owns the Sender any more (the panic happened before the take),
+        // so the engine is left running; the test process exits and the runtime
+        // does not wait for it.
+        (sent.is_err(), state.is_err(), dropped.is_err())
     });
-    let (send_panicked, state_panicked) = child.join().expect("the armed child must run");
+    let (send_panicked, state_panicked, drop_panicked) =
+        child.join().expect("the armed child must run");
 
     assert!(
         send_panicked,
@@ -120,7 +132,12 @@ fn reentrancy_trap_fires_when_the_port_is_called_from_the_engine_thread() {
     );
     assert!(
         state_panicked,
-        "Gateway::initial_state from the engine thread must panic too"
+        "Gateway::startup_state from the engine thread must panic too"
+    );
+    assert!(
+        drop_panicked,
+        "Gateway::drop from the engine thread must assert too: it is the only \\
+         blocking call on the port and it was the only one without a latch"
     );
 }
 
@@ -132,15 +149,15 @@ fn shutdown_drains_commands_queued_behind_it() {
 
     // SetPinned changes state silently, so the counted batch is Flushes — one
     // event each — and the pin goes in first to prove the engine is warm.
-    gateway.send(Command::SetPinned(true));
+    let _ = gateway.send(Command::SetPinned(true));
     const N: u64 = 25;
     for revision in 1..=N {
-        gateway.send(Command::Flush {
+        let _ = gateway.send(Command::Flush {
             text: String::new(),
             revision,
         });
     }
-    gateway.send(Command::Shutdown);
+    let _ = gateway.send(Command::Shutdown);
     // Nothing above waited, and none of them could block: the queue is unbounded.
 
     let mut revisions = Vec::new();
@@ -174,12 +191,12 @@ fn drop_without_shutdown_aborts_but_buffered_events_survive() {
     let (gateway, mut rx) = Gateway::start(StateDir(empty_dir()), Settings::default());
 
     for revision in 1..=10 {
-        gateway.send(Command::Flush {
+        let _ = gateway.send(Command::Flush {
             text: String::new(),
             revision,
         });
     }
-    gateway.send(Command::SetAutosave(false));
+    let _ = gateway.send(Command::SetAutosave(false));
     // The engine may have processed some, none or all of these already. Either
     // way no send may panic, and nothing already emitted may be lost.
     let before = drain(&mut rx);
@@ -207,7 +224,7 @@ fn drop_without_shutdown_aborts_but_buffered_events_survive() {
 #[test]
 fn dropped_receiver_does_not_kill_the_engine() {
     let (gateway, rx) = Gateway::start(StateDir(empty_dir()), Settings::default());
-    gateway.send(Command::Flush {
+    let _ = gateway.send(Command::Flush {
         text: "x".into(),
         revision: 1,
     });
@@ -218,11 +235,11 @@ fn dropped_receiver_does_not_kill_the_engine() {
     // Every one of these emits into a closed channel. The engine must swallow it:
     // no panic, and no log line at a window that is already gone.
     for revision in 2..=50 {
-        gateway.send(Command::Flush {
+        let _ = gateway.send(Command::Flush {
             text: String::new(),
             revision,
         });
-        gateway.send(Command::Open {
+        let _ = gateway.send(Command::Open {
             path: PathBuf::from("C:/notes/who.notes"),
         });
     }
@@ -232,7 +249,7 @@ fn dropped_receiver_does_not_kill_the_engine() {
         "a dead listener must not take the engine down with it"
     );
 
-    gateway.send(Command::Shutdown);
+    let _ = gateway.send(Command::Shutdown);
     let deadline = Instant::now() + WAIT;
     while gateway.engine_is_alive() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
@@ -246,9 +263,9 @@ fn dropped_receiver_does_not_kill_the_engine() {
     drop(gateway);
 }
 
-/// 5. initial_state() reads session.json and NOTHING else.
+/// 5. startup_state() reads session.json and NOTHING else.
 #[test]
-fn initial_state_reads_only_session() {
+fn startup_state_reads_only_session() {
     let dir = tempfile::tempdir().expect("tempdir");
     let decoy = dir.path().join("DECOY-NOTES.md");
     fs::write(&decoy, b"do not open me in this slice").expect("write decoy");
@@ -258,8 +275,8 @@ fn initial_state_reads_only_session() {
         .expect("write session.json");
     drop(file);
 
-    let (gateway, rx) = Gateway::start(StateDir(dir.path().to_path_buf()), Settings::default());
-    let initial: InitialState = gateway.initial_state();
+    let (mut gateway, rx) = Gateway::start(StateDir(dir.path().to_path_buf()), Settings::default());
+    let initial: InitialState = gateway.startup_state().expect("the pre-window read");
 
     assert_eq!(initial.session.rect, SAVED_RECT, "the saved rect, verbatim");
     assert!(initial.pinned, "D10: the pin bit comes out of session.json");
@@ -334,13 +351,13 @@ fn a_slow_consumer_never_blocks_the_producer() {
         // it were bounded, the engine would stall inside emit(), the drain below
         // would never finish, and the UI thread would then stall inside its own
         // send() — the exact ABBA the design notes refuse.
-        gateway.send(Command::Flush {
+        let _ = gateway.send(Command::Flush {
             text: String::new(),
             revision,
         });
     }
     let produced = started.elapsed();
-    gateway.send(Command::Shutdown);
+    let _ = gateway.send(Command::Shutdown);
 
     let mut answered = 0usize;
     while let Ok(event) = rx.recv() {

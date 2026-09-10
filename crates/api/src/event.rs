@@ -237,6 +237,22 @@ pub enum Event {
     /// A save succeeded, and the buffer at `revision` is now what is on disk
     /// (D11 — this is what makes later flushes at that revision `Clean`).
     Saved { path: PathBuf, revision: u64 },
+    /// The open document is now a DIFFERENT file: Save As wrote it elsewhere, so
+    /// the path changed, the arming changed with it (ADR-0001 requirement 4), and
+    /// the `meta` field describes the file that exists now rather than the one first
+    /// opened. Emitted right after [`Event::Saved`] for the same write.
+    ///
+    /// A variant of its own rather than a second [`Event::Loaded`] because Loaded
+    /// carries the whole text and the bridge owns the buffer: re-sending a document
+    /// to make a point about its encoding is the expensive way to say "fix your
+    /// status line". AGENTS.md: when the bridge needs a fact the port never
+    /// reported, add the event instead of reaching around the port - which is how
+    /// [`Event::LoadFailed`] came to exist (D29).
+    Rebound {
+        path: PathBuf,
+        meta: FileMeta,
+        revision: u64,
+    },
     /// A save failed. The async one: `Flush` has no reply channel, so this is
     /// how the failure reaches the status line (AGENTS.md).
     SaveFailed {
@@ -275,6 +291,15 @@ mod tests {
     /// exhaustiveness, so a new variant cannot bypass the round-trip test.
     fn rebuild(event: &Event) -> Event {
         match event {
+            Event::Rebound {
+                path,
+                meta,
+                revision,
+            } => Event::Rebound {
+                path: path.clone(),
+                meta: *meta,
+                revision: *revision,
+            },
             Event::Loaded { path, text, meta } => Event::Loaded {
                 path: path.clone(),
                 text: text.clone(),
@@ -308,6 +333,7 @@ mod tests {
             Event::Loaded { .. } => "Loaded",
             Event::LoadFailed { .. } => "LoadFailed",
             Event::Saved { .. } => "Saved",
+            Event::Rebound { .. } => "Rebound",
             Event::SaveFailed { .. } => "SaveFailed",
             Event::ExternalChange { .. } => "ExternalChange",
             Event::AutosaveSkipped { .. } => "AutosaveSkipped",
@@ -325,6 +351,18 @@ mod tests {
             Event::LoadFailed {
                 path: PathBuf::from("C:/notes/gone.md"),
                 reason: LoadError::NotFound,
+            },
+            Event::Rebound {
+                path: PathBuf::from("C:/notes/renamed.notes"),
+                meta: FileMeta {
+                    encoding: Encoding::Utf16Le,
+                    line_ending: LineEnding::CrLf,
+                    trailing_newline: true,
+                    read_only: false,
+                    oversize: false,
+                    armed: true,
+                },
+                revision: 4,
             },
             Event::Saved {
                 path: PathBuf::from("C:/notes/a.notes"),
@@ -365,7 +403,7 @@ mod tests {
         );
         // Loaded, LoadFailed, Saved, SaveFailed, ExternalChange, AutosaveSkipped,
         // RecentsUpdated.
-        assert_eq!(all.len(), 7, "Event gained or lost a variant");
+        assert_eq!(all.len(), 8, "Event gained or lost a variant");
 
         for event in &all {
             assert_eq!(event, &event.clone(), "{event:?} clone is not equal");

@@ -19,7 +19,7 @@
 //!
 //! No disk I/O happens on the engine thread in this slice. [`Gateway::start`]
 //! reads session.json once, on the calling thread, and that read is the whole
-//! synchronous surface (see [`Gateway::initial_state`] for why).
+//! synchronous surface (see [`Gateway::startup_state`] for why).
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -99,14 +99,15 @@ pub struct InitialState {
 /// `Gateway` is Send and its command Sender is Clone + Send, which is how
 /// several GPUI callbacks each get a way to send without sharing a Gateway
 /// reference. None of them may be called from the engine thread - the assertions
-/// in [`Gateway::send`] and [`Gateway::initial_state`] are what catch it.
+/// in [`Gateway::send`] and [`Gateway::startup_state`] are what catch it.
 pub struct Gateway {
     /// Option because Drop takes it: removing the last Sender IS the abort
     /// signal, and it has to happen before the join.
     cmd_tx: Option<Sender<Command>>,
     /// Option for the same reason: join once, never twice.
     engine: Option<JoinHandle<()>>,
-    initial: InitialState,
+    /// Option because startup_state takes it: the snapshot is true exactly once.
+    initial: Option<InitialState>,
 }
 
 impl Gateway {
@@ -114,7 +115,7 @@ impl Gateway {
     /// owns.
     ///
     /// session.json is read HERE, on the caller's thread, once - the only way
-    /// [`Gateway::initial_state`] can be answered before a window exists without a
+    /// [`Gateway::startup_state`] can be answered before a window exists without a
     /// request/response round trip through the queue. The read never fails
     /// ([`read_session_or_default`]), so a file the user mangled cannot stop
     /// startup. Cold start: that is one small file read and nothing else. The
@@ -150,40 +151,87 @@ impl Gateway {
             // engine is gone from the only channel that still reaches them,
             // instead of this constructor unwinding.
             engine: spawned.ok(),
-            initial,
+            initial: Some(initial),
         };
         (gateway, event_rx)
     }
 
     /// Hands a command to the engine and returns immediately.
     ///
-    /// No return value by design: the answer is an [`Event`], later, on the
-    /// channel the caller owns (rule 4). A failed send is not worth a panic - it
-    /// means the engine already exited, through Shutdown or because this Gateway
-    /// was cloned into a callback that outlived it.
-    pub fn send(&self, command: Command) {
+    /// [`Ok`] means QUEUED, not done: the answer is an [`Event`], later, on the
+    /// channel the caller owns (rule 4). A queued command is a promise the engine
+    /// keeps - [`Command::Shutdown`] drains everything queued behind it, and the
+    /// drain's bound (see `Engine::drain`) is the one case where the promise is
+    /// knowingly broken, which is why the bound is 4 096 deep.
+    ///
+    /// [`Err`] hands the command BACK and means it was never accepted: the engine
+    /// had already exited, or this Gateway was closed. It is a [`Result`] rather
+    /// than nothing because "the engine is gone" used to be invisible - a dropped
+    /// Save As with no event and no return value, which is the one failure mode
+    /// AGENTS.md forbids (silence). Callers may still ignore it with [`let _`];
+    /// they may not be unable to check.
+    ///
+    /// Panics in debug builds if called from the engine thread (see
+    /// `crate::engine::on_engine_thread`).
+    pub fn send(&self, command: Command) -> Result<(), Command> {
         debug_assert!(
             !on_engine_thread(),
             "engine thread re-entered the port: engine code must never hold or call a Gateway"
         );
-        if let Some(tx) = &self.cmd_tx {
-            let _ = tx.send(command);
+        match &self.cmd_tx {
+            Some(tx) => tx.send(command).map_err(|err| err.0),
+            // Closed or dropped: the Sender went with it, so nothing can accept
+            // this and no Event will ever describe it.
+            None => Err(command),
         }
     }
 
     /// The pre-window read (§5.5 step 1): the one synchronous call on the port.
     ///
-    /// It returns the snapshot taken in [`Gateway::start`] - no round trip to the engine,
-    /// no block on a channel, no second file read. That is what makes it safe on
-    /// the thread that is about to create the window, before the first try_recv
-    /// could ever have run.
+    /// It returns the snapshot taken in [`Gateway::start`] - no round trip to the
+    /// engine, no block on a channel, no second file read. That is what makes it
+    /// safe on the thread about to create the window, before the first try_recv
+    /// could have run.
+    ///
+    /// CONSUME-ONCE, and [`None`] afterwards, on purpose. This is NOT a live
+    /// query: [`Command::SetPinned`] and [`Command::SetAutosave`] change engine
+    /// state that this snapshot cannot see, so a second call would hand back a
+    /// start-of-day truth that has quietly become a lie. Taking the value makes
+    /// "which is it" impossible to ask by accident. A live query needs a
+    /// request/response pair in the vocabulary - it does not exist, and guessing
+    /// from a stale copy is what this signature now prevents.
     #[must_use]
-    pub fn initial_state(&self) -> InitialState {
+    pub fn startup_state(&mut self) -> Option<InitialState> {
         debug_assert!(
             !on_engine_thread(),
-            "engine thread re-entered the port: initial_state is a pre-window read for the UI thread"
+            "engine thread re-entered the port: startup_state is a pre-window read for the UI thread"
         );
-        self.initial.clone()
+        self.initial.take()
+    }
+
+    /// Asks the engine to shut down and WAITS for it to finish: the explicit,
+    /// joinable alternative to [`impl Drop for Gateway`].
+    ///
+    /// [`Command::Shutdown`] is DRAIN AND EXIT, so close() is the path that
+    /// guarantees every accepted command - and the final session write inside the
+    /// drain - has been carried out before the caller proceeds. It returns the
+    /// command back if the engine was already gone (the same [`Self::send`]
+    /// contract), and it blocks, which is precisely why it is a named method and
+    /// not something a destructor does silently.
+    ///
+    /// Never call it from the engine thread: it joins the caller's own thread.
+    /// The debug_assert in [`Self::send`] fires first if a Gateway was ever
+    /// reachable from engine code, and no clone of the command Sender escapes this
+    /// struct to make that possible.
+    pub fn close(mut self) -> Result<(), Command> {
+        let result = self.send(Command::Shutdown);
+        if let Some(handle) = self.engine.take() {
+            // join() on the current thread would panic; send() asserted it cannot
+            // be this thread. A panicked engine reports Err here as a finished
+            // thread, and EventRx closes either way.
+            let _ = handle.join();
+        }
+        result
     }
 
     /// True while the engine thread is still running. A test seam worth keeping:
@@ -209,7 +257,26 @@ impl Drop for Gateway {
     /// buffered event is lost. What Shutdown adds is the explicit drain of
     /// whatever arrives while the caller still holds a live Sender, and a defined
     /// exit point. That asymmetry is why both exist.
+    ///
+    /// THE ASSERTION BELOW AND THE PROHIBITION ARE WHAT KEEP THAT BLOCK SAFE.
+    /// Joining is only safe because no thread can be holding a Gateway that the
+    /// engine itself also runs on: a shared handle cloned into engine-reachable
+    /// code, then released there, would drop into a join of the caller's OWN
+    /// thread - a panic inside a destructor, i.e. a process abort. Thread-locals
+    /// are not inherited, so this is the only place that can see it coming.
+    ///
+    /// Which is why nothing may vend a cloned command [`Sender`] out of this
+    /// struct, and why none is vended today. A clone on another thread is a Sender
+    /// this Gateway can no longer stop: Drop would take ITS copy, the engine would
+    /// still see a live queue, and the join would wait on a thread with no reason
+    /// to exit - an unbounded wait inside a destructor. [`Self::send`] and
+    /// [`Self::close`] are the whole surface, deliberately.
     fn drop(&mut self) {
+        debug_assert!(
+            !on_engine_thread(),
+            "a Gateway was released on the engine thread: its Drop would join the \\
+             thread it is running on, panicking inside a destructor"
+        );
         drop(self.cmd_tx.take());
         if let Some(handle) = self.engine.take() {
             // A panicked engine is not re-raised from a destructor (panicking in
@@ -233,11 +300,11 @@ mod tests {
         let gateway = Gateway {
             cmd_tx: Some(cmd_tx),
             engine: None,
-            initial: InitialState {
+            initial: Some(InitialState {
                 session: Session::default(),
                 autosave_enabled: true,
                 pinned: false,
-            },
+            }),
         };
         assert!(!gateway.engine_is_alive());
         drop(gateway);
@@ -254,6 +321,73 @@ mod tests {
     }
 
     /// The product premise: autosave starts enabled.
+    /// REVIEWER ITEM 1: an already-exited engine must be OBSERVABLE. A command the
+    /// engine will never accept has to come back rather than vanish into a queue
+    /// with no reader - the silence AGENTS.md forbids, in its send() form.
+    #[test]
+    fn a_command_the_engine_cannot_accept_comes_back() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+        drop(cmd_rx); // the shape left behind when the engine thread has finished
+        let gateway = Gateway {
+            cmd_tx: Some(cmd_tx),
+            engine: None,
+            initial: None,
+        };
+        assert_eq!(
+            gateway.send(Command::SetPinned(true)),
+            Err(Command::SetPinned(true)),
+            "send must return the command itself, not swallow it"
+        );
+        // And a Gateway already closed has no Sender at all: same answer.
+        let closed = Gateway {
+            cmd_tx: None,
+            engine: None,
+            initial: None,
+        };
+        assert_eq!(closed.send(Command::Shutdown), Err(Command::Shutdown));
+    }
+
+    /// REVIEWER ITEM 2: close() is the explicit, joinable shutdown, so Drop stops
+    /// being the only way to wait for the engine - and the only blocking call that
+    /// carried no latch assertion.
+    #[test]
+    fn close_shuts_the_engine_down_and_closes_the_event_channel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (gateway, rx) = Gateway::start(StateDir(dir.path().to_path_buf()), Settings::default());
+        assert!(gateway.engine_is_alive());
+        assert!(
+            gateway.send(Command::SetPinned(true)).is_ok(),
+            "a live engine accepts commands"
+        );
+        gateway.close().expect("the Shutdown was accepted");
+        assert!(
+            rx.recv().is_err(),
+            "the engine exited, so EventRx reports Disconnected"
+        );
+    }
+
+    /// REVIEWER ITEM 5: startup_state() is a snapshot handed over ONCE, not a live
+    /// query. SetPinned changes engine state this value cannot see, so returning it
+    /// a second time would be a stale truth with a straight face.
+    #[test]
+    fn startup_state_is_handed_over_once_and_is_not_the_live_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut gateway, _rx) =
+            Gateway::start(StateDir(dir.path().to_path_buf()), Settings::default());
+        let snapshot = gateway
+            .startup_state()
+            .expect("the first call gets the pre-window snapshot");
+        assert!(!snapshot.pinned, "a fresh state dir has nothing pinned");
+        assert!(snapshot.autosave_enabled);
+        assert!(
+            gateway.startup_state().is_none(),
+            "the snapshot is taken, not kept - a second call must not repeat it"
+        );
+        // The lie this prevents: the engine now disagrees with the old snapshot.
+        assert!(gateway.send(Command::SetPinned(true)).is_ok());
+        assert!(gateway.startup_state().is_none());
+    }
+
     #[test]
     fn autosave_starts_enabled() {
         assert!(Settings::default().autosave_enabled);

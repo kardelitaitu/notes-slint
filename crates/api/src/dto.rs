@@ -35,7 +35,7 @@ pub use notes_core::paths::StateDir;
 
 /// The persisted window session: rect (frame pixels), monitor id, scale,
 /// maximised, pinned, and the document that was last open. Owned by `notes-core`,
-/// re-exported because [`Gateway::initial_state`](crate::Gateway::initial_state)
+/// re-exported because [`Gateway::startup_state`](crate::Gateway::startup_state)
 /// hands it to a bridge before the window exists, so the bridge has to be able to
 /// NAME the type it is being handed (docs/architecture.md §5.5 step 1).
 ///

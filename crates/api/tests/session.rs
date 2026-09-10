@@ -54,7 +54,7 @@ impl Harness {
         let (gateway, rx) = Gateway::start(StateDir(root.clone()), Settings::default());
         // 5.5 step 3, once per scenario: the window exists before anything is
         // asked of it, so the engine is in the state a bridge would leave it in.
-        gateway.send(Command::RegisterWindow {
+        let _ = gateway.send(Command::RegisterWindow {
             handle: WindowHandle(0x100),
         });
         Harness {
@@ -70,6 +70,16 @@ impl Harness {
         let path = self.root.join(name);
         fs::write(&path, bytes).expect("write the fixture file");
         path
+    }
+
+    /// Every command in these scenarios must be ACCEPTED. A send that returns Err
+    /// means the engine exited mid-session, which would otherwise show up as a
+    /// confusing timeout on an event that can never arrive.
+    fn send(&self, command: Command) {
+        assert!(
+            self.gateway.send(command.clone()).is_ok(),
+            "the engine must still be accepting commands: {command:?}"
+        );
     }
 
     fn bytes(&self, path: &Path) -> Vec<u8> {
@@ -107,7 +117,7 @@ impl Harness {
     }
 
     fn open(&mut self, path: &Path) -> (String, FileMeta) {
-        self.gateway.send(Command::Open {
+        self.send(Command::Open {
             path: path.to_path_buf(),
         });
         match self.until(
@@ -121,7 +131,7 @@ impl Harness {
 
     /// A flush that is expected to SAVE, returning the saved revision.
     fn flush(&mut self, path: &Path, text: &str, revision: u64) -> u64 {
-        self.gateway.send(Command::Flush {
+        self.send(Command::Flush {
             text: text.to_string(),
             revision,
         });
@@ -137,7 +147,7 @@ impl Harness {
     /// A flush that must NOT save: the reason it skipped. Asserting there was no
     /// Saved for it is the caller's job, via the file bytes.
     fn flush_skipped(&mut self, text: &str, revision: u64) -> SkipReason {
-        self.gateway.send(Command::Flush {
+        self.send(Command::Flush {
             text: text.to_string(),
             revision,
         });
@@ -149,16 +159,38 @@ impl Harness {
         }
     }
 
-    fn save_as(&mut self, path: &Path) -> u64 {
-        self.gateway.send(Command::SaveAs {
+    /// Save As carries the text (D30): the engine holds no buffer of its own, so
+    /// this is the moment the command's own text field earns its keep. Also waits
+    /// for [`Event::Rebound`], which is the point of the variant.
+    fn save_as(&mut self, path: &Path, text: &str, revision: u64) -> u64 {
+        self.send(Command::SaveAs {
             path: path.to_path_buf(),
+            text: text.to_string(),
+            revision,
         });
         match self.until("Saved", |ev| match ev {
             Event::Saved { path: p, .. } => p == path,
             Event::SaveFailed { path: p, .. } => p == path,
             _ => false,
         }) {
-            Event::Saved { revision, .. } => revision,
+            Event::Saved { revision, .. } => {
+                // The rebind must follow the save: the UI's path, arming and
+                // encoding all change at this moment and nothing else says so.
+                match self.until(
+                    "Rebound",
+                    |ev| matches!(ev, Event::Rebound { path: p, .. } if p == path),
+                ) {
+                    Event::Rebound {
+                        meta, revision: r, ..
+                    } => {
+                        assert_eq!(r, revision, "Saved and Rebound agree on the revision");
+                        assert!(meta.armed, "Save As arms the document (ADR-0001 req 4)");
+                        assert!(!meta.oversize);
+                        revision
+                    }
+                    other => unreachable!("filtered to Rebound, got {other:?}"),
+                }
+            }
             Event::SaveFailed { reason, .. } => {
                 panic!("SaveAs to {} failed: {reason}", path.display())
             }
@@ -210,7 +242,7 @@ fn a_foreign_file_reports_its_format_refuses_to_autosave_and_arms_on_one_save() 
     // The one explicit act arms it (requirement 4), and Save As is the ONLY write.
     let target = app.root.join("kept.notes");
     assert_eq!(
-        app.save_as(&target),
+        app.save_as(&target, "line one\r\nline two edited", 1),
         1,
         "Save As writes the snapshot it was given"
     );
@@ -286,8 +318,10 @@ fn a_failed_save_arrives_as_an_event_and_the_engine_keeps_working() {
 
     // The canonical "where did my file go": a directory that does not exist.
     let nowhere = app.root.join("no-such-folder").join("deep.notes");
-    app.gateway.send(Command::SaveAs {
+    app.send(Command::SaveAs {
         path: nowhere.clone(),
+        text: "content\n".to_string(),
+        revision: 0,
     });
     let event = app.until(
         "SaveFailed",
@@ -331,11 +365,11 @@ fn a_failed_save_arrives_as_an_event_and_the_engine_keeps_working() {
 fn geometry_and_the_pin_bit_survive_a_restart_and_leave_no_temp_litter() {
     let mut app = Harness::new();
     let rect = Rect::new(40, 24, 1024, 700);
-    app.gateway.send(Command::SetPinned(true));
-    app.gateway.send(Command::GeometryChanged { rect });
+    app.send(Command::SetPinned(true));
+    app.send(Command::GeometryChanged { rect });
     // Shutdown drains, and the final session write happens INSIDE the drain -
     // which is what makes the assertions below possible at all.
-    app.gateway.send(Command::Shutdown);
+    app.send(Command::Shutdown);
     app.drain_events();
     drop(app.gateway);
 
@@ -361,14 +395,50 @@ fn geometry_and_the_pin_bit_survive_a_restart_and_leave_no_temp_litter() {
     // A second engine on the same directory restores it BEFORE any window exists:
     // 5.5 step 1, the one synchronous call in the app. The TempDir is still held by
     // the harness, so this is the same directory and not a copy of it.
-    let (again, _rx) = Gateway::start(StateDir(app.root.clone()), Settings::default());
-    let initial = again.initial_state();
+    let (mut again, _rx) = Gateway::start(StateDir(app.root.clone()), Settings::default());
+    let initial = again
+        .startup_state()
+        .expect("the pre-window snapshot is handed over once");
     assert_eq!(initial.session.rect, rect);
     assert!(
         initial.pinned,
         "the bridge applies topmost from this read, not from guesswork"
     );
     drop(again);
+}
+
+/// D30, the data-loss class the snapshot used to carry: a Flush is debounced, so
+/// between typing and choosing Save As the engine has seen NOTHING of the newest
+/// text. With Save As carrying its own text, the file written at the new path is
+/// what the editor is showing - and there is no longer an engine-side copy that
+/// could be older than the window.
+#[test]
+fn save_as_writes_the_text_it_was_given_not_a_last_flush_snapshot() {
+    let mut app = Harness::new();
+    let src = app.file(
+        "draft.notes",
+        b"typed first
+",
+    );
+    app.open(&src);
+    // One flush lands, then the user keeps typing and never triggers another.
+    app.flush(
+        &src,
+        "typed first
+",
+        1,
+    );
+    let target = app.root.join("renamed.notes");
+    assert_eq!(
+        app.save_as(&target, "typed first\nand then a lot more", 2),
+        2,
+        "the Save As revision is the one reported"
+    );
+    assert_eq!(
+        app.bytes(&target),
+        b"typed first\nand then a lot more",
+        "the NEW text is on disk, not the snapshot the last flush left behind"
+    );
 }
 
 /// ADR-0001 requirement 2, the case only a second document can expose.
@@ -409,7 +479,7 @@ fn the_recent_list_is_reported_cleared_and_rebuilt() {
     app.open(&two);
     fs::remove_file(&gone).expect("delete the third file");
 
-    app.gateway.send(Command::ClearRecents);
+    app.send(Command::ClearRecents);
     app.until(
         "an empty RecentsUpdated",
         |ev| matches!(ev, Event::RecentsUpdated(entries) if entries.is_empty()),
@@ -417,7 +487,7 @@ fn the_recent_list_is_reported_cleared_and_rebuilt() {
 
     // Opening a file that vanished fails with renderable copy: the variant this
     // slice added, because the frozen vocabulary had nowhere honest for it.
-    app.gateway.send(Command::Open { path: gone.clone() });
+    app.send(Command::Open { path: gone.clone() });
     match app.until(
         "LoadFailed",
         |ev| matches!(ev, Event::LoadFailed { path, .. } if path == &gone),

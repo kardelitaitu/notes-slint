@@ -73,8 +73,8 @@ thread_local! {
 
 /// True when the calling thread IS an engine thread.
 ///
-/// The reentrancy trap's whole mechanism. [`Gateway::send`] and
-/// [`Gateway::initial_state`] assert against it: engine code that re-entered the
+/// [`Gateway::send`],
+/// [`Gateway::startup_state`] and [`Gateway::drop`] assert against it:
 /// port would queue a command behind itself and then wait on its own queue. Now
 /// that this thread does I/O, there is a second reason: a slow disk makes the
 /// deadlock intermittent rather than immediate.
@@ -101,6 +101,27 @@ pub struct EngineGuard(bool);
 impl Drop for EngineGuard {
     fn drop(&mut self) {
         ENGINE_THREAD.with(|flag| flag.set(self.0));
+    }
+}
+
+/// Observation point for [`Engine::run`]'s arming line. Test-only, because what
+/// it proves is unobservable from outside: thread-locals are not inherited, so no
+/// other thread can ask an engine thread whether it is marked, and a test that
+/// arms the flag on a thread IT spawned proves the mechanism but not the wiring.
+/// [`Engine::run`] records what its own thread sees; the test joins first.
+#[cfg(test)]
+pub(crate) mod latch_probe {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    pub(crate) fn record(armed: bool) {
+        ARMED.store(armed, Ordering::SeqCst);
+    }
+
+    /// Reads and resets, so a second run() on any thread has to re-arm to pass.
+    pub(crate) fn take() -> bool {
+        ARMED.swap(false, Ordering::SeqCst)
     }
 }
 
@@ -144,15 +165,12 @@ pub(crate) struct Engine {
     /// The frontmatter block lifted off the text at load, put back at save.
     /// [`Self::body_for_ui`] and [`Self::text_for_disk`] are its only readers.
     frontmatter: Option<String>,
-    /// The newest text snapshot the port has been given. The bridge owns the live
-    /// buffer (§5.5), so this is a copy of a moment, not a second editor: Open
-    /// fills it from the file, Flush replaces it. It exists because
-    /// [`Command::SaveAs`] carries a path and NO text, so without it Save As has
-    /// nothing to write.
-    buffer: Option<String>,
-    /// The revision [`Self::buffer`] was taken at, so a repeated Flush is
-    /// recognisable as the same moment rather than an edit.
-    buffer_revision: u64,
+    /// NO TEXT IS HELD HERE. The bridge owns the buffer (§5.5), and both commands
+    /// that write carry the text they mean. An engine-side snapshot was a second,
+    /// lagging copy of the document: a Flush is debounced, so Save As against it
+    /// could write stale text to a new path while the editor showed something
+    /// else. That is data loss with a nicer name, so the command vocabulary grew
+    /// the missing fields (D30) and the fields below disappeared with them.
     /// The last revision that reached disk. D11's rule in one u64: a Flush at or
     /// below it is Clean and no write is attempted.
     last_saved_revision: u64,
@@ -192,8 +210,6 @@ impl Engine {
             },
             detected: new_file_detected(),
             frontmatter: None,
-            buffer: None,
-            buffer_revision: 0,
             last_saved_revision: 0,
             pending_session_write: false,
             recents: Vec::new(),
@@ -205,6 +221,12 @@ impl Engine {
     /// The one engine thread. Arms the reentrancy trap for as long as it runs.
     pub(crate) fn run(mut self) {
         let _armed = mark_current_thread_as_engine();
+        // This line is the probe's ONLY writer, and it runs on the loop's own
+        // thread, so a true reading can only mean the real engine thread armed the
+        // latch. Delete the marking call above and
+        // the_real_engine_thread_arms_the_latch fails - which is the point of it.
+        #[cfg(test)]
+        latch_probe::record(on_engine_thread());
         loop {
             match self.receive() {
                 Ok(command) => {
@@ -292,7 +314,11 @@ impl Engine {
                 self.emit_recent();
             }
             Command::Open { path } => self.open(&path),
-            Command::SaveAs { path } => self.save_as(&path),
+            Command::SaveAs {
+                path,
+                text,
+                revision,
+            } => self.save_as(&path, &text, revision),
             Command::Flush { text, revision } => self.flush(text, revision),
             Command::Shutdown => {
                 self.drain();
@@ -328,8 +354,6 @@ impl Engine {
             // autosave would write a truncated file over the user's real one.
             self.doc = Document::open(path, file_kind(path), true, true);
             self.frontmatter = None;
-            self.buffer = Some(String::new());
-            self.buffer_revision = 0;
             self.last_saved_revision = 0;
             self.emit(Event::Loaded {
                 path: path.to_path_buf(),
@@ -382,8 +406,6 @@ impl Engine {
         );
         self.detected = detected;
         let body = self.body_for_ui(&raw);
-        self.buffer = Some(body.clone());
-        self.buffer_revision = 0;
         self.last_saved_revision = 0;
         self.emit(Event::Loaded {
             path: path.to_path_buf(),
@@ -418,20 +440,46 @@ impl Engine {
     /// Requirement 4 of ADR-0001 is [`Document::save_as`]'s job; this function
     /// calls it and reports. Choosing a location is an explicit act, so a second
     /// explicit save would be pedantic - which is also why the armed flag flips
+    /// Save As: write THE TEXT IT WAS GIVEN at the chosen path, then rebind and
+    /// arm.
+    ///
+    /// Requirement 4 of ADR-0001 is [`Document::save_as`]'s job; this function
+    /// calls it and reports. Choosing a location is an explicit act, so a second
+    /// explicit save would be pedantic - which is also why the armed flag flips
     /// here and nowhere else in the port.
-    fn save_as(&mut self, path: &Path) {
-        let revision = self.buffer_revision;
+    ///
+    /// Two events, in this order: [`Event::Saved`] because the write happened at
+    /// a revision (D11's stream must not gain a hole), then [`Event::Rebound`]
+    /// because the file the UI describes is now a different one - new path, new
+    /// arming, and the TARGET's encoding rather than the source's. A failed Save
+    /// As emits only [`Event::SaveFailed`]: nothing was rebound.
+    fn save_as(&mut self, path: &Path, text: &str, revision: u64) {
         // If the target already exists, ITS bytes win: overwriting a UTF-16 file
         // with the source's UTF-8 is exactly the silent change §4.5 forbids.
         let detected = existing_detected(path);
-        let disk_text = self.text_for_disk(self.buffer.as_deref().unwrap_or(""));
+        let disk_text = self.text_for_disk(text);
         match self.write(path, &disk_text, detected, revision) {
             Ok(()) => {
                 self.doc.save_as(path);
                 self.detected = detected;
                 self.last_saved_revision = revision;
+                let read_only = fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly());
                 self.emit(Event::Saved {
                     path: path.to_path_buf(),
+                    revision,
+                });
+                self.emit(Event::Rebound {
+                    path: path.to_path_buf(),
+                    meta: FileMeta {
+                        encoding: api_encoding(detected.encoding),
+                        line_ending: api_line_ending(detected.line_ending),
+                        trailing_newline: detected.trailing_newline,
+                        read_only,
+                        oversize: false,
+                        // Read back from Document, never copied from the previous
+                        // file: save_as just armed it (ADR-0001 requirement 4).
+                        armed: self.doc.is_armed(),
+                    },
                     revision,
                 });
                 self.remember(path);
@@ -460,10 +508,6 @@ impl Engine {
     /// core the questions core can answer. When core owns the buffer, this line
     /// becomes [`Document::should_flush`] and the field disappears.
     fn flush(&mut self, text: String, revision: u64) {
-        let changed = self.buffer.as_deref() != Some(text.as_str());
-        self.buffer = Some(text);
-        self.buffer_revision = revision;
-
         if revision <= self.last_saved_revision {
             self.emit(Event::AutosaveSkipped {
                 reason: SkipReason::Clean,
@@ -480,9 +524,9 @@ impl Engine {
             });
             return;
         };
-        if changed {
-            self.doc.mark_dirty();
-        }
+        // A revision above the last saved one IS the change signal (D11): no
+        // stored text is needed to know the buffer moved.
+        self.doc.mark_dirty();
         if let Some(skip) = self.doc.should_autosave(self.autosave_enabled) {
             self.emit(Event::AutosaveSkipped {
                 reason: api_skip(skip),
@@ -491,7 +535,7 @@ impl Engine {
         }
 
         let detected = self.detected;
-        let disk_text = self.text_for_disk(self.buffer.as_deref().unwrap_or(""));
+        let disk_text = self.text_for_disk(&text);
         match self.write(&path, &disk_text, detected, revision) {
             Ok(()) => {
                 self.doc.mark_saved();
@@ -772,6 +816,46 @@ fn existing_detected(path: &Path) -> Detected {
 mod tests {
     use super::*;
     use notes_core::Rect;
+
+    /// REVIEWER ITEM 3: the marking call inside [`Engine::run`] is what arms the
+    /// latch, on the thread that actually runs the loop.
+    ///
+    /// Every other test here drives [`Engine::handle`] by hand, and the
+    /// reentrancy test in tests/reentrancy.rs arms the flag on a thread the TEST
+    /// spawned - which proves the mechanism exists, not that run() uses it. Delete
+    /// [`mark_current_thread_as_engine`] from run() and this is the test that
+    /// fails, because the probe's only writer is the line right after it.
+    #[test]
+    fn the_real_engine_thread_arms_the_latch() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let engine = Engine::new(
+            cmd_rx,
+            event_tx,
+            StateDir(PathBuf::from("unused-in-this-test")),
+            Session::default(),
+            Settings::default(),
+        );
+        // Another test's flag must not carry over: take() clears before starting.
+        latch_probe::take();
+        let handle = std::thread::Builder::new()
+            .name("notes-engine-under-test".to_string())
+            .spawn(move || engine.run())
+            .expect("spawn the engine loop");
+        // The ABORT path: no Shutdown, the last Sender simply goes away.
+        drop(cmd_tx);
+        handle
+            .join()
+            .expect("the engine thread must finish cleanly");
+        assert!(
+            latch_probe::take(),
+            "run() must arm the reentrancy latch on the thread that runs the loop"
+        );
+        assert!(
+            !on_engine_thread(),
+            "and the test thread must still be unmarked"
+        );
+    }
 
     /// An engine wired to channels the test holds both ends of, so the queue can be
     /// filled before a single command is handled. No thread: every assertion below

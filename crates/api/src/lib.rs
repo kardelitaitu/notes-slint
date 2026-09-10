@@ -103,7 +103,9 @@
 //! ```text
 //! Gateway::start(state_dir: StateDir, settings: Settings) -> (Gateway, EventRx)
 //! Gateway::send(&self, command: Command)
-//! Gateway::initial_state(&self) -> InitialState
+//! Gateway::startup_state(&mut self) -> Option<InitialState>   // once, then None
+//! Gateway::send(&self, Command) -> Result<(), Command>        // Err = never accepted
+//! Gateway::close(self) -> Result<(), Command>                 // Shutdown + join
 //! Gateway::engine_is_alive(&self) -> bool      // a test seam, see below
 //! pub type EventRx = std::sync::mpsc::Receiver<Event>;
 //! ```
@@ -179,15 +181,29 @@
 //! and keeps serving commands until Disconnected. No panic, no log spam at a dead
 //! window.
 //!
-//! # The reentrancy trap
+//! # The reentrancy trap - and precisely what it does NOT cover
 //!
 //! A thread-local marks the engine thread when its loop starts, and
-//! [`Gateway::send`] and [`Gateway::initial_state`] `debug_assert!` against it.
-//! Engine code that re-entered the port would queue a command behind itself and
-//! then wait on its own queue — the second deadlock AGENTS.md names, in
-//! single-author form. It is a `debug_assert!` so the release build never pays a
-//! TLS read per send, which is exactly why tests/reentrancy.rs asserts the trap
-//! FIRES: an unarmed trap and correct code look identical from outside.
+//! [`Gateway::send`], [`Gateway::startup_state`] and [`Gateway::drop`] all
+//! [`debug_assert!`] against it. Engine code that re-entered the port would queue
+//! a command behind itself and then wait on its own queue. It is a
+//! [`debug_assert!`] so the release build never pays a TLS read per send, which is
+//! exactly why tests/reentrancy.rs asserts the trap FIRES and engine.rs's
+//! `latch_probe` test proves the marking runs on the very thread
+//! that runs the loop: an unarmed trap and correct code look identical outside.
+//!
+//! **The claim this slice corrects.** AGENTS.md names TWO deadlocks: never call
+//! into the port from the engine, and never call into it from the SAVE WORKER
+//! thread. This trap covers the FIRST ONLY. A thread-local is not inherited by a
+//! thread that spawns it, so a worker would be unmarked and could hold a callback
+//! that reaches [`Gateway::send`] without one assert firing - and a
+//! [`std::thread::Builder`] spawn from inside the engine inherits nothing either.
+//! There is no save worker in this build, so there is nothing to mark; when one
+//! lands it needs its own tag on the same slot, its own assert, and its own test
+//! (a second [`std::cell::Cell`] tag or one small [`enum`](std::option::Option),
+//! decided with it). Until then this
+//! paragraph, not a comment claiming coverage that does not exist, is what keeps
+//! deadlock #2 honest.
 //!
 //! One ownership note left, because [`StateDir`] is what makes it awkward:
 //! [`Gateway::start`] RECEIVES an already-resolved StateDir and never resolves

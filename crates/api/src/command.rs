@@ -51,7 +51,19 @@ pub enum Command {
     /// Write the document to a new path. Choosing a location is an explicit act,
     /// so this arms the document for autosave (ADR-0001 supporting requirement 4)
     /// and puts the path into the recents list.
-    SaveAs { path: PathBuf },
+    ///
+    /// It carries the text and the revision for the same reason
+    /// [`Command::Flush`] does: the bridge owns the buffer, so a Save As that
+    /// named only a path would have to write whatever the LAST debounced flush
+    /// happened to leave behind - a stale document at a new path while the editor
+    /// shows something else. That is data loss with a nicer name, and it is why
+    /// the engine holds no text of its own. Answers [`Event::Saved`](crate::Event::Saved) and then
+    /// [`Event::Rebound`](crate::Event::Rebound), or [`Event::SaveFailed`](crate::Event::SaveFailed).
+    SaveAs {
+        path: PathBuf,
+        text: String,
+        revision: u64,
+    },
 
     /// A snapshot of the buffer: `Ctrl+S` and every autosave trigger.
     ///
@@ -103,7 +115,15 @@ mod tests {
     fn rebuild(command: &Command) -> Command {
         match command {
             Command::Open { path } => Command::Open { path: path.clone() },
-            Command::SaveAs { path } => Command::SaveAs { path: path.clone() },
+            Command::SaveAs {
+                path,
+                text,
+                revision,
+            } => Command::SaveAs {
+                path: path.clone(),
+                text: text.clone(),
+                revision: *revision,
+            },
             Command::Flush { text, revision } => Command::Flush {
                 text: text.clone(),
                 revision: *revision,
@@ -140,6 +160,8 @@ mod tests {
             },
             Command::SaveAs {
                 path: PathBuf::from("C:/notes/b.notes"),
+                text: "the buffer, at the moment the dialog closed".to_string(),
+                revision: 4,
             },
             Command::Flush {
                 text: "hello".to_string(),
