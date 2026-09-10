@@ -7,7 +7,6 @@
 //! rewritten by a read — the bytes stay on disk for diagnosis — and startup
 //! goes through read_session_or_default, which never fails.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::geometry::Rect;
@@ -102,66 +101,16 @@ pub fn read_session_or_default(dir: &Path) -> Session {
 /// Two writes of the same Session produce byte-identical files: struct field
 /// order is the JSON key order, and floats use shortest round-trip form.
 pub fn write_session(dir: &Path, s: &Session) -> Result<(), SessionError> {
-    let target = dir.join(FILE_NAME);
-    let (temp_path, mut file) = create_sibling_temp(dir)?;
-    if let Err(e) = write_flush_sync(&mut file, s) {
-        drop(file);
-        // Best effort: a failed write must not leave litter behind.
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(e);
-    }
-    drop(file);
-    if let Err(e) = std::fs::rename(&temp_path, &target) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(SessionError::Io(e));
-    }
-    Ok(())
-}
-
-/// Serialise, flush, fsync — the durable part of D12 that happens before the
-/// rename. A serialisation failure (a Session that JSON cannot represent) is
-/// reported as Corrupt with the reason.
-fn write_flush_sync(file: &mut std::fs::File, s: &Session) -> Result<(), SessionError> {
-    serde_json::to_writer_pretty(&mut *file, s)
-        .map_err(|e| SessionError::Corrupt(e.to_string()))?;
-    file.flush().map_err(SessionError::Io)?;
-    file.sync_all().map_err(SessionError::Io)?;
-    Ok(())
-}
-
-/// Creates the D12 sibling temp: a session.json.tmp-* file in the SAME
-/// directory as the target, opened exclusively (create_new), so the rename
-/// can never cross a volume. Hand-rolled on std because the obvious vehicle,
-/// tempfile::NamedTempFile, pulls windows-sys on Windows — which the
-/// core-no-os arch rule forbids in core's normal-edge closure (the arch table
-/// sanctions tempfile for core only as a dev-dependency, used by these tests
-/// for their directories). A missing directory surfaces here as io::Error.
-fn create_sibling_temp(dir: &Path) -> Result<(PathBuf, std::fs::File), SessionError> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    for attempt in 0..3u32 {
-        let path = dir.join(format!(
-            "{FILE_NAME}.tmp-{}-{nanos}-{attempt}",
-            std::process::id()
-        ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => return Ok((path, file)),
-            // Raced on the name: practically impossible (pid + ns + attempt),
-            // but retrying is cheaper than failing the write.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(SessionError::Io(e)),
-        }
-    }
-    Err(SessionError::Io(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not create a uniquely named sibling temp file",
-    )))
+    // Serialise first: a Session that JSON cannot represent must never touch
+    // the filesystem, so the previous file — corrupt or not — survives.
+    let bytes = serde_json::to_vec_pretty(s).map_err(|e| SessionError::Corrupt(e.to_string()))?;
+    // The shared D12/D23 tail (save::atomic_write): sibling temp in the same
+    // directory, exclusive create, write, flush, fsync, rename, leftovers
+    // swept at the start of the next save. SessionError's frozen shape has no
+    // Save variant, so the classified reason rides in Io with its message
+    // retained.
+    crate::save::atomic_write(&dir.join(FILE_NAME), &bytes)
+        .map_err(|e| SessionError::Io(std::io::Error::other(e.to_string())))
 }
 
 #[cfg(test)]
