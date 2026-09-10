@@ -39,9 +39,30 @@
 //!   temp path and restored afterwards, loudly, so each run is a real
 //!   fresh-install test of 14295b8 rather than a re-read of an old one.
 //!
-//! Exit codes: 0 every step passed, 1 a step failed, 2 the harness could not
-//! run (no PowerShell, cannot write the probe, its own deadline), 3 declined -
-//! there was no interactive desktop to test on.
+//! Exit codes, exactly as run() returns them:
+//! * 0 - every step passed, and the user's state came back byte-identical;
+//! * 1 - a step failed (no window handle, the app died, no session.json, a
+//!   window still alive after WM_CLOSE, a nonzero exit), or the relocated bytes
+//!   came back different, or the restore could not run at all - the message
+//!   names the temp path holding the user's file either way;
+//! * 2 - the harness itself could not run: no PowerShell, no binary, the probe
+//!   script could not be written, or the outer deadline fired;
+//! * 3 - DECLINED for a reason that is not the app's fault: no interactive
+//!   desktop (no sessions win32k user32.dll), no window handle even though the
+//!   app kept running, or the session path holding foreign state this harness
+//!   will not move. 3 is never "passed" and never "the app is broken".
+//!
+//! Two facts worth recording, both measured on a real machine:
+//!
+//! * exit 3 does not stick. Declining reads the path and never writes it, so run
+//!   1 leaves whatever was there, run 2 behaves normally, and the operator's fix
+//!   is the occupant - not a state machine to reset. Only a foreign DIRECTORY on
+//!   the session path declines; the pollution this caught was a test leftover,
+//!   not a harness feedback loop.
+//! * "Access is denied (os error 5)" on this machine was the directory, exactly
+//!   what renaming a file onto a directory does. The ACL was never the problem:
+//!   owner BUILTIN\Administrators, the interactive user has FullControl, no DENY
+//!   entry, no reparse point. The next reader should not chase ACLs. */
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -576,9 +597,41 @@ fn report_captured(path: &Path, label: &str) {
     }
 }
 
-/// Brings the user's session.json back. Drop does it, so a panic, an early
-/// return or a force-killed probe cannot leave the profile holding nothing -
-/// the copy is only ever in a named temp path for the length of the run.
+/// What the run ended up doing with the user's bytes, decided from what is
+/// ACTUALLY sitting on the session path when the run finishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Conclusion {
+    /// The app wrote nothing this run, so the user's own file goes back.
+    RestoredUserState,
+    /// The app wrote a fresh artefact. Keep it - it is the proof - and leave
+    /// the user's pre-run bytes at the named temp path. Overwriting them back
+    /// would destroy the evidence the run exists to collect.
+    KeptAppArtefact {
+        app_sha: String,
+        /// True when the app happened to write the bytes the user already had.
+        /// Worth printing: it separates "the app re-persisted the same default
+        /// rect" from "the app persisted something new".
+        rewrote_same_bytes: bool,
+    },
+}
+
+/// The whole decision, pure, so the two cases are provably distinguishable in
+/// a test. 'user_before' is the sha256 of the bytes that were relocated;
+/// 'live_now' is the sha256 of whatever is on the session path now, if
+/// anything.
+pub fn conclude(user_before: Option<&str>, live_now: Option<&str>) -> Conclusion {
+    match live_now {
+        None => Conclusion::RestoredUserState,
+        Some(app_sha) => Conclusion::KeptAppArtefact {
+            rewrote_same_bytes: user_before == Some(app_sha),
+            app_sha: app_sha.to_string(),
+        },
+    }
+}
+
+/// Brings the user's session.json back - unless the run produced a real
+/// artefact to preserve. Drop still runs it, so a panic, an early return or a
+/// force-killed probe cannot leave the profile holding nothing.
 struct Restore {
     live: PathBuf,
     aside: PathBuf,
@@ -586,6 +639,8 @@ struct Restore {
     done: bool,
     /// True when the bytes did not come back identical, or could not come back.
     failed: bool,
+    /// Set once restore has decided which of the two outcomes happened.
+    conclusion: Option<Conclusion>,
 }
 
 impl Restore {
@@ -597,34 +652,80 @@ impl Restore {
     }
 
     fn restore(&mut self, when: &str) {
-        match fs::rename(&self.aside, &self.live) {
-            Ok(()) => {
-                let after = sha_of(&self.live);
-                let identical = matches!((&self.before, &after), (Some(b), Some(a)) if b == a);
+        let live_now = sha_of(&self.live);
+        match conclude(self.before.as_deref(), live_now.as_deref()) {
+            Conclusion::KeptAppArtefact {
+                app_sha,
+                rewrote_same_bytes,
+            } => {
+                println!("smoke: {when} - the app wrote a fresh session.json; keeping it");
                 println!(
-                    "smoke: {when} - restored {} from {}",
-                    self.live.display(),
+                    "smoke:   user bytes before = {:?} (held at {})",
+                    self.before,
                     self.aside.display()
                 );
                 println!(
-                    "smoke: user state sha256 before={:?} after={:?} identical={identical}",
-                    self.before, after
+                    "smoke:   app artefact now  = {app_sha} (at {})",
+                    self.live.display()
                 );
-                if !identical {
+                println!(
+                    "smoke:   user bytes after  = {app_sha} (the app's, not the pre-run ones); same_as_user_before={rewrote_same_bytes}"
+                );
+                println!(
+                    "smoke:   nothing deleted; to give the user their old file back, rename {} over {}",
+                    self.aside.display(),
+                    self.live.display()
+                );
+                self.conclusion = Some(Conclusion::KeptAppArtefact {
+                    app_sha,
+                    rewrote_same_bytes,
+                });
+            }
+            Conclusion::RestoredUserState => match fs::rename(&self.aside, &self.live) {
+                Ok(()) => {
+                    let after = sha_of(&self.live);
+                    let identical = matches!((&self.before, &after), (Some(b), Some(a)) if b == a);
+                    println!(
+                        "smoke: {when} - restored {} from {}",
+                        self.live.display(),
+                        self.aside.display()
+                    );
+                    println!(
+                        "smoke:   user bytes before = {:?}  user bytes after = {:?}  identical={identical}",
+                        self.before, after
+                    );
+                    println!("smoke:   app artefact this run = none written");
+                    if !identical {
+                        self.failed = true;
+                        eprintln!(
+                            "SMOKE FAIL: the relocated user state did not come back byte-identical"
+                        );
+                    }
+                    self.conclusion = Some(Conclusion::RestoredUserState);
+                }
+                Err(e) => {
                     self.failed = true;
                     eprintln!(
-                        "SMOKE FAIL: the relocated user state did not come back byte-identical"
+                        "SMOKE FAIL: could not restore {} from {} - the user's file is at that temp path, put it back by hand: {e}",
+                        self.live.display(),
+                        self.aside.display()
                     );
                 }
-            }
-            Err(e) => {
-                self.failed = true;
-                eprintln!(
-                    "SMOKE FAIL: could not restore {} from {} - the user's file is at that temp path, put it back by hand: {e}",
-                    self.live.display(),
+            },
+        }
+    }
+
+    /// Which of the two outcomes happened, for the verdict line.
+    fn outcome_note(&self) -> String {
+        match &self.conclusion {
+            Some(Conclusion::KeptAppArtefact { app_sha, .. }) => {
+                format!(
+                    "kept-app-artefact (wrote {app_sha}; user bytes at {})",
                     self.aside.display()
-                );
+                )
             }
+            Some(Conclusion::RestoredUserState) => "restored-user-state".to_string(),
+            None => "not reached".to_string(),
         }
     }
 }
@@ -655,7 +756,7 @@ fn clear_session_path(exe: &Path) -> (Option<Restore>, Relocation) {
             return (
                 None,
                 Relocation::Blocked(format!(
-                    "{} is {} (mtime {}); it was not moved, and no verdict about the fresh-install write is available while something sits on that path. Diagnostics: {}",
+                    "{} is {} (mtime {}); it was not moved, so no verdict about the fresh-install write is available. Diagnostics: {}",
                     path.display(),
                     describe_kind(&path),
                     meta.modified()
@@ -684,7 +785,7 @@ fn clear_session_path(exe: &Path) -> (Option<Restore>, Relocation) {
             );
         }
         println!(
-            "smoke: relocated the user's {} -> {} (sha256 {:?}); every exit path restores it",
+            "smoke: relocated the user's {} -> {} (sha256 {:?}); every exit path either puts it back or keeps the app's own artefact and leaves these bytes aside",
             path.display(),
             aside.display(),
             before
@@ -698,6 +799,7 @@ fn clear_session_path(exe: &Path) -> (Option<Restore>, Relocation) {
             before,
             done: false,
             failed: false,
+            conclusion: None,
         };
         let relocation = Relocation::Moved {
             to: guard.aside.clone(),
@@ -719,7 +821,9 @@ fn summary(verdict: &Verdict, p: &Probe, elapsed: Duration, relocation: &Relocat
         Verdict::Pass => format!("smoke: window=OK close=0 session=OK {secs}"),
         Verdict::Skip(_) => {
             let what = match relocation {
-                Relocation::Blocked(_) => "path blocked by foreign state",
+                Relocation::Blocked(_) => {
+                    "BLOCKED BY FOREIGN STATE (machine pollution, not the app) - clear the occupant"
+                }
                 _ => "no desktop",
             };
             format!("smoke: window=DECLINED close=DECLINED session=DECLINED ({what}) {secs}")
@@ -791,6 +895,11 @@ pub fn run(args: &[String]) -> i32 {
     // reason to open a window on the way to saying so.
     if let Relocation::Blocked(why) = &relocation {
         println!("smoke: DECLINED - {why}");
+        println!(
+            "smoke: this harness never creates or deletes anything under a profile; the occupant on \
+             the session path came from elsewhere, and a directory there is what an api test plants \
+             to prove a blocked write target"
+        );
         println!(
             "{}",
             summary(
@@ -894,6 +1003,7 @@ pub fn run(args: &[String]) -> i32 {
         // Explicit here so the verdict can see a failed restore; Drop is the
         // backstop for every path that does not reach this line.
         guard.finish();
+        println!("smoke: user state outcome: {}", guard.outcome_note());
         if guard.failed && code == 0 {
             println!("smoke: DECLINED TO PASS - user state did not come back byte-identical");
             return 1;
@@ -1098,9 +1208,11 @@ mod tests {
         };
         assert!(why.contains("could not be cleared"), "{why}");
         assert!(why.contains("D54"), "{why}");
+        let line = summary(&Verdict::Skip(why), &clean_gui(), Duration::ZERO, &blocked);
+        assert!(line.contains("FOREIGN STATE"), "{line}");
         assert!(
-            summary(&Verdict::Skip(why), &clean_gui(), Duration::ZERO, &blocked)
-                .contains("path blocked by foreign state")
+            line.contains("not the app"),
+            "the summary must say whose fault this is not: {line}"
         );
     }
 
@@ -1199,6 +1311,7 @@ mod tests {
                 before: Some(before.clone()),
                 done: false,
                 failed: false,
+                conclusion: None,
             };
             drop(guard);
         }
@@ -1207,5 +1320,99 @@ mod tests {
         assert_eq!(sha_of(&live).as_deref(), Some(before.as_str()));
         assert!(!aside.exists(), "the temp copy is gone once it is back");
         let _ = fs::remove_dir_all(&live_dir);
+    }
+
+    /// D33, and the bug the reviewer named: the old restore renamed the pre-run
+    /// bytes over whatever the app had just written, then reported identical=true
+    /// about the user's file compared with itself. A run that moved a stale rect
+    /// aside while the app persisted a new one left the STALE rect in the profile
+    /// and still went green. The two cases must be distinguishable, so this test
+    /// asserts on the bytes on disk, not on a flag.
+    #[test]
+    fn a_run_that_wrote_a_session_keeps_it_instead_of_burying_it() {
+        let tag = format!("xtask-smoke-keep-{}", std::process::id());
+        let dir = std::env::temp_dir().join(&tag);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let live = dir.join(SESSION_FILE);
+        let aside = dir.join("aside.json");
+        let user_bytes = b"{\"rect\":{\"x\":1,\"y\":2,\"w\":3,\"h\":4}}";
+        let app_bytes = b"{\"rect\":{\"x\":640,\"y\":200,\"w\":1024,\"h\":768},\"maximized\":true}";
+        fs::write(&live, user_bytes).expect("seed the user state");
+        let before = sha_of(&live).expect("hashable");
+        fs::rename(&live, &aside).expect("relocate it");
+        assert!(!live.exists(), "the relocation really moved it");
+        // The app then writes DIFFERENT bytes: the evidence this run exists for.
+        fs::write(&live, app_bytes).expect("simulate the app's write");
+
+        let mut guard = Restore {
+            live: live.clone(),
+            aside: aside.clone(),
+            before: Some(before.clone()),
+            done: false,
+            failed: false,
+            conclusion: None,
+        };
+        guard.finish();
+
+        // The pure decision separates the two cases.
+        assert_eq!(
+            conclude(Some(&before), Some("app-sha")),
+            Conclusion::KeptAppArtefact {
+                app_sha: "app-sha".to_string(),
+                rewrote_same_bytes: false,
+            }
+        );
+        assert_eq!(conclude(Some(&before), None), Conclusion::RestoredUserState);
+        // And the guard took the keep branch: the app's bytes survive, the user's
+        // stay held at the named path, nothing is lost or silently swapped.
+        assert_eq!(
+            guard.conclusion,
+            Some(Conclusion::KeptAppArtefact {
+                app_sha: sha_of(&live).unwrap(),
+                rewrote_same_bytes: false,
+            })
+        );
+        assert!(!guard.failed, "keeping the artefact is not a failure");
+        assert_eq!(
+            fs::read(&live).expect("read live"),
+            app_bytes,
+            "THE LIE THIS TEST KILLS: stale bytes restored over the app's write"
+        );
+        assert!(
+            aside.is_file(),
+            "the user's own bytes are still at the named path"
+        );
+        assert_eq!(fs::read(&aside).expect("read aside"), user_bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_nothing_written_the_user_bytes_go_back_and_are_the_only_ones() {
+        let tag = format!("xtask-smoke-restore-{}", std::process::id());
+        let dir = std::env::temp_dir().join(&tag);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let live = dir.join(SESSION_FILE);
+        let aside = dir.join("aside.json");
+        let user_bytes = b"{\"rect\":{\"x\":11,\"y\":12,\"w\":13,\"h\":14}}";
+        fs::write(&live, user_bytes).expect("seed the user state");
+        let before = sha_of(&live).expect("hashable");
+        fs::rename(&live, &aside).expect("relocate it");
+        let mut guard = Restore {
+            live: live.clone(),
+            aside: aside.clone(),
+            before: Some(before.clone()),
+            done: false,
+            failed: false,
+            conclusion: None,
+        };
+        guard.finish();
+        assert_eq!(guard.conclusion, Some(Conclusion::RestoredUserState));
+        assert!(!guard.failed);
+        assert_eq!(fs::read(&live).expect("restored"), user_bytes);
+        assert!(!aside.exists(), "the temp copy is gone once it is back");
+        assert_eq!(sha_of(&live).as_deref(), Some(before.as_str()));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
