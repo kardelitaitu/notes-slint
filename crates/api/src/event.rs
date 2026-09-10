@@ -335,6 +335,19 @@ pub enum Event {
         /// What core's parser said, verbatim.
         reason: String,
     },
+    /// The session file could not be written. NOT a [`SaveFailed`]: that
+    /// event is a document save's answer and carries a `revision`, and a
+    /// session file has none - the old shape claimed revision 0, which is a
+    /// number the UI could render and the user could believe. Reported ONCE
+    /// per failure episode and latched until a write succeeds (M5): the tick
+    /// retries a failed session write forever, and without the latch that is
+    /// one error toast per tick, for a problem the user cannot act on from
+    /// inside the app. [`reason`] is core's own sentence (its SessionError
+    /// Display), passed through untranslated.
+    SessionWriteFailed {
+        /// What core said when the session write was refused, verbatim.
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -399,6 +412,9 @@ mod tests {
             Event::SettingsCorrupt { reason } => Event::SettingsCorrupt {
                 reason: reason.clone(),
             },
+            Event::SessionWriteFailed { reason } => Event::SessionWriteFailed {
+                reason: reason.clone(),
+            },
         }
     }
 
@@ -413,6 +429,7 @@ mod tests {
             Event::AutosaveSkipped { .. } => "AutosaveSkipped",
             Event::GeometryNotRestored { .. } => "GeometryNotRestored",
             Event::SettingsCorrupt { .. } => "SettingsCorrupt",
+            Event::SessionWriteFailed { .. } => "SessionWriteFailed",
             Event::RecentsUpdated(_) => "RecentsUpdated",
         }
     }
@@ -467,6 +484,9 @@ mod tests {
             Event::SettingsCorrupt {
                 reason: "settings file corrupt: expected a value at line 2".to_string(),
             },
+            Event::SessionWriteFailed {
+                reason: "no space left on device".to_string(),
+            },
         ]
     }
 
@@ -485,8 +505,9 @@ mod tests {
             "the fixture must cover each variant exactly once: {names:?}"
         );
         // Loaded, LoadFailed, Saved, GeometryNotRestored, SaveFailed,
-        // ExternalChange, AutosaveSkipped, RecentsUpdated, SettingsCorrupt.
-        assert_eq!(all.len(), 10, "Event gained or lost a variant");
+        // ExternalChange, AutosaveSkipped, RecentsUpdated, SettingsCorrupt,
+        // SessionWriteFailed.
+        assert_eq!(all.len(), 11, "Event gained or lost a variant");
 
         for event in &all {
             assert_eq!(event, &event.clone(), "{event:?} clone is not equal");

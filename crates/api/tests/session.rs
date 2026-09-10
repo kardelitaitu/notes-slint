@@ -21,12 +21,12 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use notes_api::{
-    Command, Encoding, Event, FileMeta, Gateway, LineEnding, Rect, SaveError, Settings, SkipReason,
-    StateDir, WindowHandle,
+    Command, Encoding, Event, FileMeta, Gateway, LineEnding, Rect, SaveError, Session, Settings,
+    SkipReason, StateDir, WindowHandle,
 };
 // The session file is read back with core's own parser: what is being asserted is
 // that the engine wrote a file CORE can read, not one whose bytes we guessed.
-use notes_core::session::{FILE_NAME, read_session};
+use notes_core::session::{FILE_NAME, read_session, write_session};
 
 // thiserror is a dependency of notes-api, not of this test target; naming it
 // keeps the unused-crate-dependencies lint honest about that. Same for
@@ -37,6 +37,73 @@ use thiserror as _;
 /// Long enough that a real disk round trip cannot time out on a loaded machine,
 /// short enough that a hung engine fails the run instead of hanging it forever.
 const ANSWER: Duration = Duration::from_secs(5);
+
+/// The engine's idle cadence, mirrored here because AUTOSAVE_IDLE is the
+/// engine's private constant. The negative assertions below wait out two of
+/// these: a failure must be reported ONCE, not once per tick (M5).
+const TICK: Duration = Duration::from_millis(750);
+
+/// Two tick periods plus change - the silence window of a negative assertion.
+fn ticks(n: u64) -> Duration {
+    Duration::from_millis(n * TICK.as_millis() as u64 + 100)
+}
+
+/// M5: a failing session write is reported EXACTLY ONCE, then latched until a
+/// write succeeds; the next distinct failure is one event again. Without the
+/// latch this goes red immediately: the failed write leaves the pending bit
+/// set, every tick retries it, and the old code emitted one SaveFailed per
+/// tick forever, claiming revision 0 - a number a session file does not have.
+///
+/// The block is a DIRECTORY sitting where session.json belongs: core's atomic
+/// write lands a temp beside it and renames onto it, and the OS refuses a
+/// rename onto a directory - a failure with no cooperation from core, no
+/// platform calls, and no clock assumption beyond the engine's own tick.
+#[test]
+fn a_failing_session_write_is_reported_once_until_it_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let session_path = root.join(FILE_NAME);
+    write_session(&root, &Session::default()).expect("seed a writable session");
+    let mut app = Harness::at(root, Settings::default());
+
+    let assert_one_failure = |app: &mut Harness, want: &str| {
+        match app.until(want, |ev| matches!(ev, Event::SessionWriteFailed { .. })) {
+            Event::SessionWriteFailed { reason } => {
+                assert!(!reason.trim().is_empty(), "renderable: core's own sentence");
+            }
+            other => panic!("expected SessionWriteFailed ({want}), got {other:?}"),
+        }
+        // EXACTLY ONE: wait out two tick periods. Any second event here is
+        // the flood this test exists to fail on.
+        let quiet = Instant::now() + ticks(2);
+        while let Ok(event) = app
+            .rx
+            .recv_timeout(quiet.saturating_duration_since(Instant::now()))
+        {
+            assert!(
+                !matches!(event, Event::SessionWriteFailed { .. }),
+                "the failure was reported more than once: {event:?}"
+            );
+        }
+    };
+
+    fs::remove_file(&session_path).expect("remove the seed");
+    fs::create_dir(&session_path).expect("block the path with a directory");
+    app.send(Command::SetPinned(true));
+    assert_one_failure(&mut app, "the first session failure");
+
+    // Success clears the latch - SILENTLY: the port has no session-saved
+    // event, so this half waits out two tick periods for the retry to land
+    // before re-arming the failure. No signal exists to wait on; the clock
+    // here is a bound on silence, not a substitute for one.
+    fs::remove_dir(&session_path).expect("unblock the path");
+    app.send(Command::SetPinned(false));
+    std::thread::sleep(ticks(2));
+
+    fs::create_dir(&session_path).expect("block the path again");
+    app.send(Command::SetPinned(true));
+    assert_one_failure(&mut app, "the second session failure");
+}
 
 /// A running engine, its events, and the directory it writes into.
 ///

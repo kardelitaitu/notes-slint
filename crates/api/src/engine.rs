@@ -30,9 +30,9 @@ use notes_core::session::write_session;
 use notes_core::settings::{SETTINGS_FILE_NAME, write_settings};
 use notes_core::{
     DecodeError, Detected, Document, FileKind, LineEnding as CoreLineEnding, NoteParts,
-    SaveError as CoreSaveError, Session, SessionError, Settings, Skip, StateDir, TextEncoding,
-    classify_io_error, clear as clear_recents, decode, detect, is_notes_path, is_oversize,
-    mark_missing, push as push_recent, rebuild, save_document_revision, split,
+    SaveError as CoreSaveError, Session, Settings, Skip, StateDir, TextEncoding, classify_io_error,
+    clear as clear_recents, decode, detect, is_notes_path, is_oversize, mark_missing,
+    push as push_recent, rebuild, save_document_revision, split,
 };
 
 use crate::command::{Command, WindowHandle};
@@ -224,6 +224,12 @@ pub(crate) struct Engine {
     /// on the next tick instead of losing the change.
     pending: Pending,
     deadline: Instant,
+    /// M5: a failed SESSION write is reported once, then latched until a write
+    /// succeeds - see [`Engine::flush_state`]. Documents are different: one
+    /// event per failed attempt is the contract there (ADR-0001). The session
+    /// has no user action to attach to, and the tick retries it forever, so
+    /// per-tick reporting is an unbounded stream of toasts.
+    session_failure_latched: bool,
 }
 
 impl Engine {
@@ -290,6 +296,7 @@ impl Engine {
             frontmatter: None,
             pending: Pending::default(),
             load_refused: false,
+            session_failure_latched: false,
             backend,
             facts,
             deadline: Instant::now() + AUTOSAVE_IDLE,
@@ -882,8 +889,9 @@ impl Engine {
     /// Writes whichever state files are dirty. Atomicity, the temp sweep and the
     /// TOML rendering are core's ([`write_session`] and [`write_settings`]);
     /// this decides WHEN, keeps the failed bit set so the next tick retries, and
-    /// reports a failure rather than hiding it. Each event names the file that
-    /// failed, so the copy never reads as if the user's note was the thing lost.
+    /// reports a failure rather than hiding it - ONCE per failure episode for
+    /// the session (M5: the tick would otherwise report forever), per attempt
+    /// for settings and documents.
     fn flush_state(&mut self) {
         let pending = self.pending;
         if !pending.session && !pending.settings {
@@ -895,12 +903,28 @@ impl Engine {
             // GetWindowPlacement on the engine thread, where blocking is allowed.
             let _ = self.measure_rect();
             match write_session(&self.state_dir.0, &self.session) {
-                Ok(()) => self.pending.session = false,
-                Err(err) => self.emit(Event::SaveFailed {
-                    path: self.state_dir.0.join(notes_core::session::FILE_NAME),
-                    revision: 0,
-                    reason: api_session_error(&err),
-                }),
+                Ok(()) => {
+                    self.pending.session = false;
+                    // Success re-arms the report: the next distinct failure is
+                    // news again (M5).
+                    self.session_failure_latched = false;
+                }
+                Err(err) => {
+                    // M5: a locked session.json or a full disk must not become
+                    // one error per tick forever. Report ONCE, latch, keep the
+                    // pending bit set so the tick keeps retrying, and clear on
+                    // the next success. No revision rides this event - a
+                    // session file HAS none, and SaveFailed's revision-0 claim
+                    // was a lie the UI could render. The reason is core's own
+                    // sentence (SessionError's Display), passed through
+                    // untranslated, like every other platform/core refusal.
+                    if !self.session_failure_latched {
+                        self.session_failure_latched = true;
+                        self.emit(Event::SessionWriteFailed {
+                            reason: err.to_string(),
+                        });
+                    }
+                }
             }
         }
         if pending.settings {
@@ -1079,28 +1103,6 @@ fn api_save_error(err: CoreSaveError, encoding: TextEncoding) -> SaveError {
         // the real file instead"), so the port has a variant for it now (D29/D36:
         // add the variant, do not squash it).
         CoreSaveError::ReparsePoint(detail) => SaveError::ReparsePoint(detail),
-        other => SaveError::Other(other.to_string()),
-    }
-}
-
-/// session.json failing is reported through the save vocabulary because that is
-/// what it is - a write that did not happen.
-///
-/// 0db0b69 made [`SessionError::Save`] transparent, carrying core's classified
-/// [`SaveError`] instead of an [`io::Error::other`] round trip. That is a
-/// fidelity fix and this map follows it: the classified variant is mapped 1:1, so
-/// nothing becomes a string on the way to the UI. The [`Io`] arm stays because
-/// core can still surface a raw io error from the read side of the same call, and
-/// the step it reports is the write the engine attempted - [`IoStep::Write`], the
-/// step whose codes mean "the disk refused" rather than "the link is held".
-/// Missing and Corrupt are read-side states of a file the engine is writing, so
-/// they arrive as Other with core's own copy rather than an invented one.
-fn api_session_error(err: &SessionError) -> SaveError {
-    match err {
-        SessionError::Save(save_err) => api_save_error(save_err.clone(), TextEncoding::Utf8),
-        SessionError::Io(io_err) => {
-            api_save_error(classify_io_error(io_err, IoStep::Write), TextEncoding::Utf8)
-        }
         other => SaveError::Other(other.to_string()),
     }
 }
