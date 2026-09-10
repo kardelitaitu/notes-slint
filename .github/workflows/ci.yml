@@ -251,10 +251,19 @@ jobs:
       #   2  it could not JUDGE at all: no PowerShell, probe unwritable, bad usage, or
       #      unreadable source mtimes (a broken instrument, not a stale artefact)
       #   3  declined: no interactive desktop, OR foreign state on the session path
-      #   4  THE TARGET DID NOT COMPILE - nothing launched, no cached exe run; it surfaces
+      #   4  THE TARGET DID NOT COMPILE - nothing launched, no cached exe substituted; it surfaces
       #      the first real cargo error line (smoke: build | error[...])
       #   5  STALE BINARY - the exe on disk is older than the sources that build it, and
       #      the --no-build diagnostic path refuses to judge against it
+      #   6  THE WINDOW-MEMORY PROMISE BROKE - the app ran, closed cleanly and persisted
+      #      something, but not the right rect (f7b295c; GEOMETRY_FAILED_EXIT)
+      #
+      # Codes 4, 5 and 6 all say the same uncomfortable thing in different words: the app
+      # was not proven to work. 4 and 5 are the INSTRUMENT refusing to lie about which
+      # binary it tested - nothing was launched, no cached exe was quietly substituted, so
+      # a red 5 in particular must never be read as "the app is broken": it means the exe
+      # on disk is not the exe this commit builds, and the runtime was never probed at all.
+      # 6 is the opposite: everything ran, and the headline feature still failed.
       #
       # Every arm is attributable because the step prints its own identity line: "smoke:
       # tested binary <path> | <age> | built_by_this_run=YES|NO | git HEAD at that moment
@@ -265,8 +274,13 @@ jobs:
       # missing state directory, and it found a foreign occupant squatting on the session
       # path. Every other step proves the code compiles, links, lints and survives unit
       # tests; only this proves the running app does the one thing the product is for.
-      # Advisory is therefore a judgement about DESKTOPS (a runner with no window station
-      # must not gate a Rust change), not a statement that the check is worth less.
+      # Advisory (continue-on-error, and it stays that way) is a judgement about DESKTOPS:
+      # this step needs an interactive window station, a real window and a live work area,
+      # so a headless runner would fail it for reasons that are not the app's fault - the
+      # same discipline that parks the docs validator (step 5). The point of arming every
+      # code is that an advisory STEP printing an ARMED VERDICT is still a readable signal:
+      # the cell stays non-fatal, the annotation says exactly what broke, and nobody has to
+      # open a 400-line log to learn that the window memory is gone.
       #
       # What this step must not hide by filtering: it prints the stderr of the app it
       # launches, so a developer machine can show "SettingsCorrupt / running on defaults"
@@ -296,9 +310,10 @@ jobs:
             0) echo "smoke: PASS - a window appeared, WM_CLOSE shut the app down by itself, that run wrote session.json, and the user state the harness relocated is accounted for - byte-identical by the harness's own contract, which is what makes exit 1 below possible. Citable as written: graceful shutdown, real persistence, no profile left damaged. The outcome_note on the line above says WHICH pass it was - kept-app-artefact (this run wrote it, the user bytes parked aside) or restored-user-state (the user file came back unchanged) - so quote that token, not just the green." ;;
             1) echo "::error::SMOKE EXIT 1 - three unrelated readings share this code; separate them before citing it. Look at the smoke: window=.../close=.../session=... line and the SMOKE FAIL line above it. close=FORCED means the app had to be killed to stop it (shutdown bug). session=FAILED, with every path searched printed, means nothing was persisted (product bug). window=MISSING close=NOBIN means the exe disappeared between its build and the launch (an artifact that vanished, not a shutdown bug) - a TARGET THAT DOES NOT COMPILE IS EXIT 4, not this one. But if the log says the relocated user state did not come back byte-identical, or could not restore it and names a temp path, then THE HARNESS DAMAGED A USER PROFILE - an infrastructure emergency: put that file back by hand and fix the harness before this row is read as the app failing to persist." ;;
             3) echo "::notice::smoke DECLINED - the summary line above says which of the two it was: (no desktop) means no interactive session to open a window in; (BLOCKED BY FOREIGN STATE) means something that is not a session file occupies the state path, which is machine pollution and not the app - the DECLINED line prints what is sitting there, with ACLs, and says clear the occupant. Neither is a failure; the check was simply not possible on this machine." ;;
-            4) echo "::error::SMOKE EXIT 4 - THE TARGET DID NOT COMPILE. Nothing was launched and no cached exe was run, so this says nothing about shutdown or persistence: it is a build failure, reported as an annotation only because a GUI step must not gate a headless runner. The line above (smoke: build | error[E...]) is the first real cargo error, and the step BEFORE this one (3b/3c) usually carries the same verdict with a name - fix the code, then re-read 1 and 3; do not treat a green 3b as proof this 4 is wrong, smoke builds the test profile itself." ;;
-            5) echo "::error::SMOKE EXIT 5 - STALE BINARY: the notes-gpui.exe on disk is older than the sources that build it, so smoke refused to judge the running app against a build nobody compiled from this commit (window=STALE close=STALE session=STALE, and the identity line prints the age plus built_by_this_run=NO). This is an infrastructure/instrument problem, not a product bug and NOT a pass - a verdict on a stale exe would be a lie about code that no longer exists. The --no-build diagnostic path asked for this; rebuild, do not force a run." ;;
-            *) echo "::error::SMOKE COULD NOT JUDGE (exit $status) - the harness itself failed before any verdict: no PowerShell to post WM_CLOSE with, the probe script could not be written or run, unreadable mtimes on the sources (a broken instrument, deliberately not reported as 5/stale), or a bad invocation of cargo xtask smoke. Codes 0-5 are all named elsewhere in this case, so anything reaching here is an unknown contract change: read it as no information about the app, never as a pass and never as a missing desktop." ;;
+            4) echo "::error::SMOKE EXIT 4 - THE TARGET DID NOT COMPILE. THE APP WAS NEVER LAUNCHED and no cached exe was substituted to keep the row green, so this says nothing about shutdown, persistence or geometry: it is a build failure, reported as an annotation only because a GUI step must not gate a headless runner. The line above (smoke: build | error[E...]) is the first real cargo error, and the step BEFORE this one (3b/3c) usually carries the same verdict with a name - fix the code, then re-read 1 and 3; do not treat a green 3b as proof this 4 is wrong, smoke builds the test profile itself." ;;
+            5) echo "::error::SMOKE EXIT 5 - STALE BINARY: the notes-gpui.exe on disk is older than the sources that build it, so smoke refused to judge the running app against a build nobody compiled from this commit (window=STALE close=STALE session=STALE, and the identity line prints the age plus built_by_this_run=NO). Read it as the instrumentation refusing to lie about WHICH binary it tested: the app was never launched at all, so this is neither a product bug nor a pass - a verdict on a stale exe would be a claim about code that no longer exists. The --no-build diagnostic path asked for this; rebuild, do not force a run." ;;
+            6) echo "::error::SMOKE EXIT 6 - THE WINDOW-MEMORY PROMISE DID NOT HOLD (GEOMETRY_FAILED_EXIT). This one IS the product: the app launched, restored a seeded rect, was moved, closed cleanly and wrote session.json - and one of those three measurements is wrong, so read the smoke: geometry: lines in the log above for which leg failed (RESTORE / PERSIST / ROUND-TRIP) with the deltas printed. A failure at tolerance is a real bug, NOT a DPI excuse: the assertion is 6 px (smoke.rs PLACEMENT_TOLERANCE) precisely because gpui persists the CLIENT rect while GetWindowRect answers in FRAME pixels, and on this build the 8/19/8/20 chrome makes a space confusion 16 px across and 39 px down - far outside 6, which is why the tool reports a space mix-up as ChromeOffset and treats it as a warning rather than calling it memory loss. So: within 6 px of the seed in one named space is a pass; 16/39 off is the frame-vs-client argument, asserted in place() and its tests rather than only commented; anything else that still misses 6 px is a genuine broken promise. Still advisory (no desktop, no real work area, so a runner cannot gate on it) - but a red arm here is the most valuable line this job can print." ;;
+            *) echo "::error::SMOKE COULD NOT JUDGE (exit $status) - the harness itself failed before any verdict: no PowerShell to post WM_CLOSE with, the probe script could not be written or run, unreadable mtimes on the sources (a broken instrument, deliberately not reported as 5/stale), or a bad invocation of cargo xtask smoke. Codes 0-6 each have their own arm above, so anything reaching here is an unknown contract change: read it as no information about the app, never as a pass and never as a missing desktop." ;;
           esac
           exit $status
 
