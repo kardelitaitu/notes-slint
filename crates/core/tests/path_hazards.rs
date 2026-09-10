@@ -22,7 +22,7 @@
 //! removed by its own plain spelling); what survives is reported by
 //! probe_scratch_is_cleanable instead of leaked quietly.
 //!
-//! Threading: the tests each call init_scratch(), which wipes the root, so run
+//! Threading: every probe wipes and owns ITS OWN root (named after the test),
 //! this file with --test-threads=1. A wipe in the middle of another test would
 //! delete that test's evidence -- a probe that destroys its own evidence is worse
 //! than no probe.
@@ -34,17 +34,6 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, MutexGuard, OnceLock};
-
-/// All scratch probes share one root and each begins by wiping it, so they
-/// are serialised: two probes running in parallel would delete each other's
-/// rows (measured as flaky failures, not product findings).
-fn scratch_lock() -> MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-}
 
 use serde as _;
 use serde_json as _;
@@ -125,26 +114,26 @@ fn remove_hard(p: &Path) {
     }
 }
 
-fn scratch() -> PathBuf {
+fn scratch(test: &str) -> PathBuf {
     let mut root = std::env::temp_dir();
-    root.push(ROOT_NAME);
+    root.push(format!("{ROOT_NAME}-{test}"));
     root
 }
 
 /// The scratch root, rebuilt clean. Hostile names need a real absolute path that
 /// outlives a TempDir's Drop, which cannot delete them.
-fn init_scratch() -> Result<PathBuf, Box<dyn Error>> {
+fn init_scratch(test: &str) -> Result<PathBuf, Box<dyn Error>> {
     if !cfg!(windows) {
         return Err("this probe measures Win32 name behaviour".into());
     }
-    let root = scratch();
+    let root = scratch(test);
     remove_hard(&root);
     fs::create_dir_all(&root)?;
     Ok(root)
 }
 
-fn row_dir(i: usize) -> Result<PathBuf, Box<dyn Error>> {
-    let dir = scratch().join(format!("t{i:02}"));
+fn row_dir(root: &Path, i: usize) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = root.join(format!("t{i:02}"));
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -177,8 +166,8 @@ struct Row {
 }
 
 /// One row: what policy says, what the write does, what is really on disk.
-fn run_row(i: usize, display: &str, target: &Path) -> Result<Row, Box<dyn Error>> {
-    let fallback = row_dir(i)?;
+fn run_row(root: &Path, i: usize, display: &str, target: &Path) -> Result<Row, Box<dyn Error>> {
+    let fallback = row_dir(root, i)?;
     let token = format!("HAZARD-{i:02}-PAYLOAD");
     let verdict = verdict_of(target);
     let wrote = match fs::write(target, token.as_bytes()) {
@@ -291,13 +280,12 @@ fn print_rows(title: &str, rows: &[Row]) {
 /// real, with the directory itself as the witness of where the bytes landed.
 #[test]
 fn policy_table_vs_real_win32() -> Result<(), Box<dyn Error>> {
-    let _scratch = scratch_lock();
-    init_scratch()?;
+    let root = init_scratch("policy_table_vs_real_win32")?;
     let mut rows: Vec<Row> = Vec::new();
     let mut i = 0usize;
     let rel = |name: &str, rows: &mut Vec<Row>, i: &mut usize| -> Result<(), Box<dyn Error>> {
-        let dir = row_dir(*i)?;
-        rows.push(run_row(*i, name, &dir.join(name))?);
+        let dir = row_dir(&root, *i)?;
+        rows.push(run_row(&root, *i, name, &dir.join(name))?);
         *i += 1;
         Ok(())
     };
@@ -336,9 +324,14 @@ fn policy_table_vs_real_win32() -> Result<(), Box<dyn Error>> {
         rel(n, &mut rows, &mut i)?;
     }
     // A device name as a MIDDLE component: policy looks only at the last one.
-    let dir = row_dir(i)?;
+    let dir = row_dir(&root, i)?;
     let mid_device = format!("CON{BS}x.notes");
-    rows.push(run_row(i, "CON as a PARENT dir", &dir.join(&mid_device))?);
+    rows.push(run_row(
+        &root,
+        i,
+        "CON as a PARENT dir",
+        &dir.join(&mid_device),
+    )?);
     i += 1;
     // Invisible characters inside a name.
     let (r, z) = (rtl(), zwsp());
@@ -353,17 +346,22 @@ fn policy_table_vs_real_win32() -> Result<(), Box<dyn Error>> {
     }
     // A 300-char name, plain and through the extended prefix.
     let long = format!("{}.notes", "l".repeat(295));
-    let dir = row_dir(i)?;
-    rows.push(run_row(i, "a 300-char name (plain)", &dir.join(&long))?);
+    let dir = row_dir(&root, i)?;
+    rows.push(run_row(
+        &root,
+        i,
+        "a 300-char name (plain)",
+        &dir.join(&long),
+    )?);
     i += 1;
-    let dir = row_dir(i)?;
+    let dir = row_dir(&root, i)?;
     let via = PathBuf::from(format!("{EXT}{}{BS}{long}", dir.display()));
-    rows.push(run_row(i, "a 300-char name (via EXT)", &via)?);
+    rows.push(run_row(&root, i, "a 300-char name (via EXT)", &via)?);
     i += 1;
 
     // The absolute shapes from the brief, rebuilt under a real row dir so the
     // PREFIX is what is tested and never the root of C:.
-    let d = row_dir(i)?.to_string_lossy().into_owned();
+    let d = row_dir(&root, i)?.to_string_lossy().into_owned();
     let shapes: Vec<(String, PathBuf)> = vec![
         (
             format!("{EXT}C:{BS}x.notes"),
@@ -388,7 +386,7 @@ fn policy_table_vs_real_win32() -> Result<(), Box<dyn Error>> {
     ];
     for (display, target) in &shapes {
         let idx = rows.len();
-        rows.push(run_row(idx, display, target)?);
+        rows.push(run_row(&root, idx, display, target)?);
     }
     print_rows(
         "POLICY TABLE vs REAL WIN32 (attempted rows, all under %TEMP%)",
@@ -459,9 +457,8 @@ fn policy_table_vs_real_win32() -> Result<(), Box<dyn Error>> {
 /// ASCII letter before the colon, so the stream rule never fires for these.
 #[test]
 fn one_letter_name_with_a_colon_is_a_stream_not_a_drive() -> Result<(), Box<dyn Error>> {
-    let _scratch = scratch_lock();
-    init_scratch()?;
-    let dir = row_dir(95)?;
+    let root = init_scratch("one_letter_name_with_a_colon_is_a_stream_not_a_drive")?;
+    let dir = row_dir(&root, 95)?;
     let base = dir.join("a");
     fs::write(verb(&base), b"USER-DOCUMENT-A")?;
     // Built as a STRING, not with join(): join() treats "a:secret.notes" as a
@@ -665,9 +662,8 @@ fn drive_relative_child() -> Result<(), Box<dyn Error>> {
 /// wrote another -- and save_document reports Ok for both.
 #[test]
 fn stripped_middle_component_shadows_a_real_dot_directory() -> Result<(), Box<dyn Error>> {
-    let _scratch = scratch_lock();
-    init_scratch()?;
-    let dir = row_dir(92)?;
+    let root = init_scratch("stripped_middle_component_shadows_a_real_dot_directory")?;
+    let dir = row_dir(&root, 92)?;
     let plain = dir.join("sub");
     let dotted = dir.join("sub.");
     fs::create_dir_all(&plain)?;
@@ -718,9 +714,8 @@ fn stripped_middle_component_shadows_a_real_dot_directory() -> Result<(), Box<dy
 /// "x.notes." -- and no plain spelling of that name can reach it again.
 #[test]
 fn extended_prefix_trailing_dot_is_a_file_no_plain_name_reaches() -> Result<(), Box<dyn Error>> {
-    let _scratch = scratch_lock();
-    init_scratch()?;
-    let dir = row_dir(93)?;
+    let root = init_scratch("extended_prefix_trailing_dot_is_a_file_no_plain_name_reaches")?;
+    let dir = row_dir(&root, 93)?;
     let d = dir.to_string_lossy().into_owned();
     let verbatim_target = PathBuf::from(format!("{EXT}{d}{BS}x.notes."));
     let verdict = verdict_of(&verbatim_target);
@@ -768,9 +763,8 @@ fn extended_prefix_trailing_dot_is_a_file_no_plain_name_reaches() -> Result<(), 
 /// same "the name you see is not the file you get" class in user terms.
 #[test]
 fn invisible_names_reach_the_menu_verbatim() -> Result<(), Box<dyn Error>> {
-    let _scratch = scratch_lock();
-    init_scratch()?;
-    let dir = row_dir(96)?;
+    let root = init_scratch("invisible_names_reach_the_menu_verbatim")?;
+    let dir = row_dir(&root, 96)?;
     let r = rtl();
     let z = zwsp();
     // A name chosen so that, once rendered, it READS as the ordinary "notes.txt".
@@ -837,9 +831,8 @@ fn invisible_names_reach_the_menu_verbatim() -> Result<(), Box<dyn Error>> {
 /// spelling of a name must not become a second document.
 #[test]
 fn case_only_difference_is_one_file_and_one_identity() -> Result<(), Box<dyn Error>> {
-    let _scratch = scratch_lock();
-    init_scratch()?;
-    let dir = row_dir(90)?;
+    let root = init_scratch("case_only_difference_is_one_file_and_one_identity")?;
+    let dir = row_dir(&root, 90)?;
     let lower = dir.join("notes.notes");
     let upper = dir.join("NOTES.NOTES");
     fs::write(verb(&lower), b"first")?;
@@ -895,9 +888,8 @@ fn case_only_difference_is_one_file_and_one_identity() -> Result<(), Box<dyn Err
 /// name -- so one file on disk becomes two recent entries.
 #[test]
 fn refused_spelling_of_an_existing_file_splits_the_recent_list() -> Result<(), Box<dyn Error>> {
-    let _scratch = scratch_lock();
-    init_scratch()?;
-    let dir = row_dir(91)?;
+    let root = init_scratch("refused_spelling_of_an_existing_file_splits_the_recent_list")?;
+    let dir = row_dir(&root, 91)?;
     let real = dir.join("notes");
     fs::write(verb(&real), b"exists")?;
     let refused = dir.join("notes.");
@@ -935,9 +927,8 @@ fn refused_spelling_of_an_existing_file_splits_the_recent_list() -> Result<(), B
 /// blamed on the manifest.
 #[test]
 fn long_path_round_trip_plain_vs_extended() -> Result<(), Box<dyn Error>> {
-    let _scratch = scratch_lock();
-    init_scratch()?;
-    let dir = row_dir(94)?;
+    let root = init_scratch("long_path_round_trip_plain_vs_extended")?;
+    let dir = row_dir(&root, 94)?;
     let mut deep = dir.clone();
     for _ in 0..6 {
         deep.push("deep-folder-name-that-is-long-on-purpose-0123456789");
@@ -1011,7 +1002,7 @@ fn long_path_round_trip_plain_vs_extended() -> Result<(), Box<dyn Error>> {
 /// api's create_dir_all. Measured so the manager knows which side the fix is on.
 #[test]
 fn core_does_not_create_the_state_dir() -> Result<(), Box<dyn Error>> {
-    let base = init_scratch()?.join("state-missing");
+    let base = init_scratch("core_does_not_create_the_state_dir")?.join("state-missing");
     remove_hard(&base);
     let missing = base.join("notes-gpui");
     let session = match save_session_bytes(&missing, b"{}") {
@@ -1032,10 +1023,12 @@ fn core_does_not_create_the_state_dir() -> Result<(), Box<dyn Error>> {
 
 /// Honest clean-up: a hostile NAME can survive a cleanup that throws on it.
 #[test]
-#[ignore = "RACES the sibling probes: it deletes the scratch root they are writing into when the target runs in parallel; it passes standalone -- cargo test -p notes-core --test path_hazards probe_scratch_is_cleanable -- --exact -- test-threads=1 or a private root lifts it"]
 fn probe_scratch_is_cleanable() -> Result<(), Box<dyn Error>> {
-    let _scratch = scratch_lock();
-    let root = scratch();
+    // Its OWN root, wiped fresh, then deliberately polluted with a hostile
+    // name this test creates itself: the proof is that removal still wins.
+    let root = init_scratch("cleanup_proof")?;
+    fs::write(verb(&root.join("hostile.notes.")), b"x")?;
+    fs::write(root.join("plain.txt"), b"y")?;
     remove_hard(&root);
     let left = fs::symlink_metadata(&root).is_ok();
     println!();
