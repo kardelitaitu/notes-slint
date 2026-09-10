@@ -230,8 +230,8 @@ pub fn display_labels(entries: &[RecentEntry]) -> Vec<String> {
 /// * StreamName / DriveRelative — NO: a stream is another file's storage,
 ///   and a drive-relative name resolves against invisible process state;
 ///   both stay lexical (and drive-relative names are refused outright).
-/// The lexical fallback is pure and instant, and was-canonicalised=false is
-/// the honest answer (core did not touch the filesystem).
+///   The lexical fallback is pure and instant, and was-canonicalised=false
+///   is the honest answer (core did not touch the filesystem).
 fn identity_of(path: &Path) -> (String, bool) {
     use crate::path_policy::PathVerdict;
     let canonicalisable = !matches!(
