@@ -25,8 +25,6 @@
 //!   update.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
-use std::process::Command;
 
 use serde_json::Value;
 
@@ -446,22 +444,6 @@ pub fn graph_from_metadata(v: &Value) -> Result<Graph, String> {
     })
 }
 
-/// Run cargo metadata for the workspace at root and parse it. .output() drains
-/// both pipes to EOF concurrently, so the child cannot deadlock on a full pipe.
-fn cargo_metadata(root: &Path) -> Result<Value, String> {
-    let out = Command::new("cargo")
-        .args(["metadata", "--format-version", "1"])
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("failed to spawn cargo metadata: {e}"))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("cargo metadata failed: {}", stderr.trim()));
-    }
-    serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("cargo metadata printed invalid JSON: {e}"))
-}
-
 /// The packages the rules constrain, in first-appearance order.
 fn checked_packages() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = Vec::new();
@@ -483,14 +465,14 @@ pub fn run() -> i32 {
             return 2;
         }
     };
-    let root = match crate::find_workspace_root(&cwd) {
+    let root = match crate::metadata::find_workspace_root(&cwd) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("check-arch: {e}");
             return 2;
         }
     };
-    let meta = match cargo_metadata(&root) {
+    let meta = match crate::metadata::cargo_metadata(&root) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("check-arch: {e}");

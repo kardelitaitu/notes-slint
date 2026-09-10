@@ -133,6 +133,15 @@ fn step_specs() -> Vec<StepSpec> {
             budget_secs: 180,
         },
         StepSpec {
+            name: "check-deps",
+            display: "cargo run -p xtask -- check-deps",
+            program: "cargo",
+            args: &["run", "-p", "xtask", "--quiet", "--", "check-deps"],
+            advisory: false,
+            quick_skippable: false,
+            budget_secs: 180,
+        },
+        StepSpec {
             name: "fixtures",
             display: "cargo run -p xtask -- fixtures verify",
             program: "cargo",
@@ -217,7 +226,7 @@ pub fn run(quick: bool) -> i32 {
             return 2;
         }
     };
-    let root = match crate::find_workspace_root(&cwd) {
+    let root = match crate::metadata::find_workspace_root(&cwd) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("check: {e}");
@@ -230,12 +239,14 @@ pub fn run(quick: bool) -> i32 {
             "check: --quick — the workspace-wide clippy and test steps are SKIPPED; this is not a full verdict"
         );
     }
+    let specs = step_specs();
+    let total = specs.len();
     let mut verdicts: Vec<Verdict> = Vec::new();
-    for (i, spec) in step_specs().into_iter().enumerate() {
+    for (i, spec) in specs.into_iter().enumerate() {
         let outcome = if quick && spec.quick_skippable {
             Outcome::Skipped
         } else {
-            println!("==> [{}/{}] {}", i + 1, 7, spec.display);
+            println!("==> [{}/{}] {}", i + 1, total, spec.display);
             run_child(&spec, &root)
         };
         println!(
@@ -295,6 +306,28 @@ mod tests {
             outcome,
             advisory,
         }
+    }
+
+    /// A checker that is not in the roster cannot fail anyone, which is worse
+    /// than no checker: assert the gate actually runs the in-repo checkers.
+    #[test]
+    fn every_in_repo_checker_is_wired_into_the_gate() {
+        let names: Vec<&'static str> = step_specs().iter().map(|s| s.name).collect();
+        for expected in ["check-arch", "check-deps", "fixtures"] {
+            assert!(
+                names.contains(&expected),
+                "{expected} is not wired: {names:?}"
+            );
+        }
+        let deps = step_specs()
+            .into_iter()
+            .find(|s| s.name == "check-deps")
+            .expect("check-deps row");
+        assert!(!deps.advisory, "a drift checker cannot be advisory");
+        assert!(
+            !deps.quick_skippable,
+            "check-deps reads manifests only; --quick must not skip it"
+        );
     }
 
     #[test]

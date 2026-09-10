@@ -788,7 +788,7 @@ fn command_dir() -> Result<std::path::PathBuf, i32> {
             return Err(2);
         }
     };
-    match crate::find_workspace_root(&cwd) {
+    match crate::metadata::find_workspace_root(&cwd) {
         Ok(root) => Ok(root.join(FIXTURES_REL)),
         Err(e) => {
             eprintln!("fixtures: {e}");
