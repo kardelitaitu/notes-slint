@@ -1,0 +1,17 @@
+[package]
+name = "notes-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# NOTE: cargo (measured 1.98.0) forbids overriding inherited workspace lints,
+# so the workspace set is spelled out here with unsafe_code relaxed from the
+# workspace "forbid" to "deny" — platform is the one crate that may use unsafe.
+[lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+

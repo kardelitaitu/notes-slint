@@ -1,0 +1,5 @@
+# MSRV 1.85 lives in [workspace.package] rust-version (root Cargo.toml), NOT here:
+# pinning a patch toolchain would make rustup download a toolchain during someone
+# else's build. "stable" resolves to the already-installed stable toolchain.
+[toolchain]
+channel = "stable"

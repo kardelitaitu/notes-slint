@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = ["crates/core","crates/api","crates/platform","crates/bridge-gpui","crates/xtask"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+notes-core = { path = "crates/core" }
+notes-api = { path = "crates/api" }
+notes-platform = { path = "crates/platform" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.9"
+tempfile = "3"
+gpui = "=0.2.2"
+raw-window-handle = "0.6"
+windows = { version = "0.61", features = ["Win32_Foundation","Win32_UI_WindowsAndMessaging","Win32_UI_Shell","Win32_Graphics_Gdi"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_crate_dependencies = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
