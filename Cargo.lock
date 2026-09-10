@@ -3283,10 +3283,19 @@ dependencies = [
 [[package]]
 name = "notes-core"
 version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "notes-platform"
 version = "0.0.1"
+dependencies = [
+ "thiserror 2.0.20",
+ "windows 0.61.3",
+]
 
 [[package]]
 name = "ntapi"
@@ -6784,6 +6793,9 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 [[package]]
 name = "xtask"
 version = "0.0.1"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "y4m"
