@@ -1,5 +1,6 @@
 //! Where the window is, and where it can be put. Reading and writing a rect, and
-//! reporting the work area a window should stay inside - reported, never enforced.
+//! reporting the work area a window should stay inside and the DPI scale of the
+//! monitor that owns one - reported, never enforced.
 //!
 //! Every read here (GetWindowRect, GetWindowPlacement, the MonitorFrom* and
 //! GetMonitorInfoW queries) takes no SWP_ flags: reads do not marshal across input
@@ -134,6 +135,79 @@ pub fn work_area_for_rect(rect: FrameRect) -> PlatformResult<(FrameRect, u32)> {
     ))
 }
 
+/// The scale of the monitor `rect` belongs to, as physical pixels per logical
+/// pixel - see [`crate::HostFacts::scale_for_rect`].
+pub fn scale_for_rect(rect: FrameRect) -> PlatformResult<f32> {
+    let win_rect = RECT {
+        left: rect.x,
+        top: rect.y,
+        right: rect.right(),
+        bottom: rect.bottom(),
+    };
+    // SAFETY: MonitorFromRect takes a pointer to `win_rect`, a live repr(C)
+    // local that outlives the call, and a by-value flag enum; it dereferences
+    // the rect only during the call and answers with a monitor handle.
+    // MONITOR_DEFAULTTONEAREST is documented never to return null (only
+    // MONITOR_DEFAULTTONULL can), and the handle is re-checked before use.
+    let monitor = unsafe { MonitorFromRect(&win_rect, MONITOR_DEFAULTTONEAREST) };
+    scale_of_monitor(monitor)
+}
+
+/// The `GetDpiForMonitor` half of [`scale_for_rect`], so the two refusals and
+/// the out-pointer handshake have one testable seam - the same shape
+/// `work_area_of` gives [`work_area_for_rect`].
+fn scale_of_monitor(monitor: HMONITOR) -> PlatformResult<f32> {
+    if monitor.is_invalid() {
+        return Err(PlatformError::NoMonitor);
+    }
+    let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+    // SAFETY: GetDpiForMonitor is given `monitor`, an HMONITOR the lookup above
+    // answered (or a test's deliberately garbage value, which the API refuses
+    // with E_INVALIDARG rather than faulting), the by-value MDT_EFFECTIVE_DPI
+    // request, and two live u32 locals that are the only storage the call
+    // writes - no pointer is retained past the call, and the Result is mapped,
+    // never unwrapped.
+    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
+        .ok()
+        .map_err(|error| win32_error("GetDpiForMonitor", error))?;
+    // Per-monitor DPI is uniform across the axes (gpui asserts x == y; this
+    // crate panics on nothing), so the x axis is used and the invariant is
+    // stated here instead of asserted.
+    Ok(dpi_x as f32 / USER_DEFAULT_SCREEN_DPI)
+}
+
+// shcore's GetDpiForMonitor, declared locally: the windows crate gates this
+// symbol behind the `Win32_UI_HiDpi` feature, which the root manifest does not
+// enable (the feature list lives in the manager-owned root manifest). The
+// generated binding would link the very same api-set DLL with the very same
+// signature - windows-0.61's own emission for GetDpiForMonitor is exactly this
+// raw-dylib link - so here it is spelled by hand. Deliberately NOT marked
+// `safe` (unlike GetACP in `super`): it writes through its two out-pointers,
+// so every call goes through an unsafe block stating that invariant.
+#[link(
+    name = "api-ms-win-shcore-scaling-l1-1-1.dll",
+    kind = "raw-dylib",
+    modifiers = "+verbatim"
+)]
+unsafe extern "system" {
+    fn GetDpiForMonitor(
+        hmonitor: HMONITOR,
+        dpitype: i32,
+        dpix: *mut u32,
+        dpiy: *mut u32,
+    ) -> ::windows::core::HRESULT;
+}
+
+/// `MDT_EFFECTIVE_DPI` - windows's `MONITOR_DPI_TYPE`, spelled as its documented
+/// discriminant so no HiDpi feature is needed for a type: the DPI the system
+/// uses to scale UI on that monitor for this process's awareness mode, the
+/// variant the toolkit itself queries.
+const MDT_EFFECTIVE_DPI: i32 = 0;
+
+/// Win32's `USER_DEFAULT_SCREEN_DPI`: what "100%" means. The scale is reported
+/// against this base, in the unit GPUI's `scale_factor` uses.
+const USER_DEFAULT_SCREEN_DPI: f32 = 96.0;
+
 /// Moves and resizes `handle` to `r`, after `r.scaled(scale)` - see
 /// [`crate::WindowBackend::set_frame_rect`].
 ///
@@ -223,7 +297,8 @@ fn work_area_of(monitor: HMONITOR) -> PlatformResult<FrameRect> {
 mod tests {
     use super::{
         PLACEMENT_FLAGS, frame_rect, from_win32, monitor_work_area, primary_work_area,
-        restore_frame_rect, set_frame_rect, work_area_for_rect, work_area_of,
+        restore_frame_rect, scale_for_rect, scale_of_monitor, set_frame_rect, work_area_for_rect,
+        work_area_of,
     };
     use crate::{FrameRect, PlatformError, PlatformResult, WindowBackend};
     use ::windows::Win32::Foundation::RECT;
@@ -388,6 +463,38 @@ mod tests {
             matches!(&result, Err(PlatformError::Win32 { api, .. }) if *api == "GetMonitorInfoW"),
             "{result:?}"
         );
+    }
+
+    /// The scale seam's refusals are the same two diagnoses the work-area seam
+    /// makes: no monitor at all is `NoMonitor`, a monitor that stopped existing
+    /// is a `Win32` mapping carrying the OS code - never a fabricated 0.0 or
+    /// 1.0 scale, because a default scale is exactly the derived lie this read
+    /// exists to avoid.
+    #[test]
+    fn a_null_and_a_dead_monitor_are_typed_failures_not_scales() {
+        let null = scale_of_monitor(HMONITOR(core::ptr::null_mut()));
+        assert!(matches!(null, Err(PlatformError::NoMonitor)), "{null:?}");
+        // 4-byte aligned and non-null, so it clears the guard and reaches the
+        // API, but the meaningful bits of an HMONITOR are 32-bit: with the
+        // 64-bit sign bit set this cannot name a monitor on any station.
+        let dead = HMONITOR(isize::MIN as *mut core::ffi::c_void);
+        let result = scale_of_monitor(dead);
+        assert!(
+            matches!(&result, Err(PlatformError::Win32 { api, .. }) if *api == "GetDpiForMonitor"),
+            "{result:?}"
+        );
+    }
+
+    /// The scale of the monitor that owns a known rect is a measurement, not
+    /// a constant: finite and positive on any live desktop, 1.0 on a 100% box.
+    /// The measured number is printed so it is on the record.
+    #[test]
+    fn the_scale_of_a_known_rect_is_a_finite_positive_measurement() {
+        let primary = primary_work_area().expect("a primary monitor exists");
+        let scale = scale_for_rect(primary).expect("the rect has a monitor");
+        eprintln!("scale measured for the primary monitor: {scale}");
+        assert!(scale.is_finite(), "{scale} is not a scale");
+        assert!(scale > 0.0, "{scale} is not a scale");
     }
 
     /// Tolerant by design: a build agent may have no interactive desktop, a session-0

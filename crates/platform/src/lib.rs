@@ -200,6 +200,38 @@ pub trait HostFacts: Send {
     /// taskbar) still resolves to the monitor that edge belongs to, and that
     /// monitor's work area is what comes back.
     fn work_area_for_rect(&self, rect: FrameRect) -> PlatformResult<(FrameRect, u32)>;
+
+    /// The scale of the monitor `rect` belongs to, in **physical pixels per
+    /// logical pixel**: Win32's per-monitor DPI (`GetDpiForMonitor`,
+    /// `MDT_EFFECTIVE_DPI`, Windows 8.1+) divided by 96
+    /// (`USER_DEFAULT_SCREEN_DPI`). Deliberately the same computation GPUI
+    /// performs for its `scale_factor`, so the number this seam reports cannot
+    /// disagree with the toolkit's - a scale off by the ratio between them
+    /// would persist every rect wrong.
+    ///
+    /// Why this API: `GetDpiForMonitor` is per-monitor and needs only the
+    /// monitor handle a rect resolves to, so the fact exists before any window
+    /// does. `GetDpiForWindow` is per-window and needs a live HWND (Windows
+    /// 10 1607+), which the handle-less restore case does not have;
+    /// `GetScaleFactorForMonitor` is a shell-scaling API documented as not
+    /// what a per-monitor-DPI-aware app should use, answering in coarse
+    /// percent.
+    ///
+    /// Why a rect and not the persisted monitor id: that id is the session
+    /// ordinal returned by [`HostFacts::work_area_for_rect`], which unplug and
+    /// replug can renumber, while the rect is what the caller holds at flush
+    /// time - and resolving with the same `MONITOR_DEFAULTTONEAREST` rule
+    /// guarantees the scale and the work area describe the SAME monitor.
+    ///
+    /// Failure is typed, never a default: a desktop with no monitors at all is
+    /// [`PlatformError::NoMonitor`]; a monitor that stopped existing between
+    /// the lookup and the query is [`PlatformError::Win32`] with the OS code.
+    /// A 0.0 or 1.0 fallback is exactly the derived lie this read exists to
+    /// avoid. The per-monitor answer is per-monitor only for a process that
+    /// declared per-monitor awareness (the app manifest declares
+    /// `PerMonitorV2`); under system awareness Windows answers the system DPI
+    /// for every monitor.
+    fn scale_for_rect(&self, rect: FrameRect) -> PlatformResult<f32>;
 }
 #[cfg(test)]
 mod tests {
@@ -260,6 +292,11 @@ mod tests {
                 Ok((FrameRect::new(0, 0, 1920, 1040), 1))
             }
         }
+
+        fn scale_for_rect(&self, _rect: FrameRect) -> PlatformResult<f32> {
+            // A mock, not a measurement: it stands in for whatever the host answers.
+            Ok(1.0)
+        }
     }
 
     #[test]
@@ -307,9 +344,13 @@ mod tests {
             Ok(rect) if rect == FrameRect::new(5, 6, 7, 8)
         ));
         let facts: Box<dyn HostFacts> = Box::new(Mock::default());
-        // The mock's answer is a stand-in constant; the real one is measured in
-        // windows/mod.rs's test.
+        // The mock's answers are stand-in constants; the real ones are measured
+        // in windows/mod.rs's and windows/monitors.rs's tests.
         assert_eq!(facts.ansi_codepage(), 1252);
+        assert!(matches!(
+            facts.scale_for_rect(FrameRect::new(0, 0, 100, 100)),
+            Ok(scale) if scale == 1.0
+        ));
     }
 
     #[test]
