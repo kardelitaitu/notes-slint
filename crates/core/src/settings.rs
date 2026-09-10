@@ -5,11 +5,15 @@
 //! settings.toml holds the USER preferences and the recents. No field ever
 //! moves between the two files.
 //!
-//! Read discipline is the same as session.rs: a missing or corrupt file
-//! yields Default and the bytes on disk are PRESERVED for diagnosis — a
-//! failed read never rewrites, never auto-corrects. Write discipline is the
-//! D12/D23 atomic tail via save::atomic_write (same-directory sibling temp,
-//! flush, fsync, rename, leftovers swept; no tempfile dependency — D23).
+//! Read discipline — the three facts are three different answers, because
+//! "a missing file" is NOT the same fact as "the factory default":
+//! absent file -> Ok(None) (the caller decides; no default is invented
+//! behind its back); present file -> Ok(Some(exactly what was written));
+//! corrupt file -> Err(SettingsError::Corrupt) with the bytes on disk
+//! PRESERVED for diagnosis — a failed read never rewrites, never
+//! auto-corrects (D12). Write discipline is the D12/D23 atomic tail via
+//! save::atomic_write (same-directory sibling temp, flush, fsync, rename,
+//! leftovers swept; no tempfile dependency — D23).
 
 use crate::paths::StateDir;
 use crate::recent::RecentEntry;
@@ -24,14 +28,17 @@ pub struct Settings {
     /// The product premise is that the app never asks you to save: autosave
     /// starts ON.
     pub autosave_enabled: bool,
-    /// The ANSI default code page the bridge supplies from GetACP() and
-    /// passes to encoding::detect. Default = Some(1252) is the
-    /// Windows-English default and NOT a guess: it is the value the caller
-    /// is expected to overwrite with the machine's real code page. D27:
-    /// CP1252 is the only code page core can write back — anything else
-    /// opens read-only, so detect(bytes, None) (which cannot know the code
-    /// page) is never the shipped path.
-    #[serde(default = "default_codepage")]
+    /// The ANSI code page, as RECORDED: None means nobody ever chose one
+    /// (a missing file, or a file without the key — TOML cannot say null, so
+    /// the absent key IS the null), and the answer is "ask the host" via
+    /// resolved_codepage. It is never a hard-coded 1252: a default value
+    /// nobody chose would silently override a machine whose ACP is 1251 or
+    /// 1254, and D27 ("never guess a codepage") would be unimplementable.
+    /// D27 unchanged: CP1252 is the only code page core can write back —
+    /// anything else opens read-only. Serde: `default` reads a missing key
+    /// as None; `skip_serializing_if` never writes the key for None, since
+    /// TOML cannot say null — the absent key IS the null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codepage: Option<u16>,
     /// The recent-files list, capped by recent::MAX_RECENTS. Defaults to
     /// empty so a hand-trimmed settings.toml without the table still reads.
@@ -39,19 +46,28 @@ pub struct Settings {
     pub recents: Vec<RecentEntry>,
 }
 
-/// The documented default code page: Windows-English ANSI 1252, expected
-/// to be overwritten by the bridge's GetACP() value.
-fn default_codepage() -> Option<u16> {
-    Some(1252)
-}
-
 impl Default for Settings {
+    /// The FACTORY settings: no code page decision is made here — the host
+    /// supplies the ANSI code page and resolved_codepage composes the two.
+    /// A caller that genuinely wants "assume 1252 because there is no host"
+    /// must say so at its call site, in words.
     fn default() -> Self {
         Settings {
             autosave_enabled: true,
-            codepage: default_codepage(),
+            codepage: None,
             recents: Vec::new(),
         }
+    }
+}
+
+impl Settings {
+    /// The ONLY way a codepage reaches encoding::detect on a shipped path.
+    /// Precedence: explicit user setting wins; else the host's ANSI code
+    /// page; else None — and None means ANSI files are REFUSED, never
+    /// guessed (D27). Pure and total: no I/O, no GetACP (core has no OS
+    /// access; the host value arrives as a parameter).
+    pub fn resolved_codepage(&self, host_acp: Option<u16>) -> Option<u16> {
+        self.codepage.or(host_acp)
     }
 }
 
@@ -61,19 +77,31 @@ impl Default for Settings {
 pub enum SettingsError {
     #[error("settings could not be serialised: {0}")]
     Serialise(String),
+    /// The file exists but is not valid TOML. With "absent" no longer
+    /// available as a silent fallback, corrupt is a typed error the caller
+    /// renders; the bytes are never touched (D12: diagnosis beats tidiness).
+    #[error("settings file corrupt: {0}")]
+    Corrupt(String),
     #[error(transparent)]
     Save(#[from] crate::save::SaveError),
 }
 
-/// Reads settings from a StateDir. Never fails: a missing or corrupt
-/// settings.toml yields Default. A corrupt file's bytes are left exactly as
-/// they were — diagnosis beats tidiness.
-pub fn read_settings(dir: &StateDir) -> Settings {
+/// Reads settings from a StateDir. The round trip, stated as a contract:
+/// absent file -> Ok(None) -> the caller decides (there is no default to
+/// hide behind); present file -> Ok(Some(exactly what was written)); corrupt
+/// file -> Err(Corrupt) with the bytes untouched (D12: never silently
+/// correct). Unreadable-but-not-corrupt (an ACL, a locked file, a directory
+/// in the way) is Ok(None) too — no file CONTENT was seen, so no fact about
+/// the settings exists.
+pub fn read_settings(dir: &StateDir) -> Result<Option<Settings>, SettingsError> {
     let path = dir.0.join(SETTINGS_FILE_NAME);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Settings::default();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => return Ok(None),
     };
-    toml::from_str(&text).unwrap_or_default()
+    toml::from_str(&text)
+        .map(Some)
+        .map_err(|e| SettingsError::Corrupt(e.to_string()))
 }
 
 /// Writes settings.toml atomically: sibling temp in the StateDir, flush,
@@ -123,29 +151,42 @@ mod tests {
         let state = crate::paths::StateDir(dir.path().to_path_buf());
         let s = canonical();
         write_settings(&state, &s)?;
-        assert_eq!(read_settings(&state), s);
+        let read = read_settings(&state)?;
+        assert_eq!(read, Some(s), "the exact written settings come back");
         Ok(())
     }
 
+    /// The ABSENT fact: no settings.toml at all is Ok(None), NOT
+    /// Some(Settings::default()) — "nobody ever ran the app" must stay
+    /// distinguishable from "the user chose the factory settings", and an
+    /// absent file must not smuggle in a guessed codepage (D27).
     #[test]
-    fn missing_settings_file_yields_default() {
+    fn missing_settings_file_is_ok_none_not_a_default() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let state = crate::paths::StateDir(dir.path().to_path_buf());
-        assert_eq!(read_settings(&state), Settings::default());
+        let read = read_settings(&state);
         assert!(
-            read_settings(&state).autosave_enabled,
-            "the premise: autosave on"
+            matches!(&read, Ok(None)),
+            "an absent file must read as Ok(None), got {read:?}"
         );
     }
 
+    /// D12: a corrupt file is a typed error, never silently corrected and
+    /// never replaced by a default — the bytes stay on disk for diagnosis.
     #[test]
-    fn corrupt_settings_file_yields_default_and_is_preserved()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn corrupt_settings_file_is_an_error_and_is_preserved() -> Result<(), Box<dyn std::error::Error>>
+    {
         let dir = tempfile::tempdir()?;
         let state = crate::paths::StateDir(dir.path().to_path_buf());
         let garbage = b"this is not [ valid toml ===";
         std::fs::write(state.0.join(SETTINGS_FILE_NAME), garbage)?;
-        assert_eq!(read_settings(&state), Settings::default());
+        let Err(e) = read_settings(&state) else {
+            panic!("a corrupt settings file must be Err, not Ok(_)");
+        };
+        assert!(
+            matches!(e, SettingsError::Corrupt(_)),
+            "corrupt must be SettingsError::Corrupt, got {e:?}"
+        );
         // A failed read never rewrites: the corrupt bytes stay for diagnosis.
         assert_eq!(std::fs::read(state.0.join(SETTINGS_FILE_NAME))?, garbage);
         Ok(())
@@ -183,9 +224,8 @@ mod tests {
             "serde default covers the missing table"
         );
         assert_eq!(
-            s.codepage,
-            Some(1252),
-            "a toml without the key defaults to the documented code page"
+            s.codepage, None,
+            "the absent key is the null: nobody ever chose a codepage"
         );
     }
 
@@ -213,15 +253,16 @@ mod tests {
     fn codepage_is_persisted_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let state = crate::paths::StateDir(dir.path().to_path_buf());
-        // A machine whose ANSI is not 1252: the stored value is what the
-        // bridge will pass to encoding::detect.
+        // A machine whose ANSI is not 1252: the stored value is the user's
+        // recorded choice, the one resolved_codepage hands to encoding::detect.
         let s = Settings {
             codepage: Some(932),
             ..Settings::default()
         };
         write_settings(&state, &s)?;
-        assert_eq!(read_settings(&state), s);
-        assert_eq!(read_settings(&state).codepage, Some(932));
+        let read = read_settings(&state)?;
+        assert_eq!(read.as_ref(), Some(&s));
+        assert_eq!(read.and_then(|s| s.codepage), Some(932));
         Ok(())
     }
 
@@ -247,7 +288,94 @@ mod tests {
             ],
         };
         write_settings(&state, &s)?;
-        assert_eq!(read_settings(&state), s);
+        assert_eq!(read_settings(&state)?, Some(s));
         Ok(())
+    }
+
+    /// The PRESENT fact, distinguished from the absent fact above: a file
+    /// that EXISTS but carries no codepage key (TOML cannot say null, so
+    /// the absent key IS the null) is Ok(Some(...)) with codepage: None —
+    /// a readable decision, not a missing file. Same values the factory
+    /// default would have had; a different fact.
+    #[test]
+    fn a_file_without_a_codepage_key_is_some_with_none_not_absent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let state = crate::paths::StateDir(dir.path().to_path_buf());
+        // Written by hand, not via write_settings: the fact under test is
+        // the key being absent, not what our serialiser happens to emit.
+        std::fs::write(
+            state.0.join(SETTINGS_FILE_NAME),
+            "autosave_enabled = false\n",
+        )?;
+        let read = read_settings(&state)?;
+        assert_eq!(
+            read,
+            Some(Settings {
+                autosave_enabled: false,
+                codepage: None,
+                recents: Vec::new(),
+            }),
+            "a present file with no codepage key = Some with codepage None"
+        );
+        Ok(())
+    }
+
+    /// Unreadable-but-not-corrupt (here: the path is a directory) is
+    /// Ok(None) too — no file CONTENT was seen, so no fact about the
+    /// settings exists, and nothing is corrected or rewritten (D12).
+    #[test]
+    fn unreadable_settings_path_is_ok_none_no_content_no_fact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let state = crate::paths::StateDir(dir.path().to_path_buf());
+        std::fs::create_dir(state.0.join(SETTINGS_FILE_NAME))?;
+        let read = read_settings(&state);
+        assert!(
+            matches!(&read, Ok(None)),
+            "unreadable must read as absent, got {read:?}"
+        );
+        Ok(())
+    }
+
+    /// D33 mutation guard: the explicit setting is the user's CHOICE — the
+    /// host's ACP must never overwrite it. The precedence permutation
+    /// "host wins over explicit" is the mutation this test fails on.
+    #[test]
+    fn resolved_codepage_explicit_setting_beats_the_host_acp() {
+        let s = Settings {
+            codepage: Some(1252),
+            ..Settings::default()
+        };
+        assert_eq!(
+            s.resolved_codepage(Some(932)),
+            Some(1252),
+            "the user's explicit codepage wins over the host's ACP"
+        );
+    }
+
+    #[test]
+    fn resolved_codepage_falls_back_to_the_host_acp() {
+        let s = Settings {
+            codepage: None,
+            ..Settings::default()
+        };
+        assert_eq!(
+            s.resolved_codepage(Some(932)),
+            Some(932),
+            "with no explicit choice, the host's ACP is the answer"
+        );
+    }
+
+    /// D27: None out of both inputs means ANSI files are REFUSED, never
+    /// guessed — core has no OS access, so it has no codepage to offer.
+    #[test]
+    fn resolved_codepage_none_means_ansi_is_refused_never_guessed() {
+        let s = Settings::default();
+        assert_eq!(
+            s.resolved_codepage(None),
+            None,
+            "no choice and no host: refuse, do not guess"
+        );
     }
 }
