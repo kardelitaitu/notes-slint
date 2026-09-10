@@ -27,10 +27,16 @@ pub use notes_core::geometry::Rect;
 /// `api` RECEIVES a `StateDir`; it never resolves one. D-STATE keeps
 /// `notes_core::resolve_state_dir` pure, so the single `<exe_dir>\data`
 /// existence probe belongs to the caller that starts the gateway. That is why the
-/// function is deliberately NOT re-exported here while the type is: re-exporting
-/// it would hand the port a decision it is not allowed to make, and a portable
-/// deployment is signalled to `api` by which `StateDir` arrives, never by
-/// `api` probing the filesystem itself.
+/// function was deliberately not re-exported while the port had no reason to name
+/// it. FCR 2 changed the reason, not the rule: a bridge may import notes-api and
+/// its own toolkit and NOTHING else, so a resolver that lives in notes-core and is
+/// not named here forces the bridge to re-implement the portable rule - and one
+/// rule becoming two rules is the fork AGENTS.md warns about. Naming a function is
+/// not deciding with it: [`api`] still never calls it, never probes the
+/// filesystem to find out where it lives, and still receives an already-resolved
+/// `StateDir` in [`Gateway::start`](crate::Gateway::start) - which is why the
+/// type and the function are exported together, so a bridge cannot half-obey the
+/// rule.
 pub use notes_core::paths::StateDir;
 
 /// The persisted window session: rect (frame pixels), monitor id, scale,
@@ -69,3 +75,31 @@ pub use notes_core::session::Session;
 ///
 /// No longer `Copy`: it carries a Vec, so the port moves it.
 pub use notes_core::settings::Settings;
+
+/// The D-STATE rule itself, owned by notes_core::paths and re-exported so a bridge
+/// can obey it without importing notes-core (FCR 2 - this module exists precisely
+/// so a bridge can name these things). Pure passthrough: the decision (installed
+/// uses a usable roaming profile, portable is [`exe_dir`]/data, and an EMPTY
+/// appdata counts as no profile at all so a one-word launcher change cannot
+/// redirect user state) is core's, and nothing in this crate wraps, defaults or
+/// calls it.
+///
+/// The contract a bridge that reads ONLY this crate still has to honour, because it
+/// cannot see core's doc comment:
+///
+/// * **The caller performs the existence probe.** If a [`data`] directory sits
+///   next to the executable, that is a portable deployment, so pass
+///   [`appdata`] = [`None`]. Passing [`None`] unconditionally is how an
+///   installed app starts writing beside its own binary.
+/// * **Pass the roaming profile you actually read** (on Windows, APPDATA), not a
+///   path assembled from a home directory.
+/// * **Resolve once, before the window**, and hand it to
+///   [`Gateway::start`](crate::Gateway::start), which never resolves one.
+///
+/// ```text
+/// let exe_dir = std::env::current_exe()?.parent().unwrap().to_path_buf();
+/// let portable = exe_dir.join("data").is_dir();
+/// let appdata = if portable { None } else { std::env::var_os("APPDATA").map(PathBuf::from) };
+/// let state = notes_api::resolve_state_dir(&exe_dir, appdata.as_deref());
+/// ```
+pub use notes_core::paths::resolve_state_dir;

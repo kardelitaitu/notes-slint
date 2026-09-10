@@ -145,9 +145,26 @@
 //! means QUEUED, not done: the answer is still an [`Event`], later, on the
 //! channel.
 //!
-//! Still unwired: the registered [`WindowHandle`] is stored and unused —
-//! applying topmost goes through notes-platform, which this crate has no
-//! dependency on and which check-arch keeps out.
+//! Still unwired, and not for the reason an earlier version of these docs gave:
+//! the registered [`WindowHandle`] is stored and unused because this crate has
+//! not declared the dependency yet -- [`notes-platform`] is [`allowed`] to
+//! [`api`]. [`crates/xtask/src/arch.rs`] puts the port alongside core and
+//! platform deliberately, so [`cargo arch`] would not blink at an
+//! [`api => platform`] edge. That constraint was invented here and it was false,
+//! and a false constraint in a doc comment is how a good design gets skipped.
+//!
+//! What it unlocks, now that the frame-versus-client geometry question is settled
+//! (Win32 [`SetWindowPos`] and [`GetWindowRect`] are both frame space, and
+//! gpui 0.2.2 cannot express frame space at all): next slice, on
+//! [`Command::RegisterWindow`] the port does the restore itself -- primary work
+//! area, the monitor the rect belongs to, core's [`Rect::clamped_to`], then
+//! [`set_frame_rect`] -- and applies topmost from the stored [`pinned`] bit,
+//! which consumes the handle this crate only ever stored. Persistence moves to the
+//! RESTORE rect, because a maximized [`GetWindowRect`] overhangs the monitor by
+//! the invisible borders and storing it stores a lie. A failed restore is reported,
+//! never silenced: [`Event::GeometryNotRestored`] (D29/D36: add the event). And
+//! [`show = false`] is not a way to hide the correction -- gpui re-applies
+//! stashed placement on activate and would stomp it.
 //!
 //! * [`Settings`] is an api-side placeholder because notes-core has no settings
 //!   module yet; the [`Gateway::start`] parameter name survives the swap.
@@ -231,9 +248,12 @@
 //!
 //! One ownership note left, because [`StateDir`] is what makes it awkward:
 //! [`Gateway::start`] RECEIVES an already-resolved StateDir and never resolves
-//! one (D-STATE). The single `<exe_dir>\data` portable probe belongs to
-//! whoever launches the app; `api` does not call `resolve_state_dir`, does not read the
-//! environment, and does not look at the filesystem to find out where it lives.
+//! one (D-STATE) - and it is now RE-EXPORTED as `resolve_state_dir` so a
+//! bridge can reach the rule without importing notes-core (FCR 2). Naming a rule
+//! is not holding one: the single `<exe_dir>\data` portable probe still belongs
+//! to whoever launches the app, `api` never calls the resolver, does not read
+//! the environment, and does not look at the filesystem to find out where it
+//! lives.
 //! Which files the engine may touch after that is next slice's business; that it
 //! may not choose WHERE is this slice's.
 //!
@@ -254,7 +274,7 @@ mod event;
 mod gateway;
 
 pub use command::{Command, WindowHandle};
-pub use dto::{Rect, Session, Settings, StateDir};
+pub use dto::{Rect, Session, Settings, StateDir, resolve_state_dir};
 pub use engine::mark_current_thread_as_engine;
 pub use event::{
     Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason,
@@ -324,7 +344,9 @@ mod tests {
 
     /// D-STATE: `api` receives a StateDir, it never resolves one. The next
     /// slice's `Gateway::start` argument must be usable without `api` calling
-    /// `resolve_state_dir` — which is why that function is not re-exported here.
+    /// `resolve_state_dir` — but it IS re-exported (FCR 2) so a bridge can obey the rule without importing core;
+    /// the port still never calls it, and never probes anything itself - which is what
+    /// the next two lines and tests/public_surface.rs together keep honest.
     #[test]
     fn state_dir_arrives_already_resolved() {
         let portable = StateDir(PathBuf::from("C:/apps/notes").join("data"));

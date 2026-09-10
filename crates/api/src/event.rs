@@ -101,9 +101,19 @@ pub enum SkipReason {
     /// The buffer matches what is on disk (D11: the `Flush` revision is at or
     /// below the last saved revision), so there is nothing to write.
     Clean,
+    /// The note has no path yet, so the only way to persist it is an explicit
+    /// Save As. A SKIP and not a failure: a brand-new note is not an error, and an
+    /// error toast about a file that does not exist teaches the user nothing
+    /// (M9 - this replaced an [`Event::SaveFailed`] whose text the engine
+    /// invented, with an empty path beside it). No copy here on purpose: like every
+    /// other reason in this enum, the words belong to the UI.
+    NeedsPath,
     /// Read-only on disk.
     ReadOnly,
-    /// Over the 8 MiB guard, so opened read-only (D9).
+    /// Over the 8 MiB guard, so writes are refused (D9). Reached only for a
+    /// document that is open and became oversize: an [`Open`](crate::Command::Open)
+    /// that trips the guard never gets this far, it answers
+    /// [`LoadError::TooLarge`] instead, because the port has no buffer to show.
     Oversize,
 }
 
@@ -167,6 +177,13 @@ pub enum SaveError {
     /// for ANSI codepages).
     #[error("encoding {0:?} cannot represent this text")]
     Unencodable(Encoding),
+    /// Nothing was open to write. The user's action is not "fix the file" but
+    /// "choose a location", so this belongs in the enum with its own copy rather
+    /// than in a string the engine made up at the call site - AGENTS.md puts the
+    /// reason in the type because the UI has to render it, and rule 2 says every
+    /// value here is a fact somebody else decided.
+    #[error("this note has not been saved to a file yet")]
+    NoTarget,
     /// Anything else. Carries the OS text, because inventing a friendly string
     /// for an unknown failure hides the one clue the user has.
     #[error("{0}")]
@@ -197,6 +214,9 @@ pub enum LoadError {
     /// Over the 8 MiB guard (D9). Reported as a refusal, not as a truncated
     /// load, because a half-loaded buffer whose missing half the user cannot see
     /// is worse than no load: an autosave would write back a shortened file.
+    /// Emitted for real now, by the D9 byte guard in Engine::open, from the
+    /// stat alone. It replaced a Loaded event that reported an encoding, a
+    /// line ending and a read-only flag for bytes nobody had read (B1).
     #[error("file is too large to open")]
     TooLarge,
     /// The bytes are not text in any encoding we can read. the byte_offset field is
@@ -675,5 +695,33 @@ mod tests {
                 ..entry.clone()
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod honesty_tests {
+    use super::*;
+
+    /// M9: the two cases the engine used to describe with strings it invented now
+    /// have variants, and the copy is pinned where the rest of it is.
+    #[test]
+    fn a_missing_target_is_a_skip_and_a_refused_save_is_not_an_invented_string() {
+        assert_eq!(
+            SaveError::NoTarget.to_string(),
+            "this note has not been saved to a file yet"
+        );
+        // SkipReason carries no Display on purpose (slice 1's ruling: the words are
+        // the ADR's and the UI's, not the port's), so what is pinned is that the
+        // variant exists as a distinct answer.
+        assert_ne!(SkipReason::NeedsPath, SkipReason::Clean);
+        assert_ne!(SkipReason::NeedsPath, SkipReason::AutosaveDisabled);
+        // Distinct shapes, because one is an event the UI toasts and the other is a
+        // status-line note that the user can act on with Ctrl+S.
+        assert_ne!(
+            SaveError::NoTarget.to_string(),
+            SaveError::Other(String::new()).to_string(),
+            "an unknown failure must not look like the missing-target case"
+        );
+        assert_ne!(SaveError::NoTarget, SaveError::NotFound);
     }
 }

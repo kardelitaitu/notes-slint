@@ -8,7 +8,7 @@
 //! 2. Shutdown is DRAIN AND EXIT, not "drop the queue and hope";
 //! 3. dropping the Gateway is ABORT, and buffered events survive it;
 //! 4. a closed EventRx stops the events, not the engine;
-//! 5. startup_state() reads session.json and nothing else;
+//! 5. startup_state() reads the two state files and never the note;
 //! 6. a consumer that never reads cannot block a producer — the unbounded-queue
 //!    invariant, and therefore the ABBA-deadlock alarm.
 //!
@@ -263,9 +263,10 @@ fn dropped_receiver_does_not_kill_the_engine() {
     drop(gateway);
 }
 
-/// 5. startup_state() reads session.json and NOTHING else.
+/// 5. startup_state() reads the two STATE files and NOTHING else: never the note,
+///    never a probe beyond session.json and settings.toml, and it creates nothing.
 #[test]
-fn startup_state_reads_only_session() {
+fn startup_state_reads_the_state_files_and_never_the_note() {
     let dir = tempfile::tempdir().expect("tempdir");
     let decoy = dir.path().join("DECOY-NOTES.md");
     fs::write(&decoy, b"do not open me in this slice").expect("write decoy");
@@ -275,8 +276,17 @@ fn startup_state_reads_only_session() {
         .expect("write session.json");
     drop(file);
 
+    // A persisted choice the caller did NOT pass in, which is how this test proves
+    // the settings read is real rather than a default wearing a file's clothes.
+    fs::write(dir.path().join("settings.toml"), "autosave_enabled = false")
+        .expect("write settings.toml");
+
     let (mut gateway, rx) = Gateway::start(StateDir(dir.path().to_path_buf()), Settings::default());
     let initial: InitialState = gateway.startup_state().expect("the pre-window read");
+    assert!(
+        !initial.autosave_enabled,
+        "D10: the toggle comes from settings.toml, not from the argument"
+    );
 
     assert_eq!(initial.session.rect, SAVED_RECT, "the saved rect, verbatim");
     assert!(initial.pinned, "D10: the pin bit comes out of session.json");
@@ -293,9 +303,8 @@ fn startup_state_reads_only_session() {
         "the stored path is REPORTED and not opened"
     );
     assert_eq!(
-        initial.autosave_enabled,
-        Settings::default().autosave_enabled,
-        "the global toggle is the one the caller passed in"
+        initial.autosave_enabled, false,
+        "settings.toml owns the toggle; the caller's default could not override it"
     );
 
     // The document was never touched: same bytes, same modification time. A load
@@ -321,7 +330,11 @@ fn startup_state_reads_only_session() {
     entries.sort();
     assert_eq!(
         entries,
-        vec!["DECOY-NOTES.md".to_string(), "session.json".to_string()],
+        vec![
+            "DECOY-NOTES.md".to_string(),
+            "session.json".to_string(),
+            "settings.toml".to_string(),
+        ],
         "starting a Gateway must create nothing"
     );
 

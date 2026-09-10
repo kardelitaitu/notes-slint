@@ -44,7 +44,9 @@ struct Harness {
     gateway: Gateway,
     rx: Receiver<Event>,
     root: PathBuf,
-    _dir: tempfile::TempDir,
+    /// Held so the directory outlives every assertion; None when the harness is
+    /// resuming a directory that some other owner already keeps alive.
+    _dir: Option<tempfile::TempDir>,
 }
 
 impl Harness {
@@ -57,6 +59,15 @@ impl Harness {
     fn with_settings(settings: Settings) -> Self {
         let dir = tempfile::tempdir().expect("a temp state dir");
         let root = dir.path().to_path_buf();
+        let mut app = Harness::at(root, settings);
+        app._dir = Some(dir);
+        app
+    }
+
+    /// An engine on a directory that already exists - which is how a restart is
+    /// played: same [`StateDir`], fresh [`Gateway`], nothing in memory.
+    fn at(root: PathBuf, settings: Settings) -> Self {
+        let dir: Option<tempfile::TempDir> = None;
         let (gateway, rx) = Gateway::start(StateDir(root.clone()), settings);
         // 5.5 step 3, once per scenario: the window exists before anything is
         // asked of it, so the engine is in the state a bridge would leave it in.
@@ -574,4 +585,184 @@ fn an_ansi_file_is_decoded_at_the_configured_codepage_not_by_assumption() {
         }
         loaded => panic!("a page core cannot write back must not decode silently: {loaded:?}"),
     }
+}
+
+/// B1, the measured data-loss path. A file over the D9 guard must be REFUSED at
+/// open - not announced as an empty UTF-8/LF document nobody read - and the
+/// refused document must then be un-savable, because the buffer on screen is not
+/// that file. Before this fix, Save As wrote 0 bytes over it and reported Saved.
+#[test]
+fn an_oversize_file_is_refused_from_the_stat_and_cannot_be_overwritten() {
+    let mut app = Harness::new();
+    let big = app.root.join("big.notes");
+    let size = 8_usize * 1024 * 1024;
+    fs::write(&big, vec![b'A'; size]).expect("write the 8 MiB fixture");
+
+    app.send(Command::Open { path: big.clone() });
+    match app.until(
+        "LoadFailed(TooLarge)",
+        |ev| matches!(ev, Event::LoadFailed { path, .. } if path == &big),
+    ) {
+        Event::LoadFailed { reason, .. } => {
+            assert_eq!(
+                reason,
+                notes_api::LoadError::TooLarge,
+                "the byte guard's own reason"
+            );
+            assert_eq!(
+                reason.to_string(),
+                "file is too large to open",
+                "pinned copy"
+            );
+        }
+        other => panic!("expected LoadFailed, got {other:?}"),
+    }
+    // No Loaded, no Rebound, and no 4 KiB-worth of invented FileMeta anywhere.
+    assert!(matches!(
+        app.rx.try_recv(),
+        Err(_) | Ok(Event::RecentsUpdated(_))
+    ));
+
+    app.send(Command::SaveAs {
+        path: big.clone(),
+        text: "the stale buffer".to_string(),
+        revision: 1,
+    });
+    let event = app.until(
+        "SaveFailed",
+        |ev| matches!(ev, Event::SaveFailed { path, .. } if path == &big),
+    );
+    match event {
+        Event::SaveFailed { reason, .. } => {
+            assert!(
+                matches!(reason, notes_api::SaveError::NoTarget),
+                "refused, not invented: {reason:?}"
+            );
+        }
+        other => panic!("expected SaveFailed, got {other:?}"),
+    }
+    let on_disk = app.bytes(&big);
+    assert_eq!(
+        on_disk.len(),
+        size,
+        "the 8 MiB file is byte-for-byte intact"
+    );
+    assert!(!on_disk.is_empty(), "and above all, not zero bytes");
+}
+
+/// M9: a brand-new note that has never been saved is not an error.
+#[test]
+fn a_note_without_a_path_skips_instead_of_reporting_an_invented_error() {
+    let mut app = Harness::new();
+    assert_eq!(
+        app.flush_skipped("the first draft", 1),
+        SkipReason::NeedsPath,
+        "the user's next move is Save As, so the reason must say that"
+    );
+    // SkipReason carries no copy by design, so what M9 pins is that the engine
+    // answered with a named variant instead of a string it invented at the call site.
+    assert!(format!("{:?}", notes_api::SkipReason::NeedsPath).contains("NeedsPath"));
+}
+
+/// M4: a Save As observed at an OLD revision must not rewind the gate, or the
+/// flushes between it and the last save get admitted a second time.
+#[test]
+fn a_stale_save_as_cannot_rewind_the_revision_gate() {
+    let mut app = Harness::new();
+    let notes = app.file("idea.notes", b"v1");
+    app.open(&notes);
+    assert_eq!(app.flush(&notes, "v9", 9), 9);
+    let target = app.root.join("kept.notes");
+    assert_eq!(
+        app.save_as(&target, "v9", 3),
+        3,
+        "Save As reports the revision it was given"
+    );
+    // Flushes 4..=8 were already superseded by the save at 9. If the gate had been
+    // rewound to 3, this would write and answer Saved.
+    assert_eq!(app.flush_skipped("v5", 5), SkipReason::Clean);
+    assert!(
+        !app.bytes(&target).starts_with(b"v5"),
+        "nothing was written at the stale revision"
+    );
+}
+
+/// B2 / D27, the other half: with NO code page supplied the port must refuse an
+/// ANSI file rather than guess CP1252.
+#[test]
+fn without_a_codepage_an_ansi_file_is_refused_rather_than_guessed() {
+    let bytes: Vec<u8> = [b"caf".as_slice(), &[0xE9u8], b" notes"].concat();
+    let mut app = Harness::with_settings(Settings {
+        codepage: None,
+        ..Settings::default()
+    });
+    let path = app.file("fr.notes", &bytes);
+    app.send(Command::Open { path: path.clone() });
+    match app.until(
+        "LoadFailed",
+        |ev| matches!(ev, Event::LoadFailed { path: got, .. } if got == &path),
+    ) {
+        Event::LoadFailed { reason, .. } => {
+            assert!(
+                !reason.to_string().trim().is_empty(),
+                "renderable either way"
+            );
+            assert_eq!(
+                app.bytes(&path),
+                bytes,
+                "a refusal must not rewrite the file"
+            );
+        }
+        other => panic!("an unknown code page must not decode silently: {other:?}"),
+    }
+}
+
+/// Items 5 and 6 together, played as a restart: the autosave toggle and the
+/// recents list come back from settings.toml (D10's second home), and a recent
+/// whose file vanished comes back GREYED rather than deleted.
+#[test]
+fn the_toggle_and_the_recents_list_survive_a_restart_and_a_vanished_file() {
+    let dir = tempfile::tempdir().expect("a temp state dir");
+    let root = dir.path().to_path_buf();
+    let doomed = root.join("doomed.notes");
+    fs::write(&doomed, b"draft").expect("write doomed");
+
+    {
+        let mut first = Harness::at(root.clone(), Settings::default());
+        first.send(Command::SetAutosave(false));
+        first.open(&doomed);
+        assert_eq!(
+            first.flush_skipped("edited", 1),
+            SkipReason::AutosaveDisabled
+        );
+        first.send(Command::Shutdown);
+        first.drain_events();
+    }
+    fs::remove_file(&doomed).expect("delete the note between runs");
+
+    let mut again = Harness::at(root.clone(), Settings::default());
+    let other = again.file("second.notes", b"second");
+    again.open(&other);
+    assert_eq!(
+        again.flush_skipped("typed", 1),
+        SkipReason::AutosaveDisabled,
+        "settings.toml owned the toggle across the restart, not the caller's default"
+    );
+    let list = match again.until(
+        "RecentsUpdated with both files",
+        |ev| matches!(ev, Event::RecentsUpdated(entries) if entries.len() >= 2),
+    ) {
+        Event::RecentsUpdated(entries) => entries,
+        other => panic!("expected RecentsUpdated, got {other:?}"),
+    };
+    assert_eq!(
+        list[0].path, other,
+        "most recent first, from the fresh open"
+    );
+    let vanished = list
+        .iter()
+        .find(|entry| entry.path == doomed)
+        .expect("a vanished recent is kept, not silently deleted (features.md 4.4)");
+    assert!(!vanished.exists, "and it is greyed out");
+    assert!(list.len() <= 10, "D13 cap");
 }

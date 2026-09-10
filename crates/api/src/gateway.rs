@@ -18,13 +18,14 @@
 //!   join just waits for an exit that is already under way.
 //!
 //! No disk I/O happens on the engine thread in this slice. [`Gateway::start`]
-//! reads session.json once, on the calling thread, and that read is the whole
-//! synchronous surface (see [`Gateway::startup_state`] for why).
+//! reads the two state files once, on the calling thread, and those reads are the
+//! whole synchronous surface (see [`Gateway::startup_state`] for why).
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use notes_core::session::read_session_or_default;
+use notes_core::settings::read_settings;
 use notes_core::{Session, Settings, StateDir};
 
 use crate::command::Command;
@@ -91,7 +92,8 @@ impl Gateway {
     /// Starts the engine; returns the handle and the event channel the caller now
     /// owns.
     ///
-    /// session.json is read HERE, on the caller's thread, once - the only way
+    /// session.json and settings.toml are read HERE, on the caller's thread, once -
+    /// the only way
     /// [`Gateway::startup_state`] can be answered before a window exists without a
     /// request/response round trip through the queue. The read never fails
     /// ([`read_session_or_default`]), so a file the user mangled cannot stop
@@ -105,9 +107,28 @@ impl Gateway {
     /// handle than no process.
     #[must_use = "dropping the Gateway aborts the engine thread"]
     pub fn start(state_dir: StateDir, settings: Settings) -> (Gateway, EventRx) {
-        // Read before the thread exists, so the engine and the InitialState come
-        // from ONE read and cannot disagree.
+        // Both reads happen here, on the caller's thread, before the thread exists,
+        // so the engine and the InitialState come from the same bytes and cannot
+        // disagree.
         let session = read_session_or_default(&state_dir.0);
+        // D10's second half: settings.toml owns the autosave toggle and the recents
+        // list, session.json owns the window. Reading the settings file is not
+        // eager work the cold-start budget could defer - the menu cannot render a
+        // check mark it has not read, and recents are the first thing a second
+        // launch opens - so it belongs in this same pre-window slot rather than a
+        // second round trip after the window exists. Both reads are infallible by
+        // contract: a corrupt file yields defaults, and startup never fails on a
+        // state file.
+        //
+        // One field deliberately does NOT come from disk: the code page. That is a
+        // fact about the MACHINE (the bridge's GetACP), not a user choice, and a
+        // persisted value could have come from another locale entirely. The caller
+        // wins there; the file wins everywhere else.
+        let persisted = read_settings(&state_dir);
+        let settings = Settings {
+            codepage: settings.codepage,
+            ..persisted
+        };
         let initial = InitialState {
             pinned: session.pinned,
             autosave_enabled: settings.autosave_enabled,
