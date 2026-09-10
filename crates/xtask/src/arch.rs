@@ -15,7 +15,8 @@
 //!   and build edges alike.
 //! * Transitive closures follow normal and build edges only. Dev edges are
 //!   still policed where they are direct, but not followed: tempfile is a
-//!   dev-dependency and on Windows its own payload carries windows-sys, which
+//!   dev-dependency of notes-core AND of notes-api, and on Windows its own
+//!   payload carries windows-sys, which
 //!   a rule forbids - a detail of an allowed dependency, not a layering
 //!   violation, and following dev edges would reimplement the transitive
 //!   "cargo tree -i" mistake this tool replaces. That allowance is now a named,
@@ -45,7 +46,9 @@
 //! * Dev edges are still not followed, but the allowance is a LIST now, not a
 //!   mood: DEV_TRANSITIVE_EXEMPTIONS names every dev-dependency whose own
 //!   closure carries a forbidden crate (today: tempfile, which pulls
-//!   windows-sys on Windows - decision D23). A dev dep that does the same and
+//!   windows-sys on Windows and is dev-only in BOTH notes-core and notes-api
+//!   - decision D23, and run() prints each measured pairing rather than
+//!   trusting the list). A dev dep that does the same and
 //!   is not on the list is reported as [dev-transitive], and run() prints the
 //!   exemptions it applied, so the allowance is visible where violations are.
 
@@ -241,8 +244,9 @@ pub const DEV_TRANSITIVE_RULE: &str = "dev-transitive";
 
 /// The ONLY dev-dependencies allowed to carry a forbidden crate in their own
 /// closure. An explicit, finite, printed list: tempfile is dev-only in
-/// notes-core (decision D23) and on Windows drags windows-sys, so following dev
-/// edges at all would red-flag a decision, while not looking at them at all
+/// notes-core AND in notes-api (decision D23) and on Windows drags
+/// windows-sys, so following dev edges at all would red-flag a decision,
+/// while not looking at them at all
 /// would let any second one hide in the same allowance. Adding a name here is a
 /// decision; the checker prints which entries it used.
 pub const DEV_TRANSITIVE_EXEMPTIONS: &[&str] = &["tempfile"];
