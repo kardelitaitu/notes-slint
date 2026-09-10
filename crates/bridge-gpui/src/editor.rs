@@ -214,6 +214,22 @@ pub(crate) fn clamp_range(content: &str, range: &Range<usize>) -> Range<usize> {
 
 /// The splice, as a pure function, so that "it cannot panic" is a claim a test can
 /// check for every range rather than one we hope the UI never produces.
+/// The visual lines of a buffer, as byte ranges, each without its line feed. A buffer
+/// ending in a newline gets a final empty line, which is where Enter at the end puts
+/// the caret. LF only: CRLF is normalised on the way in, see the paste handler.
+pub(crate) fn line_ranges(content: &str) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            out.push(start..index);
+            start = index + 1;
+        }
+    }
+    out.push(start..content.len());
+    out
+}
+
 pub(crate) fn splice(content: &str, range: &Range<usize>, text: &str) -> String {
     let range = clamp_range(content, range);
     let mut out = String::with_capacity(content.len() + text.len());
@@ -249,6 +265,10 @@ pub(crate) struct TextState {
     /// The IME composition range: text the platform has put on screen but the user
     /// has NOT committed. Bytes, not UTF-16 units, like everything else in here.
     pub(crate) marked_range: Option<Range<usize>>,
+    /// The grapheme column up and down arrows remember, so a caret walking a ragged
+    /// paragraph does not slide to the margin and stay there. `None` until the first
+    /// horizontal move; never updated by `move_vertical`, which would destroy it.
+    desired_column: Option<usize>,
 }
 
 impl TextState {
@@ -259,6 +279,7 @@ impl TextState {
             selected_range: len..len,
             selection_reversed: false,
             marked_range: None,
+            desired_column: None,
         }
     }
 
@@ -361,13 +382,21 @@ impl TextState {
         }
     }
 
+    /// Put the caret at `offset` WITHOUT touching the remembered column - the door
+    /// `move_vertical` uses, because a vertical move that overwrote the column would
+    /// collapse the caret to the margin after one keystroke and stay there.
+    fn caret_to(&mut self, offset: usize) {
+        let at = grapheme_boundary_after(&self.content, offset);
+        self.selected_range = at..at;
+        self.selection_reversed = false;
+    }
+
     /// Collapse the selection to a caret at `offset`, snapped forward onto a grapheme
     /// boundary so a caller can hand us an index from anywhere and we cannot end up
     /// holding a position that would split a cluster if it became an insertion.
     pub(crate) fn move_to(&mut self, offset: usize) {
-        let at = grapheme_boundary_after(&self.content, offset);
-        self.selected_range = at..at;
-        self.selection_reversed = false;
+        self.caret_to(offset);
+        self.desired_column = Some(self.column_of(self.selected_range.start));
     }
 
     /// Grow the selection to `offset`, flipping which end is the head if the user
@@ -384,6 +413,7 @@ impl TextState {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.desired_column = Some(self.column_of(self.cursor_offset()));
     }
 
     /// Ctrl+A.
@@ -425,22 +455,80 @@ impl TextState {
             .unwrap_or(self.content.len())
     }
 
-    /// The end of the first line: the only part S2 shapes. Multiline is S3.
-    pub(crate) fn first_line_end(&self) -> usize {
-        match self.content.find('\n') {
-            // Exclude the newline itself: gpui shape_line debug-asserts that its input
-            // has none (src/text_system.rs:372), and a shaped line would draw a box.
-            Some(index) => index,
-            None => self.content.len(),
-        }
+    /// Which visual line a byte offset is on.
+    pub(crate) fn line_index_at(&self, byte: usize) -> usize {
+        let byte = byte.min(self.content.len());
+        self.content.as_bytes()[..byte]
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count()
     }
 
-    /// The exact text that was shaped, so a cached layout can be checked against the
-    /// buffer it came from. This is a SUBSTRING from byte 0, which is what keeps the
-    /// byte indices S3 and S4 hand to `x_for_index` in the buffers own space.
-    pub(crate) fn first_line(&self) -> &str {
-        let end = self.first_line_end();
-        &self.content[..end]
+    /// The byte range of the line under `byte`, WITHOUT its newline (a line never
+    /// contains one: gpui `shape_line` debug-asserts that its input has none,
+    /// src/text_system.rs:372, and the newline is the separator, not content to draw).
+    pub(crate) fn line_range_at(&self, byte: usize) -> Range<usize> {
+        line_ranges(&self.content)
+            .into_iter()
+            .nth(self.line_index_at(byte))
+            .unwrap_or(0..self.content.len())
+    }
+
+    /// The grapheme column of a byte offset within its line - the sticky target up and
+    /// down arrows remember. Counted in clusters, not bytes or units, so a column means
+    /// the same thing on `e`+U+0301 as on `e`.
+    pub(crate) fn column_of(&self, byte: usize) -> usize {
+        let line = self.line_range_at(byte);
+        self.content[line.start..byte.min(line.end)]
+            .graphemes(true)
+            .count()
+    }
+
+    /// The byte offset of grapheme column `column` on the line starting at `start`,
+    /// clamped to that line's end. This clamp is the whole of `end` on a short line.
+    pub(crate) fn byte_at_column(&self, start: usize, column: usize) -> usize {
+        let line = self.line_range_at(start);
+        self.content[line.start..line.end]
+            .grapheme_indices(true)
+            .map(|(index, _)| line.start + index)
+            .nth(column)
+            .unwrap_or(line.end)
+            .min(line.end)
+    }
+
+    /// Up and down. The caret goes to the remembered column of the neighbouring line,
+    /// clamped to that lines length, which is what makes walking a paragraph of ragged
+    /// lines feel right instead of sliding to the margin and staying there. Column
+    /// rather than pixel because it needs no layout, so it is testable without a
+    /// window - the same reason S1 split the state out.
+    pub(crate) fn move_vertical(&mut self, delta: isize) {
+        let lines = line_ranges(&self.content);
+        if lines.is_empty() {
+            return;
+        }
+        let here = self
+            .line_index_at(self.cursor_offset())
+            .min(lines.len() - 1);
+        let there = if delta < 0 {
+            here.saturating_sub(delta.unsigned_abs())
+        } else {
+            here.saturating_add(delta as usize).min(lines.len() - 1)
+        };
+        if there == here {
+            // At the top or bottom: collapse to the line edge, like every editor.
+            let edge = if delta < 0 {
+                lines[here].start
+            } else {
+                lines[here].end
+            };
+            self.caret_to(edge);
+            return;
+        }
+        let wanted = self
+            .desired_column
+            .unwrap_or_else(|| self.column_of(self.cursor_offset()));
+        let byte = self.byte_at_column(lines[there].start, wanted);
+        self.caret_to(byte);
     }
 
     pub(crate) fn text_for_range(
@@ -460,6 +548,24 @@ impl TextState {
 // The view: the state, plus the focus handle the toolkit needs
 // ---------------------------------------------------------------------------
 
+/// One shaped visual line and where it was drawn. Owned by the Editor, written in
+/// `paint`, read by the two geometry methods and by the next frame's shape cache.
+pub(crate) struct LineFrame {
+    /// The bytes of the buffer this line shapes, newline excluded.
+    pub(crate) bytes: Range<usize>,
+    /// The text that was handed to `shape_line`, kept by value so a cache hit can be
+    /// checked rather than assumed.
+    pub(crate) text: String,
+    /// Where the composition underline sits WITHIN this line, in the line own bytes.
+    /// Part of the cache key: reuse by text alone would hand back an underline that
+    /// belongs to another frame.
+    pub(crate) mark: Option<Range<usize>>,
+    pub(crate) line: ShapedLine,
+    /// The rect this line occupies after scrolling, in window coordinates. Its bottom
+    /// is the baseline the caret and the IME rect are measured from.
+    pub(crate) bounds: Bounds<Pixels>,
+}
+
 /// The editor widget's model. In S1 it is never rendered; S2 paints what is in here.
 pub(crate) struct Editor {
     /// Content, selection and composition. Read it as the five fields the plan names:
@@ -471,12 +577,25 @@ pub(crate) struct Editor {
     /// geometry methods. Caching it in paint rather than shaping it on demand is what
     /// keeps the IME answer and the pixels in agreement, and it is what the example
     /// does (examples/input.rs:555-559, reading :404-415).
-    last_layout: Option<ShapedLine>,
-    /// The text that `last_layout` was shaped from. Compared by value rather than
-    /// assumed equal, because the shaped text is a first-line SUBSTRING of the buffer
-    /// - see `display_desynced`.
-    last_layout_text: String,
-    last_bounds: Option<Bounds<Pixels>>,
+    /// One entry PER VISUAL LINE, in line order: the shaped line, the bytes of the
+    /// buffer it shapes, and the bounds it was actually drawn at, already scroll
+    /// offset. Line-ADDRESSED is the point - y has to choose a line before x can
+    /// choose a character - and writing the drawn bounds back is what keeps the IME
+    /// rect and the pixels from ever disagreeing (examples/input.rs:555-559 reads the
+    /// cache written at :404-415; here both are per line).
+    frames: Vec<LineFrame>,
+    /// The WHOLE buffer this frame set was shaped from, compared by value. Never
+    /// against one line of it: the examples single-line assert cannot hold once a
+    /// newline exists, because shape_line refuses to take one.
+    frame_text: String,
+    /// Pixels of the buffer scrolled above the top of the element. The rule is the
+    /// boring one every text widget uses: the caret is always visible. No animation,
+    /// no scrollbar, no horizontal scroll (word wrap is out of scope for the whole
+    /// project - a note wider than the window is a note you resize the window for).
+    scroll_y: Pixels,
+    /// What the last frames shaping cost, in microseconds, so the typing budget is a
+    /// number from the binary rather than an argument about the source.
+    shape_us: u128,
 }
 
 impl Editor {
@@ -485,14 +604,15 @@ impl Editor {
     /// (examples/input.rs:703-704).
     /// No font, no shaping, no layout: S1/S2 construct cheap and shape on first paint
     /// (the cold-start budget, whitepaper section 2). This is the whole reason
-    /// `last_layout` starts empty.
+    /// `frames` starts empty.
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         Self {
             state: TextState::default(),
             focus_handle: cx.focus_handle(),
-            last_layout: None,
-            last_layout_text: String::new(),
-            last_bounds: None,
+            frames: Vec::new(),
+            frame_text: String::new(),
+            scroll_y: px(0.0),
+            shape_us: 0,
         }
     }
 
@@ -501,9 +621,10 @@ impl Editor {
         Self {
             state: TextState::new(content),
             focus_handle: cx.focus_handle(),
-            last_layout: None,
-            last_layout_text: String::new(),
-            last_bounds: None,
+            frames: Vec::new(),
+            frame_text: String::new(),
+            scroll_y: px(0.0),
+            shape_us: 0,
         }
     }
 
@@ -511,7 +632,17 @@ impl Editor {
     /// layout is not a crash waiting to happen, it is a WRONG IME RECT waiting to
     /// happen, so both geometry methods check this instead of trusting the cache.
     fn display_desynced(&self) -> bool {
-        self.last_layout_text != self.state.first_line()
+        self.frame_text != self.state.content
+    }
+
+    /// The line a byte offset belongs to, for the geometry methods. A byte at the very
+    /// end of the buffer - the caret after the last character, which is where typing
+    /// leaves it - has no line that CONTAINS it, so it falls to the last line.
+    fn frame_for(&self, byte: usize) -> Option<&LineFrame> {
+        self.frames
+            .iter()
+            .find(|frame| frame.bytes.contains(&byte))
+            .or_else(|| self.frames.last())
     }
 
     /// What S6 will refuse to flush while this is `Some`: an uncommitted composition
@@ -593,17 +724,16 @@ impl EntityInputHandler for Editor {
             .replace_and_mark(range, new_text, new_selected_range);
         cx.notify();
     }
-    /// WHERE THE IME CANDIDATE WINDOW GOES. Real from S2, and the reason the layout is
-    /// cached in paint: the platform asks this between frames, so the only honest
-    /// source is the line that was actually drawn.
+
+    /// WHERE THE IME CANDIDATE WINDOW GOES. The x comes from the shaped line that was
+    /// actually drawn, the y from that line's bounds AFTER scrolling - a candidate list
+    /// for line 4 has to sit at line 4, which is the whole reason the cache is
+    /// line-addressed. The left edge still comes from `element_bounds`, the caller's own
+    /// idea of where the field is, so a resize in flight cannot make the list lag the
+    /// window. A range spanning several lines answers with the FIRST line's segment:
+    /// a candidate window belongs to one line.
     ///
-    /// The x coordinates come from the cached layout (byte indices, which is what
-    /// `x_for_index` takes - the buffer and the shaped line agree on them because the
-    /// shaped text is a substring from byte 0). The frame comes from `element_bounds`,
-    /// the callers own idea of where the field is, rather than from the cached bounds,
-    /// so a resize in flight cannot make the candidate list lag the window.
-    ///
-    /// If the cache does not describe the current buffer, the answer is `None`: a
+    /// If the cache does not describe the current buffer the answer is `None`. A
     /// rectangle built from a stale layout is not a rough guess, it is a lie the
     /// candidate window will sit on top of.
     fn bounds_for_range(
@@ -613,65 +743,74 @@ impl EntityInputHandler for Editor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let layout = self.last_layout.as_ref()?;
         if self.display_desynced() {
             probe("bounds_for_range: no answer, the cached layout is stale");
             return None;
         }
-        let line_len = layout.text.len();
         let range = clamp_range(
             &self.state.content,
             &range_from_utf16(&self.state.content, &range_utf16),
         );
-        let start = range.start.min(line_len);
-        let end = range.end.min(line_len).max(start);
-        let left = layout.x_for_index(start);
-        let right = layout.x_for_index(end);
+        let frame = self.frame_for(range.start)?;
+        let len = frame.text.len();
+        let start = range.start.saturating_sub(frame.bytes.start).min(len);
+        let end = range
+            .end
+            .saturating_sub(frame.bytes.start)
+            .clamp(start, len);
+        let left = frame.line.x_for_index(start);
+        let right = frame.line.x_for_index(end);
         probe(format!(
-            "bounds_for_range units {range_utf16:?} -> bytes {start}..{end}, x {:.1}..{:.1}",
+            "bounds_for_range units {range_utf16:?} -> line {} local {start}..{end}, x {:.1}..{:.1} y {:.1}",
+            self.state.line_index_at(range.start),
             f32::from(left),
-            f32::from(right)
+            f32::from(right),
+            f32::from(frame.bounds.top())
         ));
         Some(Bounds::from_corners(
-            point(element_bounds.left() + left, element_bounds.top()),
-            point(element_bounds.left() + right, element_bounds.bottom()),
+            point(element_bounds.left() + left, frame.bounds.top()),
+            point(element_bounds.left() + right, frame.bounds.bottom()),
         ))
     }
 
-    /// WHICH CHARACTER IS UNDER THIS PIXEL, used by drag-to-position. Real from S2,
-    /// and this is where the assert the plan decided to keep lives - see the comment
-    /// on the check below.
+    /// WHICH CHARACTER IS UNDER THIS PIXEL. y first, then x - the order the single-line
+    /// version could not use, because with one line there was nothing to choose. A point
+    /// in the empty space below the last line is no answer at all, not a clamp: the
+    /// caller is asking where the pointer was.
     fn character_index_for_point(
         &mut self,
         point: Point<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let line_point = self.last_bounds?.localize(&point)?;
-        let layout = self.last_layout.as_ref()?;
-        // examples/input.rs:383 has `assert_eq!(last_layout.text, self.content)` here
-        // - a plain assert, in the path a keystroke takes. The invariant is right and
-        // is kept: a cached layout that does not describe the buffer would return a
-        // character index for text that is no longer there. The FAILURE MODE is what
-        // changed. A notes app must not abort because a frame was stale, so a release
-        // build returns None (the platform loses drag-to-position for that one call)
-        // and a debug build still panics, loudly, with both strings named, at the
-        // exact frame the cache and the buffer diverged.
+        // examples/input.rs:383 asserts `last_layout.text == self.content`, comparing
+        // ONE shaped line against the WHOLE buffer - which cannot hold once a newline
+        // exists, because shape_line will not take one. The invariant is kept,
+        // restated as the pair that CAN be equal, and per S2 as a checked return rather
+        // than an abort: a notes app must not die because a frame was stale. A debug
+        // build still panics loudly at the frame the cache and the buffer diverged.
         debug_assert!(
             !self.display_desynced(),
-            "editor: cached layout {:?} does not describe the buffer's first line {:?}",
-            self.last_layout_text,
-            self.state.first_line()
+            "editor: cached frames describe {:?} but the buffer is {:?}",
+            self.frame_text,
+            self.state.content
         );
         if self.display_desynced() {
             probe("character_index_for_point: no answer, the cached layout is stale");
             return None;
         }
-        let utf8 = layout.index_for_x(point.x - line_point.x)?;
-        let units = offset_to_utf16(&self.state.content, utf8);
+        let frame = self
+            .frames
+            .iter()
+            .find(|frame| frame.bounds.contains(&point))?;
+        let local = frame.bounds.localize(&point)?;
+        let utf8 = frame.line.index_for_x(local.x)?;
+        let byte = (frame.bytes.start + utf8).min(frame.bytes.end);
+        let units = offset_to_utf16(&self.state.content, byte);
         probe(format!(
-            "character_index_for_point x={:.1} -> byte {utf8} -> unit {units}",
-            f32::from(point.x)
+            "character_index_for_point x={:.1} y={:.1} -> byte {byte} -> unit {units}",
+            f32::from(point.x),
+            f32::from(point.y)
         ));
         Some(units)
     }
@@ -696,6 +835,9 @@ actions!(
         Home,
         End,
         EscapeSelection,
+        Newline,
+        Up,
+        Down,
         Copy,
         Cut,
         Paste,
@@ -751,14 +893,35 @@ impl Editor {
     }
 
     fn home(&mut self, _: &Home, _window: &mut Window, cx: &mut Context<Self>) {
-        self.state.move_to(0);
+        // The VISUAL line end, not the buffer end. Home on line 7 of a note must not
+        // teleport to the start of the document - that difference is the whole reason a
+        // text editor is not a text field.
+        let line = self.state.line_range_at(self.state.cursor_offset());
+        self.state.move_to(line.start);
         cx.notify();
     }
 
     fn end(&mut self, _: &End, _window: &mut Window, cx: &mut Context<Self>) {
-        let len = self.state.content.len();
-        self.state.move_to(len);
+        let line = self.state.line_range_at(self.state.cursor_offset());
+        self.state.move_to(line.end);
         cx.notify();
+    }
+
+    fn up(&mut self, _: &Up, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.move_vertical(-1);
+        cx.notify();
+    }
+
+    fn down(&mut self, _: &Down, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.move_vertical(1);
+        cx.notify();
+    }
+
+    /// Enter is an edit like every other one: through the same splice, which is why it
+    /// cannot split a cluster and why a marked composition is handled here exactly as it
+    /// is everywhere else.
+    fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_text_in_range(None, "\n", window, cx);
     }
 
     fn escape(&mut self, _: &EscapeSelection, _window: &mut Window, cx: &mut Context<Self>) {
@@ -784,13 +947,12 @@ impl Editor {
 
     /// Clipboard, by the examples route (examples/input.rs:131-153): three handlers,
     /// nothing else. S2 takes them because they are that separable; S5 owns the
-    /// guarantees. Note the flatten below - it is a SINGLE-LINE field being honest,
-    /// and S3 has to delete it. Paste also goes through `replace_text_in_range`, so a
+    /// guarantees. THE NEWLINE IS KEPT: the example flattens \n at examples/input.rs:133 because its field is one line, and inheriting that into a notes app is a fork bug - a pasted paragraph arrives as one long line. CRLF collapses to LF because core keeps LF internally and the do-no-harm rule restores the file own ending at the save layer. Paste also goes through `replace_text_in_range`, so a
     /// paste cannot land mid-cluster by construction.
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            let one_line = text.replace('\n', " ");
-            self.replace_text_in_range(None, &one_line, window, cx);
+            let normalised = text.replace("\r\n", "\n").replace('\r', "\n");
+            self.replace_text_in_range(None, &normalised, window, cx);
         }
     }
 
@@ -811,23 +973,37 @@ impl Editor {
 }
 
 // ---------------------------------------------------------------------------
-// The paint: one shaped line, the caret, and the composition underlined
+// The paint: one shaped line per visual line, the caret, the composition
+// underlined, and the scroll that keeps the caret on screen
 // ---------------------------------------------------------------------------
 
+/// One line on its way from text to pixels: its bytes in the buffer, the text itself,
+/// the underline if a composition sits inside it, and the shape. Named because clippy is
+/// right that this tuple is doing four jobs at once, and prepaint is not the place to
+/// read a 60-character type.
+type ShapedEntry = (Range<usize>, String, Option<Range<usize>>, ShapedLine);
+
 /// What prepaint worked out and paint draws, so nothing is shaped twice and the
-/// quads are painted from the SAME line the caret position came from.
+/// quads come from the SAME lines the geometry methods will answer with.
 pub(crate) struct PrepaintState {
-    line: Option<ShapedLine>,
-    /// The text `line` was shaped from, carried to `paint` so it can be cached on the
-    /// editor next to the layout.
-    shaped: String,
+    /// One per visual line, already offset by `scroll_y`.
+    frames: Vec<LineFrame>,
     cursor: Option<PaintQuad>,
-    selection: Option<PaintQuad>,
+    /// ONE QUAD PER SPANNED LINE. The example's single selection rect cannot describe
+    /// a selection across a line break, so this is a list. What S3 draws is stated in
+    /// the acceptance report; per-line rects, not one bounding box.
+    selections: Vec<PaintQuad>,
+    /// Carried to `paint`, which writes the model's cache in ONE assignment: frames,
+    /// the text they describe, the offset they were drawn at and the shaping cost. A
+    /// half-updated cache is exactly the stale-rect bug the desync check exists for.
+    scroll_y: Pixels,
+    frame_text: String,
+    shape_us: u128,
 }
 
-/// The editor element. Copy of the examples shape (examples/input.rs:388-562):
-/// request a full-width, one-line-high box, shape in prepaint, and in paint hand the
-/// bounds to the IME, draw selection, glyphs, caret, then cache.
+/// The editor element: request the viewport, shape in prepaint, and in paint hand the
+/// bounds to the IME, draw, then cache the frames on the model (the example's shape,
+/// examples/input.rs:388-562, made line-addressed).
 pub(crate) struct EditorElement {
     input: Entity<Editor>,
 }
@@ -859,9 +1035,13 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        // The VIEWPORT, not the content: the buffer's height is lines x line-height and
+        // asking for that would make the element as tall as the note and push the status
+        // line off screen. The scroll happens inside, which is why the caret rule below
+        // is the only thing that decides what is visible.
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
+        style.size.height = relative(1.).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -876,97 +1056,173 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let input = self.input.read(cx);
-        let display = input.state.first_line().to_string();
-        let selected_range = input.state.selected_range.clone();
-        let cursor = input.state.cursor_offset();
-        let marked_range = input.state.marked_range.clone();
+        let text_system = window.text_system();
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
-
-        // Runs split at the composition boundaries so the marked text can be
-        // underlined: before it, the marked part, after it. Empty runs are filtered
-        // out, because a zero-length run is what makes gpui draw a stray underline.
-        let run = TextRun {
-            len: display.len(),
-            font: style.font(),
-            color: style.color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let runs = match marked_range {
-            Some(marked) => {
-                let marked = clamp_range(&display, &marked);
-                vec![
-                    TextRun {
-                        len: marked.start,
-                        ..run.clone()
-                    },
-                    TextRun {
-                        len: marked.end - marked.start,
-                        underline: Some(UnderlineStyle {
-                            color: Some(run.color),
-                            thickness: px(1.0),
-                            wavy: false,
-                        }),
-                        ..run.clone()
-                    },
-                    TextRun {
-                        len: display.len() - marked.end,
-                        ..run
-                    },
-                ]
-                .into_iter()
-                .filter(|run| run.len > 0)
-                .collect()
+        let lh = f32::from(window.line_height());
+        let viewport = f32::from(bounds.size.height);
+        let left = bounds.left();
+        let right = bounds.right();
+        let mut frames: Vec<LineFrame> = Vec::new();
+        let mut cursor_quad = None;
+        let mut selections: Vec<PaintQuad> = Vec::new();
+        let mut scroll_y = px(0.0);
+        let mut shape_us = 0u128;
+        let mut caret_line = 0usize;
+        let mut frame_text = String::new();
+        self.input.update(cx, |input, _cx| {
+            let lines = line_ranges(&input.state.content);
+            let cursor = input.state.cursor_offset();
+            let selection = input.state.selected_range.clone();
+            let marked = input.state.marked_range.clone();
+            caret_line = input.state.line_index_at(cursor);
+            // Reuse keyed by the line TEXT and its underline, never by the byte range:
+            // a newline inserted at the top shifts every following line, and a key that
+            // includes the offset would re-shape the whole note for one keystroke.
+            let mut old = std::mem::take(&mut input.frames);
+            let mut shaped: Vec<ShapedEntry> = Vec::new();
+            for range in lines.into_iter() {
+                let text = input.state.content[range.clone()].to_string();
+                let mark = marked.as_ref().and_then(|m| {
+                    let start = m.start.max(range.start);
+                    let end = m.end.min(range.end);
+                    (end > start).then_some(start - range.start..end - range.start)
+                });
+                let hit = old.iter().position(|f| f.text == text && f.mark == mark);
+                let line = match hit {
+                    Some(at) => old.remove(at).line,
+                    None => {
+                        let run = TextRun {
+                            len: text.len(),
+                            font: style.font(),
+                            color: style.color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let runs = match mark.clone() {
+                            Some(mark) => {
+                                let mark = clamp_range(&text, &mark);
+                                vec![
+                                    TextRun {
+                                        len: mark.start,
+                                        ..run.clone()
+                                    },
+                                    TextRun {
+                                        len: mark.end - mark.start,
+                                        underline: Some(UnderlineStyle {
+                                            color: Some(run.color),
+                                            thickness: px(1.0),
+                                            wavy: false,
+                                        }),
+                                        ..run.clone()
+                                    },
+                                    TextRun {
+                                        len: text.len() - mark.end,
+                                        ..run
+                                    },
+                                ]
+                                .into_iter()
+                                .filter(|run| run.len > 0)
+                                .collect()
+                            }
+                            None => vec![run],
+                        };
+                        let at = std::time::Instant::now();
+                        let line = text_system.shape_line(
+                            SharedString::from(text.clone()),
+                            font_size,
+                            &runs,
+                            None,
+                        );
+                        shape_us += at.elapsed().as_micros();
+                        line
+                    }
+                };
+                shaped.push((range, text, mark, line));
             }
-            None => vec![run],
-        };
+            // Whatever is left in `old` is a line that no longer exists; dropping it is
+            // the whole invalidation story.
 
-        let line = window.text_system().shape_line(
-            SharedString::from(display.clone()),
-            font_size,
-            &runs,
-            None,
-        );
-
-        let cursor_pos = line.x_for_index(cursor.min(display.len()));
-        let (selection, cursor_quad) = if selected_range.is_empty() {
-            (
-                None,
-                Some(fill(
+            // THE CARET IS ALWAYS VISIBLE: the minimum scroll that brings the caret line
+            // fully in, clamped to the content. No animation, no scrollbar, no
+            // horizontal scroll - word wrap is out of scope for the whole project, so a
+            // note wider than the window is a note you resize the window for.
+            let content_height = lh * (shaped.len() + 1) as f32;
+            let mut offset = f32::from(input.scroll_y);
+            let caret_top = lh * caret_line as f32;
+            if caret_top - offset + lh > viewport {
+                offset = caret_top + lh - viewport;
+            }
+            if caret_top - offset < 0.0 {
+                offset = caret_top;
+            }
+            offset = offset.max(0.0).min((content_height - viewport).max(0.0));
+            scroll_y = px(offset);
+            for (index, (range, text, mark, line)) in shaped.into_iter().enumerate() {
+                let top = f32::from(bounds.top()) + lh * index as f32 - offset;
+                let frame_bounds =
+                    Bounds::from_corners(point(left, px(top)), point(right, px(top + lh)));
+                frames.push(LineFrame {
+                    bytes: range,
+                    text,
+                    mark,
+                    line,
+                    bounds: frame_bounds,
+                });
+            }
+            if let Some(frame) = frames.get(caret_line) {
+                let x = frame.line.x_for_index(
+                    cursor
+                        .saturating_sub(frame.bytes.start)
+                        .min(frame.text.len()),
+                );
+                cursor_quad = Some(fill(
                     Bounds::new(
-                        point(bounds.left() + cursor_pos, bounds.top()),
-                        size(px(2.), bounds.bottom() - bounds.top()),
+                        point(frame.bounds.left() + x, frame.bounds.top()),
+                        size(px(2.0), frame.bounds.size.height),
                     ),
                     rgb(0x0033_99ff),
-                )),
-            )
-        } else {
-            (
-                Some(fill(
-                    Bounds::from_corners(
-                        point(
-                            bounds.left()
-                                + line.x_for_index(selected_range.start.min(display.len())),
-                            bounds.top(),
+                ));
+            }
+            if !selection.is_empty() {
+                for frame in &frames {
+                    let start = selection.start.max(frame.bytes.start);
+                    let end = selection.end.min(frame.bytes.end);
+                    if end <= start {
+                        continue;
+                    }
+                    selections.push(fill(
+                        Bounds::from_corners(
+                            point(
+                                frame.bounds.left()
+                                    + frame.line.x_for_index(start - frame.bytes.start),
+                                frame.bounds.top(),
+                            ),
+                            point(
+                                frame.bounds.left()
+                                    + frame.line.x_for_index(end - frame.bytes.start),
+                                frame.bounds.bottom(),
+                            ),
                         ),
-                        point(
-                            bounds.left() + line.x_for_index(selected_range.end.min(display.len())),
-                            bounds.bottom(),
-                        ),
-                    ),
-                    rgb(0x2d_4a_6b),
-                )),
-                None,
-            )
-        };
+                        rgb(0x2d_4a_6b),
+                    ));
+                }
+            }
+            frame_text = input.state.content.clone();
+        });
+        probe(format!(
+            "prepaint lines={} shape_us={shape_us} scroll={:.1} caret_line={caret_line}",
+            frames.len(),
+            f32::from(scroll_y)
+        ));
         PrepaintState {
-            line: Some(line),
-            shaped: display,
+            frames,
             cursor: cursor_quad,
-            selection,
+            selections,
+            scroll_y,
+            frame_text,
+            shape_us,
         }
     }
 
@@ -981,62 +1237,47 @@ impl Element for EditorElement {
         cx: &mut App,
     ) {
         let focus_handle = self.input.read(cx).focus_handle.clone();
-        // This call is what makes the two geometry methods above answerable at all:
-        // it registers this element as the windows input target for the entity.
+        // Registers this element as the Windows input target for the entity, which is
+        // what makes the two geometry methods answerable at all.
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(selection) = prepaint.selection.take() {
+        for selection in prepaint.selections.drain(..) {
             window.paint_quad(selection);
         }
-        let Some(line) = prepaint.line.take() else {
-            return;
-        };
-        // A failed paint is a blank line for one frame, not an aborted editor.
-        let _ = line.paint(bounds.origin, window.line_height(), window, cx);
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
+        let frames = std::mem::take(&mut prepaint.frames);
+        for frame in &frames {
+            // A failed line is a blank row for one frame, not an aborted editor.
+            let _ = frame
+                .line
+                .paint(frame.bounds.origin, frame.bounds.size.height, window, cx);
         }
-        let shaped = std::mem::take(&mut prepaint.shaped);
-        let caret = self.input.read(cx).state.cursor_offset();
-        // The same expression bounds_for_range evaluates, from the same line object,
-        // so the probe is evidence about the geometry answer and not about a copy of
-        // the arithmetic.
-        probe(format!(
-            "paint shaped={:?} caret_byte={caret} caret_x={:.1}",
-            shaped,
-            f32::from(line.x_for_index(caret.min(shaped.len())))
-        ));
-        // And here the SAME method the platform calls, called with the arguments the
-        // platform would give it, from inside a real frame. Nothing else available
-        // from a script proves this: without a composition in progress Windows never
-        // asks, so a live run shows zero calls. The caret x in the line above and the
-        // rect x here come from one layout object, which is the claim being made.
-        let units = offset_to_utf16(&self.input.read(cx).state.content, caret);
-        let answered = self.input.update(cx, |editor, cx| {
-            editor.bounds_for_range(units..units, bounds, window, cx)
-        });
-        match answered {
-            Some(rect) => probe(format!(
-                "bounds_for_range(0-width at unit {units}) -> x={:.1} width={:.1} height={:.1}",
-                f32::from(rect.origin.x),
-                f32::from(rect.size.width),
-                f32::from(rect.size.height)
-            )),
-            None => probe(format!("bounds_for_range(0-width at unit {units}) -> None")),
+        if focus_handle.is_focused(window) {
+            if let Some(cursor) = prepaint.cursor.take() {
+                window.paint_quad(cursor);
+            }
         }
+        // ONE WRITE, all four fields, so the cache the platform is answered from can
+        // never be half-updated: frames, the text they describe, the offset they were
+        // drawn at, and what shaping cost.
+        let frame_text = std::mem::take(&mut prepaint.frame_text);
+        let scroll_y = prepaint.scroll_y;
+        let shape_us = prepaint.shape_us;
+        let count = frames.len();
         self.input.update(cx, |input, _cx| {
-            input.last_bounds = Some(bounds);
-            input.last_layout_text = shaped;
-            input.last_layout = Some(line);
+            input.frames = frames;
+            input.frame_text = frame_text;
+            input.scroll_y = scroll_y;
+            input.shape_us = shape_us;
         });
+        probe(format!(
+            "paint lines={count} scroll={:.1} shape_us={shape_us}",
+            f32::from(self.input.read(cx).scroll_y)
+        ));
     }
 }
-
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -1057,6 +1298,9 @@ impl Render for Editor {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::newline))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
     }
 }
 
@@ -1520,5 +1764,101 @@ mod tests {
             Some("a")
         );
         assert_eq!(adjusted, Some(2..3));
+    }
+    /// S3, item 1: the line model. LF only, and a buffer ending in a newline gets the
+    /// trailing empty line - that phantom line is where Enter at the end puts the caret,
+    /// so a model that omits it cannot scroll or paint correctly at the end of a note.
+    #[test]
+    fn the_line_model_cuts_on_line_feeds_and_keeps_the_final_empty_line() {
+        assert_eq!(
+            line_ranges("a\nbb\n\nc"),
+            vec![0..1, 2..4, 5..5, 6..7],
+            "ranges exclude the line feed itself"
+        );
+        assert_eq!(
+            line_ranges(""),
+            vec![0..0],
+            "an empty buffer is one empty line"
+        );
+        assert_eq!(line_ranges("x\n"), vec![0..1, 2..2]);
+        let state = TextState::new("abcdef\nab\nabcdefghij".to_string());
+        assert_eq!(state.line_index_at(5), 0);
+        assert_eq!(state.line_index_at(7), 1);
+        assert_eq!(state.line_range_at(15), 10..20);
+    }
+
+    /// S3, item 3: the sticky column. A caret five characters into a paragraph that
+    /// walks down past a SHORT line must come back to column five on the next long one,
+    /// not camp at the margin - which is what a nearest-x implementation does.
+    #[test]
+    fn up_and_down_remember_the_column_through_a_short_line() {
+        let mut state = TextState::new("abcdef\nab\nabcdefghij".to_string());
+        state.move_to(5);
+        assert_eq!(state.column_of(5), 5);
+        state.move_vertical(1);
+        assert_eq!(state.cursor_offset(), 9, "clamped to the short line end");
+        state.move_vertical(1);
+        assert_eq!(
+            state.cursor_offset(),
+            15,
+            "and back to column five on line three"
+        );
+        state.move_vertical(-1);
+        assert_eq!(state.cursor_offset(), 9);
+        state.move_vertical(-1);
+        assert_eq!(
+            state.cursor_offset(),
+            5,
+            "the column survived the whole walk"
+        );
+        state.move_vertical(-1);
+        assert_eq!(state.cursor_offset(), 0, "the top is a no-op, not a panic");
+        state.move_vertical(5);
+        assert_eq!(
+            state.cursor_offset(),
+            15,
+            "five lines down is the LAST line, still at column five - not the margin"
+        );
+        state.move_vertical(1);
+        assert_eq!(
+            state.cursor_offset(),
+            20,
+            "and one more down on the last line goes to its end, the classic rule"
+        );
+    }
+
+    /// Columns are clusters, so a home/end/up/down walk over CJK and combining marks
+    /// steps by what the user sees rather than by bytes or code units.
+    #[test]
+    fn columns_are_clusters_so_cjk_and_marks_count_once() {
+        let state = TextState::new("\u{4e2d}\u{6587}\nabc".to_string());
+        assert_eq!(state.line_range_at(0), 0..6, "two characters, six bytes");
+        assert_eq!(state.column_of(3), 1);
+        assert_eq!(state.byte_at_column(0, 2), 6);
+        let state = TextState::new("e\u{0301}z\nq".to_string());
+        assert_eq!(
+            state.byte_at_column(0, 1),
+            3,
+            "one step is the base AND its acute, never the acute alone"
+        );
+    }
+
+    /// S3, item 2: a pasted block keeps its newlines and CRLF becomes LF on the way in.
+    /// This is the handler body without the window; the flatten the example ships at
+    /// examples/input.rs:133 would have made one 12-character line out of this.
+    #[test]
+    fn a_pasted_crlf_block_becomes_real_lines() {
+        let mut state = TextState::new(String::new());
+        let pasted = "one\r\ntwo\rthree"
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        state.replace(None, &pasted);
+        assert_eq!(state.content, "one\ntwo\nthree");
+        assert_eq!(line_ranges(&state.content).len(), 3);
+        assert!(!state.content.contains('\r'), "the buffer is LF-only");
+        assert!(
+            state.content.matches('\n').count() == 2,
+            "both line feeds are still there"
+        );
     }
 }

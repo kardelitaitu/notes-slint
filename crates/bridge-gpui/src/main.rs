@@ -469,6 +469,11 @@ impl Render for Surface {
         // the label, and the `Div` inherits its text style down to children
         // (src/elements/div.rs:1334, `window.with_text_style`).
         let counters = self.counters();
+        // A shutdown note outranks the last event, because "the engine did not finish"
+        // is the one sentence worth reading before the window disappears.
+        let status = SHUTDOWN_NOTE
+            .with(|note| note.borrow().clone())
+            .unwrap_or_else(|| self.status.clone());
         div()
             .size_full()
             .flex_col()
@@ -493,7 +498,7 @@ impl Render for Surface {
                     .bg(rgb(0x14_14_14))
                     .text_size(px(13.0))
                     .whitespace_nowrap()
-                    .child(self.status.clone())
+                    .child(status)
                     .child(counters),
             )
     }
@@ -771,6 +776,10 @@ fn main() {
                 KeyBinding::new("home", editor::Home, None),
                 KeyBinding::new("end", editor::End, None),
                 KeyBinding::new("escape", editor::EscapeSelection, None),
+                KeyBinding::new("enter", editor::Newline, None),
+                KeyBinding::new("shift-enter", editor::Newline, None),
+                KeyBinding::new("up", editor::Up, None),
+                KeyBinding::new("down", editor::Down, None),
                 KeyBinding::new("ctrl-a", editor::SelectAll, None),
                 KeyBinding::new("ctrl-c", editor::Copy, None),
                 KeyBinding::new("ctrl-x", editor::Cut, None),
@@ -870,8 +879,21 @@ fn main() {
             // has completed before this process leaves main.
             let held = Rc::clone(&subscriptions);
             let closing = Rc::clone(&gateway);
-            held.borrow_mut()
-                .push(cx.on_window_closed(move |_cx| close(&closing)));
+            //
+            // UNREGISTER FIRST, then close. A dead HWND value can be reissued to
+            // another process window, and a GeometryChanged still sitting in the queue
+            // would then be read as OUR rect: the port would write a stranger's position
+            // into session.json and move that stranger on the next launch. Unregister
+            // clears the stored handle, so every queued geometry command after it is a
+            // no-op. The order the port specifies for a recreate is unregister-then-
+            // register, and this site plus STEP 3 above are exactly that pair.
+            held.borrow_mut().push(cx.on_window_closed({
+                let unregistering = Rc::clone(&closing);
+                move |_cx| {
+                    send(&unregistering, Command::UnregisterWindow);
+                    close(&closing);
+                }
+            }));
         }
     });
 
@@ -984,10 +1006,37 @@ fn close(gateway: &Rc<RefCell<Option<Gateway>>>) {
         // Blocking by contract: drain, final session write, join. Legal here
         // because this is the UI thread on its way out, not a frame, and not the
         // engine thread.
+        //
+        // The port hands back ONE error for two outcomes and the bridge cannot tell
+        // them apart: either the queue was already closed, or the bounded join ran out
+        // and the engine was ABANDONED inside its own exit. The second is the one a
+        // user can lose characters to, so the wording covers both instead of guessing
+        // which - and it names the trade: a 3 s abandoned shutdown beats the permanent
+        // hang this replaced, which was measured at 12 s timed out and >15 s lived
+        // through once with no panic, no log, and no event.
         if gateway.close().is_err() {
-            report("Shutdown was queued behind an engine that had already stopped");
+            note_shutdown(
+                "the engine did not finish shutting down - your last edit may not be saved",
+            );
         }
     }
+}
+
+thread_local! {
+    /// A message that arrived when there may be no frame left to render it in. Kept
+    /// so the last frame CAN still show it (render asks for it before the status line)
+    /// and traced immediately, because `windows_subsystem` means there is no console by
+    /// then and the exit trace is the only surviving witness.
+    static SHUTDOWN_NOTE: RefCell<Option<SharedString>> = const { RefCell::new(None) };
+}
+
+fn note_shutdown(words: &str) {
+    SHUTDOWN_NOTE.with(|note| {
+        if note.borrow().is_none() {
+            *note.borrow_mut() = Some(SharedString::from(words.to_string()));
+        }
+    });
+    report(words);
 }
 
 /// The last look at the queue, once there is no loop and no renderer left. Same
