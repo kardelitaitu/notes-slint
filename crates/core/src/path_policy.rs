@@ -61,10 +61,18 @@ pub enum PathVerdict {
     /// The final component ends with '.' or ' ': Win32 strips both from the
     /// final component, so "a.notes." writes "a.notes" while the app reports
     /// Ok for a path that does not exist. One shared implementation with the
-    /// save engine (final_component_is_stripped, plus the shared
-    /// under_extended_prefix carve-out: past \\?\ Win32 strips nothing, so
-    /// the rule does not apply there and policy-Allowed is save-writable)
-    /// so the two can never drift.
+    /// save engine (any_component_is_stripped, judging every component) so
+    /// the two can never drift.
+    ///
+    /// REVERSAL (MAJOR-4): a previous revision carved the extended-length
+    /// prefix out of this rule — past \\?\ Win32 strips nothing, so the
+    /// written file IS the one named. That was true about the mechanism and
+    /// wrong about the product: the probe measured that the plain spelling
+    /// of the saved name is refused by THIS policy, unreadable on disk
+    /// (NotFound), and unreachable by Explorer and the file dialog, while
+    /// identity_key claims it is the same note. A note the user can never
+    /// open again is a lost note, so the rule now applies past the prefix
+    /// too. Do not re-add the carve-out without answering the probe.
     StrippedName,
 }
 
@@ -97,12 +105,14 @@ pub fn path_policy(path: &Path) -> PathVerdict {
     if starts_with_ignore_ascii_case(s, "\\\\?\\UNC\\") {
         return PathVerdict::UnboundedNetwork;
     }
-    // Extended-length prefix: legitimate, and it BYPASSES Win32 name
-    // mangling — so the StrippedName rule does not apply past it (a trailing
-    // dot is a real character there). Everything else is judged normally.
-    // The prefix fact is the SHARED predicate (save::atomic_write carves the
-    // same case out with it), not a local re-derivation.
-    let extended = under_extended_prefix(path);
+    // Extended-length prefix: legitimate — it bypasses Win32 name mangling,
+    // which is exactly why it used to be carved out of the strip rule. The
+    // carve-out is REVERSED (MAJOR-4, see StrippedName): a mangled name past
+    // the prefix writes a note nothing else can open, so the rule now
+    // applies there too. The OTHER extended-prefix judgement stays: a body
+    // that starts with anything but a drive, UNC or a root is the device
+    // namespace.
+    let extended = path.as_os_str().to_string_lossy().starts_with("\\\\?\\");
     let body = s.strip_prefix("\\\\?\\").unwrap_or(s);
     if body.starts_with("\\\\") || body.starts_with("//") {
         return PathVerdict::UnboundedNetwork;
@@ -182,9 +192,9 @@ pub fn path_policy(path: &Path) -> PathVerdict {
     if is_dos_device(name) {
         return PathVerdict::ReservedDevice;
     }
-    // Trailing dot/space mangling — EVERY component, skipped under the
-    // extended prefix (see StrippedName for that carve-out).
-    if !extended && normals.iter().any(|n| final_component_is_stripped(n)) {
+    // Trailing dot/space mangling — EVERY component, INCLUDING past the
+    // extended prefix (MAJOR-4 reversal; see StrippedName).
+    if normals.iter().any(|n| final_component_is_stripped(n)) {
         return PathVerdict::StrippedName;
     }
     PathVerdict::Allowed
@@ -220,16 +230,6 @@ pub(crate) fn any_component_is_stripped(path: &Path) -> bool {
             _ => None,
         })
         .any(|n| final_component_is_stripped(&n))
-}
-
-/// True when the path sits under the \\\\?\\ extended-length prefix, where
-/// Win32 performs NO name mangling: trailing dots and spaces in the final
-/// component are literal characters, so the StrippedName rule does not
-/// apply and what policy allows, save can write. THE shared predicate —
-/// path_policy and save::atomic_write both call this; a local re-derivation
-/// in either half is exactly the drift the sharing exists to prevent.
-pub(crate) fn under_extended_prefix(path: &Path) -> bool {
-    path.as_os_str().to_string_lossy().starts_with("\\\\?\\")
 }
 
 /// Case-insensitive ASCII prefix test. Windows matches path prefixes
@@ -362,9 +362,11 @@ mod tests {
     }
 
     #[test]
-    fn extended_length_prefix_bypasses_only_the_stripping_rule() {
-        // No Win32 mangling past the extended prefix: the dot is real.
-        assert_eq!(v(Path::new(r"\\?\C:\a.notes.")), PathVerdict::Allowed);
+    fn extended_prefix_no_longer_bypasses_the_stripping_rule() {
+        // MAJOR-4 reversal: the dot is a real character past the prefix, but
+        // the note it writes can never be reopened by a plain spelling — so
+        // the stripped spelling is refused there too.
+        assert_eq!(v(Path::new(r"\\?\C:\a.notes.")), PathVerdict::StrippedName);
         // But streams and devices are still judged.
         assert_eq!(v(Path::new(r"\\?\C:\x:ads")), PathVerdict::StreamName);
         assert_eq!(v(Path::new(r"\\?\C:\CON")), PathVerdict::ReservedDevice);
@@ -411,10 +413,6 @@ mod tests {
             1,
             "exactly one definition of the per-path strip rule"
         );
-        assert!(
-            SAVE.contains("path_policy::under_extended_prefix(target)"),
-            "the extended-prefix carve-out must be the shared predicate, not a local re-derivation"
-        );
         // The facts themselves are spelled only here. The needles are built
         // with concat! so this test's own source — part of POLICY, via the
         // include_str! above — cannot count as a second occurrence.
@@ -424,13 +422,6 @@ mod tests {
                 .count(),
             1,
             "the stripped-name rule must have exactly one definition"
-        );
-        assert_eq!(
-            POLICY
-                .matches(concat!("pub(crate) fn under", "_extended_prefix"))
-                .count(),
-            1,
-            "the extended-prefix fact must have exactly one definition"
         );
         // And no inline re-derivation in save: the strip predicate's byte
         // shape may not appear outside the helper.
@@ -476,8 +467,10 @@ mod tests {
             (r"C:\x\sub.\x.notes", PathVerdict::StrippedName),
             (r"C:\x\notes\.", PathVerdict::StrippedName),
             (r"C:\x\notes\..", PathVerdict::StrippedName),
-            // The carve-outs that must SURVIVE these fixes.
-            (r"\\?\C:\a.notes.", PathVerdict::Allowed),
+            // MAJOR-4: the EXT trailing-dot row is refused now, so it moved
+            // out of the carve-outs list; a LEGITIMATE long path (no stripped
+            // component) is still Allowed past the prefix.
+            (r"\\?\C:\a.notes.", PathVerdict::StrippedName),
             (r"\\?\\dir\x.notes", PathVerdict::Allowed), // rooted verbatim form
             (r"\??\C:\x.notes", PathVerdict::ReservedDevice),
             (r"\\.\PhysicalDrive0", PathVerdict::ReservedDevice),

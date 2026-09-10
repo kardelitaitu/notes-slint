@@ -716,7 +716,6 @@ fn stripped_middle_component_shadows_a_real_dot_directory() -> Result<(), Box<dy
 /// A trailing dot past \\?\ is a LITERAL character, so the file really is named
 /// "x.notes." -- and no plain spelling of that name can reach it again.
 #[test]
-#[ignore = r"MAJOR-4: the extended-prefix carve-out writes a trailing-dot name that no plain spelling, the file dialog or Explorer can reopen -- a note nobody can open is a lost note (d58a70d decision coming due)"]
 fn extended_prefix_trailing_dot_is_a_file_no_plain_name_reaches() -> Result<(), Box<dyn Error>> {
     let _scratch = scratch_lock();
     init_scratch()?;
@@ -943,6 +942,25 @@ fn long_path_round_trip_plain_vs_extended() -> Result<(), Box<dyn Error>> {
         Ok(_) => "Ok".to_owned(),
         Err(e) => format!("Err({e})"),
     };
+    // MAJOR-4 regression guard: the reversal must not eat the LEGITIMATE long
+    // path. A >260-char \\?\ path with no stripped component stays Allowed
+    // and savable; a >260-char path with a stripped COMPONENT is refused —
+    // the rule keys on the component, never on the length.
+    assert!(
+        plain.to_string_lossy().chars().count() > 260,
+        "the probe must actually exceed MAX_PATH: {}",
+        plain.to_string_lossy()
+    );
+    assert_eq!(
+        verdict_of(&via),
+        "Allowed",
+        "a legitimate long path past the prefix must stay Allowed"
+    );
+    assert_eq!(
+        verdict_of(&deep.join("dot.")),
+        "StrippedName",
+        "a stripped component is refused at any length"
+    );
     let read_via = match fs::read(&via) {
         Ok(b) => format!("Ok({} bytes)", b.len()),
         Err(e) => io_line(&e),
