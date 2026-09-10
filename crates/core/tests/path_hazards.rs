@@ -53,8 +53,9 @@ use thiserror as _;
 use toml as _;
 
 use notes_core::{
-    Detected, LineEnding, PathVerdict, RecentEntry, TextEncoding, display_labels, identity_key,
-    is_notes_path, path_policy, push, save_document, save_session_bytes,
+    Detected, LineEnding, PathVerdict, RecentEntry, SessionError, StateDir, TextEncoding, clear,
+    display_labels, ensure_scratch_dir, identity_key, is_notes_path, path_policy, push,
+    save_document, save_session_bytes, scratch_note_path,
 };
 
 /// Scratch root under %TEMP%.
@@ -1055,6 +1056,108 @@ fn probe_scratch_is_cleanable() -> Result<(), Box<dyn Error>> {
     assert!(
         !left,
         "the scratch root survived every deletion route -- see the printed path"
+    );
+    Ok(())
+}
+
+/// SCRATCH LOCATION (D69): the untitled note owns a fixed home at
+/// <StateDir>/notes/untitled.notes. This table walks the StateDir shapes
+/// core can produce and asserts, per row:
+/// * the scratch name is a REAL .notes name per is_notes_path — so the
+///   ADR-0001 arming rule applies to it like to any other note;
+/// * the verdict is never a stripped or reparse spelling, for any shape;
+/// * the parent-directory rule COMPOSES: a stripped component in the state
+///   dir itself is refused through the notes path (the BLOCKER-2 rule);
+/// * the UNC exe directory REFUSES as an observable outcome —
+///   ensure_scratch_dir consults the name-only policy BEFORE any filesystem
+///   call, so an unreachable host can never turn "save the untitled note"
+///   into a network stall.
+///
+/// ACCEPTED FAILURE MODES, stated as decisions (see the companion test):
+/// a roaming or OneDrive-redirected APPDATA moves the note body along with
+/// the state — the same exposure portable mode already accepted.
+#[test]
+fn scratch_location_over_state_dir_shapes() -> Result<(), Box<dyn Error>> {
+    let installed = StateDir(PathBuf::from(r"C:\Users\u\AppData\Roaming\notes-gpui"));
+    let portable = StateDir(PathBuf::from(r"C:\Apps\Notes Portable\Data"));
+    let unc_exe = StateDir(PathBuf::from(r"\\no-such-host\share\App\Data"));
+    let dotted_state = StateDir(PathBuf::from(r"C:\u\sub."));
+    for (dir, expected) in [
+        (&installed, "Allowed"),
+        (&portable, "Allowed"),
+        (&unc_exe, "UnboundedNetwork"),
+    ] {
+        let scratch = scratch_note_path(dir);
+        assert_eq!(verdict_of(&scratch), *expected, "{scratch:?}");
+        assert_ne!(
+            verdict_of(&scratch),
+            "StrippedName",
+            "never a stripped spelling: {scratch:?}"
+        );
+        assert_ne!(
+            verdict_of(&scratch),
+            "ReservedDevice",
+            "never a device spelling: {scratch:?}"
+        );
+    }
+    // A real .notes name on the ALLOWED shapes: the ADR-0001 arming rule
+    // applies to the scratch note like to any other note. On the UNC shape
+    // the AGREEMENT rule (is_notes_path) answers false too — a path core
+    // refuses is not a .notes document, so the scratch name can never be
+    // armed for a network location.
+    assert!(is_notes_path(&scratch_note_path(&installed)));
+    assert!(is_notes_path(&scratch_note_path(&portable)));
+    assert!(!is_notes_path(&scratch_note_path(&unc_exe)));
+    // The parent rule composes: the state dir's own stripped component is
+    // refused through the notes path (per-component judging, BLOCKER-2).
+    assert_eq!(
+        verdict_of(&scratch_note_path(&dotted_state)),
+        "StrippedName",
+        "a stripped state-dir component composes into the refusal"
+    );
+    // THE UNC REFUSAL, observable: the error is the policy gate (typed as
+    // PermissionDenied), raised BEFORE any filesystem call — the test would
+    // hang for seconds here if the gate ever moved behind the I/O.
+    let Err(e) = ensure_scratch_dir(&unc_exe) else {
+        panic!("a UNC state dir must refuse the scratch dir, not write across the network");
+    };
+    assert!(
+        matches!(
+            &e,
+            SessionError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied
+        ),
+        "the refusal is the policy gate, not a network error: {e:?}"
+    );
+    Ok(())
+}
+
+/// ACCEPTED FAILURE MODES, named so they are decisions and not accidents:
+/// * a roaming or OneDrive-redirected APPDATA moves the note body along
+///   with the state — asserted here by the scratch note living INSIDE the
+///   state dir; portable mode accepted the same exposure first;
+/// * ClearRecents removes the menu pointer but NOT session.path and NOT the
+///   scratch file — a known gap, out of scope (api owns session.path; core
+///   owns the file and does not delete user text).
+#[test]
+fn scratch_note_roams_with_the_state_and_clear_recents_spares_it()
+-> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let state = StateDir(dir.path().to_path_buf());
+    ensure_scratch_dir(&state)?;
+    let scratch = scratch_note_path(&state);
+    fs::write(&scratch, b"typed text")?;
+    // The exposure, made explicit: the note body lives INSIDE the state dir,
+    // so a redirected APPDATA relocates it together with the session.
+    assert!(
+        scratch.starts_with(&state.0),
+        "the accepted roaming exposure: the scratch note is inside the state dir"
+    );
+    let list = push(Vec::new(), scratch.clone(), "untitled.notes");
+    let list = clear();
+    assert!(list.is_empty(), "ClearRecents empties the menu pointer");
+    assert!(
+        scratch.exists(),
+        "KNOWN GAP: ClearRecents does not remove the scratch file (or session.path) -- accepted, out of scope"
     );
     Ok(())
 }
