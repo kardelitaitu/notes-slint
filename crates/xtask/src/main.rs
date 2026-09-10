@@ -1,6 +1,7 @@
 //! xtask: repository automation, run through the "cargo xtask" alias.
 
 mod arch;
+mod check;
 mod fixtures;
 
 use std::path::{Path, PathBuf};
@@ -31,6 +32,10 @@ fn usage() {
     eprintln!(
         "       enforce the workspace layering rules via cargo metadata (exit 1 on a violation)"
     );
+    eprintln!("usage: cargo xtask check [--quick]");
+    eprintln!(
+        "       run the AGENTS.md gate with per-step verdicts (--quick skips the slow steps)"
+    );
     eprintln!("usage: cargo xtask fixtures generate|verify [--against-generator]");
     eprintln!(
         "       write / check the byte-exact round-trip fixtures (verify exits 1 on any difference;"
@@ -43,6 +48,16 @@ fn usage() {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("check") => {
+            let rest = &args[1..];
+            let quick = rest.iter().any(|a| a == "--quick");
+            if rest.iter().any(|a| a != "--quick") {
+                eprintln!("xtask: check accepts only --quick");
+                usage();
+                std::process::exit(2);
+            }
+            std::process::exit(check::run(quick));
+        }
         Some("check-arch") => std::process::exit(arch::run()),
         Some("fixtures") => match args.get(1).map(String::as_str) {
             Some("generate") => std::process::exit(fixtures::run_generate()),
