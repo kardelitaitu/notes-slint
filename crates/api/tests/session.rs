@@ -1240,3 +1240,72 @@ fn a_note_saved_away_stops_using_the_scratch_and_the_draft_is_kept() {
         "edits after Save As land in the named file"
     );
 }
+
+/// The scratch name is DETERMINISTIC (core's scratch_note_path is pure and
+/// lexical): a second untitled buffer in the same state dir - the next launch,
+/// or another instance - reuses the SAME path rather than inventing
+/// untitled-2.notes. Two writers on one scratch resolve last-writer-wins by
+/// the atomic rename, whole file or nothing, exactly like session.json.
+#[test]
+fn a_second_untitled_note_reuses_the_same_scratch_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let scratch = notes_core::paths::scratch_note_path(&StateDir(dir.path().to_path_buf()));
+
+    // First launch: type, flush, land the draft.
+    let (first, _rx) = Gateway::start_with_host(
+        StateDir(dir.path().to_path_buf()),
+        Settings::default(),
+        None,
+        None,
+    );
+    first
+        .send(Command::Flush {
+            text: "launch one\n".to_string(),
+            revision: 1,
+        })
+        .expect("queued");
+    let deadline = Instant::now() + ANSWER;
+    while fs::read(&scratch).unwrap_or_default() != b"launch one\n" {
+        assert!(Instant::now() < deadline, "the first launch never wrote");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    first.close().expect("shutdown joins the engine");
+
+    // Second launch on the SAME state dir: an untitled buffer again, and the
+    // same path answers - no untitled-2.notes, no new name scheme.
+    let (second, _rx) = Gateway::start_with_host(
+        StateDir(dir.path().to_path_buf()),
+        Settings::default(),
+        None,
+        None,
+    );
+    second
+        .send(Command::Flush {
+            text: "launch two\n".to_string(),
+            revision: 1,
+        })
+        .expect("queued");
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        if fs::read(&scratch).unwrap_or_default() == b"launch two\n" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the second launch never wrote");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    second.close().expect("shutdown joins the engine");
+
+    // Last writer wins, whole file: the only scratch that exists is the one
+    // deterministic path, and no numbered sibling was invented.
+    let notes_dir = dir.path().join("notes");
+    let names: Vec<String> = fs::read_dir(&notes_dir)
+        .expect("list the notes dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["untitled.notes".to_string()],
+        "exactly one deterministic scratch, no invented siblings"
+    );
+}
