@@ -2,6 +2,7 @@
 
 mod arch;
 mod check;
+mod check_ci;
 mod deps;
 mod fixtures;
 mod metadata;
@@ -14,6 +15,10 @@ fn usage() {
     );
     eprintln!("usage: cargo xtask check-deps");
     eprintln!("       reject dependency declarations that can drift from the workspace templates");
+    eprintln!("usage: cargo xtask check-ci [path-to-workflow]");
+    eprintln!(
+        "       prove the CI workflow runs exactly this gate's step roster (exit 1 on drift)"
+    );
     eprintln!("usage: cargo xtask smoke [--reuse-state]");
     eprintln!(
         "       launch the built binary, close its window with WM_CLOSE, prove it exits by itself"
@@ -50,6 +55,7 @@ fn main() {
         }
         Some("check-arch") => std::process::exit(arch::run()),
         Some("check-deps") => std::process::exit(deps::run()),
+        Some("check-ci") => std::process::exit(check_ci::run(&args[1..])),
         Some("smoke") => std::process::exit(smoke::run(&args[1..])),
         Some("fixtures") => match args.get(1).map(String::as_str) {
             Some("generate") => std::process::exit(fixtures::run_generate()),

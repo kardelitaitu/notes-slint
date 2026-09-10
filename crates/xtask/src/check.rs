@@ -147,6 +147,18 @@ fn step_specs() -> Vec<StepSpec> {
             budget_secs: 180,
         },
         StepSpec {
+            name: "check-ci",
+            display: "cargo run -p xtask -- check-ci",
+            program: "cargo",
+            args: &["run", "-p", "xtask", "--quiet", "--", "check-ci"],
+            // Blocking, and never --quick-skipped: it is cheap, it reads two
+            // text files, and it is the row that protects every other row from
+            // drifting away from ci.yml.
+            advisory: false,
+            quick_skippable: false,
+            budget_secs: 60,
+        },
+        StepSpec {
             name: "fixtures",
             display: "cargo run -p xtask -- fixtures verify",
             program: "cargo",
@@ -191,6 +203,20 @@ fn step_specs() -> Vec<StepSpec> {
 /// A step exits 3 to say it DECLINED (see Outcome::Declined). It can never
 /// gate: an environment without a desktop is not a broken repo.
 const DECLINED_EXIT: i32 = 3;
+
+/// The gate's own roster, in the shape check-ci compares against ci.yml. One
+/// source of truth on this side: it is derived from step_specs(), so the list
+/// CI is checked against cannot drift from the list check() actually runs.
+pub fn roster() -> Vec<crate::check_ci::Row> {
+    step_specs()
+        .into_iter()
+        .map(|spec| crate::check_ci::Row {
+            name: spec.name,
+            command: format!("{} {}", spec.program, spec.args.join(" ")),
+            advisory: spec.advisory,
+        })
+        .collect()
+}
 
 /// Spawn the child with inherited stdio (its output streams; its exit code is
 /// the truth) and enforce a wall-clock budget. A deadlocked test suite must
@@ -344,7 +370,7 @@ mod tests {
     #[test]
     fn every_in_repo_checker_is_wired_into_the_gate() {
         let names: Vec<&'static str> = step_specs().iter().map(|s| s.name).collect();
-        for expected in ["check-arch", "check-deps", "fixtures"] {
+        for expected in ["check-arch", "check-deps", "check-ci", "fixtures"] {
             assert!(
                 names.contains(&expected),
                 "{expected} is not wired: {names:?}"
@@ -358,6 +384,31 @@ mod tests {
         assert!(
             !deps.quick_skippable,
             "check-deps reads manifests only; --quick must not skip it"
+        );
+        let ci = step_specs()
+            .into_iter()
+            .find(|s| s.name == "check-ci")
+            .expect("check-ci row");
+        assert!(
+            !ci.advisory,
+            "the drift lock cannot be advisory - that is the hole it closes"
+        );
+        assert!(
+            !ci.quick_skippable,
+            "check-ci protects the other rows, so --quick must not skip it"
+        );
+        // The roster check-ci compares against must be this same list.
+        let roster = roster();
+        assert_eq!(
+            roster.len(),
+            step_specs().len(),
+            "roster() must not lag step_specs()"
+        );
+        assert!(
+            roster
+                .iter()
+                .any(|r| r.name == "check-ci" && r.command.contains("check-ci")),
+            "{roster:?}"
         );
     }
 
