@@ -11,6 +11,7 @@
 
 pub mod document;
 pub mod encoding;
+pub mod format;
 pub mod geometry;
 pub mod paths;
 pub mod save;
@@ -21,6 +22,7 @@ pub use encoding::{
     DecodeError, Detected, EncodeError, LineEnding, MAX_TEXT_BYTES, SUPPORTED_ANSI_CODEPAGES,
     TextEncoding, decode, detect, encode, is_oversize, round_trip,
 };
+pub use format::{NoteParts, is_notes_path, rebuild, split};
 pub use geometry::Rect;
 pub use paths::{StateDir, resolve_state_dir};
 pub use save::{
