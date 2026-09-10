@@ -6,16 +6,20 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-# serde (derive, from the workspace template) is used by the persisted geometry
-# type `geometry::Rect`; thiserror by the crate-wide typed error. Deps are
-# added only as used: unused_crate_dependencies + clippy -D warnings make an
-# unused dep a hard gate error.
+# serde (derive) for the persisted geometry type `geometry::Rect` and the
+# session file; serde_json for the session.json encoding; thiserror for the
+# typed errors. Deps are added only as used: unused_crate_dependencies +
+# clippy -D warnings make an unused dep a hard gate error.
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-# Used only by the serde round-trip test for `Rect`.
-serde_json = { workspace = true }
+# Test directories for the session round-trip tests. Stays a DEV dependency
+# on purpose: on Windows tempfile pulls windows-sys, and the core-no-os arch
+# rule (crates/xtask/src/arch.rs) forbids that in core's normal-edge closure
+# while explicitly sanctioning tempfile as a dev-dependency of notes-core.
+tempfile = { workspace = true }
 
 # NOTE: cargo (measured 1.98.0) forbids overriding inherited workspace lints
 # ("cannot override `workspace.lints` in `lints`"), so the workspace set is
