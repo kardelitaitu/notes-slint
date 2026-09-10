@@ -66,11 +66,41 @@ jobs:
       # once, and the exclusion keeps the verdict attributable. It is NOT a loophole - the
       # bridge is linted by its own named step below (3c), same -D warnings, its own
       # red/green. See 3b/3c for which bridge checks gate and which do not.
+      # DELIBERATELY UNBOUNDED (and this is step 2, the first cargo step of the job, so it
+      # pays for the cold dependency compile out of Swatinem/rust-cache). Warm, the subset
+      # measured below costs 1.7 s; cold, nothing here was measurable this session without
+      # a real CI run to time it against, and a step timeout guessed below the cold graph
+      # compile would convert a slow-but-green run into a false red. The 45-minute job
+      # timeout is the backstop. Revisit with one measured CI duration - and if you do
+      # bound it, bound the bridge clippy at 3c too so the two cannot disagree.
       - name: clippy — cargo clippy --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings
         run: cargo clippy --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings
 
       # --- 3. tests (== the `cargo gate` alias) ------------------------------
+      # BOUNDED, and bounded from measured numbers rather than a guess, because a hang in
+      # here used to cost the job its whole 45-minute timeout with nothing in the log to
+      # say which test stopped: the port has a REPRODUCED deadlock (engine thread inside
+      # SetWindowPos against a parked UI thread, close() joining unbounded - blocked
+      # 12,002 ms in isolation, >15 s with no panic and no event in the full-stack probe).
+      # AGENTS.md already says the two deadlocks show up "only under load", which is
+      # precisely the bug that passes a laptop and hangs a runner, so the bound is the
+      # point: a 15-minute red with this step name beats a 45-minute silence.
+      #
+      # Measured on this machine (warm target dir, --offline, this session):
+      #   cargo test -p notes-core      3.0 s  (142 passed, 2.05 s of test time)
+      #   cargo test -p notes-platform  0.5 s  (28 passed, 0.01 s)
+      #   cargo test -p xtask           2.1 s  (78 passed, 1.60 s)
+      #   cargo clippy -p core -p platform -p xtask --all-targets -D warnings  1.7 s
+      # A full green three-run sample of the step itself was NOT obtainable: the tree is
+      # red mid-flight in notes-api (test target reentrancy) and in notes-core
+      # (path_hazards), both other lanes' edits, so the workspace run fails fast in ~1 s
+      # instead of measuring. Cold compile is bounded from the nearest measured cold
+      # number in this session - the private-target bridge build, 2m11s for the whole
+      # dependency graph - so 15 min is ~7x that and ~300x the warm worst case (3 s):
+      # slack enough that no legitimately slow runner gets cut off, short enough to name
+      # a hang. Raise it only with a measured CI duration, never to silence a red.
       - name: test — cargo test --workspace --exclude notes-bridge-gpui
+        timeout-minutes: 15
         run: cargo test --workspace --exclude notes-bridge-gpui
 
       # --- 3b/3c. THE BRIDGE: which checks gate, and which deliberately do not -
@@ -155,7 +185,10 @@ jobs:
 
       # --- 3c. the bridge is linted too ----------------------------------------
       # Separate step, separate name, so "clippy broke" and "the link broke" are two
-      # different red cells - one merged step would hide which check broke.
+      # different red cells - one merged step would hide which check broke. UNBOUNDED ON
+      # PURPOSE like step 2 (measured here this session: 1m26s cold in a private target dir,
+      # 10.44s warm; the job timeout is the backstop) - the reason and the numbers are
+      # written down so this is a decision, not an oversight. See step 2 for the rule.
       - name: clippy (bridge) — cargo clippy -p notes-bridge-gpui --all-targets -- -D warnings
         id: bridge_clippy
         shell: bash
@@ -206,6 +239,14 @@ jobs:
       #   1  app or persistence failure, OR the harness damaged a user profile, OR no exe
       #   2  the harness could not run at all (no PowerShell, probe unwritable, bad usage)
       #   3  declined: no interactive desktop, OR foreign state on the session path
+      #
+      # And one reason its colour is not its value: smoke is the ONLY step in this file that
+      # has ever caught a wrote-nothing persistence failure on a real machine - it found the
+      # missing state directory, and it found a foreign occupant squatting on the session
+      # path. Every other step proves the code compiles, links, lints and survives unit
+      # tests; only this proves the running app does the one thing the product is for.
+      # Advisory is therefore a judgement about DESKTOPS (a runner with no window station
+      # must not gate a Rust change), not a statement that the check is worth less.
       #
       # What this step must not hide by filtering: it prints the stderr of the app it
       # launches, so a developer machine can show "SettingsCorrupt / running on defaults"
