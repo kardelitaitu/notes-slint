@@ -111,8 +111,18 @@ pub fn clear() -> Vec<RecentEntry> {
 }
 
 /// (identity key, was-canonicalised). The single filesystem touch in this
-/// module: canonicalise reads, nothing writes.
+/// module: canonicalise reads, nothing writes — and NEVER on a path the
+/// name-only policy has judged hostile: canonicalise on an unreachable UNC
+/// host froze a quit for 2.68s in measurement. The lexical fallback is pure
+/// and instant, and was-canonicalised=false is the honest answer (core did
+/// not touch the filesystem).
 fn identity_of(path: &Path) -> (String, bool) {
+    if crate::path_policy::path_policy(path) != crate::path_policy::PathVerdict::Allowed {
+        return (
+            key_from_raw(&lexical_normalisation(path).to_string_lossy()),
+            false,
+        );
+    }
     match std::fs::canonicalize(path) {
         Ok(canonical) => (key_from_raw(&canonical.to_string_lossy()), true),
         Err(_) => (

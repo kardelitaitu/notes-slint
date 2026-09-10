@@ -145,7 +145,7 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError>
     // and the caller keeps editing the name the app did not write. Refuse
     // with the reason; silently rewriting a user-visible path is the same
     // class of lie as reporting success for a different file.
-    if file_name.ends_with('.') || file_name.ends_with(' ') {
+    if crate::path_policy::final_component_is_stripped(&file_name) {
         return Err(SaveError::InvalidPath(
             "the file name ends with '.' or a space, which Windows strips — the file written would not be the one named; rename the target"
                 .to_owned(),

@@ -80,8 +80,15 @@ pub fn rebuild(frontmatter: Option<&str>, body: &str) -> String {
 /// case-insensitive; it never touches the filesystem, so a path need not
 /// exist and a trailing separator is simply ignored by Path parsing.
 pub fn is_notes_path(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("notes"))
+    // Agreement rule (one policy, not two half-rules): a path core would
+    // refuse to open or save — a stream, a device, a stripped name, a
+    // network share — is not a .notes document no matter its extension.
+    // This is what closes the "a.notes." disagreement: the engine refuses
+    // the save, so the app can never hold the stripped name open.
+    crate::path_policy::path_policy(path) == crate::path_policy::PathVerdict::Allowed
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("notes"))
 }
 
 /// Offset just past the first line's terminator (including the '\n' itself;

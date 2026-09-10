@@ -13,6 +13,7 @@ pub mod document;
 pub mod encoding;
 pub mod format;
 pub mod geometry;
+pub mod path_policy;
 pub mod paths;
 pub mod recent;
 pub mod save;
@@ -26,6 +27,7 @@ pub use encoding::{
 };
 pub use format::{NoteParts, is_notes_path, rebuild, split};
 pub use geometry::Rect;
+pub use path_policy::{PathVerdict, path_policy};
 pub use paths::{StateDir, resolve_state_dir};
 pub use recent::{MAX_RECENTS, RecentEntry, RecentList, clear, identity_key, mark_missing, push};
 pub use save::{
