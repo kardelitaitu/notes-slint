@@ -62,13 +62,13 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyWindowHandle, App, Application, AsyncApp, Bounds, Context, IntoElement, Point, Render,
-    SharedString, Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBounds,
+    AnyWindowHandle, App, Application, AsyncApp, Bounds, Context, IntoElement, Pixels, Point,
+    Render, SharedString, Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBounds,
     WindowOptions, div, px, rgb, size,
 };
 use notes_api::{
     Command, Encoding, Event, EventRx, FileMeta, Gateway, InitialState, LineEnding, RecentEntry,
-    Settings, SkipReason, StateDir, WindowHandle, resolve_state_dir,
+    Rect, Settings, SkipReason, StateDir, WindowHandle, resolve_state_dir,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -127,6 +127,14 @@ struct Pump {
     /// the exit trace can name it: this binary is `windows_subsystem`, so after the
     /// window is gone the only place a rendered fact can still be read is stderr.
     last_shown: Option<String>,
+    /// GeometryChanged commands sent, and rect-changes seen: the ratio is the
+    /// debounce, measured. A drag that changes the rect 118 times and costs 2 sends
+    /// is a 59:1 suppression, and this is where that number comes from.
+    rects_sent: u64,
+    motions: u64,
+    /// True while a run of motion is being held back, waiting for quiet.
+    drag_open: bool,
+    last_rect: Option<String>,
 }
 
 /// Take up to `limit` events, NON-BLOCKING, ITERATIVE.
@@ -159,6 +167,132 @@ fn drain_bounded(events: &EventRx, out: &mut Vec<Event>, limit: usize) -> Drain 
     drain
 }
 
+/// How long a moved window must hold still before the bridge tells the port.
+///
+/// A drag fires a new frame rect on almost every frame - Windows sends WM_MOVE and
+/// WM_SIZE continuously (gpui src/platform/windows/events.rs:44-45, and
+/// handle_move_msg at :120 re-stores the origin per message) - and there is no
+/// public subscription for any of it, so an undebounced bridge would post one
+/// command per pixel. The queue is unbounded (api lib.rs: the channels are
+/// unbounded), which makes that a leak rather than a stall: nothing blocks, it just
+/// grows. 250 ms of stillness is 15x the measured wake cadence (16.9 ms), so no user
+/// can feel it, and a drag that never stops is capped by GEOMETRY_FORCE below.
+const GEOMETRY_QUIET: Duration = Duration::from_millis(250);
+
+/// The most a continuous drag may be held back. Without this, a user who resizes
+/// slowly forever would never be recorded at all, which is worse than a few extra
+/// commands: one send per second of unbroken dragging, and it is measured.
+const GEOMETRY_FORCE: Duration = Duration::from_millis(1000);
+
+/// The rect the bridge can see, in physical pixels.
+///
+/// THIS IS NOT A FRAME RECT, and it cannot be. Window::window_bounds (gpui
+/// src/window.rs:1466) is the only public read of where a window is, and on Windows
+/// it is GetWindowPlacement().rcNormalPosition through
+/// calculate_client_rect(rcNormalPosition, border_offset, scale_factor)
+/// (src/platform/windows/window.rs:166-186): the RESTORE position - which is exactly
+/// what a maximized close needs, because WindowBounds::Maximized carries the restore
+/// size by definition (src/platform.rs:1192) - but with the non-client chrome
+/// already SUBTRACTED, in LOGICAL pixels. Putting the chrome back needs border_offset,
+/// which is private to GPUI's window state, and asking Win32 directly needs a windows
+/// dependency this crate may not have (AGENTS.md: a bridge imports the port and its
+/// own toolkit).
+///
+/// So the number sent is a HINT in the bridge's own space, which is what the port
+/// says it is: GeometryChanged is "a TRIGGER and a FALLBACK" (api engine.rs, D48) and
+/// measure_rect overwrites it with the measured FRAME rect on the same tick that
+/// writes. What this slice had to supply is the trigger: nothing else in the app ever
+/// marks the session dirty when the user moves the window.
+fn rect_of(window: &Window) -> Rect {
+    let bounds = match window.window_bounds() {
+        WindowBounds::Windowed(bounds) | WindowBounds::Maximized(bounds) => bounds,
+        // Fullscreen carries the RESTORE size too (gpui src/platform.rs:1195: "the
+        // bounds provided here represent the restore size"), so this is the one case
+        // where reading it is right: the user's note goes back where it was before it
+        // went fullscreen, not to the monitor's full frame.
+        WindowBounds::Fullscreen(bounds) => bounds,
+    };
+    let scale = window.scale_factor();
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let physical = |v: Pixels| f32::from(v).mul_add(scale, 0.0).round();
+    Rect::new(
+        physical(bounds.origin.x) as i32,
+        physical(bounds.origin.y) as i32,
+        physical(bounds.size.width).max(0.0) as u32,
+        physical(bounds.size.height).max(0.0) as u32,
+    )
+}
+
+/// The debounce itself: no GPUI, no clock of its own. Time is passed in, so the
+/// rules are testable as data (a synthetic drag) rather than as a timing hope.
+#[derive(Debug, Default)]
+struct Watch {
+    /// The rect the port was last told about. None until the first look, which is
+    /// the BASELINE: the port put the window there, so reporting it back is noise -
+    /// and it would be the client-space number, a worse answer than the measured one
+    /// the port already holds.
+    reported: Option<Rect>,
+    /// A rect that has been seen and not yet sent.
+    pending: Option<Rect>,
+    /// When the current run of motion began, and when it last changed.
+    first: Option<Instant>,
+    changed: Option<Instant>,
+    /// Counted, because "debounced" is a claim and the number is the proof.
+    motions: u64,
+    sends: u64,
+}
+
+impl Watch {
+    /// Look at the current rect; get back the rect to send, or nothing.
+    fn observe(&mut self, seen: Rect, now: Instant) -> Option<Rect> {
+        let Some(reported) = self.reported else {
+            self.reported = Some(seen);
+            return None;
+        };
+        if seen == reported {
+            // The window is where the port already thinks it is. Any half-finished
+            // run of motion is moot - a drag that ends where it started is not a
+            // fact about the window - so drop it rather than send a stale rect.
+            self.pending = None;
+            self.first = None;
+            self.changed = None;
+            return None;
+        }
+        if self.pending != Some(seen) {
+            self.motions += 1;
+            if self.pending.is_none() && self.first.is_none() {
+                self.first = Some(now);
+            }
+            self.pending = Some(seen);
+            self.changed = Some(now);
+        }
+        // Send only a rect that has STOPPED changing, or one that has been overdue
+        // for a whole force window while the drag never stopped.
+        let quiet = self
+            .changed
+            .is_some_and(|at| now.saturating_duration_since(at) >= GEOMETRY_QUIET);
+        let overdue = self
+            .first
+            .is_some_and(|at| now.saturating_duration_since(at) >= GEOMETRY_FORCE);
+        (quiet || overdue).then(|| self.commit(seen, now, overdue && !quiet))
+    }
+
+    /// Take a rect as sent. A forced send keeps the drag's clock running (the next
+    /// force is another GEOMETRY_FORCE away); a quiet send ends the episode.
+    fn commit(&mut self, rect: Rect, now: Instant, forced: bool) -> Rect {
+        self.reported = Some(rect);
+        self.pending = None;
+        self.first = forced.then_some(now);
+        self.changed = forced.then_some(now);
+        self.sends += 1;
+        rect
+    }
+}
+
 /// The window's root view: the status line, and the Task that feeds it.
 struct Surface {
     /// Shared with `main` so the exit trace can report what the pump cost after
@@ -172,15 +306,32 @@ struct Surface {
     _pump: Option<Task<()>>,
     /// The last event, rendered. Only `describe` writes it.
     status: SharedString,
+    /// This window, so the wake can look at where it is. Filled in by `main` right
+    /// after `open_window` returns, because the view is BUILT inside that call and
+    /// the handle only exists after it: an empty slot simply means "nothing to
+    /// compare yet", which is what the window-not-yet-open case must do anyway.
+    window: Rc<RefCell<Option<AnyWindowHandle>>>,
+    /// Only to send `GeometryChanged` when the watch says the drag has settled.
+    gateway: Rc<RefCell<Option<Gateway>>>,
+    watch: Watch,
 }
 
 impl Surface {
-    fn new(events: Rc<RefCell<EventRx>>, stats: Rc<RefCell<Pump>>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        events: Rc<RefCell<EventRx>>,
+        stats: Rc<RefCell<Pump>>,
+        gateway: Rc<RefCell<Option<Gateway>>>,
+        window: Rc<RefCell<Option<AnyWindowHandle>>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = Self {
             events,
             stats,
             _pump: None,
             status: SharedString::from("no event from the port yet"),
+            window,
+            gateway,
+            watch: Watch::default(),
         };
         this.start_pump(cx);
         this
@@ -189,10 +340,20 @@ impl Surface {
     /// THE ONE WAKE ROUTE. A single main-thread Task, awaited on GPUI's own timer,
     /// draining on wake. See the module comment for the dispatcher path.
     fn start_pump(&mut self, cx: &mut Context<Self>) {
+        let window = Rc::clone(&self.window);
         let task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 cx.background_executor().timer(ENGINE_POLL).await;
-                let keep_running = match this.update(cx, |this, cx| this.pump(cx)) {
+                // The other half of the wake: one read of where the window is now.
+                // It is a `Window` method, so it happens on the loop thread; it is
+                // GPUI's own cached placement, so it costs no syscall of ours beyond
+                // what GPUI already refreshed on WM_MOVE/WM_SIZE. A closed window
+                // reads as None, which the pump treats as "nothing to compare".
+                let seen = match window.borrow().as_ref() {
+                    Some(handle) => handle.update(cx, |_view, window, _cx| rect_of(window)).ok(),
+                    None => None,
+                };
+                let keep_running = match this.update(cx, |this, cx| this.pump(seen, cx)) {
                     Ok(keep) => keep,
                     // The entity is gone with its window, so the pump goes with it.
                     Err(_) => break,
@@ -205,10 +366,10 @@ impl Surface {
         self._pump = Some(task);
     }
 
-    /// One wake: drain, render, and ask for a repaint ONLY if there was something
-    /// to show. Notifying on an idle wake would turn 125 polls a second into 125
-    /// frames a second, which is the mistake this function exists to avoid.
-    fn pump(&mut self, cx: &mut Context<Self>) -> bool {
+    /// One wake: drain, look at the window, render, and ask for a repaint ONLY if
+    /// there was something to show. Notifying on an idle wake would turn 125 polls a
+    /// second into 125 frames a second, which is the mistake this avoids.
+    fn pump(&mut self, seen: Option<Rect>, cx: &mut Context<Self>) -> bool {
         let started = Instant::now();
         let mut batch = Vec::new();
         let drain = {
@@ -250,6 +411,25 @@ impl Surface {
             report(&format!("status line: {shown}"));
             cx.notify();
         }
+
+        // The geometry half of the same wake. ONE read, ONE possible send per wake,
+        // and only after the drag has settled - so a two-second drag cannot put 4000
+        // commands on an unbounded queue. The counters are what prove that claim.
+        if let Some(rect) = seen {
+            let settled = self.watch.observe(rect, Instant::now());
+            if let Some(rect) = settled {
+                send(&self.gateway, Command::GeometryChanged { rect });
+                let mut stats = self.stats.borrow_mut();
+                stats.rects_sent += 1;
+                stats.last_rect = Some(format!(
+                    "{} {}x{} at {},{}",
+                    "sent", rect.w, rect.h, rect.x, rect.y
+                ));
+            }
+            let mut stats = self.stats.borrow_mut();
+            stats.motions = self.watch.motions;
+            stats.drag_open = self.watch.pending.is_some();
+        }
         !drain.closed
     }
 }
@@ -290,7 +470,7 @@ impl Surface {
         let stats = self.stats.borrow();
         let total = stats.busy + stats.idle;
         SharedString::from(format!(
-            "pump: {total} wakes ({busy} with work, {idle} idle) · {events} events · slowest drain {slowest} us · {trunc} capped · cap {cap} · poll {poll} ms",
+            "pump: {total} wakes ({busy} with work, {idle} idle) · {events} events · slowest drain {slowest} us · {trunc} capped · cap {cap} · poll {poll} ms · geometry: {motions} changes, {sends} sent{drag}",
             busy = stats.busy,
             idle = stats.idle,
             events = stats.events,
@@ -298,6 +478,9 @@ impl Surface {
             trunc = stats.truncations,
             cap = MAX_DRAIN_PER_WAKE,
             poll = ENGINE_POLL.as_millis(),
+            motions = stats.motions,
+            sends = stats.rects_sent,
+            drag = if stats.drag_open { " (drag open)" } else { "" },
         ))
     }
 }
@@ -522,12 +705,18 @@ fn main() {
     // A dropped Subscription unsubscribes, so the close handler needs somewhere to
     // live for the whole loop rather than for one call.
     let subscriptions = Rc::new(RefCell::new(Vec::<Subscription>::new()));
+    // The pump needs this window's handle to look at its bounds, but the handle only
+    // exists once `open_window` has returned, and the view is built INSIDE that call.
+    // A one-slot cell is the smallest thing that resolves the ordering; the pump reads
+    // `None` until it is filled, and `None` means "nothing to compare yet".
+    let window_slot: Rc<RefCell<Option<AnyWindowHandle>>> = Rc::new(RefCell::new(None));
 
     Application::new().run({
         let gateway = Rc::clone(&gateway);
         let events = Rc::clone(&events);
         let stats = Rc::clone(&stats);
         let subscriptions = Rc::clone(&subscriptions);
+        let window_slot = Rc::clone(&window_slot);
         move |cx: &mut App| {
             // STEP 2 - create the window AT the saved rect, before anything is
             // drawn. Only the bridge can: the port has no window type at all. The
@@ -546,7 +735,19 @@ fn main() {
             let opened = cx.open_window(options, {
                 let events = Rc::clone(&events);
                 let stats = Rc::clone(&stats);
-                move |_, cx| cx.new(|cx| Surface::new(Rc::clone(&events), Rc::clone(&stats), cx))
+                let gateway = Rc::clone(&gateway);
+                let window_slot = Rc::clone(&window_slot);
+                move |_, cx| {
+                    cx.new(|cx| {
+                        Surface::new(
+                            Rc::clone(&events),
+                            Rc::clone(&stats),
+                            Rc::clone(&gateway),
+                            Rc::clone(&window_slot),
+                            cx,
+                        )
+                    })
+                }
             });
             let Ok(handle) = opened else {
                 // No window means no UI to run: close the port - drain, final
@@ -555,10 +756,13 @@ fn main() {
                 cx.quit();
                 return;
             };
-
             // STEP 3 - register the window handle with the port. The HWND crosses
             // as an i64 because the port must not know a platform type exists.
             let any: AnyWindowHandle = handle.into();
+            // Fill the slot the pump reads. The view was built inside open_window and
+            // could not have had the handle then; until this line lands the pump has
+            // nothing to compare and sends nothing, which is the safe reading.
+            *window_slot.borrow_mut() = Some(any);
             match any
                 .update(cx, |_view, window, _cx| hwnd_of(window))
                 .ok()
@@ -621,6 +825,16 @@ fn main() {
         reported.slowest_us,
         reported.truncations,
     ));
+    report(&format!(
+        "geometry: {} rect changes seen, {} GeometryChanged sent (quiet {} ms, force {} ms)",
+        reported.motions,
+        reported.rects_sent,
+        GEOMETRY_QUIET.as_millis(),
+        GEOMETRY_FORCE.as_millis(),
+    ));
+    if let Some(rect) = reported.last_rect.as_deref() {
+        report(&format!("last GeometryChanged: {rect}"));
+    }
     // And the rendered line itself. `windows_subsystem` means there is no console
     // open once the window is gone, so the exit trace is where "what did the status
     // line show" can still be answered from the binary rather than from a reading
@@ -959,5 +1173,139 @@ mod tests {
         assert!(loaded.contains("9 chars"));
         assert!(describe(&cases[2]).contains("revision 3"));
         assert!(describe(&cases[8]).contains("a.notes (gone)"));
+    }
+
+    fn rect_at(x: i32) -> Rect {
+        Rect::new(x, 200, 800, 600)
+    }
+
+    /// THE DEBOUNCE, as data. A two-second drag at the MEASURED wake cadence
+    /// (16.9 ms, from the 15 s idle run) changes the rect on nearly every wake. Sent
+    /// raw, that is ~118 commands on an unbounded queue for one gesture - the leak
+    /// this slice exists to close. Through `Watch` it costs one.
+    #[test]
+    fn a_two_second_drag_costs_one_command_not_one_per_frame() {
+        let t0 = Instant::now();
+        let mut watch = Watch::default();
+        assert_eq!(
+            watch.observe(rect_at(100), t0),
+            None,
+            "the first look is the baseline"
+        );
+        let mut sends = 0usize;
+        for step in 1..=118u64 {
+            let at = t0 + Duration::from_micros(16_900 * step);
+            if watch.observe(rect_at(100 + step as i32), at).is_some() {
+                sends += 1;
+            }
+        }
+        assert_eq!(
+            watch.motions, 118,
+            "every distinct frame of the drag was seen"
+        );
+        assert!(
+            sends <= 1,
+            "a 2 s drag of 118 changes cost {sends} commands during the drag itself"
+        );
+        assert_eq!(
+            watch.pending,
+            Some(rect_at(218)),
+            "the newest rect is the held one"
+        );
+        // Stop dragging: the held rect goes out on the first wake after the quiet
+        // period, and nothing else follows.
+        let settled = t0 + Duration::from_micros(16_900 * 119) + GEOMETRY_QUIET;
+        assert_eq!(watch.observe(rect_at(218), settled), Some(rect_at(218)));
+        assert_eq!(watch.observe(rect_at(218), settled + GEOMETRY_QUIET), None);
+        assert_eq!(watch.sends, sends as u64 + 1);
+        assert!(watch.sends <= 2, "whole gesture: {} commands", watch.sends);
+    }
+
+    /// A drag that never stops must still be recorded, or a slow resize followed by
+    /// a crash loses the window. The ceiling is one command per GEOMETRY_FORCE.
+    #[test]
+    fn an_endless_drag_is_recorded_once_per_force_window() {
+        let t0 = Instant::now();
+        let mut watch = Watch::default();
+        watch.observe(rect_at(0), t0);
+        let mut at_ms = Vec::new();
+        for step in 1..=600u64 {
+            let now = t0 + Duration::from_millis(10 * step);
+            if watch.observe(rect_at(step as i32), now).is_some() {
+                at_ms.push(now.duration_since(t0).as_millis() as u64);
+            }
+        }
+        assert_eq!(watch.motions, 600, "6 s of 10 ms steps is 600 changes");
+        assert!(
+            at_ms.len() >= 4 && at_ms.len() <= 6,
+            "6 s of unbroken dragging sent {} commands at {at_ms:?}",
+            at_ms.len()
+        );
+        for pair in at_ms.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= GEOMETRY_FORCE.as_millis() as u64 - 20,
+                "forced sends bunched up: {at_ms:?}"
+            );
+        }
+    }
+
+    /// One move, then stillness: exactly one command, and never before the quiet
+    /// period has passed. And a drag that ends where it started is not a fact about
+    /// the window at all, so it must cost nothing.
+    #[test]
+    fn a_stopped_move_sends_once_and_a_return_home_sends_nothing() {
+        let t0 = Instant::now();
+        let mut watch = Watch::default();
+        watch.observe(rect_at(500), t0);
+        let moved = t0 + Duration::from_millis(20);
+        assert_eq!(
+            watch.observe(rect_at(700), moved),
+            None,
+            "too early: still moving"
+        );
+        assert_eq!(
+            watch.observe(rect_at(700), moved + GEOMETRY_QUIET / 2),
+            None,
+            "half the quiet period is not the quiet period"
+        );
+        assert_eq!(
+            watch.observe(rect_at(700), moved + GEOMETRY_QUIET),
+            Some(rect_at(700)),
+            "settled: send it"
+        );
+        assert_eq!(watch.sends, 1);
+        // Stay put: a settled rect is not re-sent, however many wakes pass.
+        assert_eq!(
+            watch.observe(rect_at(700), moved + GEOMETRY_QUIET * 9),
+            None,
+            "a still window must never be reported twice"
+        );
+        assert_eq!(watch.sends, 1, "one move, one command");
+    }
+
+    /// A drag that comes back to where the port already has the window is not a fact
+    /// about the window, so it must cost NOTHING: the held rect is dropped, not sent.
+    /// Without this rule a round trip would persist a window to a place it never was.
+    #[test]
+    fn a_round_trip_before_the_send_costs_no_command_at_all() {
+        let t0 = Instant::now();
+        let mut watch = Watch::default();
+        watch.observe(rect_at(500), t0);
+        let out = t0 + Duration::from_millis(20);
+        assert_eq!(
+            watch.observe(rect_at(700), out),
+            None,
+            "outbound, still held"
+        );
+        assert_eq!(watch.pending, Some(rect_at(700)));
+        let back = out + Duration::from_millis(20);
+        assert_eq!(watch.observe(rect_at(500), back), None, "home again");
+        assert_eq!(watch.pending, None, "a round trip is not a change");
+        assert_eq!(
+            watch.observe(rect_at(500), back + GEOMETRY_QUIET * 4),
+            None,
+            "the round trip must never wake the port"
+        );
+        assert_eq!(watch.sends, 0);
     }
 }
