@@ -250,6 +250,14 @@ const SWEEP_MIN_AGE_SECS: u64 = 60;
 /// value this loop could have produced is, by definition, not ours.
 const MAX_TEMP_ATTEMPTS: u32 = 3;
 
+/// The plausibility floor for a temp's nanos field (MAJOR-2): unix nanos
+/// crossed 1.7e18 in late 2023, so every temp we could ever have created is
+/// above it, and every human-typed date ("2026", "20260101", "1") is far
+/// below. This is the load-bearing bound of the temp shape — the pid field
+/// cannot be bounded (a real pid is any u32) and the attempt field is
+/// already bounded by the retry loop.
+const MIN_PLAUSIBLE_UNIX_NANOS: u128 = 1_700_000_000_000_000_000;
+
 /// B1: the EXACT-SHAPE predicate for our own temp names. A prefix match is
 /// not a capability — "session.json.tmp-backup" (a user's copy of a corrupt
 /// file kept for diagnosis, exactly what D12 invites) would die to a plain
@@ -258,8 +266,11 @@ const MAX_TEMP_ATTEMPTS: u32 = 3;
 /// Round 2 (proven by test): even "three all-digit fields" is typeable by a
 /// human — "session.json.tmp-2026-09-10" parses as pid/nanos/attempt and a
 /// dated backup is by definition older than the age gate. The name must
-/// therefore also end in our ".part" marker, and the attempt field must be
-/// one the retry loop could actually have produced (0..MAX_TEMP_ATTEMPTS).
+/// therefore also end in our ".part" marker, the attempt field must be one
+/// the retry loop could actually have produced (0..MAX_TEMP_ATTEMPTS), and
+/// the nanos field must be a plausible unix-nanos timestamp (MAJOR-2, third
+/// occurrence of this class: "tmp-2026-1-1" parses as nanos=1 and was swept
+/// once older than the age gate; one range check kills every human date).
 /// Matching is case-SENSITIVE on purpose: we only reclaim names we could
 /// have created byte-exactly, never "X.notes.TMP-Mixed" (it cannot be ours).
 fn is_our_temp(file_name: &str, prefix: &str) -> bool {
@@ -272,7 +283,9 @@ fn is_our_temp(file_name: &str, prefix: &str) -> bool {
     let parts: Vec<&str> = body.split('-').collect();
     parts.len() == 3
         && parts[0].parse::<u32>().is_ok()
-        && parts[1].parse::<u128>().is_ok()
+        && parts[1]
+            .parse::<u128>()
+            .is_ok_and(|nanos| nanos >= MIN_PLAUSIBLE_UNIX_NANOS)
         && parts[2]
             .parse::<u32>()
             .is_ok_and(|attempt| attempt < MAX_TEMP_ATTEMPTS)
@@ -652,7 +665,9 @@ mod tests {
         std::fs::write(&target, b"old")?;
         // A REAL crash litter: our exact shape (pid-nanos-attempt.part),
         // with its mtime pushed back past the sweep age so the gate lets go.
-        let litter = dir.path().join("note.notes.tmp-4242-1726000000000-1.part");
+        let litter = dir
+            .path()
+            .join("note.notes.tmp-4242-1770000000000000000-1.part");
         std::fs::write(&litter, b"stale")?;
         age_file(&litter, 120)?;
         // The user's own files: a sweep that deletes either is a disaster.
@@ -789,6 +804,41 @@ mod tests {
         Ok(())
     }
 
+    /// THE CLASS ANSWER (MAJOR-2): a human-typed date in the nanos field
+    /// ("tmp-2026-1-1" parses as nanos=1) used to pass the shape check and
+    /// was swept once older than the age gate — someone's dated note, gone.
+    /// The nanos field must now be a plausible unix-nanos timestamp. Shapes
+    /// audited against this predicate: "tmp-2026-1-1" (rejected: nanos 1),
+    /// "tmp-2026-09-10" (rejected: no .part marker), "tmp-1-2-3-4.part"
+    /// (rejected: four fields), "tmp-0-<real nanos>-0.part" (accepted — a
+    /// typed pid is indistinguishable from a real one, so the nanos range is
+    /// the load-bearing bound), and a real temp (accepted).
+    #[test]
+    fn a_human_date_in_the_nanos_field_is_never_our_temp() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let dated = dir.path().join("sw.notes.tmp-2026-1-1.part");
+        std::fs::write(&dated, b"someone's dated note")?;
+        age_file(&dated, 120)?;
+        // The positive control: a REAL temp of the same age IS reclaimed, so
+        // the sweep ran and the survival below is the gate's verdict.
+        let real = dir
+            .path()
+            .join("sw.notes.tmp-4242-1770000000000000000-0.part");
+        std::fs::write(&real, b"a real crashed temp")?;
+        age_file(&real, 120)?;
+        sweep_stale_temps(dir.path(), "sw.notes.tmp-");
+        assert!(
+            dated.exists(),
+            "a human-typed date must never be mistaken for our temp"
+        );
+        assert!(
+            !real.exists(),
+            "the positive control failed: a real temp was not reclaimed"
+        );
+        Ok(())
+    }
+
     /// M4: the age gate. A temp of OUR shape but written seconds ago (a live
     /// temp of another instance) is never swept; the same shape, old enough,
     /// is.
@@ -799,10 +849,14 @@ mod tests {
         let target = dir.path().join("n.notes");
         std::fs::write(&target, b"old")?;
         // Instance A's live temp: our exact shape, seconds old.
-        let live = dir.path().join("n.notes.tmp-4242-1726000000000-0.part");
+        let live = dir
+            .path()
+            .join("n.notes.tmp-4242-1770000000000000000-0.part");
         std::fs::write(&live, b"being written right now")?;
         // Instance-from-yesterday's litter: same shape, ancient.
-        let ancient = dir.path().join("n.notes.tmp-1717-1726000000000-2.part");
+        let ancient = dir
+            .path()
+            .join("n.notes.tmp-1717-1760000000000000000-2.part");
         std::fs::write(&ancient, b"crash litter")?;
         age_file(&ancient, 3_600)?;
         save_document(&target, "new", det(TextEncoding::Utf8, false))?;
