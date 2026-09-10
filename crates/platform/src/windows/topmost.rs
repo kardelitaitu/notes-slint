@@ -22,8 +22,11 @@ const TOPMOST_FLAGS: SET_WINDOW_POS_FLAGS =
 pub fn set_topmost(handle: isize, on: bool) -> PlatformResult<()> {
     let hwnd = to_hwnd(handle)?;
     let insert_after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
-    // SAFETY: SetWindowPos receives the HWND that `to_hwnd` accepted from IsWindow,
-    // so it names a live window; `insert_after` is one of the two documented
+    // SAFETY: SetWindowPos receives the HWND that `to_hwnd` accepted from IsWindow
+    // at check time. The window may have been destroyed since; SetWindowPos
+    // re-validates the handle internally and fails closed, which maps to
+    // [`PlatformError::Win32`] - not to `InvalidHandle`, and not to undefined
+    // behaviour. `insert_after` is one of the two documented
     // well-known window handles (-1 topmost, -2 not-topmost) and never something this
     // side dereferences; no pointer crosses at all, and TOPMOST_FLAGS carries
     // SWP_NOMOVE and SWP_NOSIZE, which make the four zero coordinates ignored.
@@ -42,12 +45,12 @@ mod tests {
 
     #[test]
     fn a_bad_handle_is_refused_and_never_reaches_the_z_order() {
-        // Every value below is misaligned (kernel handles are 4-byte aligned), so
-        // none can name a live window: the assertions are exact and cannot be flaked
-        // by another process on the desktop. No window is created, focused or waited
-        // on here.
+        // A USER handle value is 4-byte aligned, and the meaningful bits of an HWND
+        // are 32-bit; every value below is misaligned or has the 64-bit sign bit set,
+        // so none can name a live window and no other process can flake this. No
+        // window is created, focused or waited on here.
         for on in [true, false] {
-            for handle in [0, 0x1234_5679, 0x0000_000f, isize::MIN] {
+            for handle in [0, 0x1234_5679, 0x0000_000f, isize::MIN + 1] {
                 let result: PlatformResult<()> = set_topmost(handle, on);
                 assert!(
                     matches!(result, Err(PlatformError::InvalidHandle)),

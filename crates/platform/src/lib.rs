@@ -59,13 +59,22 @@ pub type PlatformResult<T> = Result<T, PlatformError>;
 /// and it never panics, so a caller branches on exactly these three cases.
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {
-    /// The handle was null, or `IsWindow` says it is not a window. Checked before
-    /// any call that would use it, so a stale or forged handle is an error rather
-    /// than an access violation.
+    /// The handle was null, or `IsWindow` refused it at check time: the value never
+    /// named a window on this station.
+    ///
+    /// This is *not* the stale-handle signal. A handle that was live when the guard
+    /// ran and whose window was destroyed a moment later is refused by Win32, and it
+    /// arrives as [`PlatformError::Win32`] instead: all this crate can assert about a
+    /// handle is what one call, at one instant, reported about it.
     #[error("invalid window handle")]
     InvalidHandle,
     /// A Win32 call was made and refused. `api` names the call; `message` is the OS
-    /// text and code, passed through untranslated.
+    /// text and code, passed through untranslated - kept even when the API only
+    /// answered FALSE, so a vanished monitor stays distinguishable from a monitor
+    /// that was never there ([`PlatformError::NoMonitor`]).
+    ///
+    /// This is also what a caller gets for a handle that went stale between the guard
+    /// and the call: the guard cannot hold a window open.
     #[error("Win32 {api} failed: {message}")]
     Win32 {
         /// The Win32 entry point that failed, e.g. `"SetWindowPos"`.
@@ -73,7 +82,9 @@ pub enum PlatformError {
         /// The OS message and error code, as windows-rs reported them.
         message: String,
     },
-    /// No monitor could be resolved for the handle or for the request.
+    /// The monitor lookup returned no monitor at all: a null handle for the request,
+    /// not a monitor that stopped existing mid-call (that is
+    /// [`PlatformError::Win32`], with the OS code intact).
     #[error("no monitor for handle")]
     NoMonitor,
 }

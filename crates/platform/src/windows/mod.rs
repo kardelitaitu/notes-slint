@@ -47,18 +47,27 @@ impl WindowBackend for Backend {
 
 /// Turns an `isize` into an `HWND`, or refuses it.
 ///
-/// This guard is the contract: a null, stale, forged or already-destroyed handle
-/// becomes [`PlatformError::InvalidHandle`] *before* any call that would use it to
-/// look up window state, which is what keeps a bad handle an error instead of an
-/// access violation.
+/// The guard is a check, not a lease. `IsWindow` says the value names a window at
+/// this instant; the `HWND` is then used once, immediately. Nothing here keeps that
+/// window alive, and a window destroyed in the meantime is Win32 to notice: every
+/// call below re-validates the handle internally and fails closed, so the caller
+/// gets an `Err` - a [`PlatformError::Win32`] mapping, deliberately *not*
+/// [`PlatformError::InvalidHandle`].
+///
+/// What the guard does buy is the cheap and certain part: a null value, a forged
+/// value, or a value that never named a window is refused without a second call.
+/// What it cannot buy: a value recycled to some other window inside the same
+/// session is a policy-level misfire, never undefined behaviour - cross-process
+/// `SetWindowPos` is permitted by Windows, and this crate decides nothing about who
+/// owns the handle.
 pub(crate) fn to_hwnd(handle: isize) -> PlatformResult<HWND> {
     if handle == 0 {
         return Err(PlatformError::InvalidHandle);
     }
     let hwnd = HWND(handle as *mut core::ffi::c_void);
-    // SAFETY: IsWindow is a lookup in the window table, not a dereference - Win32
-    // accepts any value-shaped HWND, including 0x1 and isize::MIN, and returns FALSE
-    // for anything that is not a live window. The pointer above is built from an
+    // SAFETY: IsWindow is a lookup in the USER handle table, not a dereference -
+    // Win32 accepts any value-shaped HWND, including 0x1 and isize::MIN + 1, and
+    // answers TRUE or FALSE for this instant. The pointer above is built from an
     // isize already known to be non-zero and is never read through on this side.
     if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         Ok(hwnd)
@@ -81,9 +90,11 @@ mod tests {
     use crate::{FrameRect, PlatformError, PlatformResult, WindowBackend};
 
     /// Runs the three handle-taking seams and returns their verdicts. None of the
-    /// handles used here can name a live window: kernel handles are 4-byte aligned,
-    /// and every value the tests pass is misaligned or out of range. So the
-    /// assertions are exact and cannot be flaked by another process on the desktop.
+    /// handles used here can name a live window: a USER handle value is 4-byte
+    /// aligned, and each value the tests pass is either misaligned or has the 64-bit
+    /// sign bit set - and the meaningful bits of an `HWND` are 32-bit, so no such
+    /// value is a window. The assertions are therefore exact and cannot be flaked by
+    /// another process creating or destroying a window mid-run.
     fn all_handle_seams(backend: &mut Backend, handle: isize) -> Vec<PlatformResult<()>> {
         vec![
             backend.set_topmost(handle, true),
@@ -106,7 +117,7 @@ mod tests {
     #[test]
     fn a_garbage_handle_is_refused_before_it_is_used() {
         let mut backend = Backend;
-        for handle in [1, 2, 3, -1, 0x4000_0002, isize::MIN] {
+        for handle in [1, 2, 3, -1, 0x4000_0002, isize::MIN + 1] {
             for result in all_handle_seams(&mut backend, handle) {
                 assert!(
                     matches!(result, Err(PlatformError::InvalidHandle)),

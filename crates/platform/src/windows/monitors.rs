@@ -37,10 +37,11 @@ fn from_win32(rect: RECT) -> FrameRect {
 pub fn frame_rect(handle: isize) -> PlatformResult<FrameRect> {
     let hwnd = to_hwnd(handle)?;
     let mut rect = RECT::default();
-    // SAFETY: GetWindowRect is given the HWND that `to_hwnd` accepted from IsWindow,
-    // plus a pointer to `rect`, a local repr(C) RECT that is aligned, writable and
-    // alive for the whole call. Win32 writes at most that struct; nothing on this
-    // side dereferences the handle.
+    // SAFETY: GetWindowRect is given the HWND that `to_hwnd` accepted from IsWindow
+    // at check time (the call re-validates it and fails closed if the window died
+    // since), plus a pointer to `rect`, a local repr(C) RECT that is aligned,
+    // writable and alive for the whole call. Win32 writes at most that struct;
+    // nothing on this side dereferences the handle.
     unsafe { GetWindowRect(hwnd, &mut rect) }
         .map_err(|error| win32_error("GetWindowRect", error))?;
     Ok(from_win32(rect))
@@ -51,7 +52,9 @@ pub fn frame_rect(handle: isize) -> PlatformResult<FrameRect> {
 pub fn set_frame_rect(handle: isize, r: FrameRect, scale: f32) -> PlatformResult<()> {
     let hwnd = to_hwnd(handle)?;
     let placed = r.scaled(scale);
-    // SAFETY: the HWND is the one `to_hwnd` accepted from IsWindow; the four
+    // SAFETY: the HWND is the one `to_hwnd` accepted from IsWindow at check time -
+    // SetWindowPos re-validates it and fails closed, so a window destroyed in the
+    // meantime is an error rather than a write into someone else's window; the four
     // coordinates are i32 values rather than pointers; and `None` is the documented
     // null insert-after handle, only meaningful because PLACEMENT_FLAGS carries
     // SWP_NOZORDER. No memory is shared with Win32 in this call.
@@ -77,7 +80,8 @@ pub fn set_frame_rect(handle: isize, r: FrameRect, scale: f32) -> PlatformResult
 /// here moves the window into the area it reports.
 pub fn monitor_work_area(handle: isize) -> PlatformResult<FrameRect> {
     let hwnd = to_hwnd(handle)?;
-    // SAFETY: MonitorFromWindow takes the validated HWND and a by-value flag enum,
+    // SAFETY: MonitorFromWindow takes the check-time-validated HWND and a by-value
+    // flag enum,
     // dereferences nothing, and may return a null monitor handle - which
     // `work_area_of` checks before use.
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
@@ -96,6 +100,12 @@ pub fn primary_work_area() -> PlatformResult<FrameRect> {
 
 /// The `GetMonitorInfoW` half of both entry points above, so the `cbSize`
 /// handshake exists once.
+///
+/// The two refusals are kept apart on purpose: no monitor at all (a null handle from
+/// the lookup) is [`PlatformError::NoMonitor`], while a monitor that stopped
+/// existing - unplugged, or stale since the lookup - arrives as
+/// [`PlatformError::Win32`] with the OS code, because that is a different
+/// diagnosis for the caller and losing the code would hide it.
 fn work_area_of(monitor: HMONITOR) -> PlatformResult<FrameRect> {
     if monitor.is_invalid() {
         return Err(PlatformError::NoMonitor);
@@ -108,19 +118,20 @@ fn work_area_of(monitor: HMONITOR) -> PlatformResult<FrameRect> {
     // `size_of::<MONITORINFO>()` as the API demands, and writes its two RECTs into
     // `&mut info`, a live repr(C) local that outlives the call. `monitor` was just
     // checked non-null; a monitor unplugged since then makes the call return FALSE
-    // rather than fault.
-    if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        Ok(from_win32(info.rcWork))
-    } else {
-        Err(PlatformError::NoMonitor)
-    }
+    // rather than fault. `BOOL::ok` converts that FALSE into an error from the
+    // calling thread immediately, so the code it carries is this call's.
+    unsafe { GetMonitorInfoW(monitor, &mut info) }
+        .ok()
+        .map_err(|error| win32_error("GetMonitorInfoW", error))?;
+    Ok(from_win32(info.rcWork))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PLACEMENT_FLAGS, from_win32, monitor_work_area, set_frame_rect};
+    use super::{PLACEMENT_FLAGS, from_win32, monitor_work_area, set_frame_rect, work_area_of};
     use crate::{FrameRect, PlatformError, PlatformResult, WindowBackend};
     use ::windows::Win32::Foundation::RECT;
+    use ::windows::Win32::Graphics::Gdi::HMONITOR;
     use ::windows::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE,
         SWP_NOZORDER,
@@ -157,7 +168,10 @@ mod tests {
 
     #[test]
     fn a_bad_handle_never_reaches_a_monitor_or_placement_call() {
-        for handle in [0, 2, 3, isize::MIN] {
+        // 2 and 3 are misaligned for a USER handle, 0 is null, and isize::MIN + 1
+        // has the 64-bit sign bit set while the meaningful bits of an HWND are
+        // 32-bit: none of them can name a live window.
+        for handle in [0, 2, 3, isize::MIN + 1] {
             let result: PlatformResult<FrameRect> = monitor_work_area(handle);
             assert!(
                 matches!(result, Err(PlatformError::InvalidHandle)),
@@ -169,6 +183,25 @@ mod tests {
                 "{result:?}"
             );
         }
+    }
+
+    /// The two refusals are different diagnoses, so they must not share a variant: a
+    /// null monitor handle is `NoMonitor`, a monitor that stopped existing is a
+    /// `Win32` mapping that still carries the OS code.
+    #[test]
+    fn a_null_monitor_and_a_dead_monitor_are_not_the_same_refusal() {
+        let null = work_area_of(HMONITOR(core::ptr::null_mut()));
+        assert!(matches!(null, Err(PlatformError::NoMonitor)), "{null:?}");
+        // 4-byte aligned and non-null, so it clears the guard and reaches the API,
+        // but an HWND/HMONITOR's meaningful bits are 32-bit: with the 64-bit sign bit
+        // set this cannot name a monitor on any station. GetMonitorInfoW answers
+        // FALSE, and the point of the test is that the code survives the mapping.
+        let dead = HMONITOR(isize::MIN as *mut core::ffi::c_void);
+        let result = work_area_of(dead);
+        assert!(
+            matches!(&result, Err(PlatformError::Win32 { api, .. }) if *api == "GetMonitorInfoW"),
+            "{result:?}"
+        );
     }
 
     /// Tolerant by design: a build agent may have no interactive desktop, a session-0
