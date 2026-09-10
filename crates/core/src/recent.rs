@@ -136,6 +136,10 @@ const MAX_LABEL_CHARS: usize = 64;
 ///   marks any parents above it that were cut; every label is then
 ///   hard-capped at MAX_LABEL_CHARS chars. Residual ambiguity past the
 ///   bounds is honest and harmless: a label is never an identity.
+/// * Invisible and bidi control characters are substituted with visible
+///   markers ([RTL], [ZWSP]): a menu is a security surface, and a U+202E
+///   name that renders backwards, or two labels that render identically,
+///   is filename spoofing (MAJOR-6). The path and identity are untouched.
 /// * A vanished entry (exists = false) labels exactly like a present one:
 ///   greying is the bridge's rendering of 'exists', not a naming rule.
 pub fn display_labels(entries: &[RecentEntry]) -> Vec<String> {
@@ -212,7 +216,21 @@ pub fn display_labels(entries: &[RecentEntry]) -> Vec<String> {
             }
         }
     }
-    labels.into_iter().map(hard_cap).collect()
+    labels
+        .into_iter()
+        .map(|l| hard_cap(visible_label(&l)))
+        .collect()
+}
+
+/// The label is a SECURITY surface (MAJOR-6): U+202E (bidi override —
+/// renders what follows backwards) and U+200B (zero-width) are legal in
+/// filenames but must never reach a menu verbatim. The user sees the
+/// bracketed marker instead: it NAMES the oddity rather than silently
+/// hiding it, and two labels that differed only invisibly become visibly
+/// different. The path, the identity and the file are untouched — this is
+/// the label rule, not a refusal.
+fn visible_label(label: &str) -> String {
+    label.replace('\u{202E}', "[RTL]").replace('\u{200B}', "[ZWSP]")
 }
 
 /// (identity key, was-canonicalised). The single filesystem touch in this

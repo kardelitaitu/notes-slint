@@ -812,6 +812,25 @@ fn invisible_names_reach_the_menu_verbatim() -> Result<(), Box<dyn Error>> {
         "  the menu carries the bidi control unescaped? {}",
         labels.iter().any(|l| l.contains(&rtl().to_string()))
     );
+    // MAJOR-6, ASSERTED (D45: a print is not a test): no raw invisible or
+    // bidi control may reach a menu label, every control must be visibly
+    // substituted, and two labels that used to render identically once the
+    // invisible char was dropped must differ without any stripping.
+    assert!(
+        labels
+            .iter()
+            .all(|l| !l.contains(&rtl().to_string()) && !l.contains(&zwsp().to_string())),
+        "a raw invisible or bidi control reached a menu label: {visible:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l.contains("[RTL]"))
+            && labels.iter().any(|l| l.contains("[ZWSP]")),
+        "the controls must be visibly substituted, got {visible:?}"
+    );
+    assert_eq!(
+        twins, 0,
+        "two labels still render identically once the control is dropped: {visible:?}"
+    );
     Ok(())
 }
 /// CASE AND COLLISION: NTFS is case-insensitive and case-preserving, so a second
