@@ -29,7 +29,9 @@ use notes_api::{
 use notes_core::session::{FILE_NAME, read_session};
 
 // thiserror is a dependency of notes-api, not of this test target; naming it
-// keeps the unused-crate-dependencies lint honest about that.
+// keeps the unused-crate-dependencies lint honest about that. Same for
+// notes-platform: the port owns its host now (D46), this test never calls it.
+use notes_platform as _;
 use thiserror as _;
 
 /// Long enough that a real disk round trip cannot time out on a loaded machine,
@@ -68,7 +70,13 @@ impl Harness {
     /// played: same [`StateDir`], fresh [`Gateway`], nothing in memory.
     fn at(root: PathBuf, settings: Settings) -> Self {
         let dir: Option<tempfile::TempDir> = None;
-        let (gateway, rx) = Gateway::start(StateDir(root.clone()), settings);
+        // No host on this harness: none of these scenarios exercise window
+        // geometry, and the port now OWNS the platform object (D46), so a real
+        // Win32 backend here would answer a made-up handle with refusals.
+        // facts = None is also exactly the no-codepage state the D27 test below
+        // relies on: with no host there is no gap-filler, so an ANSI file is
+        // refused rather than guessed.
+        let (gateway, rx) = Gateway::start_with_host(StateDir(root.clone()), settings, None, None);
         // 5.5 step 3, once per scenario: the window exists before anything is
         // asked of it, so the engine is in the state a bridge would leave it in.
         let _ = gateway.send(Command::RegisterWindow {

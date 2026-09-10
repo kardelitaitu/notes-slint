@@ -14,7 +14,9 @@ use std::path::Path;
 // and never used, which is the whole point of the file - a bridge needs nothing
 // from it. The unused-crate-dependencies lint is per target, so it is told.
 use notes_core as _;
-// Named for the same per-target lint; this file uses none of it.
+// Named for the same per-target lint; this file uses none of them. The port
+// owning its host (D46) put notes-platform on this target's graph too.
+use notes_platform as _;
 use thiserror as _;
 
 use notes_api::{
@@ -85,8 +87,9 @@ fn a_bridge_can_obey_the_startup_order_with_only_notes_api() {
             })
             .is_ok()
     );
-    // 4. apply topmost from [`initial.pinned`], through notes-platform, which
-    //    this crate cannot even name - the boundary is the assertion.
+    // 4. topmost is the PORT's work now, applied on registration from the
+    //    stored pin bit (D46) - a bridge supplies a handle, never a platform
+    //    call. The boundary is the assertion.
     assert!(!gateway.is_closed(), "a started engine is open");
     assert!(gateway.engine_is_alive());
 

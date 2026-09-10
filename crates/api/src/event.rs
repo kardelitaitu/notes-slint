@@ -10,6 +10,7 @@
 //! This module is **data only**: no serializer, no watcher, no debounce. Those
 //! are engine and core work.
 
+use notes_core::Rect;
 use std::path::PathBuf;
 
 /// How a file's bytes are encoded, and therefore how they must be written back.
@@ -273,6 +274,23 @@ pub enum Event {
     /// A save succeeded, and the buffer at `revision` is now what is on disk
     /// (D11 — this is what makes later flushes at that revision `Clean`).
     Saved { path: PathBuf, revision: u64 },
+    /// The port could not put the window where the session said it belongs, or
+    /// could not apply the pin bit. Emitted by
+    /// [`RegisterWindow`](crate::Command::RegisterWindow) - the moment the handle
+    /// becomes usable - and by the save tick when the RESTORE rect cannot be
+    /// measured (D48). Silence is forbidden here: a window that opens in the wrong
+    /// place, and a session meant to be pinned that is not, otherwise look exactly
+    /// like the app forgetting. [`rect`] is the rect the port asked for, so the
+    /// copy can name the place it could not reach; [`reason`] is notes-platform's
+    /// own sentence (its [`PlatformError`] Display) passed through untranslated,
+    /// for the same reason [`SaveError::Other`] carries OS text - it is the one
+    /// clue the user has, and the port may not invent a friendlier one.
+    GeometryNotRestored {
+        /// Where the window was supposed to go, in frame pixels.
+        rect: Rect,
+        /// The platform's own words for why it refused.
+        reason: String,
+    },
     /// The open document is now a DIFFERENT file: Save As wrote it elsewhere, so
     /// the path changed, the arming changed with it (ADR-0001 requirement 4), and
     /// the `meta` field describes the file that exists now rather than the one first
@@ -304,6 +322,19 @@ pub enum Event {
     AutosaveSkipped { reason: SkipReason },
     /// The recent-files list, in most-recent-first order, capped at 10 (D13).
     RecentsUpdated(Vec<RecentEntry>),
+    /// settings.toml exists but is not valid TOML. D12: the bytes are left
+    /// untouched on disk for diagnosis, the launch proceeds on factory
+    /// settings - and this event is the rendering of THAT fact, because a
+    /// corrupt file that quietly became defaults would read, a year later,
+    /// as the app having lost a user's choice. Emitted once, at startup,
+    /// before any engine event: [`Gateway::start`] is where the file is read,
+    /// and the queue is the only output the port has. [`reason`] is core's
+    /// own sentence (its SettingsError::Corrupt Display), passed through
+    /// untranslated - the same rule as [`SaveError::Other`].
+    SettingsCorrupt {
+        /// What core's parser said, verbatim.
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -360,7 +391,14 @@ mod tests {
             },
             Event::ExternalChange { path } => Event::ExternalChange { path: path.clone() },
             Event::AutosaveSkipped { reason } => Event::AutosaveSkipped { reason: *reason },
+            Event::GeometryNotRestored { rect, reason } => Event::GeometryNotRestored {
+                rect: *rect,
+                reason: reason.clone(),
+            },
             Event::RecentsUpdated(entries) => Event::RecentsUpdated(entries.clone()),
+            Event::SettingsCorrupt { reason } => Event::SettingsCorrupt {
+                reason: reason.clone(),
+            },
         }
     }
 
@@ -373,6 +411,8 @@ mod tests {
             Event::SaveFailed { .. } => "SaveFailed",
             Event::ExternalChange { .. } => "ExternalChange",
             Event::AutosaveSkipped { .. } => "AutosaveSkipped",
+            Event::GeometryNotRestored { .. } => "GeometryNotRestored",
+            Event::SettingsCorrupt { .. } => "SettingsCorrupt",
             Event::RecentsUpdated(_) => "RecentsUpdated",
         }
     }
@@ -415,11 +455,18 @@ mod tests {
             Event::AutosaveSkipped {
                 reason: SkipReason::ForeignFileNotArmed,
             },
+            Event::GeometryNotRestored {
+                rect: Rect::new(120, 90, 800, 600),
+                reason: "Win32 SetWindowPos failed: the fixture's sentence".to_string(),
+            },
             Event::RecentsUpdated(vec![RecentEntry {
                 path: PathBuf::from("C:/notes/a.notes"),
                 display: "a.notes".to_string(),
                 exists: true,
             }]),
+            Event::SettingsCorrupt {
+                reason: "settings file corrupt: expected a value at line 2".to_string(),
+            },
         ]
     }
 
@@ -437,9 +484,9 @@ mod tests {
             all.len(),
             "the fixture must cover each variant exactly once: {names:?}"
         );
-        // Loaded, LoadFailed, Saved, SaveFailed, ExternalChange, AutosaveSkipped,
-        // RecentsUpdated.
-        assert_eq!(all.len(), 8, "Event gained or lost a variant");
+        // Loaded, LoadFailed, Saved, GeometryNotRestored, SaveFailed,
+        // ExternalChange, AutosaveSkipped, RecentsUpdated, SettingsCorrupt.
+        assert_eq!(all.len(), 10, "Event gained or lost a variant");
 
         for event in &all {
             assert_eq!(event, &event.clone(), "{event:?} clone is not equal");

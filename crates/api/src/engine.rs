@@ -24,6 +24,7 @@ use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use notes_core::geometry::Rect;
 use notes_core::save::IoStep;
 use notes_core::session::write_session;
 use notes_core::settings::{SETTINGS_FILE_NAME, write_settings};
@@ -38,6 +39,8 @@ use crate::command::{Command, WindowHandle};
 use crate::event::{
     Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason,
 };
+use notes_platform::{FrameRect, HostFacts, WindowBackend};
+
 use crate::gateway::EventTx;
 
 /// The autosave idle cadence, in its temporary home.
@@ -171,20 +174,25 @@ pub(crate) struct Engine {
     /// file they are persisted to (D10's one-home discipline, applied to the
     /// settings.toml half of state; session.json owns the window half).
     ///
-    /// One value inside it is still a placeholder for a machine fact: core's
-    /// [`Settings::codepage`] defaults to Some(1252), which is a CP1252 guess, and
-    /// D27 forbids guessing a code page. The bridge is meant to read
-    /// notes-platform's [`HostFacts::ansi_codepage`] and hand it over on every
-    /// start; until that lands, a caller that cares must overwrite the field. This
-    /// crate cannot ask the OS (no dependency yet, and the value is not ours to
-    /// decide) and must not present the default as measured.
+    /// Codepage resolution happens at DETECT time, not here (D27): what the file
+    /// persisted is the user's choice, the gap nobody chose is filled by the
+    /// host's ANSI code page through the [`HostFacts`] seam this crate owns, and
+    /// when both are silent an ANSI file is REFUSED, never guessed. See
+    /// [`Engine::resolved_codepage`].
     settings: Settings,
-    /// // §5.5 step 3: the handle the bridge registered. Stored, never used -
-    /// topmost goes through notes-platform -- an edge arch.rs ALLOWS the port
-    /// (it groups api with core and platform on purpose). The handle is unused
-    /// today only because the dependency line has not been added and the wiring is
-    /// the next slice, not because the boundary forbids it.
+    /// 5.5 step 3: the handle the bridge registered. Now USED: the first
+    /// registration is the moment the port restores the window and applies the
+    /// pin, through its own host seams (D46) - see [`Engine::restore_and_pin`].
     window: Option<WindowHandle>,
+    /// The two host seams, constructed by the port (D46) so a bridge never names a
+    /// platform type. [`None`] only where notes-platform has no implementation to
+    /// offer - its Win32 module is [`cfg(windows)`] - and then the port places
+    /// nothing and pins nothing, quietly. That is a build-time fact about a host this
+    /// app does not ship to, not a refused action, so it is the one case allowed to
+    /// stay silent; every refusal by a REAL seam becomes
+    /// [`Event::GeometryNotRestored`].
+    backend: Option<Box<dyn WindowBackend>>,
+    facts: Option<Box<dyn HostFacts>>,
     /// Revision, dirty, armed, read-only, oversize and the fixed order of the skip
     /// reasons: all of it core's judgement. This engine supplies the facts the
     /// bridge sent and records what happened.
@@ -220,12 +228,33 @@ pub(crate) struct Engine {
 
 impl Engine {
     /// Builds the loop's state from what [`Gateway::start`] already read.
+    /// The engine with the host it was built for. Tests that must SEE a platform
+    /// call pass a recording host, through
+    /// [`start_with_host`](crate::Gateway::start_with_host) or [`with_host`] below.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         cmd_rx: mpsc::Receiver<Command>,
         event_tx: EventTx,
         state_dir: StateDir,
         session: Session,
         settings: Settings,
+        backend: Option<Box<dyn WindowBackend>>,
+        facts: Option<Box<dyn HostFacts>>,
+    ) -> Self {
+        Self::with_host(
+            cmd_rx, event_tx, state_dir, session, settings, backend, facts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_host(
+        cmd_rx: mpsc::Receiver<Command>,
+        event_tx: EventTx,
+        state_dir: StateDir,
+        session: Session,
+        settings: Settings,
+        backend: Option<Box<dyn WindowBackend>>,
+        facts: Option<Box<dyn HostFacts>>,
     ) -> Self {
         // The session's last document is RESTORED as state, not read from disk:
         // no bytes are touched here, and whether to Open it is the bridge's call
@@ -261,6 +290,8 @@ impl Engine {
             frontmatter: None,
             pending: Pending::default(),
             load_refused: false,
+            backend,
+            facts,
             deadline: Instant::now() + AUTOSAVE_IDLE,
             session,
         }
@@ -331,12 +362,28 @@ impl Engine {
     fn handle(&mut self, command: Command) -> Flow {
         match command {
             Command::RegisterWindow { handle } => {
-                // §5.5 step 3. Stored, and nothing emitted: no UI is waiting to
-                // hear its own registration back, and there is no platform call
-                // this crate is allowed to make with the handle.
+                // 5.5 steps 3 AND 4 in one arm (D46): the handle is stored, and the
+                // first registration is the earliest moment anything can be done with
+                // it - the window exists, and its rect is the one number that has to
+                // be right before the user sees the frame.
+                //
+                // first-registration ONLY, deliberately: a later one (a recreate, a
+                // duplicate send) must never yank a window the user has since moved
+                // by hand. That guard is the difference between a restore and a theft.
+                let first = self.window.is_none();
                 self.window = Some(handle);
+                if first {
+                    self.restore_and_pin(handle);
+                }
             }
             Command::GeometryChanged { rect } => {
+                // D48: a TRIGGER and a FALLBACK, no longer the source of truth. The
+                // bridge may import api and its toolkit and nothing else, so the only
+                // rect it can measure is its own space, while what must be persisted is
+                // the RESTORE frame rect - which it has no seam to read. The hint is
+                // kept (it is the best available number if the platform call fails, and
+                // a move the bridge recorded is not a lie); [`measure_rect`] replaces
+                // it with the measured rect on the same tick that writes.
                 if self.session.rect != rect {
                     self.session.rect = rect;
                     self.queue(Target::Session);
@@ -424,7 +471,7 @@ impl Engine {
             }
         };
 
-        let detected = detect(&bytes, self.settings.codepage);
+        let detected = detect(&bytes, self.resolved_codepage());
         let raw = match decode(&bytes, detected) {
             Ok(text) => text,
             Err(err) => {
@@ -513,7 +560,7 @@ impl Engine {
         }
         // If the target already exists, ITS bytes win: overwriting a UTF-16 file
         // with the source's UTF-8 is exactly the silent change §4.5 forbids.
-        let detected = existing_detected(path, self.settings.codepage);
+        let detected = existing_detected(path, self.resolved_codepage());
         let disk_text = self.text_for_disk(text);
         match self.write(path, &disk_text, detected, revision) {
             Ok(()) => {
@@ -685,6 +732,153 @@ impl Engine {
         self.flush_state();
     }
 
+    /// How many pixels must stay on screen after a clamp, per axis. Core takes the
+    /// number per call precisely because it is product policy and not geometry, and
+    /// nobody has decided it - so it is named here with a reopening condition
+    /// instead of buried in a call. 32 is a title-bar grab: enough to drag the window
+    /// back, few enough that a nearly-offscreen window still reads as where the user
+    /// left it. THE ONE NUMBER IN THIS SLICE WITH NO OWNER.
+    const MIN_VISIBLE: u32 = 32;
+
+    /// Places the window and applies the pin, through the host seams (D46, D48).
+    ///
+    /// The monitor is resolved from the SAVED rect, before clamping, because the
+    /// answer is per-monitor: [`work_area_for_rect`] picks the monitor with the most
+    /// overlap and falls back to the NEAREST one, which is exactly the unplugged-
+    /// monitor case this app promises to survive, and blind-primary is what core's
+    /// geometry doc forbids. The clamp is core's rule too ([`Rect::clamped_to`]):
+    /// this function computes nothing.
+    ///
+    /// A maximized session is not moved: the stored rect is its restore position and
+    /// moving a maximized window means un-maximizing it first, a decision platform
+    /// explicitly leaves above itself. It is still pinned, because the pin is
+    /// orthogonal to placement.
+    fn restore_and_pin(&mut self, handle: WindowHandle) {
+        let rect = self.session.rect;
+        if self.session.maximized || self.backend.is_none() || self.facts.is_none() {
+            // No move to make, or no seam on this build (see [`Engine::backend`]).
+            // Pinned anyway, and the rect recorded anyway - maximized or not, the
+            // host's NORMAL position is still the number worth persisting.
+            self.apply_topmost(handle);
+            self.record_measured_rect();
+            return;
+        }
+        match self
+            .facts
+            .as_ref()
+            .expect("checked above")
+            .work_area_for_rect(to_frame(rect))
+        {
+            Ok((work, monitor_id)) => {
+                let clamped = rect.clamped_to(to_rect(work), Self::MIN_VISIBLE);
+                let moved = self
+                    .backend
+                    .as_mut()
+                    .expect("checked above")
+                    .set_frame_rect(handle.0 as isize, to_frame(clamped), 1.0);
+                match moved {
+                    // scale 1.0 because the rect is already frame pixels in this
+                    // window's space; anything else is the double conversion the seam
+                    // documents against.
+                    Ok(()) => {
+                        self.session.monitor_id = monitor_id;
+                        if clamped != rect {
+                            // The clamp moved it: store where it actually is, so the
+                            // next launch does not have to clamp it again.
+                            self.session.rect = clamped;
+                            self.queue(Target::Session);
+                        }
+                    }
+                    Err(err) => self.emit(Event::GeometryNotRestored {
+                        rect: clamped,
+                        reason: err.to_string(),
+                    }),
+                }
+            }
+            Err(err) => self.emit(Event::GeometryNotRestored {
+                rect,
+                reason: err.to_string(),
+            }),
+        }
+        self.apply_topmost(handle);
+        self.record_measured_rect();
+    }
+
+    /// THE FRESH-INSTALL BUG the live bridge run found on disk: nothing marked the
+    /// session dirty at startup, so the first [@@flush_state@@] had no reason to
+    /// write, and a user who never dragged the window never got a session.json at
+    /// all - "it comes back where you left it" silently depended on having moved it
+    /// once. Registration is the only moment with a handle to ask, so it queues
+    /// exactly one write, on the tick that already exists (no second timer).
+    ///
+    /// What it stores is the rect the host REPORTS, never the one this crate asked
+    /// for: a clamp or a frame/client correction only lands in the file if the
+    /// measured number wins, or the second launch re-diverges exactly as the first
+    /// did. No measurement, no queue - see [@@Engine::measure_rect@@].
+    fn record_measured_rect(&mut self) {
+        if self.measure_rect() {
+            self.queue(Target::Session);
+        }
+    }
+
+    /// 5.5 step 4, which until this slice was "stored, never used": the pin bit
+    /// lives only in session.json (D10) and this is the one place that acts on it.
+    /// A refusal is reported rather than swallowed, because a session that was pinned
+    /// yesterday and is not today otherwise reads as a lost setting.
+    fn apply_topmost(&mut self, handle: WindowHandle) {
+        let on = self.session.pinned;
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        if let Err(err) = backend.set_topmost(handle.0 as isize, on) {
+            self.emit(Event::GeometryNotRestored {
+                rect: self.session.rect,
+                reason: err.to_string(),
+            });
+        }
+    }
+
+    /// Overwrites the stored rect with this window's NORMAL position (D48). No handle,
+    /// or no seam: nothing to ask, and the last known rect stays - it was measured or
+    /// clamped when it was written, so keeping it is not a new claim. A seam that
+    /// answers with an error did refuse, and the refusal is reported: the alternative
+    /// is persisting a rect known to be wrong. Returns whether a rect was actually
+    /// measured: [@@false@@] is the caller's instruction to write nothing new.
+    fn measure_rect(&mut self) -> bool {
+        let Some(handle) = self.window else {
+            return false;
+        };
+        let Some(backend) = self.backend.as_mut() else {
+            return false;
+        };
+        match backend.restore_frame_rect(handle.0 as isize) {
+            Ok(frame) => {
+                let rect = to_rect(frame);
+                if rect != self.session.rect {
+                    self.session.rect = rect;
+                }
+                true
+            }
+            Err(err) => {
+                self.emit(Event::GeometryNotRestored {
+                    rect: self.session.rect,
+                    reason: err.to_string(),
+                });
+                false
+            }
+        }
+    }
+
+    /// The code page THIS HOST can decode ANSI with (D27): the user's persisted
+    /// choice when there is one, else the machine's ANSI code page through the
+    /// [`HostFacts`] seam, else [`None`] - and [`None`] means an ANSI file is
+    /// refused, never guessed. The host is asked per call, not cached: GetACP is
+    /// one syscall, and the seam's rule is call out, value back, decide nothing.
+    fn resolved_codepage(&self) -> Option<u16> {
+        let host_acp = self.facts.as_ref().map(|facts| facts.ansi_codepage());
+        self.settings.resolved_codepage(host_acp)
+    }
+
     /// Writes whichever state files are dirty. Atomicity, the temp sweep and the
     /// TOML rendering are core's ([`write_session`] and [`write_settings`]);
     /// this decides WHEN, keeps the failed bit set so the next tick retries, and
@@ -696,6 +890,10 @@ impl Engine {
             return;
         }
         if pending.session {
+            // One tick, one write, and the rect inside it is the one the host reports
+            // (D48) rather than the one a toolkit guessed. The cost is a single
+            // GetWindowPlacement on the engine thread, where blocking is allowed.
+            let _ = self.measure_rect();
             match write_session(&self.state_dir.0, &self.session) {
                 Ok(()) => self.pending.session = false,
                 Err(err) => self.emit(Event::SaveFailed {
@@ -810,6 +1008,24 @@ fn file_kind(path: &Path) -> FileKind {
         FileKind::Notes
     } else {
         FileKind::Foreign
+    }
+}
+
+/// Both rects are physical FRAME pixels with the same four fields in the same order;
+/// the two types exist because one crate may not name the other's geometry (core is
+/// pure, platform is the OS). Nothing is converted - no scaling, no origin shift.
+fn to_frame(rect: Rect) -> FrameRect {
+    FrameRect::new(rect.x, rect.y, rect.w, rect.h)
+}
+
+/// The way back. See [`to_frame`].
+#[must_use]
+fn to_rect(frame: FrameRect) -> Rect {
+    Rect {
+        x: frame.x,
+        y: frame.y,
+        w: frame.w,
+        h: frame.h,
     }
 }
 
@@ -956,6 +1172,11 @@ mod tests {
             StateDir(PathBuf::from("unused-in-this-test")),
             Session::default(),
             Settings::default(),
+            // No host in a unit test: these fixtures never register a window, and a
+            // None seam makes any accidental call a no-op rather than a Win32 call
+            // with a made-up handle.
+            None,
+            None,
         );
         // Another test's flag must not carry over: take() clears before starting.
         latch_probe::take();
@@ -994,6 +1215,11 @@ mod tests {
                 ..Session::default()
             },
             Settings::default(),
+            // No host in a unit test: these fixtures never register a window, and a
+            // None seam makes any accidental call a no-op rather than a Win32 call
+            // with a made-up handle.
+            None,
+            None,
         );
         (engine, cmd_tx, event_rx)
     }
@@ -1115,6 +1341,8 @@ mod tests {
                 ..Session::default()
             },
             Settings::default(),
+            None,
+            None,
         )
     }
 

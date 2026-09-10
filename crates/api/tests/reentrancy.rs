@@ -21,9 +21,11 @@
 //! the honest answer to a flush there is nothing to write; D11 is why the revision
 //! ranges below start at 1, since a flush at revision 0 against a fresh engine is
 //! stale and answers [`Event::AutosaveSkipped`] with Clean instead.
-//! [`Command::RegisterWindow`] stores its handle and emits nothing: there is no
-//! platform call this crate may make (check-arch keeps notes-platform out of its
-//! graph). No arm is a silent no-op, and no test here pretends otherwise.
+//! No test here registers a window, so the port's host seams (D46: it owns the
+//! notes-platform objects) are never called from this file - but the claim of
+//! an earlier version of this header, that api may not make platform calls at
+//! all, was false and is gone. No arm is a silent no-op, and no test here
+//! pretends otherwise.
 
 use std::fs;
 use std::io::Write;
@@ -38,11 +40,13 @@ use notes_api::{
     SaveError, Session, Settings, StateDir, WindowHandle, mark_current_thread_as_engine,
 };
 
-// unused_crate_dependencies is per TARGET: notes-core and thiserror are linked
-// into this test binary because they are dependencies of notes-api, and this
-// file names neither (it goes through the port, which is the point). The two
-// lines below are the lint's own documented opt-out, not a placeholder.
+// unused_crate_dependencies is per TARGET: notes-core, notes-platform and
+// thiserror are linked into this test binary because they are dependencies of
+// notes-api, and this file names none of them (it goes through the port, which
+// is the point - including the port's own host seams, D46). The lines below are
+// the lint's own documented opt-out, not a placeholder.
 use notes_core as _;
+use notes_platform as _;
 use thiserror as _;
 
 /// Longer than the engine's 750 ms tick, for the few places a test must wait on

@@ -15,6 +15,11 @@ publish.workspace = true
 # Deps are added only as used: unused_crate_dependencies + clippy -D warnings
 # make an unused dep a hard gate error.
 notes-core = { workspace = true }
+# notes-platform: the two host seams (WindowBackend, HostFacts), constructed by the
+# port itself (D46). arch.rs allows this edge - it groups api with core and platform
+# deliberately - and it is what lets the bridge register a window without ever naming
+# a platform type, which is the whole point of the seam.
+notes-platform = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -27,6 +27,7 @@ use std::thread::{self, JoinHandle};
 use notes_core::session::read_session_or_default;
 use notes_core::settings::read_settings;
 use notes_core::{Session, Settings, StateDir};
+use notes_platform::{HostFacts, WindowBackend};
 
 use crate::command::Command;
 use crate::engine::{Engine, on_engine_thread};
@@ -88,6 +89,31 @@ pub struct Gateway {
     initial: Option<InitialState>,
 }
 
+/// The two host seams the port owns, built or absent together (D46). Named
+/// because it is a CONCEPT the port hands its engine, not a type to spell out.
+type PlatformHost = (Option<Box<dyn WindowBackend>>, Option<Box<dyn HostFacts>>);
+
+/// The host this process runs on, as the two seams the port owns (D46). One
+/// Win32 surface serves both traits, so the same unit struct is boxed twice.
+/// The cfg is a build fact, not a decision: on a host notes-platform has no
+/// implementation for, the port owns no host, and placement and pinning do
+/// nothing - allowed to be silent because it can never be a refusal on a
+/// machine this app ships to. A REAL seam's refusal never is (see
+/// [`Event::GeometryNotRestored`]).
+#[cfg(windows)]
+fn platform_host() -> PlatformHost {
+    (
+        Some(Box::new(notes_platform::windows::Backend)),
+        Some(Box::new(notes_platform::windows::Backend)),
+    )
+}
+
+/// See [`platform_host`].
+#[cfg(not(windows))]
+fn platform_host() -> PlatformHost {
+    (None, None)
+}
+
 impl Gateway {
     /// Starts the engine; returns the handle and the event channel the caller now
     /// owns.
@@ -107,27 +133,66 @@ impl Gateway {
     /// handle than no process.
     #[must_use = "dropping the Gateway aborts the engine thread"]
     pub fn start(state_dir: StateDir, settings: Settings) -> (Gateway, EventRx) {
+        // D46: the port constructs the host itself, so a bridge never names a
+        // notes-platform type. The cfg split is a build fact, not a decision:
+        // where platform has no Win32 module to offer, the port owns no host.
+        let (backend, facts) = platform_host();
+        Self::start_with_host(state_dir, settings, backend, facts)
+    }
+
+    /// The seam under [`Gateway::start`], for tests: the same engine with a
+    /// caller-chosen host instead of the real one. Deliberately doc(hidden) -
+    /// this is a seam for the test suite, not a feature; a bridge never sees
+    /// this name and never supplies a host (D46/D47).
+    #[doc(hidden)]
+    pub fn start_with_host(
+        state_dir: StateDir,
+        settings: Settings,
+        backend: Option<Box<dyn WindowBackend>>,
+        facts: Option<Box<dyn HostFacts>>,
+    ) -> (Gateway, EventRx) {
         // Both reads happen here, on the caller's thread, before the thread exists,
         // so the engine and the InitialState come from the same bytes and cannot
-        // disagree.
+        // disagree. The channels exist first because a corrupt settings file is
+        // REPORTED, not defaulted over, and the queue is the only output the
+        // port has (see the match below).
         let session = read_session_or_default(&state_dir.0);
         // D10's second half: settings.toml owns the autosave toggle and the recents
         // list, session.json owns the window. Reading the settings file is not
         // eager work the cold-start budget could defer - the menu cannot render a
         // check mark it has not read, and recents are the first thing a second
         // launch opens - so it belongs in this same pre-window slot rather than a
-        // second round trip after the window exists. Both reads are infallible by
-        // contract: a corrupt file yields defaults, and startup never fails on a
-        // state file.
+        // second round trip after the window exists. Startup still never fails on
+        // a state file.
         //
-        // One field deliberately does NOT come from disk: the code page. That is a
-        // fact about the MACHINE (the bridge's GetACP), not a user choice, and a
-        // persisted value could have come from another locale entirely. The caller
-        // wins there; the file wins everywhere else.
-        let persisted = read_settings(&state_dir);
-        let settings = Settings {
-            codepage: settings.codepage,
-            ..persisted
+        // The code page is NOT overridden here, and the old rule that said it was
+        // - "the caller wins, because the code page is a machine fact" - is dead:
+        // D46 gave the port its own HostFacts, so the machine is asked at detect
+        // time through [`Settings::resolved_codepage`], not by a GetACP in the
+        // bridge, which may not import notes-platform at all. What the FILE says
+        // is the user's own choice and wins once persisted; the gap nobody chose
+        // is filled by the host; when both are silent, ANSI files are refused,
+        // never guessed (D27).
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        let settings = match read_settings(&state_dir) {
+            // Exactly what was written, machine locale included: it is the
+            // user's own persisted choice.
+            Ok(Some(persisted)) => persisted,
+            // NO FILE is an absent fact, and the caller decides what a first
+            // launch starts on - that is what the `settings` parameter is.
+            Ok(None) => settings,
+            // CORRUPT is a present fact about present bytes, and D12 forbids
+            // both rewriting them and swallowing them: the launch proceeds on
+            // FACTORY settings and the fact is rendered as
+            // [`Event::SettingsCorrupt`], queued before the engine thread
+            // exists, so it is the first thing the caller drains.
+            Err(err) => {
+                let _ = event_tx.send(Event::SettingsCorrupt {
+                    reason: err.to_string(),
+                });
+                Settings::default()
+            }
         };
         let initial = InitialState {
             pinned: session.pinned,
@@ -135,9 +200,9 @@ impl Gateway {
             session: session.clone(),
         };
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
-        let (event_tx, event_rx) = mpsc::channel::<Event>();
-        let engine = Engine::new(cmd_rx, event_tx, state_dir, session, settings);
+        let engine = Engine::new(
+            cmd_rx, event_tx, state_dir, session, settings, backend, facts,
+        );
         let spawned = thread::Builder::new()
             .name("notes-engine".to_string())
             .spawn(move || engine.run());

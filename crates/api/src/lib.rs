@@ -128,14 +128,14 @@
 //! 1. query session       Gateway::startup_state() -> Option<InitialState>  (once)
 //! 2. create the window   bridge, AT the rect from step 1
 //! 3. register the handle Gateway::send(Command::RegisterWindow { .. })
-//! 4. apply topmost       bridge, from InitialState.pinned (notes-platform)
+//! 4. apply topmost       the port, on registration, from session.pinned (D46)
 //!
 //! ```
 //! Step 1 is consume-once on purpose: [`Gateway::startup_state`] is the snapshot
 //! [`Gateway::start`] took, not a live query - a second call would hand back a
 //! pin bit and autosave toggle that [`Command::SetPinned`] has since changed. The
 //! port's part of the order is that the rect and the pin arrive BEFORE the first
-//! frame; steps 2 and 4 are bridge work.
+//! frame; step 2 is bridge work.
 //!
 //! **What to do with an [`Err`] from [`Gateway::send`]**: the [`Err`] carries
 //! the command back, meaning the engine never took it, so no [`Event`] for it can
@@ -145,13 +145,12 @@
 //! means QUEUED, not done: the answer is still an [`Event`], later, on the
 //! channel.
 //!
-//! Still unwired, and not for the reason an earlier version of these docs gave:
-//! the registered [`WindowHandle`] is stored and unused because this crate has
-//! not declared the dependency yet -- [`notes-platform`] is [`allowed`] to
-//! [`api`]. [`crates/xtask/src/arch.rs`] puts the port alongside core and
-//! platform deliberately, so [`cargo arch`] would not blink at an
-//! [`api => platform`] edge. That constraint was invented here and it was false,
-//! and a false constraint in a doc comment is how a good design gets skipped.
+//! WIRED (D46): the port constructs the host itself. `Gateway::start` builds
+//! notes-platform's Win32 backend behind the unchanged public signature, and
+//! tests inject a recording fake through `Gateway::start_with_host`, which is
+//! doc(hidden) because it is a seam, not a feature - a bridge never names it.
+//! notes-platform is a declared dependency, arch.rs has allowed the edge all
+//! along, and the paragraph that claimed otherwise was false and is gone.
 //!
 //! What it unlocks, now that the frame-versus-client geometry question is settled
 //! (Win32 [`SetWindowPos`] and [`GetWindowRect`] are both frame space, and
