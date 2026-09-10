@@ -23,13 +23,17 @@ use std::path::{Path, PathBuf};
 // underscore use keeps unused_crate_dependencies (a hard error under the
 // gate's -D warnings) quiet without changing behaviour.
 use thiserror as _;
+use toml as _;
 
 use notes_core::{Detected, LineEnding, TextEncoding, decode, detect, round_trip, save_document};
 
-/// The ANSI code page the app uses on its primary platform; detect() needs
-/// it to classify the ansi1252 fixtures, and it never changes the outcome
-/// for the UTF-8/UTF-16 fixtures (they are decided before ANSI is tried).
-const DEFAULT_CODEPAGE: Option<u16> = Some(1252);
+/// The ANSI code page this gate judges the fixture corpus under; detect()
+/// needs it to classify the ansi1252 fixtures, and it never changes the
+/// outcome for the UTF-8/UTF-16 fixtures (they are decided before ANSI is
+/// tried). The manifest declares its own ansi_codepage and the two must
+/// agree (asserted in load_manifest) — a corpus authored for one code page
+/// can never be judged under another without a loud failure.
+const GATE_CODEPAGE: u16 = 1252;
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -39,6 +43,7 @@ fn fixtures_dir() -> PathBuf {
 
 #[derive(serde::Deserialize)]
 struct Manifest {
+    ansi_codepage: u16,
     count: u32,
     files: Vec<ManifestEntry>,
 }
@@ -52,9 +57,10 @@ struct ManifestEntry {
     bom_present: bool,
 }
 
-/// Loads the manifest. A missing, unreadable, empty or self-inconsistent
+/// Loads the manifest and returns it with its declared code page. A
+/// missing, unreadable, empty, self-inconsistent or code-page-disagreeing
 /// manifest is a HARD FAILURE — never a skip.
-fn load_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
+fn load_manifest() -> Result<(Manifest, u16), Box<dyn std::error::Error>> {
     let path = fixtures_dir().join("manifest.json");
     let text = fs::read_to_string(&path).map_err(|e| {
         format!(
@@ -75,7 +81,14 @@ fn load_manifest() -> Result<Manifest, Box<dyn std::error::Error>> {
         )
         .into());
     }
-    Ok(manifest)
+    if manifest.ansi_codepage != GATE_CODEPAGE {
+        return Err(format!(
+            "the fixture corpus declares ansi_codepage {} but this gate judges it under {GATE_CODEPAGE} — the two must agree",
+            manifest.ansi_codepage
+        )
+        .into());
+    }
+    Ok((manifest, manifest.ansi_codepage))
 }
 
 fn read_fixture(entry: &ManifestEntry) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -155,13 +168,13 @@ fn hex_diff(expected: &[u8], actual: &[u8]) -> String {
 /// failure names the exact fixture file.
 #[test]
 fn every_manifest_fixture_round_trips_byte_exactly() -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = load_manifest()?;
+    let (manifest, codepage) = load_manifest()?;
     for entry in &manifest.files {
         let bytes = read_fixture(entry)?;
         let expected = expected_detected(entry)?;
 
         // (1) Detection agrees with the manifest.
-        let seen = detect(&bytes, DEFAULT_CODEPAGE);
+        let seen = detect(&bytes, Some(codepage));
         assert_eq!(
             seen, expected,
             "{}: detection disagrees with the manifest",
@@ -169,7 +182,7 @@ fn every_manifest_fixture_round_trips_byte_exactly() -> Result<(), Box<dyn std::
         );
 
         // (2) The pure round trip is byte-identical.
-        match round_trip(&bytes, DEFAULT_CODEPAGE) {
+        match round_trip(&bytes, Some(codepage)) {
             Ok(rt) => {
                 if rt != bytes {
                     panic!(
@@ -205,7 +218,7 @@ fn every_manifest_fixture_round_trips_byte_exactly() -> Result<(), Box<dyn std::
 /// UTF-8; they must be detected as Ansi(1252) and still round-trip exactly.
 #[test]
 fn ansi1252_fixture_is_deliberately_not_valid_utf8() -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = load_manifest()?;
+    let (manifest, codepage) = load_manifest()?;
     let entry = manifest
         .files
         .iter()
@@ -217,9 +230,9 @@ fn ansi1252_fixture_is_deliberately_not_valid_utf8() -> Result<(), Box<dyn std::
         "{}: an ansi1252 fixture that is valid UTF-8 proves nothing",
         entry.file
     );
-    let d = detect(&bytes, DEFAULT_CODEPAGE);
+    let d = detect(&bytes, Some(codepage));
     assert_eq!(d.encoding, TextEncoding::Ansi(1252));
-    assert_eq!(round_trip(&bytes, DEFAULT_CODEPAGE)?, bytes);
+    assert_eq!(round_trip(&bytes, Some(codepage))?, bytes);
     Ok(())
 }
 
@@ -227,7 +240,7 @@ fn ansi1252_fixture_is_deliberately_not_valid_utf8() -> Result<(), Box<dyn std::
 /// newline into someone's empty file is a harm.
 #[test]
 fn empty_fixture_round_trips_to_zero_bytes() -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = load_manifest()?;
+    let (manifest, codepage) = load_manifest()?;
     let entry = manifest
         .files
         .iter()
@@ -238,9 +251,9 @@ fn empty_fixture_round_trips_to_zero_bytes() -> Result<(), Box<dyn std::error::E
         bytes.is_empty(),
         "edge__empty.notes is not empty — fixture drift"
     );
-    assert_eq!(round_trip(&bytes, DEFAULT_CODEPAGE)?, bytes);
+    assert_eq!(round_trip(&bytes, Some(codepage))?, bytes);
     // And the full save path writes exactly zero bytes.
-    let d = detect(&bytes, DEFAULT_CODEPAGE);
+    let d = detect(&bytes, Some(codepage));
     let text = decode(&bytes, d)?;
     let dir = tempfile::tempdir()?;
     let target = dir.path().join("empty.notes");
@@ -254,7 +267,7 @@ fn empty_fixture_round_trips_to_zero_bytes() -> Result<(), Box<dyn std::error::E
 /// 0x0D byte without gaining an LF.
 #[test]
 fn lone_cr_fixture_gains_no_lf() -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = load_manifest()?;
+    let (manifest, codepage) = load_manifest()?;
     let entry = manifest
         .files
         .iter()
@@ -265,9 +278,9 @@ fn lone_cr_fixture_gains_no_lf() -> Result<(), Box<dyn std::error::Error>> {
         bytes.contains(&b'\r') && !bytes.contains(&b'\n'),
         "edge__lone-cr.notes is not a lone-CR file — fixture drift"
     );
-    let d = detect(&bytes, DEFAULT_CODEPAGE);
+    let d = detect(&bytes, Some(codepage));
     assert_eq!(d.line_ending, LineEnding::Lf);
-    assert_eq!(round_trip(&bytes, DEFAULT_CODEPAGE)?, bytes);
+    assert_eq!(round_trip(&bytes, Some(codepage))?, bytes);
     Ok(())
 }
 
@@ -275,20 +288,20 @@ fn lone_cr_fixture_gains_no_lf() -> Result<(), Box<dyn std::error::Error>> {
 /// survive detection, the pure round trip and the full save path.
 #[test]
 fn frontmatter_fixture_survives_the_full_save_path() -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = load_manifest()?;
+    let (manifest, codepage) = load_manifest()?;
     let entry = manifest
         .files
         .iter()
         .find(|e| e.file == "edge__frontmatter.notes")
         .ok_or("the manifest has no edge__frontmatter.notes fixture — the gate is incomplete")?;
     let bytes = read_fixture(entry)?;
-    let text = decode(&bytes, detect(&bytes, DEFAULT_CODEPAGE))?;
+    let text = decode(&bytes, detect(&bytes, Some(codepage)))?;
     assert!(
         text.starts_with("---"),
         "edge__frontmatter.notes lost its frontmatter block — fixture drift"
     );
-    assert_eq!(round_trip(&bytes, DEFAULT_CODEPAGE)?, bytes);
-    let d = detect(&bytes, DEFAULT_CODEPAGE);
+    assert_eq!(round_trip(&bytes, Some(codepage))?, bytes);
+    let d = detect(&bytes, Some(codepage));
     let dir = tempfile::tempdir()?;
     let target = dir.path().join("copy.notes");
     save_document(&target, &text, d)?;
