@@ -103,6 +103,15 @@ pub enum Command {
     /// interpret, clamp or scale it — those are methods on [`Rect`](crate::Rect)
     /// in `notes-core`, and they belong there.
     GeometryChanged { rect: Rect },
+
+    /// The window the bridge registered is GONE (destroyed, recreated). The
+    /// stored handle is a VALUE, not a lease: a destroyed HWND fails closed
+    /// (IsWindow refuses it), but Windows RECYCLES handle numbers, so a stale
+    /// one can pass IsWindow and name a STRANGER's window - and the port would
+    /// then read that stranger's normal position into session.rect and MOVE
+    /// it. Unregistering clears the stored value; every host call and every
+    /// GeometryChanged after it is a no-op until the next RegisterWindow.
+    UnregisterWindow,
 }
 
 #[cfg(test)]
@@ -134,6 +143,7 @@ mod tests {
             Command::Shutdown => Command::Shutdown,
             Command::RegisterWindow { handle } => Command::RegisterWindow { handle: *handle },
             Command::GeometryChanged { rect } => Command::GeometryChanged { rect: *rect },
+            Command::UnregisterWindow => Command::UnregisterWindow,
         }
     }
 
@@ -150,6 +160,7 @@ mod tests {
             Command::Shutdown => "Shutdown",
             Command::RegisterWindow { .. } => "RegisterWindow",
             Command::GeometryChanged { .. } => "GeometryChanged",
+            Command::UnregisterWindow => "UnregisterWindow",
         }
     }
 
@@ -177,6 +188,7 @@ mod tests {
             Command::GeometryChanged {
                 rect: Rect::new(120, 80, 900, 600),
             },
+            Command::UnregisterWindow,
         ]
     }
 
@@ -196,8 +208,8 @@ mod tests {
             "the fixture must cover each variant exactly once: {names:?}"
         );
         // Open, SaveAs, Flush, SetAutosave, SetPinned, ClearRecents, Shutdown,
-        // RegisterWindow, GeometryChanged.
-        assert_eq!(all.len(), 9, "Command gained or lost a variant");
+        // RegisterWindow, GeometryChanged, UnregisterWindow.
+        assert_eq!(all.len(), 10, "Command gained or lost a variant");
 
         for command in &all {
             assert_eq!(command, &command.clone(), "{command:?} clone is not equal");

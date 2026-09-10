@@ -21,9 +21,9 @@
 //! reads the two state files once, on the calling thread, and those reads are the
 //! whole synchronous surface (see [`Gateway::startup_state`] for why).
 
-use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use notes_core::session::read_session_or_default;
 use notes_core::settings::read_settings;
@@ -91,59 +91,35 @@ pub struct Gateway {
 }
 
 /// The state directory: created if absent (case a), accepted as-is if it is
-/// already there (case b), and PROBED for the ability to persist (case c).
-/// [`Some`] is why it cannot, with the OS's own sentence - the port invents no
-/// copy, it only names the path the OS refused to tell us about. [`None`] means
-/// writes into this directory are expected to work.
-///
-/// The probe is one create+delete of a temp file and one append-open of
-/// session.json when it exists: two syscalls in the common case, no writes,
-/// no truncation, no clobbering (the temp name is unique and removed at once,
-/// and an append-open of an existing file changes nothing). It runs on the
-/// caller's thread in the same pre-window slot as the two state reads, so its
-/// cost is inside the cold-start budget and must be stated, not assumed: see
-/// `state_dir_probe_cost_is_bounded_by_syscalls` in tests/session.rs.
-fn ensure_state_dir(dir: &Path) -> Option<String> {
-    // (a)+(b): create_dir_all is idempotent and never clobbers - an existing
-    // directory with files in it is the normal case, not an error to survive.
-    if let Err(err) = std::fs::create_dir_all(dir) {
-        // A FILE sitting where the directory belongs arrives here too, with
-        // the OS's own sentence.
-        return Some(format!("{}: {err}", dir.display()));
-    }
-    // create_dir_all FOLLOWS links, and core's save path refuses reparse
-    // points per save target - a state directory that IS a link would pass
-    // every probe below and have every write refused one file at a time.
-    // Named as the fact it is, with the path.
-    if let Ok(meta) = std::fs::symlink_metadata(dir) {
-        if meta.file_type().is_symlink() {
-            return Some(format!("the state directory is a link: {}", dir.display()));
-        }
-    }
-    // (c1): can anything be written into the directory at all? An ACL that
-    // grants read-only, or a directory that stopped existing between the
-    // create and now, fails here - and NOT in the append probe below, which
-    // would pass silently when session.json does not exist yet.
-    let probe = dir.join(format!("notes-probe-{}.tmp", std::process::id()));
-    if let Err(err) = std::fs::File::create(&probe) {
-        return Some(format!("{}: {err}", dir.display()));
-    }
-    // Leftover on a failed delete is cosmetic, not a persistence failure, and
-    // core's own temp sweep owns stale temps - so it is not reported.
-    let _ = std::fs::remove_file(&probe);
-    // (c2): can the file the app must replace actually be replaced? This is
-    // the case the second smoke run measured: the directory was there and
-    // writable, and session.json itself refused the write. An append-open
-    // with FILE_FLAG_WRITE_THROUGH semantics is what the rename will hit -
-    // read-only attribute, an ACL, another process's lock, or a target that
-    // is not a file at all all answer the same way here as they will at the
-    // save. Absent is NOT a failure: the first write creates it, and (c1)
-    // just proved that is possible.
-    let session = dir.join(notes_core::session::FILE_NAME);
-    match std::fs::OpenOptions::new().append(true).open(&session) {
-        Ok(_) => None,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => Some(format!("{session:?}: {err}")),
+/// The bounded wait on the engine thread, and WHY 3 s: a healthy shutdown is
+/// the drain (bounded at MAX_DRAIN cheap commands) plus two small state-file
+/// writes - tens of milliseconds, measured. 3 s is four idle ticks and orders
+/// of magnitude above that, and it is under the 5 s the port's own suite
+/// allows any answer: if shutdown has not completed in 3 s, an engine is
+/// blocked in something that will outlive any reasonable wait - the measured
+/// case being a synchronous window op whose owner thread is parked and cannot
+/// pump (12 s timed, >15 s reproduced). The deadline turns that from a hang
+/// into an abandonment and a report.
+const JOIN_DEADLINE: Duration = Duration::from_secs(3);
+
+/// The std shape for a bounded join: the actual join moves to a helper thread
+/// and the caller waits on a completion channel with recv_timeout. On timeout
+/// the engine thread is ABANDONED, not stopped - Rust cannot cancel a thread,
+/// and our send() is unbounded so it never blocks, which means a permanently
+/// stuck engine can never be joined by definition; hanging shutdown on it is
+/// the same bug wearing a different hat. The helper detaches and finishes
+/// whenever the engine does (the engine unblocks when its owner next pumps
+/// and completes its own exit, final flush included).
+fn join_bounded(handle: JoinHandle<()>, deadline: Duration) -> Option<Duration> {
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        let _ = handle.join();
+        let _ = done_tx.send(());
+    });
+    let started = Instant::now();
+    match done_rx.recv_timeout(deadline) {
+        Ok(()) => None,
+        Err(_) => Some(started.elapsed()),
     }
 }
 
@@ -242,22 +218,20 @@ impl Gateway {
         // directory can see the gap, so the suite now has exactly that test.
         // THREE cases, and the middle smoke run proved they are not one:
         // (a) the directory is absent -> create it; (b) it exists with files
-        // in it -> the normal case, nothing to do; (c) it exists and we still
-        // cannot persist into it -> an unwritable directory, or a session
-        // file that is not writable (read-only attribute, an ACL, a lock, or
-        // something that is not a file at all). Treating (b) as the whole
-        // story is the hole the smoke run measured as "Access is denied" on a
-        // machine where the directory already existed. So this does not stop
-        // at create_dir_all: it PROBES, once, and reports.
-        //
-        // The report is an Event emitted HERE, before the engine thread
-        // exists, so the bridge can render it while the window is still up. A
-        // once-per-process latch on the write path cannot do that: by the time
-        // the session write fails, the bridge may already be tearing the
-        // window down, and an unrendered report is the same silence as no
-        // report - which is exactly how D54 shipped.
-        if let Some(reason) = ensure_state_dir(&state_dir.0) {
-            let _ = event_tx.send(Event::StateDirUnusable { reason });
+        // in it -> the normal case; (c) it exists and we still cannot persist
+        // into it. CORE OWNS all three now (914e53a): ensure_state_dir creates
+        // (idempotently), judges (NotADirectory / Symlink via the SAME
+        // predicate the save path refuses on), and probes for writability -
+        // the port keeps only the REPORTING, because the moment to tell the
+        // user is HERE, before the engine thread exists and while the window
+        // the bridge is about to create can still render it. An unrendered
+        // report is the same silence as no report - which is how D54 shipped.
+        if let Err(err) = notes_core::session::ensure_state_dir(&state_dir.0) {
+            // Core wrote the three sentences (NotADirectory / Symlink /
+            // NotWritable) as renderable copy; the port passes them verbatim.
+            let _ = event_tx.send(Event::StateDirUnusable {
+                reason: err.to_string(),
+            });
         }
         let settings = match read_settings(&state_dir) {
             // Exactly what was written, machine locale included: it is the
@@ -373,10 +347,23 @@ impl Gateway {
     pub fn close(mut self) -> Result<(), Command> {
         let result = self.send(Command::Shutdown);
         if let Some(handle) = self.engine.take() {
-            // join() on the current thread would panic; send() asserted it cannot
-            // be this thread. A panicked engine reports Err here as a finished
-            // thread, and EventRx closes either way.
-            let _ = handle.join();
+            // BOUNDED, never a bare join: the engine can be blocked in a
+            // synchronous window op whose owner is PARKED - and the thread
+            // calling close() from the window's own close callback is the one
+            // thread that owner needs in order to pump. A bare join here was
+            // the measured permanent hang (12 s timed, >15 s reproduced, no
+            // panic, no log, no event).
+            if let Some(waited) = join_bounded(handle, JOIN_DEADLINE) {
+                // The report is the TYPED RESULT, not an Event: the only Event
+                // sender lives in the engine, and a clone held by the Gateway
+                // would delay EventRx's Disconnected past close() - breaking
+                // the pinned "Disconnected means the engine is gone" contract
+                // (pinned by a_slow_consumer_never_blocks_the_producer). The
+                // abandoned engine's own later events still arrive on the
+                // channel, and it finishes its exit when its owner next pumps.
+                let _ = waited;
+                return Err(Command::Shutdown);
+            }
         }
         result
     }
@@ -437,10 +424,15 @@ impl Drop for Gateway {
         );
         drop(self.cmd_tx.take());
         if let Some(handle) = self.engine.take() {
-            // A panicked engine is not re-raised from a destructor (panicking in
-            // Drop while unwinding aborts the process). EventRx is how the caller
-            // learns the engine is gone.
-            let _ = handle.join();
+            // BOUNDED for the same reason as close(): a bare join in a
+            // destructor is an unkillable hang. A panicked engine is not
+            // re-raised from a destructor (panicking in Drop while unwinding
+            // aborts the process); EventRx is how the caller learns the engine
+            // is gone. A timeout here CANNOT be reported - the Gateway holds no
+            // Event sender by contract - and it is the one silent path, chosen
+            // so the Disconnected contract survives; close() is the reporting
+            // shutdown path.
+            let _ = join_bounded(handle, JOIN_DEADLINE);
         }
     }
 }

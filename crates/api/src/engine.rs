@@ -14,8 +14,18 @@
 //! Why a thread at all: autosave fires seconds after any UI call, so it cannot be
 //! answered by the call that triggered it (§5.4). One engine thread owns the state
 //! and performs every read and write; the UI thread owns an
-//! [`EventRx`](crate::EventRx) and never runs engine code. Because both queues
-//! are unbounded (D24), a 400 ms save cannot block a frame in either direction.
+//! [`EventRx`](crate::EventRx) and never runs engine code. The queues are
+//! unbounded (D24), so no command is dropped and no event is back-pressured -
+//! but THAT is not what keeps a 400 ms save from blocking a frame, and saying
+//! it was, was FALSE: the engine also calls user32 synchronously, and a window
+//! op from another thread SENDS to the window's owner and blocks until that
+//! owner pumps. Two things carry the no-frame-blocking guarantee now, and both
+//! are load-bearing: the platform crate's ASYNC window ops
+//! (SWP_ASYNCWINDOWPOS - the call returns before the move lands, so the engine
+//! never waits on the owner), and the BOUNDED JOIN in gateway.rs, so that even
+//! an engine stalled on some future blocking seam cannot hang shutdown. Do not
+//! remove either and do not add a synchronous window call without an async
+//! route.
 
 use std::cell::Cell;
 use std::fs;
@@ -233,6 +243,16 @@ pub(crate) struct Engine {
     /// The settings.toml twin of [`Self::session_failure_latched`] (M5/D54):
     /// same per-tick retry, same flood without a latch, same clear-on-success.
     settings_failure_latched: bool,
+    /// MAJOR 4: set while the shutdown drain runs, so side-effecting host work
+    /// (the restore move and the pin) is skipped for commands that were queued
+    /// behind Shutdown - the one moment the UI thread is already waiting on
+    /// this thread's exit. State writes still happen; only window ops skip.
+    draining: bool,
+    /// MAJOR 6: the flush-tick re-measure can fail forever (an IsWindow
+    /// refusal does not heal), and an unlatched report is one event per tick.
+    /// Same discipline as the state-file latches: one report per failure
+    /// episode, cleared by the next successful measurement.
+    measure_failure_latched: bool,
 }
 
 impl Engine {
@@ -301,6 +321,8 @@ impl Engine {
             load_refused: false,
             session_failure_latched: false,
             settings_failure_latched: false,
+            draining: false,
+            measure_failure_latched: false,
             backend,
             facts,
             deadline: Instant::now() + AUTOSAVE_IDLE,
@@ -383,9 +405,24 @@ impl Engine {
                 // by hand. That guard is the difference between a restore and a theft.
                 let first = self.window.is_none();
                 self.window = Some(handle);
-                if first {
+                // MAJOR 4: the shutdown drain re-runs this arm for any
+                // RegisterWindow queued behind Shutdown - exactly the state in
+                // which the UI thread already holds the bounded join. The
+                // handle is STATE and is stored either way; the restore is a
+                // SIDE EFFECT on a window the bridge is tearing down, so the
+                // drain skips it while still writing everything else.
+                if first && !self.draining {
                     self.restore_and_pin(handle);
                 }
+            }
+            // MAJOR 3: the handle is a VALUE, not a lease, and nothing cleared
+            // it. A destroyed HWND fails closed, but Windows RECYCLES the
+            // numbers: a stale handle that passes IsWindow names a STRANGER,
+            // whose normal position the port would read into session.rect and
+            // then MOVE. Unregister is the bridge's "this window is gone";
+            // after it, nothing touches the stored value again.
+            Command::UnregisterWindow => {
+                self.window = None;
             }
             Command::GeometryChanged { rect } => {
                 // D48: a TRIGGER and a FALLBACK, no longer the source of truth. The
@@ -395,7 +432,11 @@ impl Engine {
                 // kept (it is the best available number if the platform call fails, and
                 // a move the bridge recorded is not a lie); [`measure_rect`] replaces
                 // it with the measured rect on the same tick that writes.
-                if self.session.rect != rect {
+                // MAJOR 3: after UnregisterWindow there is no window to
+                // describe. Persisting a rect for a handle the port no longer
+                // holds is how a stranger's placement gets written; a no-op,
+                // deliberately, until the next RegisterWindow.
+                if self.window.is_some() && self.session.rect != rect {
                     self.session.rect = rect;
                     self.queue(Target::Session);
                 }
@@ -722,6 +763,7 @@ impl Engine {
     ///   Gateway::drop waits in join() with no timeout anywhere on that path.
     ///   Pinned by drain_stops_at_its_budget_instead_of_hanging_shutdown.
     fn drain(&mut self) {
+        self.draining = true;
         for _ in 0..MAX_DRAIN {
             match self.cmd_rx.try_recv() {
                 // Already carrying this one out: not a re-entry, not an event.
@@ -772,14 +814,24 @@ impl Engine {
     /// (gpui may re-apply stashed placement, and a recording backend has no
     /// window to lie about). That half is the smoke run's on-screen check
     /// (persisted rect vs the rect the user actually sees), not this suite's.
+    /// NAMED HOLES the fake cannot reach, so nobody mistakes them for covered:
+    /// (1) a DPI change between `work_area_for_rect` and the move - the clamp
+    /// was computed against a work area that may no longer be the truth;
+    /// (2) the monitor vanishing in that same window of time - nearest-monitor
+    /// fallback happens inside the seam, invisible here; (3) `scale_factor` is
+    /// never refreshed after the move, and `monitor_id` only on a SUCCESSFUL
+    /// move - a refused move leaves both stale for the next launch. Each is a
+    /// bounded wrongness (a clamp, a hint ordinal), not a hang - but they are
+    /// unproven, and this paragraph is the receipt.
     fn restore_and_pin(&mut self, handle: WindowHandle) {
         let rect = self.session.rect;
         if self.session.maximized || self.backend.is_none() || self.facts.is_none() {
             // No move to make, or no seam on this build (see [`Engine::backend`]).
-            // Pinned anyway, and the rect recorded anyway - maximized or not, the
-            // host's NORMAL position is still the number worth persisting.
+            // Pinned anyway. The session is marked dirty WITHOUT measuring: the
+            // fresh-install fix below, and the measurement belongs to the flush
+            // tick (MEASURE LATER, in flush_state).
             self.apply_topmost(handle);
-            self.record_measured_rect();
+            self.queue(Target::Session);
             return;
         }
         match self
@@ -819,25 +871,14 @@ impl Engine {
                 reason: err.to_string(),
             }),
         }
+        // THE FRESH-INSTALL DIRTY MARK, kept from the D54 fix: without it a
+        // user who never drags the window never gets a session.json (the flush
+        // sees nothing pending and writes nothing). Registration queues ONE
+        // write; the MEASURE itself happens on the flush tick, never here -
+        // an async move has not landed when the call returns, so measuring now
+        // stores the pre-move rect and D48 becomes quietly false (probe5).
+        self.queue(Target::Session);
         self.apply_topmost(handle);
-        self.record_measured_rect();
-    }
-
-    /// THE FRESH-INSTALL BUG the live bridge run found on disk: nothing marked the
-    /// session dirty at startup, so the first [@@flush_state@@] had no reason to
-    /// write, and a user who never dragged the window never got a session.json at
-    /// all - "it comes back where you left it" silently depended on having moved it
-    /// once. Registration is the only moment with a handle to ask, so it queues
-    /// exactly one write, on the tick that already exists (no second timer).
-    ///
-    /// What it stores is the rect the host REPORTS, never the one this crate asked
-    /// for: a clamp or a frame/client correction only lands in the file if the
-    /// measured number wins, or the second launch re-diverges exactly as the first
-    /// did. No measurement, no queue - see [@@Engine::measure_rect@@].
-    fn record_measured_rect(&mut self) {
-        if self.measure_rect() {
-            self.queue(Target::Session);
-        }
     }
 
     /// 5.5 step 4, which until this slice was "stored, never used": the pin bit
@@ -850,6 +891,11 @@ impl Engine {
             return;
         };
         if let Err(err) = backend.set_topmost(handle.0 as isize, on) {
+            // The pin failure rides GeometryNotRestored FOR NOW: the split into
+            // its own variant is one event-vocabulary wave, together with the
+            // state-failure consolidation, so the bridge's exhaustive match
+            // recompiles once. Until then one name carries two causes, and the
+            // reason string is the only discriminator.
             self.emit(Event::GeometryNotRestored {
                 rect: self.session.rect,
                 reason: err.to_string(),
@@ -872,6 +918,9 @@ impl Engine {
         };
         match backend.restore_frame_rect(handle.0 as isize) {
             Ok(frame) => {
+                // A success re-arms the report (MAJOR 6): the next distinct
+                // failure is news again.
+                self.measure_failure_latched = false;
                 let rect = to_rect(frame);
                 if rect != self.session.rect {
                     self.session.rect = rect;
@@ -879,10 +928,16 @@ impl Engine {
                 true
             }
             Err(err) => {
-                self.emit(Event::GeometryNotRestored {
-                    rect: self.session.rect,
-                    reason: err.to_string(),
-                });
+                // MAJOR 6: this runs every flush tick while the bit stays set,
+                // and an IsWindow refusal does not heal - one report per
+                // failure episode, not one per 750 ms.
+                if !self.measure_failure_latched {
+                    self.measure_failure_latched = true;
+                    self.emit(Event::GeometryNotRestored {
+                        rect: self.session.rect,
+                        reason: err.to_string(),
+                    });
+                }
                 false
             }
         }
@@ -913,7 +968,17 @@ impl Engine {
             // One tick, one write, and the rect inside it is the one the host reports
             // (D48) rather than the one a toolkit guessed. The cost is a single
             // GetWindowPlacement on the engine thread, where blocking is allowed.
-            let _ = self.measure_rect();
+            //
+            // MEASURE LATER, NEVER IMMEDIATELY, and this is the ONLY measure site:
+            // with the platform's async window ops (SWP_ASYNCWINDOWPOS),
+            // set_frame_rect RETURNS BEFORE THE MOVE LANDS, so a measurement at
+            // registration time stores the PRE-MOVE rect and D48 becomes quietly
+            // false (probe5). By the flush tick the owner has pumped many times
+            // and the measured normal position is the truth. Do not move this
+            // call back to restore_and_pin.
+            if self.measure_rect() {
+                self.queue(Target::Session);
+            }
             match write_session(&self.state_dir.0, &self.session) {
                 Ok(()) => {
                     self.pending.session = false;
@@ -1422,8 +1487,19 @@ mod tests {
     #[test]
     fn repeated_geometry_at_one_rect_queues_one_update() {
         let mut engine = engine();
+        // MAJOR 3: geometry describes a REGISTERED window; register one first.
+        // Registration itself marks the session dirty (the fresh-install fix),
+        // which is ONE pending write, and the geometry updates that follow
+        // join that same write instead of stacking a second.
+        engine.handle(Command::RegisterWindow {
+            handle: WindowHandle(1),
+        });
+        assert_eq!(
+            pending(&engine),
+            1,
+            "registration marks the session dirty exactly once"
+        );
         let rect = Rect::new(10, 20, 300, 200);
-        assert_eq!(pending(&engine), 0, "nothing is queued before a change");
 
         engine.handle(Command::GeometryChanged { rect });
         assert_eq!(pending(&engine), 1);
@@ -1443,6 +1519,10 @@ mod tests {
     #[test]
     fn geometry_updates_coalesce_to_the_latest_rect() {
         let mut engine = engine();
+        // MAJOR 3: geometry describes a REGISTERED window; register one first.
+        engine.handle(Command::RegisterWindow {
+            handle: WindowHandle(1),
+        });
         engine.handle(Command::GeometryChanged {
             rect: Rect::new(1, 1, 100, 100),
         });

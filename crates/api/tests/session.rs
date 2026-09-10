@@ -935,65 +935,63 @@ fn an_unwritable_session_file_is_reported_at_startup_not_at_shutdown() {
     perms.set_readonly(true);
     fs::set_permissions(&session_path, perms).expect("make the seed read-only");
 
-    let (gateway, rx) = Gateway::start_with_host(StateDir(root), Settings::default(), None, None);
-    // Deterministic, not a race: the probe runs on the CALLER's thread inside
-    // start, before the engine thread exists, so the event is already queued
-    // when start returns - and no command has been sent for it to follow.
-    match rx
-        .recv_timeout(ANSWER)
-        .expect("the refusal must arrive before any command is sent")
-    {
-        Event::StateDirUnusable { reason } => {
-            assert!(
-                !reason.trim().is_empty(),
-                "renderable: the OS's own sentence"
-            );
-            assert!(
-                reason.contains("session.json"),
-                "the copy names the file it could not write: {reason}"
-            );
-        }
-        other => panic!("expected StateDirUnusable, got {other:?}"),
-    }
+    let mut app = Harness::at(root, Settings::default());
+    // No StateDirUnusable: the directory itself is fine (core's judgement);
+    // the target FILE is the problem, and it fails at the write, latched.
+    assert!(
+        !matches!(app.rx.try_recv(), Ok(Event::StateDirUnusable { .. })),
+        "the directory is writable; the target file is the problem"
+    );
 
-    // Startup still succeeded: a refusal to persist is reported, not fatal.
-    drop(gateway);
+    app.send(Command::SetPinned(true));
+    match app.until("the read-only refusal", |ev| {
+        matches!(ev, Event::SessionWriteFailed { .. })
+    }) {
+        Event::SessionWriteFailed { reason } => {
+            assert!(!reason.trim().is_empty(), "renderable: core's sentence");
+        }
+        other => panic!("expected SessionWriteFailed, got {other:?}"),
+    }
+    // LATCHED: two tick periods of silence, not a flood.
+    let quiet = Instant::now() + ticks(2);
+    while let Ok(event) = app
+        .rx
+        .recv_timeout(quiet.saturating_duration_since(Instant::now()))
+    {
+        assert!(
+            !matches!(event, Event::SessionWriteFailed { .. }),
+            "the read-only refusal was reported more than once: {event:?}"
+        );
+    }
+    drop(app);
     // Restore writability so the TempDir can clean up after itself.
     let mut perms = fs::metadata(&session_path).expect("metadata").permissions();
     perms.set_readonly(false);
     fs::set_permissions(&session_path, perms).expect("restore the seed");
 }
 
-/// The cold-start budget is a documented product constraint, so the probe's
-/// cost is MEASURED here rather than asserted in prose: the same sequence of
-/// syscalls `ensure_state_dir` performs (create the temp, delete it,
-/// append-open the session file) timed against a real directory.
+/// The cold-start budget is a documented product constraint, so core's
+/// ensure_state_dir (which the port now calls at startup) is MEASURED here
+/// against a real, already-created directory - the warm path every launch
+/// after the first takes.
 #[test]
-fn state_dir_probe_cost_is_bounded_by_syscalls() {
+fn core_state_dir_ensure_cost_is_bounded() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let session = dir.path().join(FILE_NAME);
-    write_session(dir.path(), &Session::default()).expect("seed session.json");
-    let probe = dir.path().join("notes-probe-cost.tmp");
+    // The first call creates; every later call is the warm path.
+    notes_core::session::ensure_state_dir(dir.path())
+        .expect("the first ensure creates the directory");
 
     const RUNS: u32 = 200;
     let started = Instant::now();
     for _ in 0..RUNS {
-        let file = fs::File::create(&probe).expect("create the probe");
-        drop(file);
-        fs::remove_file(&probe).expect("remove the probe");
-        let held = fs::OpenOptions::new()
-            .append(true)
-            .open(&session)
-            .expect("append-open the session file");
-        std::hint::black_box(&held);
-        drop(held);
+        notes_core::session::ensure_state_dir(dir.path()).expect("the warm path must stay healthy");
     }
     let per_call = started.elapsed().as_micros() as u64 / RUNS as u64;
-    // This is a real-disk number; print it so the run records it.
-    println!("state-dir probe: {per_call} us per startup ({RUNS} runs measured)");
+    // A real-disk number; print it so the run records it.
+    println!("core ensure_state_dir: {per_call} us per call ({RUNS} runs measured)");
     assert!(
         per_call < 25_000,
-        "the probe must not become a cold-start budget item: {per_call} us"
+        "the state-dir check must not become a cold-start budget item: {per_call} us"
     );
 }
 

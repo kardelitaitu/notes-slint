@@ -59,6 +59,12 @@ pub struct Answers {
     pub fail_topmost: Option<String>,
     pub fail_restore: Option<String>,
     pub fail_work_area: Option<String>,
+    /// MAJOR: how long `set_frame_rect` BLOCKS before answering, in
+    /// milliseconds. Zero by default. This is the hang reproducer: a window op
+    /// from another thread SENDS to the window's owner and waits for it to
+    /// pump, so a blocked move is exactly what the real seam does to an engine
+    /// whose owner is parked.
+    pub block_move_ms: u64,
 }
 
 impl Default for Answers {
@@ -72,6 +78,7 @@ impl Default for Answers {
             fail_topmost: None,
             fail_restore: None,
             fail_work_area: None,
+            block_move_ms: 0,
         }
     }
 }
@@ -186,6 +193,10 @@ impl WindowBackend for Host {
             rect: r,
             scale,
         });
+        let block = self.answers().block_move_ms;
+        if block > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(block));
+        }
         match self.answers().fail_move.clone() {
             Some(message) => Err(PlatformError::Win32 {
                 api: "SetWindowPos",

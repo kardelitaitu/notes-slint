@@ -276,6 +276,97 @@ fn a_fresh_install_writes_the_session_with_the_rect_the_host_reports() {
     );
 }
 
+/// MAJOR 3: the handle is a VALUE, not a lease. After UnregisterWindow, no
+/// host call may happen (nothing moves - a RECYCLED handle would pass IsWindow
+/// and name a stranger) and a post-unregister GeometryChanged is a no-op (no
+/// stranger's rect lands in session.rect). The fake's restore answer is set
+/// equal to the session's rect, so the persisted value proves which path
+/// wrote it: anything other than `before` means the GeometryChanged leaked.
+#[test]
+fn after_unregister_nothing_moves_and_no_rect_is_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let before = Rect::new(50, 60, 700, 500);
+    write_session(
+        dir.path(),
+        &Session {
+            rect: before,
+            ..Session::default()
+        },
+    )
+    .expect("write the session fixture");
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(FrameRect::new(50, 60, 700, 500)),
+            ..Answers::default()
+        },
+    );
+
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    wait_for_calls(&host, 1, "the registration's move");
+    let moves_at_registration = host.moves().len();
+
+    gateway.send(Command::UnregisterWindow).expect("queued");
+    // A geometry update for a window the port no longer holds.
+    gateway
+        .send(Command::GeometryChanged {
+            rect: Rect::new(900, 900, 400, 300),
+        })
+        .expect("queued");
+    // Re-registering would be a legitimate NEW window; deliberately not sent.
+    gateway.close().expect("shutdown joins the engine");
+
+    assert_eq!(
+        host.moves().len(),
+        moves_at_registration,
+        "nothing may move after UnregisterWindow"
+    );
+    let persisted = read_session(dir.path()).expect("session readable");
+    assert_eq!(
+        persisted.rect, before,
+        "the post-unregister GeometryChanged must not write session.rect"
+    );
+}
+
+/// MAJOR 4: the shutdown drain re-runs every queued command, so a
+/// RegisterWindow behind Shutdown used to run SetWindowPos again at exit - in
+/// the exact state where the UI thread already holds the (now bounded) join.
+/// The drain stores the handle as state but performs no host work.
+#[test]
+fn the_shutdown_drain_does_not_replay_the_restore() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_session(dir.path(), &Session::default()).expect("write the session fixture");
+    let (gateway, _rx, host) = start_with(dir.path(), Answers::default());
+
+    // First registration moves once (the legitimate restore).
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    wait_for_calls(&host, 1, "the first move");
+
+    // Shutdown first, a second RegisterWindow BEHIND it: the drain must store
+    // the handle and skip the move.
+    gateway.send(Command::Shutdown).expect("queued");
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x200),
+        })
+        .expect("queued behind shutdown");
+    gateway.close().expect("shutdown joins the engine");
+
+    assert_eq!(
+        host.moves().len(),
+        1,
+        "the drain replayed the restore: a second move happened at exit"
+    );
+}
+
 /// The settings contract's middle case, through the port's OWN seam: the
 /// settings left the codepage unset, and the host's ANSI code page fills the
 /// gap - here the fake's CP932, which must turn a CP1252 byte stream into a

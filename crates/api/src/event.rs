@@ -274,17 +274,23 @@ pub enum Event {
     /// A save succeeded, and the buffer at `revision` is now what is on disk
     /// (D11 — this is what makes later flushes at that revision `Clean`).
     Saved { path: PathBuf, revision: u64 },
-    /// The port could not put the window where the session said it belongs, or
-    /// could not apply the pin bit. Emitted by
-    /// [`RegisterWindow`](crate::Command::RegisterWindow) - the moment the handle
-    /// becomes usable - and by the save tick when the RESTORE rect cannot be
-    /// measured (D48). Silence is forbidden here: a window that opens in the wrong
-    /// place, and a session meant to be pinned that is not, otherwise look exactly
-    /// like the app forgetting. [`rect`] is the rect the port asked for, so the
-    /// copy can name the place it could not reach; [`reason`] is notes-platform's
-    /// own sentence (its [`PlatformError`] Display) passed through untranslated,
-    /// for the same reason [`SaveError::Other`] carries OS text - it is the one
-    /// clue the user has, and the port may not invent a friendlier one.
+    /// The port could not put the window where the session said it belongs,
+    /// could not measure the rect to persist, or could not apply the pin bit.
+    /// Emitted by [`RegisterWindow`](crate::Command::RegisterWindow) - the
+    /// moment the handle becomes usable - and by the save tick when the
+    /// measurement fails, LATCHED (one report per failure episode, not one per
+    /// tick - an IsWindow refusal does not heal). Silence is forbidden here: a
+    /// window that opens in the wrong place otherwise looks exactly like the
+    /// app forgetting. THIS VARIANT ALSO CARRIES PIN FAILURES for now - one
+    /// name, two causes, and the reason string is the only discriminator; the
+    /// split is sequenced into the one event-vocabulary wave with the state-
+    /// failure consolidation so the bridge's exhaustive match rewrites once.
+    /// [`rect`] is the rect the port asked
+    /// for, so the copy can name the place it could not reach; [`reason`] is
+    /// notes-platform's own sentence (its PlatformError Display) passed
+    /// through untranslated, for the same reason [`SaveError::Other`] carries
+    /// OS text - it is the one clue the user has, and the port may not invent
+    /// a friendlier one.
     GeometryNotRestored {
         /// Where the window was supposed to go, in frame pixels.
         rect: Rect,
@@ -476,6 +482,7 @@ mod tests {
             Event::SessionWriteFailed { .. } => "SessionWriteFailed",
             Event::StateDirUnusable { .. } => "StateDirUnusable",
             Event::SettingsWriteFailed { .. } => "SettingsWriteFailed",
+
             Event::RecentsUpdated(_) => "RecentsUpdated",
         }
     }
@@ -559,6 +566,11 @@ mod tests {
         // Loaded, LoadFailed, Saved, GeometryNotRestored, SaveFailed,
         // ExternalChange, AutosaveSkipped, RecentsUpdated, SettingsCorrupt,
         // SessionWriteFailed, StateDirUnusable, SettingsWriteFailed.
+        // (GeometryNotRestored still carries BOTH the placement and the pin
+        // causes; the split is one vocabulary wave with the state-failure
+        // consolidation, after this slice. A bounded-join timeout is reported
+        // through close()'s typed Err, not through an Event: a Gateway-held
+        // Event sender would delay the Disconnected contract.)
         assert_eq!(all.len(), 13, "Event gained or lost a variant");
 
         for event in &all {
