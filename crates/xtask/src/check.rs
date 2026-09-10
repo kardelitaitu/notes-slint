@@ -179,14 +179,36 @@ fn step_specs() -> Vec<StepSpec> {
             quick_skippable: true,
             budget_secs: 120,
         },
+        // The bridge is GATED, and by more than a type-check: CI builds the
+        // exe (the link has to work) and lints every target. Raising the local
+        // roster to what CI already runs is the resolution check-ci pointed at
+        // - weakening CI was not on the table, and cargo check was weaker than
+        // both of these.
         StepSpec {
-            name: "bridge",
-            display: "cargo check -p notes-bridge-gpui (advisory: excluded from the gate by design, D1)",
+            name: "bridge-build",
+            display: "cargo build -p notes-bridge-gpui --bin notes-gpui",
             program: "cargo",
-            args: &["check", "-p", "notes-bridge-gpui"],
-            advisory: true,
-            quick_skippable: false,
-            budget_secs: 600,
+            args: &["build", "-p", "notes-bridge-gpui", "--bin", "notes-gpui"],
+            advisory: false,
+            quick_skippable: true,
+            budget_secs: 900,
+        },
+        StepSpec {
+            name: "bridge-clippy",
+            display: "cargo clippy -p notes-bridge-gpui --all-targets -- -D warnings",
+            program: "cargo",
+            args: &[
+                "clippy",
+                "-p",
+                "notes-bridge-gpui",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            advisory: false,
+            quick_skippable: true,
+            budget_secs: 900,
         },
         StepSpec {
             name: "docs",

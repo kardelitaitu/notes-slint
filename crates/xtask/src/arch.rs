@@ -14,15 +14,40 @@
 //! * Direct checks read packages[].dependencies[] and apply to normal, dev
 //!   and build edges alike.
 //! * Transitive closures follow normal and build edges only. Dev edges are
-//!   still policed where they are direct, but not followed: the rule table
-//!   sanctions tempfile as a dev-dependency of notes-core, and on Windows
-//!   tempfile itself pulls windows-sys — a detail of an allowed dependency,
-//!   not a layering violation. Following dev edges transitively would
-//!   reimplement the transitive "cargo tree -i" mistake this tool replaces.
+//!   still policed where they are direct, but not followed: tempfile is a
+//!   dev-dependency and on Windows its own payload carries windows-sys, which
+//!   a rule forbids - a detail of an allowed dependency, not a layering
+//!   violation, and following dev edges would reimplement the transitive
+//!   "cargo tree -i" mistake this tool replaces. That allowance is now a named,
+//!   finite, printed list: see [DEV_TRANSITIVE_EXEMPTIONS].
 //! * Repo-crate rules are STRUCTURAL: they read metadata.workspace_members at
 //!   runtime, so a crate added to the workspace tomorrow is forbidden where
 //!   the rules say "nothing else in this repo" — no name list to forget to
 //!   update.
+//! * [wrapper-evades] closes the one-crate escape hatch that structural
+//!   direct-only rules left open: bridge -> a non-member shim ->
+//!   notes-platform was invisible, because the shim is not a workspace member
+//!   and the forbidden crate sat one hop further out. Every structural rule
+//!   now also walks the normal+build closure of EVERY dependency, member or
+//!   not, treating the rule's allowed members as boundaries: bridge -> api ->
+//!   core stays clean, bridge -> shim -> core is a violation and names the
+//!   shim. Reaching around the port through a helper is the same reach.
+//! * Optional edges are visible because metadata runs with --all-features
+//!   (see [crate::metadata]). A feature-gated edge breaks an unconditional
+//!   rule: the graph carries it whenever the feature exists, and these rules
+//!   describe the architecture, not today's default build.
+//! * cfg(target)-gated dependencies are read CONSERVATIVELY, not precisely:
+//!   the target field on packages[].dependencies[] is ignored, so a Linux-only
+//!   edge counts on a Windows run too. That can only over-report, never
+//!   under-report - the right direction for a gate, since a precise reading
+//!   would have to evaluate every cfg expression, and a checker that quietly
+//!   drops edges is worse than one that keeps too many.
+//! * Dev edges are still not followed, but the allowance is a LIST now, not a
+//!   mood: DEV_TRANSITIVE_EXEMPTIONS names every dev-dependency whose own
+//!   closure carries a forbidden crate (today: tempfile, which pulls
+//!   windows-sys on Windows - decision D23). A dev dep that does the same and
+//!   is not on the list is reported as [dev-transitive], and run() prints the
+//!   exemptions it applied, so the allowance is visible where violations are.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -73,6 +98,13 @@ pub enum Scope {
     DirectOnly,
     /// Direct edges plus the transitive closure (normal/build edges).
     DirectAndTransitive,
+    /// The closure again, but with the rule's ALLOWED members treated as
+    /// boundaries instead of starting points: their internal payload is
+    /// sanctioned by construction, so a forbidden crate found on any other path
+    /// was reached around the port — through a wrapper. This is what structural
+    /// (Members) rules need; a Names rule wants DirectAndTransitive, because an
+    /// external crate has nothing legitimate to be a corridor to.
+    Corridor,
 }
 
 pub struct Rule {
@@ -114,7 +146,7 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "core-orthogonal-to-platform",
         package: NOTES_PLATFORM,
-        scope: Scope::DirectOnly,
+        scope: Scope::Corridor,
         forbidden: Forbidden::Members {
             allowed: &[NOTES_PLATFORM],
             also: &[],
@@ -151,7 +183,7 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "no-new-backdoor",
         package: NOTES_API,
-        scope: Scope::DirectOnly,
+        scope: Scope::Corridor,
         forbidden: Forbidden::Members {
             allowed: &[NOTES_CORE, NOTES_PLATFORM],
             also: &[],
@@ -164,7 +196,7 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "bridge-sees-only-api",
         package: NOTES_BRIDGE,
-        scope: Scope::DirectOnly,
+        scope: Scope::Corridor,
         forbidden: Forbidden::Members {
             allowed: &[NOTES_API],
             also: &[],
@@ -175,7 +207,7 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "checker-is-independent",
         package: XTASK,
-        scope: Scope::DirectOnly,
+        scope: Scope::Corridor,
         forbidden: Forbidden::Members {
             allowed: &[XTASK],
             also: &["gpui"],
@@ -198,23 +230,50 @@ impl Via {
     }
 }
 
+/// The rule id a wrapper finding carries. It is deliberately NOT the structural
+/// rule's own id: "bridge -> shim -> notes-platform" is a different failure than
+/// "bridge -> notes-platform" - the second is a dependency, the first is a
+/// workaround, and the message has to name the workaround.
+pub const WRAPPER_RULE: &str = "no-transitive-through-external";
+/// The rule id for a dev-only edge that carries a forbidden crate. See
+/// [DEV_TRANSITIVE_EXEMPTIONS].
+pub const DEV_TRANSITIVE_RULE: &str = "dev-transitive";
+
+/// The ONLY dev-dependencies allowed to carry a forbidden crate in their own
+/// closure. An explicit, finite, printed list: tempfile is dev-only in
+/// notes-core (decision D23) and on Windows drags windows-sys, so following dev
+/// edges at all would red-flag a decision, while not looking at them at all
+/// would let any second one hide in the same allowance. Adding a name here is a
+/// decision; the checker prints which entries it used.
+pub const DEV_TRANSITIVE_EXEMPTIONS: &[&str] = &["tempfile"];
+
 #[derive(Debug)]
 pub struct Violation {
     pub rule: &'static str,
     pub package: &'static str,
     pub dep: String,
     pub via: Via,
+    /// For [wrapper-evades] findings: the crate the forbidden one was reached
+    /// through. None on every other rule.
+    pub wrapper: Option<String>,
 }
 
 impl Violation {
     fn message(&self) -> String {
-        format!(
-            "ARCH VIOLATION: {} has a forbidden dependency on {} ({}) [rule: {}]",
-            self.package,
-            self.dep,
-            self.via.as_str(),
-            self.rule
-        )
+        match &self.wrapper {
+            Some(w) => format!(
+                "ARCH VIOLATION: {} has a forbidden dependency on {} (reached through the non-member \
+                 wrapper {}) [rule: {}]",
+                self.package, self.dep, w, self.rule
+            ),
+            None => format!(
+                "ARCH VIOLATION: {} has a forbidden dependency on {} ({}) [rule: {}]",
+                self.package,
+                self.dep,
+                self.via.as_str(),
+                self.rule
+            ),
+        }
     }
 
     fn human_hint(&self) -> String {
@@ -233,6 +292,53 @@ pub struct Graph {
     pub(crate) direct: BTreeMap<String, BTreeSet<String>>,
     /// package name -> names reachable via normal/build edges
     pub(crate) closure: BTreeMap<String, BTreeSet<String>>,
+    /// package name -> dependencies that exist ONLY as dev-deps. Tracked so the
+    /// dev-edge allowance is a checked list rather than an unfollowed edge type
+    /// nobody looks at (see [DEV_TRANSITIVE_EXEMPTIONS]).
+    pub(crate) dev_only: BTreeMap<String, BTreeSet<String>>,
+    /// package name -> direct deps carried by normal or build edges. The
+    /// corridor walk uses this so a dev-only edge is never mistaken for a
+    /// production path.
+    pub(crate) normal_build: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Graph {
+    /// Everything reachable from 'start' over normal/build edges WITHOUT ever
+    /// expanding one of 'boundaries' - the rule's allowed members. Their own
+    /// payload is sanctioned by construction (that is what "bridge may import
+    /// api" means), so a forbidden crate found on any other path was reached
+    /// around the port. Returns forbidden-name -> the direct dependency of
+    /// 'start' that carried it, which is the wrapper to name in the message.
+    pub(crate) fn reached_around(
+        &self,
+        start: &str,
+        boundaries: &BTreeSet<String>,
+    ) -> BTreeMap<String, String> {
+        let mut carrier: BTreeMap<String, String> = BTreeMap::new();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut stack: Vec<(String, String)> = Vec::new();
+        for dep in self.normal_build.get(start).into_iter().flatten() {
+            if dep.as_str() == start || boundaries.contains(dep) {
+                continue;
+            }
+            stack.push((dep.clone(), dep.clone()));
+        }
+        while let Some((name, from)) = stack.pop() {
+            if !visited.insert(name.clone()) {
+                continue;
+            }
+            carrier.entry(name.clone()).or_insert_with(|| from.clone());
+            if boundaries.contains(&name) {
+                continue;
+            }
+            for next in self.normal_build.get(&name).into_iter().flatten() {
+                if next != start && !visited.contains(next) {
+                    stack.push((next.clone(), from.clone()));
+                }
+            }
+        }
+        carrier
+    }
 }
 
 /// The names a rule forbids, resolved against the graph. Structural rules
@@ -264,6 +370,37 @@ fn banned_names(rule: &Rule, graph: &Graph) -> BTreeSet<String> {
 /// fixtures freely.
 pub fn evaluate(graph: &Graph) -> Vec<Violation> {
     let mut violations = Vec::new();
+
+    // [dev-transitive]: dev edges are still not followed (D23), but the
+    // allowance is now checked against a finite printed list instead of being
+    // an invisible consequence of which edge kind the walk happens to skip.
+    for rule in RULES {
+        if rule.scope == Scope::Corridor {
+            continue;
+        }
+        let banned = banned_names(rule, graph);
+        let Some(devs) = graph.dev_only.get(rule.package) else {
+            continue;
+        };
+        for dev in devs {
+            if DEV_TRANSITIVE_EXEMPTIONS.contains(&dev.as_str()) {
+                continue;
+            }
+            let Some(reached) = graph.closure.get(dev) else {
+                continue;
+            };
+            for hit in reached.iter().filter(|n| banned.contains(*n)) {
+                violations.push(Violation {
+                    rule: DEV_TRANSITIVE_RULE,
+                    package: rule.package,
+                    dep: hit.clone(),
+                    via: Via::Transitive,
+                    wrapper: Some(format!("the dev-dependency {dev}")),
+                });
+            }
+        }
+    }
+
     for rule in RULES {
         let Some(direct) = graph.direct.get(rule.package) else {
             continue; // an absent checked package is reported by run(), not guessed at here
@@ -276,8 +413,39 @@ pub fn evaluate(graph: &Graph) -> Vec<Violation> {
                     package: rule.package,
                     dep: dep.clone(),
                     via: Via::Direct,
+                    wrapper: None,
                 });
             }
+        }
+        // [wrapper-evades]: the forbidden crate may also sit behind a crate
+        // that is not a workspace member at all. Banning members direct-only
+        // let "bridge -> shim -> notes-platform" through untouched, which is
+        // exactly reaching around the port. The walk treats the rule's allowed
+        // members as boundaries: their payload is sanctioned, anything else
+        // that reaches a forbidden crate is named along with its carrier.
+        if rule.scope == Scope::Corridor {
+            let allowed: BTreeSet<String> = match rule.forbidden {
+                Forbidden::Members { allowed, .. } => {
+                    allowed.iter().map(|s| s.to_string()).collect()
+                }
+                Forbidden::Names(_) => BTreeSet::new(),
+            };
+            let mut edges: BTreeSet<String> = allowed.clone();
+            edges.insert(rule.package.to_string());
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            for (dep, carrier) in graph.reached_around(rule.package, &edges) {
+                if carrier == dep || !banned.contains(dep.as_str()) || !seen.insert(dep.clone()) {
+                    continue; // a direct hit is reported above; names only once
+                }
+                violations.push(Violation {
+                    rule: WRAPPER_RULE,
+                    package: rule.package,
+                    dep,
+                    via: Via::Transitive,
+                    wrapper: Some(carrier),
+                });
+            }
+            continue;
         }
         if rule.scope != Scope::DirectAndTransitive {
             continue;
@@ -295,11 +463,44 @@ pub fn evaluate(graph: &Graph) -> Vec<Violation> {
                     package: rule.package,
                     dep: dep.clone(),
                     via: Via::Transitive,
+                    wrapper: None,
                 });
             }
         }
     }
     violations
+}
+
+/// Which entries of [DEV_TRANSITIVE_EXEMPTIONS] this graph actually exercises.
+/// Both halves matter: one applied and unnamed in the output would let a second
+/// dev-only violation hide inside the same allowance, and one listed but never
+/// used is a stale exemption somebody should delete. run() prints which.
+pub fn dev_exemptions_applied(graph: &Graph) -> BTreeSet<String> {
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    for rule in RULES {
+        if rule.scope == Scope::Corridor {
+            continue;
+        }
+        let banned = banned_names(rule, graph);
+        let Some(devs) = graph.dev_only.get(rule.package) else {
+            continue;
+        };
+        for dev in devs {
+            let Some(name) = DEV_TRANSITIVE_EXEMPTIONS.iter().find(|e| *e == dev) else {
+                continue;
+            };
+            let hit = graph
+                .closure
+                .get(dev)
+                .into_iter()
+                .flatten()
+                .find(|n| banned.contains(n.as_str()));
+            if let Some(hit) = hit {
+                used.insert(format!("{name} ({}, reaching {})", rule.package, hit));
+            }
+        }
+    }
+    used
 }
 
 /// Parse "cargo metadata --format-version 1" JSON into a [Graph].
@@ -348,20 +549,40 @@ pub fn graph_from_metadata(v: &Value) -> Result<Graph, String> {
     // a normal dependency, "dev" or "build" otherwise; forbidden sets apply to
     // all three.
     let mut direct: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut dev_only: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut normal_build: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for p in packages {
         let name = p
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| "metadata: package without name".to_string())?;
         let entry = direct.entry(name.to_string()).or_default();
+        let dev_entry = dev_only.entry(name.to_string()).or_default();
+        let nb_entry = normal_build.entry(name.to_string()).or_default();
+        let mut normal_or_build: BTreeSet<String> = BTreeSet::new();
         for d in p
             .get("dependencies")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            if let Some(dep) = d.get("name").and_then(Value::as_str) {
-                entry.insert(dep.to_string());
+            let Some(dep) = d.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            entry.insert(dep.to_string());
+            if d.get("kind").is_none_or(Value::is_null)
+                || d.get("kind").and_then(Value::as_str) == Some("build")
+            {
+                normal_or_build.insert(dep.to_string());
+                nb_entry.insert(dep.to_string());
+            } else {
+                dev_entry.insert(dep.to_string());
+            }
+        }
+        // A dep declared both ways is not dev-only.
+        if let Some(set) = dev_only.get_mut(name) {
+            for n in &normal_or_build {
+                set.remove(n);
             }
         }
     }
@@ -407,8 +628,14 @@ pub fn graph_from_metadata(v: &Value) -> Result<Graph, String> {
     // Transitive closure, per package named by the rules. Several versions of
     // one name (windows 0.57 and 0.61) collapse into one name set on purpose:
     // the rules are written against names.
+    // Every package, not only the ones a rule names: the corridor walk and the
+    // dev-transitive check both need the subtree of an arbitrary crate.
     let mut closure: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for name in checked_packages() {
+    let checked: Vec<&'static str> = checked_packages();
+    let mut names: Vec<&str> = name_of_id.values().copied().collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names.iter().copied().chain(checked.iter().copied()) {
         let roots: Vec<&str> = packages
             .iter()
             .filter(|p| p.get("name").and_then(Value::as_str) == Some(name))
@@ -441,6 +668,8 @@ pub fn graph_from_metadata(v: &Value) -> Result<Graph, String> {
         members,
         direct,
         closure,
+        dev_only,
+        normal_build,
     })
 }
 
@@ -501,6 +730,15 @@ pub fn run() -> i32 {
         return 2;
     }
     let violations = evaluate(&graph);
+    let applied = dev_exemptions_applied(&graph);
+    println!(
+        "check-arch: dev-transitive exemption applied to: {}",
+        if applied.is_empty() {
+            "none".to_string()
+        } else {
+            applied.into_iter().collect::<Vec<_>>().join("; ")
+        }
+    );
     for v in &violations {
         println!("{}", v.message());
         println!("{}", v.human_hint());
@@ -516,20 +754,6 @@ pub fn run() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn graph(members: &[&str], direct: &[(&str, &[&str])], closure: &[(&str, &[&str])]) -> Graph {
-        Graph {
-            members: members.iter().map(|s| s.to_string()).collect(),
-            direct: direct
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
-                .collect(),
-            closure: closure
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
-                .collect(),
-        }
-    }
 
     fn workspace() -> Vec<&'static str> {
         vec![NOTES_CORE, NOTES_API, NOTES_PLATFORM, NOTES_BRIDGE, XTASK]
@@ -596,7 +820,9 @@ mod tests {
     }
 
     /// One poisoning per rule id; windows-sys sits only in core's closure so
-    /// the transitive path is exercised too.
+    /// the transitive path is exercised too. The seventh finding is the new
+    /// wrapper rule: the poison bridge -> notes-core, and core's own closure
+    /// carries notes-platform, so bridge reaches platform around the port.
     fn poisoned_graph() -> Graph {
         graph(
             &workspace(),
@@ -617,13 +843,21 @@ mod tests {
         )
     }
 
-    #[test]
-    fn clean_graph_produces_zero_findings() {
-        let violations = evaluate(&clean_graph());
-        assert!(
-            violations.is_empty(),
-            "clean fixture must not false-positive: {violations:?}"
-        );
+    fn graph(members: &[&str], direct: &[(&str, &[&str])], closure: &[(&str, &[&str])]) -> Graph {
+        let direct: BTreeMap<String, BTreeSet<String>> = direct
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+            .collect();
+        Graph {
+            members: members.iter().map(|s| s.to_string()).collect(),
+            normal_build: direct.clone(),
+            dev_only: BTreeMap::new(),
+            closure: closure
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+                .collect(),
+            direct,
+        }
     }
 
     #[test]
@@ -640,13 +874,14 @@ mod tests {
                 "core-is-pure",
                 "core-no-os",
                 "core-orthogonal-to-platform",
+                "no-transitive-through-external",
                 "port-is-ui-agnostic",
             ]
         );
         assert_eq!(
             violations.len(),
-            6,
-            "one finding per poison, no noise: {violations:?}"
+            7,
+            "one finding per poison plus the reach-around it enables: {violations:?}"
         );
         let direct = violations.iter().filter(|v| v.via == Via::Direct).count();
         assert_eq!(
@@ -682,11 +917,25 @@ mod tests {
             &[],
         );
         let violations = evaluate(&g);
+        // Four direct reach-arounds, plus three more the wrapper rule now sees:
+        // platform -> bridge is poisoned, and bridge's own subtree carries api,
+        // core and the new helper, so platform reaches all three around the port.
         assert_eq!(
             violations.len(),
-            4,
-            "exactly the four reach-arounds: {violations:?}"
+            7,
+            "four direct poisons and three wrapper paths: {violations:?}"
         );
+        for dep in ["notes-api", "notes-core", "notes-helper"] {
+            assert!(
+                violations.iter().any(|v| {
+                    v.rule == WRAPPER_RULE
+                        && v.package == NOTES_PLATFORM
+                        && v.dep == dep
+                        && v.wrapper.as_deref() == Some("notes-bridge-gpui")
+                }),
+                "platform reaches {dep} through the poisoned bridge: {violations:?}"
+            );
+        }
         let expected = [
             (
                 "core-orthogonal-to-platform",
@@ -760,6 +1009,7 @@ mod tests {
             package: "notes-core",
             dep: "gpui".to_string(),
             via: Via::Direct,
+            wrapper: None,
         };
         assert_eq!(
             v.message(),
@@ -877,5 +1127,146 @@ mod tests {
         assert_eq!(violations[0].via, Via::Transitive);
         assert_eq!(violations[1].rule, "port-is-ui-agnostic");
         assert_eq!(violations[1].via, Via::Transitive);
+    }
+
+    // ---- the four holes: each test is a checker that can fail ----
+
+    /// HOLE 1: an EXTERNAL wrapper crate used to evade every structural rule,
+    /// because Members banned only workspace members and the bridge/port rules
+    /// were direct-only. bridge -> notes-shim -> notes-platform is exactly
+    /// "reaching around the port".
+    #[test]
+    fn an_external_wrapper_reaching_a_member_is_a_wrapper_evades_violation() {
+        let mut g = clean_graph();
+        g.normal_build
+            .entry("notes-bridge-gpui".to_string())
+            .or_default()
+            .insert("notes-shim".to_string());
+        g.normal_build.insert(
+            "notes-shim".to_string(),
+            ["notes-platform".to_string()].into_iter().collect(),
+        );
+        let v = evaluate(&g);
+        let hits: Vec<&Violation> = v
+            .iter()
+            .filter(|x| x.rule == WRAPPER_RULE && x.package == NOTES_BRIDGE)
+            .collect();
+        assert_eq!(hits.len(), 1, "the shim path must be caught: {v:?}");
+        assert_eq!(hits[0].dep, "notes-platform");
+        assert_eq!(hits[0].wrapper.as_deref(), Some("notes-shim"));
+        assert!(
+            hits[0].message().contains("no-transitive-through-external"),
+            "{}",
+            hits[0].message()
+        );
+    }
+
+    /// HOLE 1, the other direction: reaching THROUGH the port is the design and
+    /// must stay silent, or the rule becomes a false-fail machine nobody keeps.
+    #[test]
+    fn the_sanctioned_path_through_the_port_is_not_a_wrapper() {
+        let v = evaluate(&clean_graph());
+        assert!(
+            v.iter()
+                .all(|x| x.rule != WRAPPER_RULE || x.package != NOTES_BRIDGE),
+            "bridge -> api -> core/platform is legal: {v:?}"
+        );
+    }
+
+    /// The same trick around the port itself: api -> helper -> bridge.
+    #[test]
+    fn a_wrapper_around_the_port_is_caught_too() {
+        let mut g = clean_graph();
+        g.normal_build
+            .entry("notes-api".to_string())
+            .or_default()
+            .insert("helper".to_string());
+        g.normal_build.insert(
+            "helper".to_string(),
+            ["notes-bridge-gpui".to_string()].into_iter().collect(),
+        );
+        let v = evaluate(&g);
+        assert!(
+            v.iter().any(|x| x.rule == WRAPPER_RULE
+                && x.package == NOTES_API
+                && x.dep == "notes-bridge-gpui"),
+            "{v:?}"
+        );
+    }
+
+    /// HOLE 2: metadata must run with --all-features, or an optional edge
+    /// behind a non-default feature is absent from resolve entirely.
+    #[test]
+    fn metadata_is_read_with_every_feature_enabled() {
+        assert!(
+            crate::metadata::METADATA_ARGS.contains(&"--all-features"),
+            "optional edges would be invisible: {:?}",
+            crate::metadata::METADATA_ARGS
+        );
+    }
+
+    /// HOLE 4: the tempfile allowance is a named list the checker proves it
+    /// used - and a SECOND dev-only wrapper cannot hide in its shade.
+    #[test]
+    fn a_second_dev_only_wrapper_cannot_hide_in_the_tempfile_allowance() {
+        let mut g = clean_graph();
+        g.dev_only.insert(
+            "notes-core".to_string(),
+            ["tempfile".to_string()].into_iter().collect(),
+        );
+        g.closure.insert(
+            "tempfile".to_string(),
+            ["faux".to_string(), "windows-sys".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        assert!(
+            evaluate(&g).is_empty(),
+            "tempfile is D23-sanctioned: {:?}",
+            evaluate(&g)
+        );
+        let applied = dev_exemptions_applied(&g);
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        assert!(
+            applied
+                .iter()
+                .any(|a| a.contains("tempfile") && a.contains("notes-core")),
+            "{applied:?}"
+        );
+        g.dev_only.insert(
+            "notes-core".to_string(),
+            ["tempfile".to_string(), "sneaky-fixture".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        g.closure.insert(
+            "sneaky-fixture".to_string(),
+            ["windows-sys".to_string()].into_iter().collect(),
+        );
+        let v = evaluate(&g);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].rule, DEV_TRANSITIVE_RULE);
+        assert_eq!(v[0].package, NOTES_CORE);
+        assert_eq!(v[0].dep, "windows-sys");
+        assert_eq!(
+            v[0].wrapper.as_deref(),
+            Some("the dev-dependency sneaky-fixture")
+        );
+        assert_eq!(
+            dev_exemptions_applied(&g).len(),
+            1,
+            "tempfile stays exempted"
+        );
+    }
+
+    /// The list is a decision with a size, not a pile that absorbs whatever is
+    /// dropped on it.
+    #[test]
+    fn the_exemption_list_is_exactly_what_d23_sanctioned() {
+        assert_eq!(
+            DEV_TRANSITIVE_EXEMPTIONS,
+            &["tempfile"],
+            "adding a name here is a decision; say so in the commit message"
+        );
     }
 }

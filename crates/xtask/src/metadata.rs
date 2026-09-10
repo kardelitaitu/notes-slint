@@ -36,9 +36,23 @@ pub fn find_workspace_root(start: &Path) -> Result<PathBuf, String> {
 /// Run cargo metadata for the workspace at root and parse it. `.output()`
 /// drains both pipes to EOF concurrently, so the child cannot deadlock on a
 /// full pipe.
+///
+/// `--all-features` is not decoration. An optional dependency behind a
+/// non-default feature does not appear in `resolve.nodes[]` unless that
+/// feature is on, so without the flag this reader is blind to exactly the
+/// edges a layering rule has to see: `cargo add -p notes-core windows-sys
+/// --optional --features x` would sail through today and break the rule the
+/// moment anyone turns `x` on. The rules here are stated unconditionally, so
+/// they are evaluated against the union of every feature combination - a
+/// feature-gated edge is a real edge, because the graph carries it for as
+/// long as the feature exists.
+/// The exact cargo invocation. A constant so a test can hold it to the
+/// contract: dropping --all-features is a silent weakening, not a refactor.
+pub const METADATA_ARGS: &[&str] = &["metadata", "--format-version", "1", "--all-features"];
+
 pub fn cargo_metadata(root: &Path) -> Result<Value, String> {
     let out = Command::new("cargo")
-        .args(["metadata", "--format-version", "1"])
+        .args(METADATA_ARGS)
         .current_dir(root)
         .output()
         .map_err(|e| format!("failed to spawn cargo metadata: {e}"))?;
