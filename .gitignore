@@ -1,0 +1,10 @@
+/target
+/dist
+**/*.rs.bk
+Cargo.lock
+!.cargo/config.toml
+
+/packaging/**/out
+node_modules/
+.DS_Store
+Thumbs.db
