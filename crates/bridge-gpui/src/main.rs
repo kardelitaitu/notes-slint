@@ -103,6 +103,11 @@ const ENGINE_POLL: Duration = Duration::from_millis(8);
 /// is taken on the next wake. A flood then costs latency, never the frame.
 const MAX_DRAIN_PER_WAKE: usize = 64;
 
+/// How many capped passes the exit drain will make before it says it ran out of
+/// patience: 64 x 64 = 4096 events, far more than a note app can queue at exit, and a
+/// bound is cheaper than a proof that an abandoned engine has stopped sending.
+const MAX_EXIT_PASSES: usize = 64;
+
 /// What one bounded look at the queue produced. Counted, not assumed, because
 /// objective is the frame cost and not the feeling of it.
 #[derive(Debug, Clone, Copy, Default)]
@@ -127,9 +132,12 @@ struct Pump {
     events: u64,
     /// The longest single bounded drain, in microseconds.
     slowest_us: u128,
-    /// Times the cap truncated a drain. Non-zero is a queue running ahead of the
-    /// UI, which is a fact worth being able to see rather than a silent case.
-    truncations: u64,
+    /// Times a pass took the full cap. Named for what it measures: the pass STOPPED
+    /// at the cap, which is not a claim that anything was dropped - the rest is taken
+    /// on the next wake, and at exit the passes loop until the queue is empty. A queue
+    /// of exactly 64 reaches the cap and truncates nothing, and the old name
+    /// (truncations) said otherwise.
+    caps_reached: u64,
     /// The last line the status line showed. Kept here as well as on the view so
     /// the exit trace can name it: this binary is `windows_subsystem`, so after the
     /// window is gone the only place a rendered fact can still be read is stderr.
@@ -405,7 +413,7 @@ impl Surface {
                 stats.slowest_us = stats.slowest_us.max(took_us);
             }
             if drain.capped {
-                stats.truncations += 1;
+                stats.caps_reached += 1;
             }
         }
 
@@ -420,12 +428,16 @@ impl Surface {
         }
         if drain.taken > 0 || drain.closed {
             let shown = self.status.to_string();
-            self.stats.borrow_mut().last_shown = Some(shown.clone());
-            // The rendered line goes on the last-resort trace as it is rendered,
-            // not only at exit: "what did the status line show" has to be answerable
-            // from a real run, and a `windows_subsystem` binary has no other voice.
-            // One line per CHANGED line, so an idle app never writes.
-            report(&format!("status line: {shown}"));
+            // The rendered line goes on the last-resort trace as it is rendered, not
+            // only at exit: "what did the status line show" has to be answerable from a
+            // real run, and a `windows_subsystem` binary has no other voice. Gated on a
+            // REAL change, so an idle app never writes and a repeated event does not
+            // grow a log without bound - the claim this comment used to make without the
+            // code behind it. The repaint is NOT gated: the counters line under this one
+            // changes every wake and has to keep updating.
+            if record_shown(&mut self.stats.borrow_mut().last_shown, &shown) {
+                report(&format!("status line: {shown}"));
+            }
             cx.notify();
         }
 
@@ -511,12 +523,12 @@ impl Surface {
         let stats = self.stats.borrow();
         let total = stats.busy + stats.idle;
         SharedString::from(format!(
-            "pump: {total} wakes ({busy} with work, {idle} idle) · {events} events · slowest drain {slowest} us · {trunc} capped · cap {cap} · poll {poll} ms · geometry: {motions} changes, {sends} sent{drag}",
+            "pump: {total} wakes ({busy} with work, {idle} idle) · {events} events · slowest drain {slowest} us · {caps} reached cap · cap {cap} · poll {poll} ms · geometry: {motions} changes, {sends} sent{drag}",
             busy = stats.busy,
             idle = stats.idle,
             events = stats.events,
             slowest = stats.slowest_us,
-            trunc = stats.truncations,
+            caps = stats.caps_reached,
             cap = MAX_DRAIN_PER_WAKE,
             poll = ENGINE_POLL.as_millis(),
             motions = stats.motions,
@@ -723,6 +735,16 @@ fn recents_words(entries: &[RecentEntry]) -> String {
 }
 
 fn main() {
+    // A panic in a `windows_subsystem = "windows"` binary is invisible: no console, and
+    // the process simply leaves, which is how a crash in the frame loop or the pump
+    // would go permanently unreported. Route it into the same last-resort trace every
+    // other fact uses. The events still queued at that moment are unrecoverable - the
+    // pump dies with the panic and nothing can promise a clean exit drain from inside
+    // one - so the second line says that rather than leaving it to be guessed.
+    std::panic::set_hook(Box::new(|info| {
+        report(&format!("panic: {info}"));
+        report("a panic ended the app: queued events were not drained");
+    }));
     // STEP 1 - query the saved session. `Gateway::start` reads session.json once,
     // on this thread; `startup_state` hands over that snapshot and is consume-once,
     // so it is read here and nowhere else.
@@ -730,8 +752,14 @@ fn main() {
     let Some(initial) = gateway.startup_state() else {
         // Only None if the snapshot had already been consumed, which one call site
         // cannot do. If it ever can: close is the defined exit, where dropping the
-        // Gateway would be an abort with no word said.
-        let _ = gateway.close();
+        // Gateway would be an abort with no word said. Nothing of the user's exists
+        // yet - no window, no editor text - so an Err here cannot lose an edit, and the
+        // line says that instead of asserting a cause it did not observe.
+        if gateway.close().is_err() {
+            report(
+                "the engine was already gone before a window opened - there was nothing yet to lose",
+            );
+        }
         return;
     };
 
@@ -903,15 +931,27 @@ fn main() {
     // The pump died with its window, so anything the engine said during its own
     // shutdown has nowhere to be rendered. It is named in the trace instead of
     // being dropped in silence, which is what the previous two drains did.
-    let tail = final_drain(&events);
+    let (tail, exhausted) = final_drain(&events);
+    // The count first, so the list can be checked: 100 named, 100 counted. Without it
+    // "every event was reported" is a claim about a trace nobody is going to count by
+    // hand, which is the same silence with more words.
+    report(&format!(
+        "exit drain: {} event(s) accounted for{}",
+        tail.len(),
+        if exhausted {
+            ""
+        } else {
+            " (the pass limit was reached - MORE MAY BE QUEUED BEHIND THIS)"
+        }
+    ));
     let reported = stats.borrow();
     report(&format!(
-        "pump: {} wakes, {} had work, {} events, slowest drain {} us, {} capped drains",
+        "pump: {} wakes, {} had work, {} events, slowest drain {} us, {} drains reached the cap",
         reported.busy + reported.idle,
         reported.busy,
         reported.events,
         reported.slowest_us,
-        reported.truncations,
+        reported.caps_reached,
     ));
     report(&format!(
         "geometry: {} rect changes seen, {} GeometryChanged sent (quiet {} ms, force {} ms)",
@@ -1093,19 +1133,60 @@ fn note_shutdown(words: &str) {
     report(words);
 }
 
-/// The last look at the queue, once there is no loop and no renderer left. Same
-/// bounded, non-blocking shape as the pump; the result goes to the trace.
-fn final_drain(events: &Rc<RefCell<EventRx>>) -> Vec<Event> {
+/// The last look at the queue, once there is no loop and no renderer left, and it is
+/// COMPLETE: pass after pass until the queue says it is empty or the sender is gone.
+///
+/// One capped pass was a lie about this file's own contract ("named in the trace
+/// instead of being dropped in silence"): with more than `MAX_DRAIN_PER_WAKE` events
+/// queued at exit, event 65 and everything after it left no trace at all. It is
+/// reachable for real, because the engine sends its shutdown events after the pump has
+/// stopped - a SaveFailed and a batch of RecentsUpdated are enough. The queue is finite
+/// by now because `close` has already joined or abandoned the engine, so looping is
+/// safe; `MAX_EXIT_PASSES` is there so an ABANDONED engine that keeps sending cannot
+/// turn the exit trace into a loop that never ends, and hitting it is reported rather
+/// than assumed. Every event still goes through the same bounded, non-blocking
+/// `drain_bounded` - the cap stays, only the passing repeats.
+fn final_drain(events: &Rc<RefCell<EventRx>>) -> (Vec<Event>, bool) {
     let mut out = HOLDOVER.with(|held| held.borrow_mut().drain(..).collect::<Vec<Event>>());
-    let guard = events.borrow();
-    drain_bounded(&guard, &mut out, MAX_DRAIN_PER_WAKE);
-    out
+    for _ in 0..MAX_EXIT_PASSES {
+        let drain = {
+            let guard = events.borrow();
+            drain_bounded(&guard, &mut out, MAX_DRAIN_PER_WAKE)
+        };
+        if drain.closed {
+            return (out, true);
+        }
+        if !drain.capped {
+            // A short pass means the queue was empty at that instant.
+            return (out, true);
+        }
+    }
+    (out, false)
 }
 
 fn report(why: &str) {
     // `windows_subsystem` means there is no console attached, so this is the
     // last-resort trace until the port grows an Event for an undelivered command.
     eprintln!("notes-gpui: {why}");
+}
+
+/// Print the status line to the trace only when it CHANGED. `last` holds what was
+/// printed last, or None at startup. Returns true when it printed.
+///
+/// The comment above this call site always claimed "one line per CHANGED line" and the
+/// code printed on every event-taking wake instead. The distinction is not pedantic:
+/// the same event arriving repeatedly is the normal case, not the rare one - a 750 ms
+/// AutosaveSkipped with an unchanged reason, or a SaveFailed that retries, would each
+/// add a line per wake to a redirected log forever. Two states genuinely ALTERNATING
+/// still print every one of them, and correctly so: that is information, and suppressing
+/// it would be rate limiting, which this is not.
+fn record_shown(last: &mut Option<String>, shown: &str) -> bool {
+    if last.as_deref() == Some(shown) {
+        false
+    } else {
+        *last = Some(shown.to_string());
+        true
+    }
 }
 
 /// Where app state lives. The D-STATE rule is notes-core's and the port now
@@ -1475,5 +1556,125 @@ mod tests {
             "the round trip must never wake the port"
         );
         assert_eq!(watch.sends, 0);
+    }
+    /// The reviewer's Major: `final_drain` used to be ONE capped pass, so 100 events
+    /// queued at exit left 36 of them with no trace at all - while the comment at that
+    /// call site promised "named in the trace instead of being dropped in silence". The
+    /// claim was false for n > 64. The passes now repeat, and this counts them BY NAME.
+    #[test]
+    fn the_exit_drain_accounts_for_every_queued_event_and_not_one_less() {
+        const QUEUED: usize = 100;
+        let (tx, rx) = channel::<Event>();
+        for index in 0..QUEUED {
+            tx.send(Event::Saved {
+                path: PathBuf::from(format!("C:/notes/{index}.notes")),
+                revision: index as u64,
+            })
+            .expect("unbounded queue");
+        }
+        drop(tx);
+        let events = Rc::new(RefCell::new(rx));
+        let (tail, exhausted) = final_drain(&events);
+        assert!(
+            exhausted,
+            "a finite queue must be reported as fully drained"
+        );
+        assert_eq!(tail.len(), QUEUED, "100 in, 100 accounted for");
+        let mut revisions: Vec<u64> = tail
+            .iter()
+            .filter_map(|event| match event {
+                Event::Saved { revision, .. } => Some(*revision),
+                _ => None,
+            })
+            .collect();
+        revisions.sort_unstable();
+        for (index, revision) in revisions.iter().enumerate() {
+            assert_eq!(
+                *revision, index as u64,
+                "event {index} was dropped in silence"
+            );
+        }
+    }
+
+    /// The flap, as numbers. A wake that ends on the SAME line is the normal case, not
+    /// the rare one: the 750 ms AutosaveSkipped S6 is about to put on a timer, a retry,
+    /// a duplicate. Unconditional printing (what the code did while its comment claimed
+    /// otherwise) is one line per wake into a redirected log, forever. A genuine
+    /// two-state flap still prints every line, and that is the correct limit of this
+    /// fix: this is change gating, not rate limiting.
+    #[test]
+    fn a_repeated_line_prints_once_and_a_real_alternation_prints_every_time() {
+        let mut last: Option<String> = None;
+        let mut printed = 0usize;
+        for _ in 0..200 {
+            if record_shown(&mut last, "autosave skipped: nothing to save") {
+                printed += 1;
+            }
+        }
+        assert_eq!(printed, 1, "200 wakes on one line must cost ONE trace line");
+
+        let mut last: Option<String> = None;
+        let mut printed = 0usize;
+        for step in 0..200u64 {
+            let line = if step % 2 == 0 { "saved" } else { "edited" };
+            if record_shown(&mut last, line) {
+                printed += 1;
+            }
+        }
+        assert_eq!(
+            printed, 200,
+            "an alternating pair of states is information; suppressing it would be rate limiting"
+        );
+    }
+
+    /// THE WIGGLE, and the decision. A rect oscillating home to away to home faster
+    /// than the quiet window never sends and never stops, because every observation of
+    /// the reported rect drops pending/first/changed and so restarts the force clock:
+    /// the 1 s ceiling the force rule exists to hold is starved indefinitely. The
+    /// reviewer is right that it can be starved; the disagreement is whether that is an
+    /// accident.
+    ///
+    /// It is not. A window that keeps returning to where the port already believes it is
+    /// has never left, and the position worth persisting is the one it rests at.
+    /// Sending the away-rect on a timer during an endless wiggle would store a placement
+    /// the user did not choose. Zero commands is the design, and the cost is named:
+    /// during a long drag that happens to pass through the resting rect, the port can go
+    /// longer than GEOMETRY_FORCE without an update, and the last rect it holds is the
+    /// resting one. Reopen if a real drag is ever observed losing an update it should
+    /// have made - the fix is to carry `first` across a home visit, paid for with one
+    /// stale send at the start of the next episode.
+    #[test]
+    fn an_endless_wiggle_through_the_resting_rect_owes_nothing_by_design() {
+        let t0 = Instant::now();
+        let mut watch = Watch::default();
+        watch.observe(rect_at(500), t0);
+        for step in 0..6000u64 {
+            let at = t0 + Duration::from_millis(step);
+            let seen = if step % 2 == 0 {
+                rect_at(500)
+            } else {
+                rect_at(508)
+            };
+            assert_eq!(
+                watch.observe(seen, at),
+                None,
+                "step {step}: a window that keeps coming home must not be reported as moving"
+            );
+        }
+        assert_eq!(
+            watch.motions, 3000,
+            "the motion was counted, so the silence is visible on the counters line"
+        );
+        let stop = t0 + Duration::from_millis(6000);
+        assert_eq!(
+            watch.observe(rect_at(508), stop),
+            None,
+            "still inside the quiet window"
+        );
+        assert_eq!(
+            watch.observe(rect_at(508), stop + GEOMETRY_QUIET),
+            Some(rect_at(508)),
+            "and the same watch reports the moment the movement rests away from home"
+        );
     }
 }
