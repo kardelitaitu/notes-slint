@@ -578,4 +578,63 @@ mod tests {
         assert_eq!(Outcome::Skipped.label(false), "SKIPPED (--quick)");
         assert_eq!(Outcome::Timeout.label(false), "TIMEOUT");
     }
+
+    /// The demotion of a gating row to advisory is exactly the silent weakening
+    /// this checker exists to catch. An indirect guard - the roster length
+    /// assertion, or check-ci going red - would not name WHICH decision broke,
+    /// and a guard that cannot name its own violation is not a guard. So this
+    /// one says it out loud.
+    #[test]
+    fn the_bridge_is_gated_by_a_build_and_a_lint_never_an_advisory_check() {
+        let specs = step_specs();
+        let names: Vec<&'static str> = specs.iter().map(|s| s.name).collect();
+        let build = specs
+            .iter()
+            .find(|s| s.name == "bridge-build")
+            .unwrap_or_else(|| panic!("bridge-build row is gone: {names:?}"));
+        let lint = specs
+            .iter()
+            .find(|s| s.name == "bridge-clippy")
+            .unwrap_or_else(|| panic!("bridge-clippy row is gone: {names:?}"));
+
+        assert!(
+            !build.advisory,
+            "bridge-build was demoted to advisory: CI BUILDS the bridge and gates it, so the \
+             local gate must too"
+        );
+        assert!(
+            !lint.advisory,
+            "bridge-clippy was demoted to advisory: CI lints every bridge target and gates it"
+        );
+        // The exact commands, because "cargo check" passing looks identical in a
+        // name-only assertion and is strictly weaker than both.
+        assert_eq!(
+            build.args.join(" "),
+            "build -p notes-bridge-gpui --bin notes-gpui"
+        );
+        assert_eq!(
+            lint.args.join(" "),
+            "clippy -p notes-bridge-gpui --all-targets -- -D warnings"
+        );
+        // Still quick-skippable: a desktop-less runner must be able to run
+        // check --quick. Skipping is not the same as not gating.
+        assert!(
+            build.quick_skippable && lint.quick_skippable,
+            "the bridge rows must stay out of --quick"
+        );
+
+        // And the row that used to be here - an advisory cargo check - stays gone.
+        assert!(
+            !names.contains(&"bridge"),
+            "the advisory cargo-check bridge row is back: {names:?}"
+        );
+        for spec in &specs {
+            if spec.args.contains(&"notes-bridge-gpui") && spec.args.contains(&"check") {
+                panic!(
+                    "{} re-introduces an advisory-shaped cargo check of the bridge",
+                    spec.name
+                );
+            }
+        }
+    }
 }
