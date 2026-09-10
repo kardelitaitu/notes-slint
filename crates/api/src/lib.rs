@@ -96,7 +96,7 @@
 //! a product surface: renaming a variant is a refactor, editing its text is a
 //! decision. `event.rs` pins every string verbatim in a test for that reason.
 //!
-//! # What exists, and what W5 adds
+//! # What exists, and what the next slices add
 //!
 //! Wired now, exactly as the last slice recorded it:
 //!
@@ -108,24 +108,31 @@
 //! pub type EventRx = std::sync::mpsc::Receiver<Event>;
 //! ```
 //!
-//! Not wired, all of it W5's, and none of it silent: [`Command::Open`],
-//! [`Command::SaveAs`] and [`Command::Flush`] have no file engines to run
-//! (notes-core's encoding and save modules are being written right now),
-//! [`Command::ClearRecents`] has no list to clear, the session write that a
-//! [`Command::GeometryChanged`] queues is never performed, and the registered
-//! [`WindowHandle`] is stored but unused — applying topmost goes through
-//! notes-platform, which this crate has no dependency on and which `check-arch`
-//! keeps out.
+//! Wired by this slice, with every rule in notes-core and only the routing here:
+//! [`Command::Open`] stats first — so D9's guard answers from the length
+//! without reading or decoding 8 MiB — then reads, detects and decodes, and answers
+//! [`Event::Loaded`] or [`Event::LoadFailed`]; [`Command::SaveAs`] writes the
+//! snapshot at the chosen path and ARMS the document (ADR-0001 requirement 4);
+//! [`Command::Flush`] saves behind core's own `Document`'s fixed skip order, so a foreign
+//! file refuses and says why, and a stale revision is reported Clean rather than
+//! written (D11); [`Command::ClearRecents`] empties the list the engine reports;
+//! and the session write that [`Command::GeometryChanged`] queues is performed on
+//! the tick arm and once more inside the shutdown drain.
+//!
+//! Still unwired: the registered [`WindowHandle`] is stored and unused —
+//! applying topmost goes through notes-platform, which this crate has no
+//! dependency on and which check-arch keeps out.
 //!
 //! * [`Settings`] is an api-side placeholder because notes-core has no settings
-//!   module yet. W5 deletes it and re-exports the core type; the
-//!   [`Gateway::start`] parameter name survives the swap unchanged.
+//!   module yet; the [`Gateway::start`] parameter name survives the swap.
 //! * The 750 ms cadence in `engine::AUTOSAVE_IDLE` is a constant until a loaded
-//!   interval replaces it. M4 changes the BODY of the tick arm, not the shape.
-//! * [`Command::Open`] reports its failure through [`Event::SaveFailed`]
-//!   because the frozen vocabulary has no load-failure variant. The honest fix is
-//!   an `Event::LoadFailed` — a vocabulary change, and this line is the note
-//!   asking for it rather than a private workaround inside the engine.
+//!   interval replaces it. M4 changes the BODY of the tick arm, not its shape.
+//! * The [`.notes` frontmatter seam delegates to [`notes_core::format`], which
+//!   landed as contracted, so the port parses nothing itself.
+//! * A file over the D9 guard opens read-only with an empty buffer
+//!   [`FileMeta::oversize`] rather than being refused: a half-loaded buffer is the
+//!   one option that could shorten the user's file. [`LoadError::TooLarge`] stays
+//!   in the vocabulary for the paths that cannot present that at all.
 //!
 //! # The channels, and why unbounded is load-bearing
 //!
@@ -209,7 +216,9 @@ mod gateway;
 pub use command::{Command, WindowHandle};
 pub use dto::{Rect, Session, StateDir};
 pub use engine::mark_current_thread_as_engine;
-pub use event::{Encoding, Event, FileMeta, LineEnding, RecentEntry, SaveError, SkipReason};
+pub use event::{
+    Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason,
+};
 pub use gateway::{EventRx, Gateway, InitialState, Settings};
 
 #[cfg(test)]

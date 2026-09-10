@@ -12,19 +12,18 @@
 //! 6. a consumer that never reads cannot block a producer — the unbounded-queue
 //!    invariant, and therefore the ABBA-deadlock alarm.
 //!
-//! ## What is intentionally UNWIRED in this build
+//! ## What these tests answer with, and why
 //!
-//! This slice is lifecycle only; the file engines land next slice (W5). So
-//! [`Command::Open`], [`Command::SaveAs`], [`Command::Flush`] and
-//! [`Command::ClearRecents`] do no work: each ANSWERS with
-//! [`Event::SaveFailed`] whose [`SaveError::Other`] text names the missing
-//! engine, which is why tests 2, 3 and 6 can count them.
-//! [`Command::RegisterWindow`] stores its handle and emits nothing (there is no
-//! platform call available to make — [`check-arch`] keeps notes-platform out of
-//! this crate's graph), and a queued [`Command::GeometryChanged`] still persists
-//! nothing: it sets the coalesced needs-write flag, whose 0-or-1 behaviour is
-//! asserted in engine.rs's unit tests where that state is visible. No arm is a
-//! silent no-op, and no test here pretends otherwise.
+//! The file arms are wired now (tests/session.rs is the proof against real bytes),
+//! but every test HERE drives the engine with no document open and no edits, so a
+//! [`Command::Flush`] is answered with [`Event::SaveFailed`] carrying its own
+//! revision, which is why tests 2, 3 and 6 can count events at all. That failure is
+//! the honest answer to a flush there is nothing to write; D11 is why the revision
+//! ranges below start at 1, since a flush at revision 0 against a fresh engine is
+//! stale and answers [`Event::AutosaveSkipped`] with Clean instead.
+//! [`Command::RegisterWindow`] stores its handle and emits nothing: there is no
+//! platform call this crate may make (check-arch keeps notes-platform out of its
+//! graph). No arm is a silent no-op, and no test here pretends otherwise.
 
 use std::fs;
 use std::io::Write;
@@ -327,7 +326,10 @@ fn a_slow_consumer_never_blocks_the_producer() {
     let (gateway, rx) = Gateway::start(StateDir(empty_dir()), Settings::default());
 
     let started = Instant::now();
-    for revision in 0..N as u64 {
+    // From 1, not 0: a flush at revision 0 is stale against a fresh engine and
+    // answers Clean (D11), which would make this count one short of N for the
+    // wrong reason.
+    for revision in 1..=N as u64 {
         // Nobody reads rx here, so the engine's event queue grows to 10 000. If
         // it were bounded, the engine would stall inside emit(), the drain below
         // would never finish, and the UI thread would then stall inside its own

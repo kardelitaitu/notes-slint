@@ -1,26 +1,41 @@
-//! The engine loop: one thread, one receiver, no disk I/O yet.
+//! The engine loop: one thread, one receiver, and the disk behind both.
 //!
-//! Lifecycle only in this slice. This file owns the loop, the drain/abort
-//! asymmetry, the reentrancy trap and the deadline seam. The command ARMS that
-//! need a file are deliberately incomplete and say so out loud - see the single
-//! dispatch site marked TODO(W5). notes-core's encoding and save engines are
-//! being written in parallel and land next slice.
+//! This file owns the loop, the drain/abort asymmetry, the reentrancy trap, the
+//! deadline seam, and the three file arms (Open, SaveAs, Flush). It is still not a
+//! domain layer: every rule it applies lives in notes-core, and what happens here
+//! is CALLING - detect/decode for the do-no-harm round trip (D14, §4.5),
+//! [`Document`] for armed/dirty/read-only and the fixed skip order (ADR-0001,
+//! D11), [`save_document_revision`] for the atomic write (D12),
+//! [`write_session`] for session.json, [`notes_core::recent`] for the MRU
+//! (D13), [`notes_core::format`] for .notes frontmatter. Where a decision would
+//! have needed core and core has no function for it yet, the code says so at the
+//! site (see the revision-space note in [`Engine::flush`]).
 //!
-//! Why a thread at all: autosave fires seconds after any UI call, so it cannot
-//! be answered by the call that triggered it (docs/architecture.md §5.4). One
-//! engine thread owns the state; the UI thread owns an
-//! [`EventRx`](crate::EventRx) of [`Event`](crate::Event)s and never runs
-//! engine code.
+//! Why a thread at all: autosave fires seconds after any UI call, so it cannot be
+//! answered by the call that triggered it (§5.4). One engine thread owns the state
+//! and performs every read and write; the UI thread owns an
+//! [`EventRx`](crate::EventRx) and never runs engine code. Because both queues
+//! are unbounded (D24), a 400 ms save cannot block a frame in either direction.
 
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::fs;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use notes_core::{Session, StateDir};
+use notes_core::session::write_session;
+use notes_core::{
+    DecodeError, Detected, Document, FileKind, LineEnding as CoreLineEnding, NoteParts,
+    SaveError as CoreSaveError, Session, SessionError, Skip, StateDir, TextEncoding,
+    classify_io_error, clear as clear_recents, decode, detect, is_notes_path, is_oversize,
+    push as push_recent, rebuild, save_document_revision, split,
+};
 
 use crate::command::{Command, WindowHandle};
-use crate::event::{Event, SaveError};
+use crate::event::{
+    Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason,
+};
 use crate::gateway::{EventTx, Settings};
 
 /// The autosave idle cadence, in its temporary home.
@@ -28,19 +43,27 @@ use crate::gateway::{EventTx, Settings};
 /// It lives HERE rather than in a bridge timer on purpose: a UI timer dies with
 /// the window, and then save cadence has quietly become a UI concern. M4 changes
 /// the POLICY inside the tick arm - when to flush - not this structure, and a
-/// settings-loaded interval replaces this constant once notes-core grows
-/// settings.rs. Until then the deadline is fixed, so the tick arm fires about
-/// every 750 ms and does nothing except keep the seam honest.
+/// settings-loaded interval replaces this constant once settings.rs lands. Until
+/// then the cadence is fixed and the tick's job is the session write.
 const AUTOSAVE_IDLE: Duration = Duration::from_millis(750);
-
-/// The one reason a not-yet-wired command reports, so the next slice deletes a
-/// constant instead of hunting strings.
-const NOT_WIRED: &str = "the save path is not wired in this build: notes-core's encoding and save engines land in the next slice";
 
 /// How many commands the shutdown drain will process, at most. Why the budget is
 /// a count rather than a duration, and what happens when it runs out, is written
 /// down at [`Engine::drain`].
 const MAX_DRAIN: usize = 4_096;
+
+/// The format of a file that does not exist yet: nothing to preserve, so the
+/// format the product writes by default - UTF-8, no BOM, LF, and a trailing
+/// newline, because a text file whose last line is unterminated earns a warning
+/// in every other editor.
+fn new_file_detected() -> Detected {
+    Detected {
+        encoding: TextEncoding::Utf8,
+        line_ending: CoreLineEnding::Lf,
+        trailing_newline: true,
+        bom_present: false,
+    }
+}
 
 thread_local! {
     /// Set when an engine loop starts, on that thread only. See
@@ -50,11 +73,11 @@ thread_local! {
 
 /// True when the calling thread IS an engine thread.
 ///
-/// This is the reentrancy trap's whole mechanism. [`Gateway::send`] and
-/// [`Gateway::initial_state`] assert against it, because engine code that
-/// calls back into the port queues a command behind itself and then blocks
-/// waiting on its own queue - a self-deadlock, and exactly the failure AGENTS.md
-/// says only shows up under load.
+/// The reentrancy trap's whole mechanism. [`Gateway::send`] and
+/// [`Gateway::initial_state`] assert against it: engine code that re-entered the
+/// port would queue a command behind itself and then wait on its own queue. Now
+/// that this thread does I/O, there is a second reason: a slow disk makes the
+/// deadlock intermittent rather than immediate.
 pub(crate) fn on_engine_thread() -> bool {
     ENGINE_THREAD.with(|flag| flag.get())
 }
@@ -62,9 +85,9 @@ pub(crate) fn on_engine_thread() -> bool {
 /// Arms the trap on the current thread; disarms when the returned guard drops.
 ///
 /// Hidden from the docs, and pub for one reason: a trap that cannot be observed
-/// firing is indistinguishable from a trap that was never wired, and
-/// tests/reentrancy.rs is a separate crate that has to stand on an engine thread
-/// to prove the assert is live. Only [`Engine::run`] and that test call this.
+/// firing is indistinguishable from one that was never wired, and
+/// tests/reentrancy.rs is a separate crate that has to stand on an engine thread to
+/// prove the assert is live. Only [`Engine::run`] and that test call this.
 #[must_use = "the trap is armed only while the returned guard is alive"]
 #[doc(hidden)]
 pub fn mark_current_thread_as_engine() -> EngineGuard {
@@ -91,37 +114,55 @@ enum Flow {
 /// The engine thread's entire state.
 ///
 /// Moved into one thread and never handed back, so nothing here is shared and
-/// nothing here is locked: the channels are the only synchronisation, which is
-/// what makes the unbounded-queue decision safe rather than merely convenient.
+/// nothing is locked. That is what makes it survivable to do file I/O here: the
+/// engine can be slow, but it cannot contend, and it cannot be called back into.
 pub(crate) struct Engine {
     cmd_rx: mpsc::Receiver<Command>,
     /// None means "nobody is listening any more" - see [`Self::emit`].
     event_tx: Option<Sender<Event>>,
-    /// Where session.json lives. Read once by [`Gateway::start`] before this
-    /// thread existed; writing it is the next slice's job, and the write happens
-    /// on THIS thread, so the directory belongs here. Not read yet, and the
-    /// reason is spelled out rather than left as a bare allow: W5's persistence
-    /// arm is the reader, and it must not grow a second StateDir to find it.
-    #[allow(dead_code, reason = "read by W5's session-persistence arm")]
+    /// Where session.json lives. D-STATE: the caller resolved it, this thread only
+    /// writes into it.
     state_dir: StateDir,
-    /// The in-memory session, seeded from session.json by whoever spawned us.
-    /// Geometry and the pin bit are written HERE and nowhere else: D10 gives pin
-    /// state one home, and this field is it.
+    /// The in-memory session, seeded from session.json by the spawner. Geometry and
+    /// the pin bit are written HERE and nowhere else (D10), and the last-open path
+    /// travels with them because §5.5 restores the window's document.
     session: Session,
-    /// The global auto-save toggle (settings.toml in the shipped app). Not the
-    /// same thing as per-document arming, which is ADR-0001 and lives on the
-    /// document - see [`FileMeta::armed`](crate::FileMeta::armed).
+    /// The global auto-save toggle (settings.toml in the shipped app). NOT
+    /// per-document arming, which is [`Document`]'s field - D10's discipline of
+    /// one home per bit, applied to a second flag.
     autosave_enabled: bool,
-    /// §5.5 step 3: the handle the bridge registered. Stored, never used yet -
-    /// applying topmost goes through notes-platform, which this crate is
-    /// forbidden to import, so this slice cannot even try by accident.
+    /// §5.5 step 3: the handle the bridge registered. Stored, never used -
+    /// topmost goes through notes-platform, which this crate may not import.
     window: Option<WindowHandle>,
-    /// Coalesced "session.json needs writing": one bool, not a queue. Two
-    /// geometry updates before the next flush is ONE write of the newest state,
-    /// never two (D11's spirit - no disk churn). Nothing clears it in this
-    /// build, because persistence is next slice's work: the flag records intent,
-    /// not a completed write.
+    /// Revision, dirty, armed, read-only, oversize and the fixed order of the skip
+    /// reasons: all of it core's judgement. This engine supplies the facts the
+    /// bridge sent and records what happened.
+    doc: Document,
+    /// What the file's own bytes said they were, which IS the write-back
+    /// instruction (§4.5, D14). The text alone cannot reproduce the file.
+    detected: Detected,
+    /// The frontmatter block lifted off the text at load, put back at save.
+    /// [`Self::body_for_ui`] and [`Self::text_for_disk`] are its only readers.
+    frontmatter: Option<String>,
+    /// The newest text snapshot the port has been given. The bridge owns the live
+    /// buffer (§5.5), so this is a copy of a moment, not a second editor: Open
+    /// fills it from the file, Flush replaces it. It exists because
+    /// [`Command::SaveAs`] carries a path and NO text, so without it Save As has
+    /// nothing to write.
+    buffer: Option<String>,
+    /// The revision [`Self::buffer`] was taken at, so a repeated Flush is
+    /// recognisable as the same moment rather than an edit.
+    buffer_revision: u64,
+    /// The last revision that reached disk. D11's rule in one u64: a Flush at or
+    /// below it is Clean and no write is attempted.
+    last_saved_revision: u64,
+    /// Coalesced "session.json needs writing": a bool, not a queue, so 65 geometry
+    /// updates before the next tick cost ONE write (D11's spirit - no disk churn).
     pending_session_write: bool,
+    /// D13's MRU, most-recent-first and capped by [`notes_core::recent`] itself.
+    /// Held in core's entry type so the identity rule is never re-implemented
+    /// here; it becomes a port type only at [`Self::emit_recent`].
+    recents: Vec<notes_core::RecentEntry>,
     deadline: Instant,
 }
 
@@ -134,15 +175,30 @@ impl Engine {
         session: Session,
         settings: Settings,
     ) -> Self {
+        // The session's last document is RESTORED as state, not read from disk:
+        // no bytes are touched here, and whether to Open it is the bridge's call
+        // (§5.5). Recents start empty because their store is settings.toml, which
+        // the settings slice owns; the first Open or Save As repopulates the list
+        // this build reports.
         Engine {
             cmd_rx,
             event_tx: Some(event_tx),
             state_dir,
-            session,
             autosave_enabled: settings.autosave_enabled,
             window: None,
+            doc: match session.path.as_ref() {
+                Some(path) => Document::open(path, file_kind(path), false, false),
+                None => Document::new(),
+            },
+            detected: new_file_detected(),
+            frontmatter: None,
+            buffer: None,
+            buffer_revision: 0,
+            last_saved_revision: 0,
             pending_session_write: false,
+            recents: Vec::new(),
             deadline: Instant::now() + AUTOSAVE_IDLE,
+            session,
         }
     }
 
@@ -156,18 +212,17 @@ impl Engine {
                         break;
                     }
                 }
-                // The tick arm. M4 puts the autosave policy in here.
+                // The tick arm: the session write's other home, and where M4's
+                // periodic-flush policy will go.
                 Err(RecvTimeoutError::Timeout) => self.on_tick(),
                 // The ABORT path: Gateway::drop took the last Sender. recv hands
-                // over everything already queued before it reports Disconnected,
-                // and nothing further can arrive, so exiting here cannot strand a
-                // command the port accepted.
+                // over everything already queued before reporting Disconnected,
+                // so no accepted command - and no accepted write - is stranded.
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        // Dropping self.event_tx here is what tells the caller's EventRx that the
-        // engine is finished: their buffered events stay readable, then report
-        // Disconnected. That is how a test proves this thread joined.
+        // Dropping self.event_tx is how the caller's EventRx learns the engine is
+        // finished: buffered events stay readable, then Disconnected.
     }
 
     /// Blocks for the next command, but never past [`Self::next_deadline`].
@@ -175,15 +230,13 @@ impl Engine {
         match self.next_deadline() {
             Some(at) => {
                 let now = Instant::now();
-                // A deadline at or behind now would make recv_timeout return
-                // immediately forever: a 100% CPU spin. on_tick always moves it
-                // forward, so this branch costs one extra trip, not a busy loop.
+                // A deadline at or behind now would spin recv_timeout at 100% CPU;
+                // on_tick always moves it forward.
                 if at <= now {
                     return Err(RecvTimeoutError::Timeout);
                 }
                 self.cmd_rx.recv_timeout(at - now)
             }
-            // No pending timer: wait for a command indefinitely.
             None => self
                 .cmd_rx
                 .recv()
@@ -191,18 +244,16 @@ impl Engine {
         }
     }
 
-    /// When the tick arm should next run; None means "no timer, wait for a
-    /// command forever".
+    /// When the tick arm should next run; None means "wait for a command forever".
     ///
-    /// Fixed today (see [`AUTOSAVE_IDLE`]), and a method rather than a constant
-    /// because M4 makes it depend on the document: a dirty buffer, the debounce
-    /// and a loaded interval all move it. The Option is what lets the engine
-    /// sleep properly when there is nothing to save.
+    /// Fixed today, and a method because M4 makes it depend on the document: a
+    /// dirty buffer, the debounce and a loaded interval all move it.
     fn next_deadline(&self) -> Option<Instant> {
         Some(self.deadline)
     }
 
     fn on_tick(&mut self) {
+        self.flush_session();
         self.deadline = Instant::now() + AUTOSAVE_IDLE;
     }
 
@@ -211,8 +262,8 @@ impl Engine {
         match command {
             Command::RegisterWindow { handle } => {
                 // §5.5 step 3. Stored, and nothing emitted: no UI is waiting to
-                // hear its own registration back, and inventing an event for it
-                // would be noise on the channel.
+                // hear its own registration back, and there is no platform call
+                // this crate is allowed to make with the handle.
                 self.window = Some(handle);
             }
             Command::GeometryChanged { rect } => {
@@ -220,12 +271,12 @@ impl Engine {
                     self.session.rect = rect;
                     self.queue_session_write();
                 }
-                // The same rect twice changes nothing, so it queues nothing.
+                // The same rect twice changes nothing, so it queues nothing:
+                // pinned by repeated_geometry_at_one_rect_queues_one_update.
             }
             Command::SetAutosave(on) => {
-                // The global toggle. No event: the menu's own checked state is
-                // the answer, and the consequence for a document surfaces later
-                // as SkipReason::AutosaveDisabled.
+                // The global toggle, answered by the menu's own check mark. The
+                // per-document half is ADR-0001's and lives on Document.
                 self.autosave_enabled = on;
             }
             Command::SetPinned(on) => {
@@ -235,74 +286,265 @@ impl Engine {
                 }
             }
             Command::ClearRecents => {
-                // The recent list is notes-core's (recent.rs) and is not held
-                // here yet. Answering with an EMPTY RecentsUpdated would claim a
-                // list was cleared that this engine never had, so it reports as
-                // unwired like the file arms instead of going silent.
-                self.unwired("ClearRecents", 0);
+                // core's own clear, so the cap and the entry type stay core's
+                // business even for the empty case.
+                self.recents = clear_recents();
+                self.emit_recent();
             }
+            Command::Open { path } => self.open(&path),
+            Command::SaveAs { path } => self.save_as(&path),
+            Command::Flush { text, revision } => self.flush(text, revision),
             Command::Shutdown => {
                 self.drain();
                 return Flow::Exit;
-            }
-            // TODO(W5): everything below needs file engines that are still
-            // landing in notes-core, and this slice promises no disk I/O. They
-            // ANSWER rather than sit silent (AGENTS.md: silence is forbidden),
-            // and they never claim success - Saved is not emitted for work that
-            // did not happen. Open is the awkward one: the frozen vocabulary has
-            // no load-failure variant, so it borrows SaveFailed with the missing
-            // piece named in the text. The honest fix is Event::LoadFailed, which
-            // is a vocabulary change, not an engine one.
-            Command::Open { path } => self.emit(Event::SaveFailed {
-                path,
-                revision: 0,
-                reason: SaveError::Other(format!("{NOT_WIRED}: Open")),
-            }),
-            Command::SaveAs { path } => {
-                // The path the user just chose is the one to name in the failure.
-                self.emit(Event::SaveFailed {
-                    path,
-                    revision: self.last_revision(),
-                    reason: SaveError::Other(format!("{NOT_WIRED}: SaveAs")),
-                })
-            }
-            Command::Flush { revision, .. } => {
-                // The revision is echoed back so the bridge can reconcile its
-                // dirty state (D11): a failed save must not leave the status line
-                // looking like a saved buffer.
-                self.emit(Event::SaveFailed {
-                    path: self.document_path(),
-                    revision,
-                    reason: SaveError::Other(format!("{NOT_WIRED}: Flush")),
-                })
             }
         }
         Flow::Continue
     }
 
-    /// DRAIN AND EXIT: every command already queued behind Shutdown is handled,
-    /// and its events emitted, before the loop breaks. Deliberately the opposite
-    /// of [`Gateway::drop`](crate::Gateway), which removes the last Sender so
-    /// the engine stops at Disconnected instead. Both paths are tested in
-    /// tests/reentrancy.rs; only the drop path joins.
+    /// Open: stat first, read second, decode last - and never at all when the
+    /// file is over the guard.
+    ///
+    /// The order is the cold-start rule (whitepaper §2): [`is_oversize`] answers
+    /// from the length, so a 9 MiB file is decided on the stat without reading,
+    /// allocating or decoding anything. Per D9 nothing is refused outright - the
+    /// document still opens, and [`FileMeta::oversize`] plus
+    /// [`FileMeta::read_only`] carry the verdict, which is what
+    /// [`LoadError::TooLarge`] is for on the paths that cannot present an empty
+    /// read-only buffer at all.
+    fn open(&mut self, path: &Path) {
+        let on_disk = match fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(err) => {
+                self.fail_load(path, &err);
+                return;
+            }
+        };
+        let oversize = is_oversize(usize::try_from(on_disk.len()).unwrap_or(usize::MAX));
+        if oversize {
+            // D9: the file is opened, not refused, and the text is deliberately
+            // not decoded - so the buffer is empty and read-only rather than
+            // half-loaded. A half-loaded buffer is the dangerous option: the next
+            // autosave would write a truncated file over the user's real one.
+            self.doc = Document::open(path, file_kind(path), true, true);
+            self.frontmatter = None;
+            self.buffer = Some(String::new());
+            self.buffer_revision = 0;
+            self.last_saved_revision = 0;
+            self.emit(Event::Loaded {
+                path: path.to_path_buf(),
+                text: String::new(),
+                meta: FileMeta {
+                    encoding: Encoding::Utf8,
+                    line_ending: LineEnding::Lf,
+                    trailing_newline: false,
+                    read_only: true,
+                    oversize: true,
+                    armed: self.doc.is_armed(),
+                },
+            });
+            self.remember(path);
+            return;
+        }
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.fail_load(path, &err);
+                return;
+            }
+        };
+
+        // The ANSI default is None on purpose: the system codepage is a
+        // GetACP-style platform call and api may not import notes-platform. The
+        // settings slice replaces this with a loaded codepage.
+        let detected = detect(&bytes, None);
+        let raw = match decode(&bytes, detected) {
+            Ok(text) => text,
+            Err(err) => {
+                self.emit(Event::LoadFailed {
+                    path: path.to_path_buf(),
+                    reason: LoadError::Undecodable {
+                        byte_offset: decode_offset(&err),
+                        encoding_hint: Some(api_encoding(detected.encoding)),
+                    },
+                });
+                return;
+            }
+        };
+
+        // §5.5's do-no-harm chain, all of it core's: detect once, strip
+        // frontmatter for the UI, remember it for the write-back.
+        self.doc = Document::open(
+            path,
+            file_kind(path),
+            on_disk.permissions().readonly(),
+            false,
+        );
+        self.detected = detected;
+        let body = self.body_for_ui(&raw);
+        self.buffer = Some(body.clone());
+        self.buffer_revision = 0;
+        self.last_saved_revision = 0;
+        self.emit(Event::Loaded {
+            path: path.to_path_buf(),
+            text: body,
+            meta: FileMeta {
+                encoding: api_encoding(detected.encoding),
+                line_ending: api_line_ending(detected.line_ending),
+                trailing_newline: detected.trailing_newline,
+                read_only: on_disk.permissions().readonly(),
+                oversize: false,
+                // ADR-0001, read from the one place that decides it: a .notes file
+                // arms on open, a foreign file does not, and a freshly opened
+                // document never inherits the arming of the one before it.
+                armed: self.doc.is_armed(),
+            },
+        });
+        self.remember(path);
+    }
+
+    /// A load that never got as far as decoding. The Windows error-code knowledge
+    /// is core's ([`classify_io_error`] is what separates a sharing violation
+    /// from a denied ACL); the port only shapes it for the UI.
+    fn fail_load(&mut self, path: &Path, err: &std::io::Error) {
+        self.emit(Event::LoadFailed {
+            path: path.to_path_buf(),
+            reason: load_error_from_io(err),
+        });
+    }
+
+    /// Save As: write the snapshot at the chosen path, then rebind AND arm.
+    ///
+    /// Requirement 4 of ADR-0001 is [`Document::save_as`]'s job; this function
+    /// calls it and reports. Choosing a location is an explicit act, so a second
+    /// explicit save would be pedantic - which is also why the armed flag flips
+    /// here and nowhere else in the port.
+    fn save_as(&mut self, path: &Path) {
+        let revision = self.buffer_revision;
+        // If the target already exists, ITS bytes win: overwriting a UTF-16 file
+        // with the source's UTF-8 is exactly the silent change §4.5 forbids.
+        let detected = existing_detected(path);
+        let disk_text = self.text_for_disk(self.buffer.as_deref().unwrap_or(""));
+        match self.write(path, &disk_text, detected, revision) {
+            Ok(()) => {
+                self.doc.save_as(path);
+                self.detected = detected;
+                self.last_saved_revision = revision;
+                self.emit(Event::Saved {
+                    path: path.to_path_buf(),
+                    revision,
+                });
+                self.remember(path);
+            }
+            Err(reason) => self.emit(Event::SaveFailed {
+                path: path.to_path_buf(),
+                revision,
+                reason,
+            }),
+        }
+    }
+
+    /// Flush: an explicit save or an autosave trigger, gated by core's order.
+    ///
+    /// The stale check runs FIRST, before Document is consulted at all, because
+    /// "this flush is old" outranks every other reason (D11): a stale autosave on
+    /// a read-only file must report Clean, not ReadOnly, or the status line
+    /// explains a write that was never needed. Everything after that is
+    /// [`Document::should_autosave`]'s fixed order, so the rendered reason is
+    /// deterministic and the rule stays in core.
+    ///
+    /// Why should_flush is not the gate: it compares the flush revision against
+    /// core's own counter, and the two are different spaces while the bridge owns
+    /// the buffer (§10.4, decision (ii)) - core has no setter for it. So the port
+    /// carries the counter it was handed ([`Self::last_saved_revision`]) and asks
+    /// core the questions core can answer. When core owns the buffer, this line
+    /// becomes [`Document::should_flush`] and the field disappears.
+    fn flush(&mut self, text: String, revision: u64) {
+        let changed = self.buffer.as_deref() != Some(text.as_str());
+        self.buffer = Some(text);
+        self.buffer_revision = revision;
+
+        if revision <= self.last_saved_revision {
+            self.emit(Event::AutosaveSkipped {
+                reason: SkipReason::Clean,
+            });
+            return;
+        }
+        let Some(path) = self.doc.path().map(Path::to_path_buf) else {
+            // Nothing to write to. Reported, not swallowed: a flush the engine
+            // cannot honour is a fact the status line needs.
+            self.emit(Event::SaveFailed {
+                path: PathBuf::new(),
+                revision,
+                reason: SaveError::Other("no document is open to save".to_string()),
+            });
+            return;
+        };
+        if changed {
+            self.doc.mark_dirty();
+        }
+        if let Some(skip) = self.doc.should_autosave(self.autosave_enabled) {
+            self.emit(Event::AutosaveSkipped {
+                reason: api_skip(skip),
+            });
+            return;
+        }
+
+        let detected = self.detected;
+        let disk_text = self.text_for_disk(self.buffer.as_deref().unwrap_or(""));
+        match self.write(&path, &disk_text, detected, revision) {
+            Ok(()) => {
+                self.doc.mark_saved();
+                self.last_saved_revision = revision;
+                self.emit(Event::Saved { path, revision });
+            }
+            Err(reason) => self.emit(Event::SaveFailed {
+                path,
+                revision,
+                reason,
+            }),
+        }
+    }
+
+    /// The one write path: encode with the DETECTED settings (never a normalised
+    /// one) and let core do the atomic dance - sibling temp, fsync, rename, sweep
+    /// (D12). Encoding happens before any filesystem touch, so an unencodable
+    /// character leaves the previous good file byte-for-byte intact.
+    fn write(
+        &self,
+        path: &Path,
+        text: &str,
+        detected: Detected,
+        revision: u64,
+    ) -> Result<(), SaveError> {
+        match save_document_revision(path, text, detected, revision) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(api_save_error(err, detected.encoding)),
+        }
+    }
+
+    /// DRAIN AND EXIT, ITERATIVELY AND BOUNDED: every command already queued
+    /// behind Shutdown is handled, and its events emitted, before the loop breaks.
+    /// Deliberately the opposite of [`Gateway::drop`](crate::Gateway), which
+    /// removes the last Sender so the engine stops at Disconnected instead. Both
+    /// paths are tested; only the drop path joins, and it ends with
+    /// [`Self::flush_session`] so a clean shutdown never loses geometry or the
+    /// pin bit.
+    ///
     /// Two properties this loop has to keep, both learned from a mutation test
     /// rather than from reading it:
     ///
     /// * **No recursion.** A Shutdown found INSIDE the queue is the instruction
     ///   already being carried out, so here it is a no-op. Handing it back to
-    ///   [`Self::handle`] called drain() again, and thousands of queued Shutdowns
-    ///   overflowed the engine thread's stack and killed the process - not a panic, so
-    ///   nothing unwinds, nothing joins, and the "clean exit" this function promises
-    ///   becomes a dead process. Pinned by
-    ///   [`drain_never_recurses_on_a_queued_shutdown`].
+    ///   [`Self::handle`] called drain() again, and thousands of queued
+    ///   Shutdowns overflowed the engine thread's stack and killed the process -
+    ///   not a panic, so nothing unwinds and nothing joins. Pinned by
+    ///   drain_never_recurses_on_a_queued_shutdown.
     /// * **A bound.** try_recv succeeds for as long as anyone keeps sending, so the
     ///   drain stops at [`MAX_DRAIN`] and the excess dies with the thread. A
     ///   truncated exit loses events; a hung one loses the process, because
-    ///   [`Gateway::drop`](crate::Gateway) waits in join() with no timeout. Pinned by
-    ///   [`drain_stops_at_its_budget_instead_of_hanging_shutdown`].
-    ///
-    /// [`Flow::Exit`] is never returned from in here: the caller is the one already
-    /// exiting, so a nested exit is the case handled above, not a second exit.
+    ///   Gateway::drop waits in join() with no timeout anywhere on that path.
+    ///   Pinned by drain_stops_at_its_budget_instead_of_hanging_shutdown.
     fn drain(&mut self) {
         for _ in 0..MAX_DRAIN {
             match self.cmd_rx.try_recv() {
@@ -312,47 +554,103 @@ impl Engine {
                     let _ = self.handle(command);
                 }
                 // Nothing left in the queue. This is the normal exit.
-                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => return,
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.flush_session();
+                    return;
+                }
             }
+        }
+        self.flush_session();
+    }
+
+    /// Writes session.json when something changed. Atomicity and the temp sweep
+    /// are core's (D12); this function only decides WHEN, keeps the flag set so a
+    /// failure retries on the next tick, and reports the failure rather than
+    /// hiding it. The path names the file that failed, so the copy never reads as
+    /// if the user's note was the thing lost.
+    fn flush_session(&mut self) {
+        if !self.pending_session_write {
+            return;
+        }
+        match write_session(&self.state_dir.0, &self.session) {
+            Ok(()) => self.pending_session_write = false,
+            Err(err) => self.emit(Event::SaveFailed {
+                path: self.state_dir.0.join(notes_core::session::FILE_NAME),
+                revision: 0,
+                reason: api_session_error(&err),
+            }),
         }
     }
 
-    /// Reports a command this build cannot serve, naming the missing variant so
-    /// the message is a diagnosis and not a shrug.
-    fn unwired(&mut self, what: &str, revision: u64) {
-        self.emit(Event::SaveFailed {
-            path: self.document_path(),
-            revision,
-            reason: SaveError::Other(format!("{NOT_WIRED}: {what}")),
-        });
-    }
-
-    /// Queues the one coalesced session write. True when this call added the
-    /// pending flag, false when one was already outstanding.
+    /// Queues the one coalesced session write. True when this call added the flag,
+    /// false when one was already outstanding.
     fn queue_session_write(&mut self) -> bool {
         let queued = !self.pending_session_write;
         self.pending_session_write = true;
         queued
     }
 
-    /// The document this engine believes is open. Empty when none is - which in
-    /// this build is always, because Open is unwired.
-    fn document_path(&self) -> PathBuf {
-        self.session.path.clone().unwrap_or_default()
+    /// Records a file as opened: into the session (so the next launch restores it,
+    /// which is a stored path and not an automatic Open), into the MRU, and into
+    /// the menu via an event.
+    fn remember(&mut self, path: &Path) {
+        self.session.path = Some(path.to_path_buf());
+        self.queue_session_write();
+        let display = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        // D13 in full - identity, case preservation, the cap, the no-duplicates
+        // move-to-top - is core's function, not a re-statement of it here.
+        self.recents = push_recent(
+            std::mem::take(&mut self.recents),
+            path.to_path_buf(),
+            &display,
+        );
+        self.emit_recent();
     }
 
-    /// The last revision this engine saw. api holds no buffer (the bridge owns
-    /// it), so 0 until core's Document is wired in here.
-    fn last_revision(&self) -> u64 {
-        0
+    /// core's entries to the port's, at the one place they become UI data.
+    fn emit_recent(&mut self) {
+        let list = self
+            .recents
+            .iter()
+            .map(|entry| RecentEntry {
+                path: entry.path.clone(),
+                display: entry.display.clone(),
+                exists: entry.exists,
+            })
+            .collect();
+        self.emit(Event::RecentsUpdated(list));
+    }
+
+    /// THE .notes seam: frontmatter comes off for the editor, so the user never
+    /// types into a --- block, and goes back on for the file, byte-for-byte.
+    ///
+    /// Both halves are [`notes_core::format`], landed as contracted:
+    /// [`split`] returns [`NoteParts`] whose frontmatter span includes both
+    /// --- lines and their terminators, which is why rebuild is lossless and why
+    /// a foreign file (no frontmatter) round-trips as its own bytes. There is no
+    /// parser in this crate and there must never be one (AGENTS.md rule 5).
+    fn body_for_ui(&mut self, raw: &str) -> String {
+        let NoteParts { frontmatter, body } = split(raw);
+        self.frontmatter = frontmatter.map(str::to_owned);
+        body.to_owned()
+    }
+
+    /// The write side of [`Self::body_for_ui`]. A file that never had
+    /// frontmatter is rebuilt as exactly what the UI holds, so §4.5's
+    /// byte-identical round trip survives the port.
+    fn text_for_disk(&self, ui: &str) -> String {
+        rebuild(self.frontmatter.as_deref(), ui)
     }
 
     /// Emits one event, and stops emitting once the listener is gone.
     ///
     /// A closed [`EventRx`](crate::EventRx) is a signal, not an error: the UI is
-    /// gone and nobody can hear anything. The engine keeps serving commands until
-    /// Disconnected - shutting down is the caller's decision, not ours - and it
-    /// neither panics nor spams a log at a dead window.
+    /// gone. The engine keeps serving commands - including the file arms, which is
+    /// the point: a window the user closed must not cost them a save - until
+    /// Disconnected, with no panic and no log spam at a dead window.
     fn emit(&mut self, event: Event) {
         let Some(tx) = self.event_tx.as_ref() else {
             return;
@@ -363,6 +661,113 @@ impl Engine {
     }
 }
 
+/// FileKind is core's extension classification (ADR-0001 option B), and
+/// [`is_notes_path`] is core's - one owner of "what counts as ours", shared with
+/// the frontmatter rules that have to agree with it. api asks, never decides.
+fn file_kind(path: &Path) -> FileKind {
+    if is_notes_path(path) {
+        FileKind::Notes
+    } else {
+        FileKind::Foreign
+    }
+}
+
+/// core's fixed skip order, named as the port names it. Total, and the
+/// exhaustiveness is what catches a new core variant at compile time.
+fn api_skip(skip: Skip) -> SkipReason {
+    match skip {
+        Skip::AutosaveDisabled => SkipReason::AutosaveDisabled,
+        Skip::ForeignFileNotArmed => SkipReason::ForeignFileNotArmed,
+        Skip::Clean => SkipReason::Clean,
+        Skip::ReadOnly => SkipReason::ReadOnly,
+        Skip::Oversize => SkipReason::Oversize,
+    }
+}
+
+fn api_encoding(encoding: TextEncoding) -> Encoding {
+    match encoding {
+        TextEncoding::Utf8 => Encoding::Utf8,
+        TextEncoding::Utf8Bom => Encoding::Utf8Bom,
+        TextEncoding::Utf16Le => Encoding::Utf16Le,
+        TextEncoding::Utf16Be => Encoding::Utf16Be,
+        TextEncoding::Ansi(codepage) => Encoding::Ansi(codepage),
+    }
+}
+
+fn api_line_ending(ending: CoreLineEnding) -> LineEnding {
+    match ending {
+        CoreLineEnding::Lf => LineEnding::Lf,
+        CoreLineEnding::CrLf => LineEnding::CrLf,
+    }
+}
+
+/// core's save failure to the port's, adding the ENCODING the file asked for -
+/// core's Unencodable carries none, and the port's copy names it. Every other
+/// case keeps core's rendered text inside [`SaveError::Other`], so the port never
+/// invents UI copy.
+fn api_save_error(err: CoreSaveError, encoding: TextEncoding) -> SaveError {
+    match err {
+        CoreSaveError::ReadOnly => SaveError::ReadOnly,
+        CoreSaveError::PermissionDenied => SaveError::PermissionDenied,
+        CoreSaveError::DiskFull => SaveError::DiskFull,
+        CoreSaveError::Locked => SaveError::Locked,
+        CoreSaveError::NotFound => SaveError::NotFound,
+        CoreSaveError::Unencodable => SaveError::Unencodable(api_encoding(encoding)),
+        other => SaveError::Other(other.to_string()),
+    }
+}
+
+/// session.json failing is reported through the save vocabulary because that is
+/// what it is - a write that did not happen. Missing/corrupt are read-side states
+/// of a file the engine is writing, so they arrive as Other with core's copy.
+fn api_session_error(err: &SessionError) -> SaveError {
+    match err {
+        SessionError::Io(io_err) => api_save_error(classify_io_error(io_err), TextEncoding::Utf8),
+        other => SaveError::Other(other.to_string()),
+    }
+}
+
+/// A read failure, shaped for the UI. NotFound is separated out because a missing
+/// file is not a failed operation and the copy is different.
+fn load_error_from_io(err: &std::io::Error) -> LoadError {
+    match err.kind() {
+        ErrorKind::NotFound => LoadError::NotFound,
+        ErrorKind::PermissionDenied => LoadError::PermissionDenied,
+        _ => match classify_io_error(err) {
+            CoreSaveError::Locked => LoadError::Locked,
+            CoreSaveError::NotFound => LoadError::NotFound,
+            CoreSaveError::PermissionDenied => LoadError::PermissionDenied,
+            other => LoadError::Other(other.to_string()),
+        },
+    }
+}
+
+/// Where decoding broke, or 0 when no single byte is the culprit - an unsupported
+/// codepage is a verdict about the whole file, not about an offset.
+fn decode_offset(err: &DecodeError) -> usize {
+    match err {
+        DecodeError::MalformedUtf8 { byte_offset }
+        | DecodeError::UnterminatedUtf16 { byte_offset } => *byte_offset,
+        DecodeError::UnsupportedCodepage(_) => 0,
+    }
+}
+
+/// What an existing target's own bytes say they are, so Save As preserves the
+/// TARGET's format rather than imposing the source's (§4.5). Unreadable, empty or
+/// oversize targets fall back to the product default: replacing something we
+/// cannot read is the user's explicit choice, made in a dialog.
+fn existing_detected(path: &Path) -> Detected {
+    let Ok(meta) = fs::metadata(path) else {
+        return new_file_detected();
+    };
+    if meta.len() == 0 || is_oversize(usize::try_from(meta.len()).unwrap_or(usize::MAX)) {
+        return new_file_detected();
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return new_file_detected();
+    };
+    detect(&bytes, None)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,7 +865,9 @@ mod tests {
     fn drain_stops_at_its_budget_instead_of_hanging_shutdown() {
         let (mut engine, cmd_tx, events) = wired();
         let excess = MAX_DRAIN + 5;
-        for revision in 0..excess as u64 {
+        // From 1, not 0: revision 0 would be stale against a fresh engine's
+        // last_saved_revision and answer Clean instead of echoing the flush.
+        for revision in 1..=excess as u64 {
             cmd_tx.send(flush(revision)).expect("unbounded");
         }
 
@@ -471,8 +878,8 @@ mod tests {
             MAX_DRAIN,
             "the drain must stop at exactly its budget",
         );
-        assert_eq!(answered.first().copied(), Some(0));
-        assert_eq!(answered.last().copied(), Some(MAX_DRAIN as u64 - 1));
+        assert_eq!(answered.first().copied(), Some(1));
+        assert_eq!(answered.last().copied(), Some(MAX_DRAIN as u64));
         // The 5 over the budget are dropped by the exit, not panicked over, and
         // not half-written: they never reach handle() at all.
         let mut left = 0usize;

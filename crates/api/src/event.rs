@@ -173,6 +173,48 @@ pub enum SaveError {
     Other(String),
 }
 
+/// Why a file could not be opened.
+///
+/// The load-side sibling of [`SaveError`], added because the port otherwise had
+/// no shaped failure for a Command::Open, and an open failure was being
+/// reported as a SAVE failure — which is not a refactor of the vocabulary, it is
+/// a wrong message: the user read-only'd nothing, filled no disk, and the thing
+/// that failed was reading. Same rule as SaveError: **the Display text below IS
+/// the user-visible copy** and is pinned verbatim in a test, so editing one of
+/// these strings is a product decision (AGENTS.md: the enum is part of the
+/// public contract because the UI must render the reason).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LoadError {
+    /// Nothing is at that path (deleted, moved, or a typo in a command line).
+    #[error("file no longer exists")]
+    NotFound,
+    /// The ACL or the sharing mode refused the read.
+    #[error("permission denied")]
+    PermissionDenied,
+    /// Another process holds it exclusively.
+    #[error("file is locked by another program")]
+    Locked,
+    /// Over the 8 MiB guard (D9). Reported as a refusal, not as a truncated
+    /// load, because a half-loaded buffer whose missing half the user cannot see
+    /// is worse than no load: an autosave would write back a shortened file.
+    #[error("file is too large to open")]
+    TooLarge,
+    /// The bytes are not text in any encoding we can read. the byte_offset field is
+    /// where it broke, the encoding_hint field is what the header said — a hostile or
+    /// half-written file must produce this, never a panic.
+    #[error("cannot decode this file as text (at byte {byte_offset})")]
+    Undecodable {
+        /// Offset of the first byte that does not decode.
+        byte_offset: usize,
+        /// The encoding the file's own header claimed, when it claimed one.
+        encoding_hint: Option<Encoding>,
+    },
+    /// Anything else, carrying the OS text for the same reason as
+    /// [`SaveError::Other`].
+    #[error("{0}")]
+    Other(String),
+}
+
 /// Everything the engine can tell the UI.
 ///
 /// Delivered on the UI thread. `RecentsUpdated` carries the whole list rather
@@ -187,6 +229,11 @@ pub enum Event {
         text: String,
         meta: FileMeta,
     },
+    /// A file could not be opened, and why. Async like every other answer: an
+    /// [`Open`](crate::Command::Open) has no reply channel to return an Err to.
+    /// The bridge shows the reason and keeps the current document loaded rather
+    /// than blanking the window into an unsaved-buffer lie.
+    LoadFailed { path: PathBuf, reason: LoadError },
     /// A save succeeded, and the buffer at `revision` is now what is on disk
     /// (D11 — this is what makes later flushes at that revision `Clean`).
     Saved { path: PathBuf, revision: u64 },
@@ -233,6 +280,10 @@ mod tests {
                 text: text.clone(),
                 meta: *meta,
             },
+            Event::LoadFailed { path, reason } => Event::LoadFailed {
+                path: path.clone(),
+                reason: reason.clone(),
+            },
             Event::Saved { path, revision } => Event::Saved {
                 path: path.clone(),
                 revision: *revision,
@@ -255,6 +306,7 @@ mod tests {
     fn variant(event: &Event) -> &'static str {
         match event {
             Event::Loaded { .. } => "Loaded",
+            Event::LoadFailed { .. } => "LoadFailed",
             Event::Saved { .. } => "Saved",
             Event::SaveFailed { .. } => "SaveFailed",
             Event::ExternalChange { .. } => "ExternalChange",
@@ -269,6 +321,10 @@ mod tests {
                 path: PathBuf::from("C:/notes/a.notes"),
                 text: "hi".to_string(),
                 meta: meta(),
+            },
+            Event::LoadFailed {
+                path: PathBuf::from("C:/notes/gone.md"),
+                reason: LoadError::NotFound,
             },
             Event::Saved {
                 path: PathBuf::from("C:/notes/a.notes"),
@@ -307,9 +363,9 @@ mod tests {
             all.len(),
             "the fixture must cover each variant exactly once: {names:?}"
         );
-        // Loaded, Saved, SaveFailed, ExternalChange, AutosaveSkipped,
+        // Loaded, LoadFailed, Saved, SaveFailed, ExternalChange, AutosaveSkipped,
         // RecentsUpdated.
-        assert_eq!(all.len(), 6, "Event gained or lost a variant");
+        assert_eq!(all.len(), 7, "Event gained or lost a variant");
 
         for event in &all {
             assert_eq!(event, &event.clone(), "{event:?} clone is not equal");
@@ -329,6 +385,16 @@ mod tests {
             Event::Saved {
                 path: PathBuf::from("a"),
                 revision: 2
+            }
+        );
+        assert_ne!(
+            Event::LoadFailed {
+                path: PathBuf::from("a"),
+                reason: LoadError::Locked
+            },
+            Event::LoadFailed {
+                path: PathBuf::from("a"),
+                reason: LoadError::NotFound
             }
         );
         assert_ne!(
@@ -481,6 +547,64 @@ mod tests {
         assert_eq!(
             SaveError::Other("os error 5".to_string()).to_string(),
             "os error 5"
+        );
+    }
+
+    /// Acceptance (b), load half: the shipped UI copy of every `LoadError`.
+    /// Pinned for the same reason as SaveError's — these strings are what the
+    /// user reads when their file will not open, so a rename is free and an
+    /// edit is a product change.
+    #[test]
+    fn load_error_ui_copy_is_pinned() {
+        assert_eq!(LoadError::NotFound.to_string(), "file no longer exists");
+        assert_eq!(LoadError::PermissionDenied.to_string(), "permission denied");
+        assert_eq!(
+            LoadError::Locked.to_string(),
+            "file is locked by another program"
+        );
+        assert_eq!(LoadError::TooLarge.to_string(), "file is too large to open");
+        assert_eq!(
+            LoadError::Undecodable {
+                byte_offset: 17,
+                encoding_hint: Some(Encoding::Utf16Le),
+            }
+            .to_string(),
+            "cannot decode this file as text (at byte 17)"
+        );
+        assert_eq!(
+            LoadError::Other("os error 1450".to_string()).to_string(),
+            "os error 1450"
+        );
+    }
+
+    /// `Undecodable` must carry WHERE it broke and what the header claimed:
+    /// `{0}`-style copy hides the offset the user would quote to support, and a
+    /// lost encoding hint is how a UTF-19-ish file becomes an unanswerable bug.
+    #[test]
+    fn undecodable_keeps_its_offset_and_hint() {
+        let reason = LoadError::Undecodable {
+            byte_offset: 4096,
+            encoding_hint: Some(Encoding::Ansi(1252)),
+        };
+        let same = reason.clone();
+        assert_eq!(reason, same);
+        assert_ne!(
+            reason,
+            LoadError::Undecodable {
+                byte_offset: 4097,
+                encoding_hint: Some(Encoding::Ansi(1252)),
+            }
+        );
+        assert_ne!(
+            reason,
+            LoadError::Undecodable {
+                byte_offset: 4096,
+                encoding_hint: None,
+            }
+        );
+        assert!(
+            reason.to_string().contains("4096"),
+            "the offset is in the copy"
         );
     }
 
