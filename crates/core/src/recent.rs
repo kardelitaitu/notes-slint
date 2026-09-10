@@ -216,13 +216,29 @@ pub fn display_labels(entries: &[RecentEntry]) -> Vec<String> {
 }
 
 /// (identity key, was-canonicalised). The single filesystem touch in this
-/// module: canonicalise reads, nothing writes — and NEVER on a path the
-/// name-only policy has judged hostile: canonicalise on an unreachable UNC
-/// host froze a quit for 2.68s in measurement. The lexical fallback is pure
-/// and instant, and was-canonicalised=false is the honest answer (core did
-/// not touch the filesystem).
+/// module: canonicalise reads, nothing writes. The policy verdict decides
+/// whether canonicalise is SAFE to attempt, per verdict:
+/// * UnboundedNetwork — NEVER: canonicalise on an unreachable UNC host froze
+///   a quit for 2.68s in measurement.
+/// * ReservedDevice — NEVER: canonicalising a device namespace opens the
+///   device, which is the harm the verdict exists to refuse.
+/// * StrippedName — YES (MAJOR-3): a stripped spelling is a LOCAL mangled
+///   name the OS will rewrite on contact, so canonicalising it is exactly
+///   "normalise to what the OS would write". Without this, one real file
+///   occupies two recent slots and the refused spelling can never be
+///   reopened — the list refuses the name it displays.
+/// * StreamName / DriveRelative — NO: a stream is another file's storage,
+///   and a drive-relative name resolves against invisible process state;
+///   both stay lexical (and drive-relative names are refused outright).
+/// The lexical fallback is pure and instant, and was-canonicalised=false is
+/// the honest answer (core did not touch the filesystem).
 fn identity_of(path: &Path) -> (String, bool) {
-    if crate::path_policy::path_policy(path) != crate::path_policy::PathVerdict::Allowed {
+    use crate::path_policy::PathVerdict;
+    let canonicalisable = !matches!(
+        crate::path_policy::path_policy(path),
+        PathVerdict::UnboundedNetwork | PathVerdict::ReservedDevice
+    );
+    if !canonicalisable {
         return (
             key_from_raw(&lexical_normalisation(path).to_string_lossy()),
             false,

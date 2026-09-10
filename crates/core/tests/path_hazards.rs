@@ -875,7 +875,6 @@ fn case_only_difference_is_one_file_and_one_identity() -> Result<(), Box<dyn Err
 /// to "notes"), yet identity_key is computed WITHOUT canonicalising a refused
 /// name -- so one file on disk becomes two recent entries.
 #[test]
-#[ignore = "MAJOR-3: one real file occupies two recent slots -- 'notes' and 'notes.' get different identity keys because a refused spelling is keyed lexically instead of as the OS would write it"]
 fn refused_spelling_of_an_existing_file_splits_the_recent_list() -> Result<(), Box<dyn Error>> {
     let _scratch = scratch_lock();
     init_scratch()?;
