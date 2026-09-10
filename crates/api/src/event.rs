@@ -102,8 +102,11 @@ pub enum SkipReason {
     /// The buffer matches what is on disk (D11: the `Flush` revision is at or
     /// below the last saved revision), so there is nothing to write.
     Clean,
-    /// The note has no path yet, so the only way to persist it is an explicit
-    /// Save As. A SKIP and not a failure: a brand-new note is not an error, and an
+    /// We could not make a file for the note (D69): the scratch location or
+    /// the write was refused. NOT "the note has no path" — the untitled note
+    /// owns a scratch home (<StateDir>/notes/untitled.notes) that the engine
+    /// ensures and writes to, so a mere missing path can no longer reach
+    /// here. A SKIP and not a failure: an
     /// error toast about a file that does not exist teaches the user nothing
     /// (M9 - this replaced an [`Event::SaveFailed`] whose text the engine
     /// invented, with an empty path beside it). No copy here on purpose: like every

@@ -448,6 +448,40 @@ mod tests {
         assert_eq!(d.should_autosave(true), Some(Skip::Clean));
     }
 
+    /// THE EMPTY-BUFFER RULE (D69 companion), proved where the state lives:
+    /// a brand-new, unmodified, never-saved document is never worth a file —
+    /// both the debounced flush and autosave refuse it, so the port cannot
+    /// create the scratch file "for nothing" by asking core honestly. The
+    /// moment text exists (one revision), both proceed. The queries are
+    /// &self: asking can never bump the revision that makes it dirty.
+    #[test]
+    fn an_empty_untitled_document_is_never_worth_a_file_until_text_exists() {
+        let mut d = Document::new();
+        assert_eq!(d.revision(), 0, "asking about the buffer never edits it");
+        assert!(!d.is_dirty());
+        assert_eq!(
+            d.should_autosave(true),
+            Some(Skip::Clean),
+            "empty and unmodified: autosave skips"
+        );
+        assert_eq!(
+            d.should_flush(0, true),
+            Some(Skip::Clean),
+            "empty and unmodified: the flush skips too"
+        );
+        d.apply_edit(); // the first character exists
+        assert_eq!(
+            d.should_autosave(true),
+            None,
+            "text exists: autosave proceeds"
+        );
+        assert_eq!(
+            d.should_flush(1, true),
+            None,
+            "text exists: the flush proceeds"
+        );
+    }
+
     /// D33: the D11 anchor assert exists to be TRIP-ABLE. The wiring bug it
     /// catches: a save anchored at a revision the bridge never noted — the
     /// next stale Flush is then judged Clean against the invented anchor
