@@ -28,7 +28,7 @@ pub use encoding::{
 pub use format::{NoteParts, is_notes_path, rebuild, split};
 pub use geometry::Rect;
 pub use path_policy::{PathVerdict, path_policy};
-pub use paths::{StateDir, resolve_state_dir};
+pub use paths::{StateDir, ensure_scratch_dir, resolve_state_dir, scratch_note_path};
 pub use recent::{
     MAX_RECENTS, RecentEntry, RecentList, clear, display_labels, identity_key, mark_missing, push,
 };

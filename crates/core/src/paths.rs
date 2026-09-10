@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::SessionError;
+
 /// The directory the app persists state into (window geometry, session).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDir(pub PathBuf);
@@ -60,6 +62,47 @@ pub fn resolve_state_dir(exe_dir: &Path, appdata: Option<&Path>) -> StateDir {
         // comment), or an empty appdata path, treated as no profile at all.
         _ => StateDir(exe_dir.join("data")),
     }
+}
+
+/// The scratch note's FIXED home: <StateDir>/notes/untitled.notes (D69).
+///
+/// The name is DETERMINISTIC on purpose — no pid, no timestamp, no counter:
+/// * two instances of the app share one scratch, and whole-file-or-nothing
+///   atomic rename makes that last-writer-wins — already the sharing model
+///   of session.json and settings.toml, since no single-instance guard
+///   exists anywhere in this repo;
+/// * a generated name is how a state dir becomes a junk drawer: every
+///   crashed launch would leave another orphan behind.
+///
+/// Pure and lexical: no filesystem, no environment — the same contract as
+/// resolve_state_dir. The caller (api) owns writing the file; core owns
+/// deciding WHERE it lives and proving the place is safe
+/// (ensure_scratch_dir), and the name is judged by path_policy like every
+/// other name (see the pin test below).
+pub fn scratch_note_path(dir: &StateDir) -> PathBuf {
+    dir.0.join("notes").join("untitled.notes")
+}
+
+/// Creates — and proves usable — <StateDir>/notes, the scratch note's
+/// directory (D69). Reuses session::ensure_state_dir WHOLESALE: the same
+/// pure metadata judge, the same writability probe, no second copy to drift.
+///
+/// The scratch verdict is checked against the name-only policy BEFORE any
+/// filesystem call, so a UNC or otherwise hostile state dir is refused
+/// without a network stall: "save the untitled note" must never become the
+/// 2.68s freeze this repo already measured once.
+pub fn ensure_scratch_dir(dir: &StateDir) -> Result<(), SessionError> {
+    let notes = dir.0.join("notes");
+    if crate::path_policy::path_policy(&notes) != crate::path_policy::PathVerdict::Allowed {
+        return Err(SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "the scratch location is refused by the name-only policy: {}",
+                notes.display()
+            ),
+        )));
+    }
+    crate::session::ensure_state_dir(&notes)
 }
 
 #[cfg(test)]
@@ -124,6 +167,35 @@ mod tests {
                 resolve_state_dir(exe_dir, appdata),
                 resolve_state_dir(exe_dir, appdata),
                 "nondeterministic for {exe_dir:?} / {appdata:?}"
+            );
+        }
+    }
+
+    /// THE PIN (D69): our own default must pass our own predicate for every
+    /// StateDir shape core can produce. If the scratch name failed
+    /// path_policy, the save path would refuse a file we invented — exactly
+    /// the bug class this repo has been hunting. D33: this test fails if the
+    /// scratch name is changed to "untitled.notes." (StrippedName).
+    #[test]
+    fn the_scratch_note_passes_the_name_only_policy_for_every_state_shape() {
+        let shapes = [
+            resolve_state_dir(
+                Path::new("C:/Program Files/Notes"),
+                Some(Path::new("C:/Users/u/AppData/Roaming")),
+            ),
+            resolve_state_dir(Path::new("C:/apps/notes"), None),
+            StateDir(PathBuf::from("C:/Users/u/AppData/Roaming/notes-gpui")),
+            StateDir(PathBuf::from("C:/Apps/Notes Portable/Data with spaces")),
+            StateDir(PathBuf::from(
+                "C:/Users/multi.dot.user/AppData/Roaming/notes-gpui",
+            )),
+        ];
+        for dir in shapes {
+            let scratch = scratch_note_path(&dir);
+            assert_eq!(
+                crate::path_policy::path_policy(&scratch),
+                crate::path_policy::PathVerdict::Allowed,
+                "our own scratch home must pass our own predicate: {scratch:?}"
             );
         }
     }
