@@ -30,8 +30,9 @@ use gpui::prelude::*;
 use gpui::{
     App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, PaintQuad, Pixels, Point, Render, ShapedLine, SharedString, Style, TextRun,
-    UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, px, relative, rgb, size,
+    LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
+    Window, actions, div, fill, point, px, relative, rgb, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 /// A development probe, silent unless `NOTES_S2_PROBE` is set in the environment.
@@ -501,10 +502,14 @@ impl TextState {
     /// lines feel right instead of sliding to the margin and staying there. Column
     /// rather than pixel because it needs no layout, so it is testable without a
     /// window - the same reason S1 split the state out.
-    pub(crate) fn move_vertical(&mut self, delta: isize) {
+    /// Where up/down should LAND, without moving anything: one rule shared by the
+    /// caret motion and the selection motion, so the keyboard cannot disagree with
+    /// itself about what a line is. Clamped to the neighbour line length, which is the
+    /// whole of a short line and the remembered column on a long one.
+    pub(crate) fn vertical_target(&self, delta: isize) -> usize {
         let lines = line_ranges(&self.content);
         if lines.is_empty() {
-            return;
+            return 0;
         }
         let here = self
             .line_index_at(self.cursor_offset())
@@ -515,20 +520,35 @@ impl TextState {
             here.saturating_add(delta as usize).min(lines.len() - 1)
         };
         if there == here {
-            // At the top or bottom: collapse to the line edge, like every editor.
-            let edge = if delta < 0 {
+            return if delta < 0 {
                 lines[here].start
             } else {
                 lines[here].end
             };
-            self.caret_to(edge);
-            return;
         }
         let wanted = self
             .desired_column
             .unwrap_or_else(|| self.column_of(self.cursor_offset()));
-        let byte = self.byte_at_column(lines[there].start, wanted);
+        self.byte_at_column(lines[there].start, wanted)
+    }
+
+    pub(crate) fn move_vertical(&mut self, delta: isize) {
+        let byte = self.vertical_target(delta);
         self.caret_to(byte);
+    }
+
+    /// Shift+up/down. Same target, the other door: ONE selection model, two input
+    /// routes, which is the only reason the mouse in S4 and the keyboard agree at all.
+    pub(crate) fn select_vertical(&mut self, delta: isize) {
+        let byte = self.vertical_target(delta);
+        // The column is restored after the move, exactly as `caret_to` protects it for
+        // the motion door: `select_to` records the column it landed on, and after a
+        // clamp to a short line that would be the SHORT lines column - so the second
+        // shift-down would walk down the margin instead of back to column five. Found
+        // by the test, in code I had just written.
+        let kept = self.desired_column;
+        self.select_to(byte);
+        self.desired_column = kept;
     }
 
     pub(crate) fn text_for_range(
@@ -596,6 +616,13 @@ pub(crate) struct Editor {
     /// What the last frames shaping cost, in microseconds, so the typing budget is a
     /// number from the binary rather than an argument about the source.
     shape_us: u128,
+    /// The height of the element box at the last paint, i.e. the viewport the scroll is
+    /// clamped against. The model needs it because the wheel listener sits on the Div
+    /// and the clamp rule lives here.
+    viewport_h: Pixels,
+    /// The caret line the last painted frame showed. The caret rule compares against
+    /// this; the wheel never writes it, which is the whole reason a scroll survives.
+    caret_line_shown: Option<usize>,
 }
 
 impl Editor {
@@ -613,6 +640,8 @@ impl Editor {
             frame_text: String::new(),
             scroll_y: px(0.0),
             shape_us: 0,
+            viewport_h: px(0.0),
+            caret_line_shown: None,
         }
     }
 
@@ -625,6 +654,8 @@ impl Editor {
             frame_text: String::new(),
             scroll_y: px(0.0),
             shape_us: 0,
+            viewport_h: px(0.0),
+            caret_line_shown: None,
         }
     }
 
@@ -643,6 +674,83 @@ impl Editor {
             .iter()
             .find(|frame| frame.bytes.contains(&byte))
             .or_else(|| self.frames.last())
+    }
+
+    /// The line a PIXEL y falls on, with the clamp S4 was asked for: below the last line
+    /// is the last line, above the first is the first line, and `None` is left for the
+    /// one genuinely unresolvable case - no layout yet, which is only true before the
+    /// first paint. This is what makes "click in the empty space under a short note" put
+    /// the caret at the END of the text instead of doing nothing, which is how every
+    /// text control on Windows behaves.
+    fn frame_at(&self, y: Pixels) -> Option<&LineFrame> {
+        let mut chosen = self.frames.first()?;
+        for frame in &self.frames {
+            if frame.bounds.top() <= y {
+                chosen = frame;
+            } else {
+                break;
+            }
+        }
+        Some(chosen)
+    }
+
+    /// WHEEL AND TRACKPAD. gpui routes `PlatformInput::ScrollWheel` to any `Div` with a
+    /// listener (the fluent `on_scroll_wheel` at src/elements/div.rs:827-834, the
+    /// platform input at src/window.rs:3615-3618), so no port seam is needed for a delta
+    /// that is pure UI state - and the port must not own one, because api routes and
+    /// translates and decides nothing (AGENTS.md).
+    ///
+    /// A `Lines` delta is worth a whole row of this font, which is what a wheel means to
+    /// a user. Clamped to the content, and it does NOT move the caret: a wheel is not an
+    /// edit, and a caret that jumps on scroll is a bug users report.
+    fn scroll_by(&mut self, delta: &ScrollDelta, cx: &mut Context<Self>) {
+        let row = self
+            .frames
+            .first()
+            .map_or(0.0, |frame| f32::from(frame.bounds.size.height));
+        let raw = match delta {
+            ScrollDelta::Lines(point) => point.y * row,
+            ScrollDelta::Pixels(point) => f32::from(point.y),
+        };
+        let content = row * self.frames.len().max(1) as f32;
+        let max = (content - f32::from(self.viewport_h)).max(0.0);
+        // The platform reports scroll-down as positive y and the offset is measured the
+        // other way, so the sign flips exactly once, here.
+        let next = (f32::from(self.scroll_y) + raw).clamp(0.0, max);
+        probe(format!(
+            "wheel raw={raw:.1} offset_before={:.1} offset_after={next:.1} row={row:.1}",
+            f32::from(self.scroll_y)
+        ));
+        if next != f32::from(self.scroll_y) {
+            self.scroll_y = px(next);
+            cx.notify();
+        }
+    }
+
+    /// CLICK TO CARET, and the shift-click that extends. It goes through the same
+    /// `move_to`/`select_to` as every keyboard motion, so a click cannot land
+    /// mid-cluster - the boundary snap is in the state, not re-implemented here.
+    fn position_caret(&mut self, point: Point<Pixels>, shift: bool, cx: &mut Context<Self>) {
+        probe(format!(
+            "caret_point x={:.1} y={:.1} shift={shift}",
+            f32::from(point.x),
+            f32::from(point.y)
+        ));
+        let Some(frame) = self.frame_at(point.y) else {
+            return;
+        };
+        let x = point.x - frame.bounds.left();
+        // Past the end of the line's glyphs is that line's end - the second of the two
+        // rules, and it falls out of `unwrap_or` because `index_for_x` has nothing to
+        // report beyond the text it shaped.
+        let utf8 = frame.line.index_for_x(x).unwrap_or(frame.text.len());
+        let byte = (frame.bytes.start + utf8).min(frame.bytes.end);
+        if shift {
+            self.state.select_to(byte);
+        } else {
+            self.state.move_to(byte);
+        }
+        cx.notify();
     }
 
     /// What S6 will refuse to flush while this is `Some`: an uncommitted composition
@@ -835,6 +943,8 @@ actions!(
         Home,
         End,
         EscapeSelection,
+        SelectUp,
+        SelectDown,
         Newline,
         Up,
         Down,
@@ -914,6 +1024,16 @@ impl Editor {
 
     fn down(&mut self, _: &Down, _window: &mut Window, cx: &mut Context<Self>) {
         self.state.move_vertical(1);
+        cx.notify();
+    }
+
+    fn select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.select_vertical(-1);
+        cx.notify();
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.select_vertical(1);
         cx.notify();
     }
 
@@ -999,6 +1119,9 @@ pub(crate) struct PrepaintState {
     scroll_y: Pixels,
     frame_text: String,
     shape_us: u128,
+    /// The caret line this frame intends to have shown; written to the model only by
+    /// paint, because only paint proves the frame reached the screen.
+    shown_line: Option<usize>,
 }
 
 /// The editor element: request the viewport, shape in prepaint, and in paint hand the
@@ -1037,11 +1160,26 @@ impl Element for EditorElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         // The VIEWPORT, not the content: the buffer's height is lines x line-height and
         // asking for that would make the element as tall as the note and push the status
-        // line off screen. The scroll happens inside, which is why the caret rule below
-        // is the only thing that decides what is visible.
+        // line off screen. The scroll happens inside, and what is visible is decided by
+        // two things now - the caret rule (only when the caret changed line) and the wheel.
+        // THE BOX, and why it is a definite length instead of "fill the parent".
+        // Measured on a live 200-line note, not reasoned from the source: `relative(1.)`
+        // here reported h=0.0 - and `visible=0`, which is how the one-line-tall box S2 and
+        // S3 shipped with went unnoticed, since glyphs paint at their origin whatever the
+        // box claims; `px(300.)` reported h=300.0; and pinning this bridge's ROOT div to
+        // the window's own height changed nothing, so the percentage collapses somewhere
+        // above the view root, in gpui's wrapper, which is not in 0.2.2's shipped sources
+        // under any name I could find (`struct Root` and `fn size_full` are both absent).
+        // The one definite length available at layout time is the window's client height,
+        // so the editor takes that minus the status block this bridge draws beneath it.
+        // Revisit if gpui ever gives a bare Element a resolvable percentage.
+        let status_box = window.line_height() * 2.0 + px(8.0);
+        let viewport = (f32::from(window.window_bounds().get_bounds().size.height)
+            - f32::from(status_box))
+        .max(24.0);
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = relative(1.).into();
+        style.size.height = px(viewport).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -1070,6 +1208,13 @@ impl Element for EditorElement {
         let mut shape_us = 0u128;
         let mut caret_line = 0usize;
         let mut frame_text = String::new();
+        let mut shown_line: Option<usize> = None;
+        let mut sel_probe = (0usize, 0usize);
+        let mut caret_probe = 0usize;
+        // The whole prepaint, timed: shape_us alone cannot show the rebuild cost, which
+        // is what the quadratic first draft of the cache was. This is the number the
+        // wheel moves, because scrolling walks lines that were never shaped.
+        let began = std::time::Instant::now();
         self.input.update(cx, |input, _cx| {
             let lines = line_ranges(&input.state.content);
             let cursor = input.state.cursor_offset();
@@ -1079,7 +1224,18 @@ impl Element for EditorElement {
             // Reuse keyed by the line TEXT and its underline, never by the byte range:
             // a newline inserted at the top shifts every following line, and a key that
             // includes the offset would re-shape the whole note for one keystroke.
-            let mut old = std::mem::take(&mut input.frames);
+            // ONE PASS, not a search per line: the old frames are moved into a pool
+            // keyed by the exact text, so a keystroke at the top of a 2000-line note
+            // costs a linear walk instead of the quadratic scan the first draft of this
+            // had (Vec::remove(position) inside a per-line loop). Composition is excluded
+            // from the pool on both sides: one marked line re-shaping per frame is worth
+            // never handing back an underline that belongs to another row.
+            let mut pool: std::collections::HashMap<String, ShapedLine> =
+                std::mem::take(&mut input.frames)
+                    .into_iter()
+                    .filter(|frame| frame.mark.is_none())
+                    .map(|frame| (frame.text, frame.line))
+                    .collect();
             let mut shaped: Vec<ShapedEntry> = Vec::new();
             for range in lines.into_iter() {
                 let text = input.state.content[range.clone()].to_string();
@@ -1088,9 +1244,9 @@ impl Element for EditorElement {
                     let end = m.end.min(range.end);
                     (end > start).then_some(start - range.start..end - range.start)
                 });
-                let hit = old.iter().position(|f| f.text == text && f.mark == mark);
-                let line = match hit {
-                    Some(at) => old.remove(at).line,
+                let cached = mark.is_none().then(|| pool.remove(&text)).flatten();
+                let line = match cached {
+                    Some(line) => line,
                     None => {
                         let run = TextRun {
                             len: text.len(),
@@ -1144,21 +1300,34 @@ impl Element for EditorElement {
             // Whatever is left in `old` is a line that no longer exists; dropping it is
             // the whole invalidation story.
 
-            // THE CARET IS ALWAYS VISIBLE: the minimum scroll that brings the caret line
-            // fully in, clamped to the content. No animation, no scrollbar, no
-            // horizontal scroll - word wrap is out of scope for the whole project, so a
-            // note wider than the window is a note you resize the window for.
+            // THE CARET IS VISIBLE WHEN THE CARET MOVED, not every frame. The first form
+            // of this rule ran unconditionally and made a wheel delta unobservable: every
+            // frame after it snapped the view back onto the caret line, so the user
+            // scrolled and nothing had happened. Comparing against the line the last PAINT
+            // showed - not the last prepaint, because a prepaint that never painted must
+            // not claim to have shown anything - gives the rule both directions: scroll
+            // away and it stays, move the caret and the view follows.
             let content_height = lh * (shaped.len() + 1) as f32;
-            let mut offset = f32::from(input.scroll_y);
             let caret_top = lh * caret_line as f32;
-            if caret_top - offset + lh > viewport {
-                offset = caret_top + lh - viewport;
-            }
-            if caret_top - offset < 0.0 {
-                offset = caret_top;
-            }
+            let mut offset = if input.caret_line_shown == Some(caret_line) {
+                f32::from(input.scroll_y)
+            } else {
+                let mut offset = f32::from(input.scroll_y);
+                if caret_top - offset + lh > viewport {
+                    offset = caret_top + lh - viewport;
+                }
+                if caret_top - offset < 0.0 {
+                    offset = caret_top;
+                }
+                offset
+            };
+            // The clamp is not conditional on who moved the view: content can shrink under
+            // a scroll the wheel owns, and an offset past the end is a blank page.
             offset = offset.max(0.0).min((content_height - viewport).max(0.0));
             scroll_y = px(offset);
+            shown_line = Some(caret_line);
+            sel_probe = (selection.start, selection.end);
+            caret_probe = cursor;
             for (index, (range, text, mark, line)) in shaped.into_iter().enumerate() {
                 let top = f32::from(bounds.top()) + lh * index as f32 - offset;
                 let frame_bounds =
@@ -1187,6 +1356,15 @@ impl Element for EditorElement {
             }
             if !selection.is_empty() {
                 for frame in &frames {
+                    // VIEWPORT CLIP: a selection across 400 lines would draw 400 quads,
+                    // and every one outside the visible rows is work nobody can see. The
+                    // frames stay complete - the IME rect and the click hit-test still
+                    // need a line that is scrolled off - only the QUADS are clipped.
+                    if frame.bounds.bottom() <= bounds.top()
+                        || frame.bounds.top() >= bounds.bottom()
+                    {
+                        continue;
+                    }
                     let start = selection.start.max(frame.bytes.start);
                     let end = selection.end.min(frame.bytes.end);
                     if end <= start {
@@ -1211,9 +1389,13 @@ impl Element for EditorElement {
             }
             frame_text = input.state.content.clone();
         });
+        let prepaint_us = began.elapsed().as_micros();
         probe(format!(
-            "prepaint lines={} shape_us={shape_us} scroll={:.1} caret_line={caret_line}",
+            "prepaint lines={} h={:.1} caret={caret_probe} sel={:?}..{:?} scroll={:.1} caret_line={caret_line} shape_us={shape_us} prepaint_us={prepaint_us}",
             frames.len(),
+            f32::from(bounds.size.height),
+            sel_probe.0,
+            sel_probe.1,
             f32::from(scroll_y)
         ));
         PrepaintState {
@@ -1223,6 +1405,7 @@ impl Element for EditorElement {
             scroll_y,
             frame_text,
             shape_us,
+            shown_line,
         }
     }
 
@@ -1248,7 +1431,15 @@ impl Element for EditorElement {
             window.paint_quad(selection);
         }
         let frames = std::mem::take(&mut prepaint.frames);
+        let mut visible = 0usize;
         for frame in &frames {
+            // The same clip the selection quads use: the cache holds every line so the
+            // IME and a click can be answered for a scrolled-off row, but only the rows
+            // inside the box are drawn.
+            if frame.bounds.bottom() <= bounds.top() || frame.bounds.top() >= bounds.bottom() {
+                continue;
+            }
+            visible += 1;
             // A failed line is a blank row for one frame, not an aborted editor.
             let _ = frame
                 .line
@@ -1266,24 +1457,41 @@ impl Element for EditorElement {
         let scroll_y = prepaint.scroll_y;
         let shape_us = prepaint.shape_us;
         let count = frames.len();
+        let scroll_probe = scroll_y;
         self.input.update(cx, |input, _cx| {
             input.frames = frames;
             input.frame_text = frame_text;
             input.scroll_y = scroll_y;
             input.shape_us = shape_us;
+            input.viewport_h = bounds.size.height;
+            input.caret_line_shown = prepaint.shown_line.take();
         });
         probe(format!(
-            "paint lines={count} scroll={:.1} shape_us={shape_us}",
-            f32::from(self.input.read(cx).scroll_y)
+            "paint lines={count} visible={visible} scroll={:.1} shape_us={shape_us}",
+            f32::from(scroll_probe)
         ));
     }
 }
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let wheel_target = cx.entity();
+        let click_target = cx.entity();
         div()
             .key_context("NotesEditor")
             .track_focus(&self.focus_handle(cx))
-            .size_full()
+            .flex_1()
+            .on_scroll_wheel(move |event: &ScrollWheelEvent, _window, cx| {
+                wheel_target.update(cx, |editor, cx| editor.scroll_by(&event.delta, cx));
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                move |event: &MouseDownEvent, _window, cx| {
+                    let shift = event.modifiers.shift;
+                    click_target.update(cx, |editor, cx| {
+                        editor.position_caret(event.position, shift, cx)
+                    });
+                },
+            )
             .child(EditorElement { input: cx.entity() })
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
@@ -1301,6 +1509,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
     }
 }
 
@@ -1859,6 +2069,38 @@ mod tests {
         assert!(
             state.content.matches('\n').count() == 2,
             "both line feeds are still there"
+        );
+    }
+    /// S4: shift+up and shift+down share the caret motions target exactly, so the
+    /// selection can never disagree with where the arrow would have gone - one rule,
+    /// two doors. And the head is the end that moves, which is what makes a second
+    /// shift-down continue rather than restart.
+    #[test]
+    fn shift_selection_across_lines_follows_the_same_target_as_the_caret() {
+        let mut state = TextState::new("abcdef\nab\nabcdefghij".to_string());
+        state.move_to(5);
+        state.select_vertical(1);
+        assert_eq!(
+            state.selected_range,
+            5..9,
+            "the head moved to the short line end and the anchor stayed put"
+        );
+        assert!(
+            !state.selection_reversed,
+            "growing forward leaves the head at the end; reversed means the head is at the start"
+        );
+        state.select_vertical(1);
+        assert_eq!(
+            state.selected_range,
+            5..15,
+            "and a second shift-down continues to column five on line three"
+        );
+        state.select_vertical(-1);
+        assert_eq!(state.selected_range, 5..9, "back up the same rule applies");
+        assert_eq!(
+            state.vertical_target(1),
+            15,
+            "and down still means column five - one rule, two doors"
         );
     }
 }

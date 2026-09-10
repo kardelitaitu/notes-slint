@@ -192,6 +192,11 @@ fn drain_bounded(events: &EventRx, out: &mut Vec<Event>, limit: usize) -> Drain 
 /// unbounded), which makes that a leak rather than a stall: nothing blocks, it just
 /// grows. 250 ms of stillness is 15x the measured wake cadence (16.9 ms), so no user
 /// can feel it, and a drag that never stops is capped by GEOMETRY_FORCE below.
+/// CAUTION, pinned by a test: a window that keeps returning to the rect the port
+/// already holds resets the episode clock, and an oscillation like that sends nothing
+/// at all - which is the design (a window that ends where it started owes no fact), but
+/// it means the force interval below is a ceiling on CONTINUOUS motion away from home,
+/// not a promise that any given movement is eventually reported.
 const GEOMETRY_QUIET: Duration = Duration::from_millis(250);
 
 /// The most a continuous drag may be held back. Without this, a user who resizes
@@ -808,6 +813,8 @@ fn main() {
                 KeyBinding::new("shift-enter", editor::Newline, None),
                 KeyBinding::new("up", editor::Up, None),
                 KeyBinding::new("down", editor::Down, None),
+                KeyBinding::new("shift-up", editor::SelectUp, None),
+                KeyBinding::new("shift-down", editor::SelectDown, None),
                 KeyBinding::new("ctrl-a", editor::SelectAll, None),
                 KeyBinding::new("ctrl-c", editor::Copy, None),
                 KeyBinding::new("ctrl-x", editor::Cut, None),
@@ -860,6 +867,23 @@ fn main() {
             };
             // STEP 3 - register the window handle with the port. The HWND crosses
             // as an i64 because the port must not know a platform type exists.
+            //
+            // THIS IS THE PIN ORDER, and it is worth the four lines. The platform lane
+            // measured (442c2a1) that an async topmost reband applied to a HIDDEN window
+            // never lands - silently lost - while an async move on the same hidden window
+            // does. The port drives restore-and-pin off this registration, so the order
+            // matters: `open_window` above has already created the window, applied its
+            // placement through `SetWindowPlacement` (which carries the show state; gpui
+            // src/platform/windows/window.rs:302-316) and let it draw at least once before
+            // returning (src/app.rs:959-961). So the first pin is applied to a window that
+            // is up, not merely created, and the very first pinned launch is NOT the broken
+            // case. What is still unverified, and named rather than claimed: that a
+            // minimize/hide cannot slip between this line and the reband landing. There is
+            // no guard here and no new Event asked for, because the bridge has no path that
+            // hides a window today - no tray, no hide, no second window - and the pin is
+            // applied once, at registration, before any user minimize is possible. If S7 or
+            // the menus ever add a hide, this comment is the place that decision has to be
+            // revisited.
             let any: AnyWindowHandle = handle.into();
             // Fill the slot the pump reads. The view was built inside open_window and
             // could not have had the handle then; until this line lands the pump has
