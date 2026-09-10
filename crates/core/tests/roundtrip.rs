@@ -88,7 +88,8 @@ fn load_manifest() -> Result<(Manifest, u16), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    Ok((manifest, manifest.ansi_codepage))
+    let codepage = manifest.ansi_codepage;
+    Ok((manifest, codepage))
 }
 
 fn read_fixture(entry: &ManifestEntry) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
