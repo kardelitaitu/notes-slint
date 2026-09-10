@@ -1139,8 +1139,7 @@ fn scratch_location_over_state_dir_shapes() -> Result<(), Box<dyn Error>> {
 ///   scratch file — a known gap, out of scope (api owns session.path; core
 ///   owns the file and does not delete user text).
 #[test]
-fn scratch_note_roams_with_the_state_and_clear_recents_spares_it()
--> Result<(), Box<dyn Error>> {
+fn scratch_note_roams_with_the_state_and_clear_recents_spares_it() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     let state = StateDir(dir.path().to_path_buf());
     ensure_scratch_dir(&state)?;
@@ -1152,7 +1151,8 @@ fn scratch_note_roams_with_the_state_and_clear_recents_spares_it()
         scratch.starts_with(&state.0),
         "the accepted roaming exposure: the scratch note is inside the state dir"
     );
-    let list = push(Vec::new(), scratch.clone(), "untitled.notes");
+    let listed = push(Vec::new(), scratch.clone(), "untitled.notes");
+    assert_eq!(listed.len(), 1, "the scratch note was on the menu");
     let list = clear();
     assert!(list.is_empty(), "ClearRecents empties the menu pointer");
     assert!(
