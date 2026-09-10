@@ -95,6 +95,36 @@ jobs:
           esac
           exit $status
 
+      # --- 4b. byte-fidelity fixtures (the do-no-harm rule, whitepaper SS4.5) --
+      # These 28 files ARE the proof that a load+save cycle leaves a foreign file
+      # byte-identical: BOM present or absent, codepage, CRLF vs LF, trailing newline
+      # or none. They are GENERATED, never hand-edited, because an editor silently
+      # "tidies" a file that lacks a trailing newline - the exact corruption these
+      # fixtures exist to detect - and .gitattributes marks the directory binary so Git
+      # can never normalise the bytes either. This step is the net under both: it is what
+      # catches someone opening a fixture in an IDE and committing the result. CI only
+      # judges the fixtures; there is deliberately no "fixtures generate" step here.
+      # Exit codes: 0 clean | 1 a fixture no longer matches its manifest sha256 | 2 the
+      # verifier could not run (manifest missing/unreadable), which is not a violation.
+      - name: fixtures — cargo run -p xtask -- fixtures verify (encoding fixtures are byte-exact vs manifest)
+        id: fixtures
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          cargo run -p xtask -- fixtures verify 2>&1 | tee "$RUNNER_TEMP/fixtures-verify.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # Annotate each offending fixture by name, straight from the verifier output.
+          while IFS= read -r line; do
+            echo "::error::$line"
+          done < <(grep -o 'FIXTURES VIOLATION: .*' "$RUNNER_TEMP/fixtures-verify.log" || true)
+          case $status in
+            0) echo "fixtures verify: clean - every fixture matches the sha256 recorded in manifest.json." ;;
+            1) echo "::error::FIXTURE BYTES CHANGED (fixtures verify exit 1). Either a fixture was opened and re-saved (an editor added a trailing newline, or Git normalised CRLF), or core round-trip behaviour changed. Fix the code, or re-generate deliberately with: cargo xtask fixtures generate. Never edit manifest.json by hand." ;;
+            *) echo "::error::FIXTURES VERIFIER COULD NOT RUN (exit $status) - manifest.json is missing or unreadable. This is a harness failure, not a fidelity violation." ;;
+          esac
+          exit $status
+
       # --- 5. docs placement validator ---------------------------------------
       # Its OWN step, never chained with a cargo command, and it runs even when a step
       # above failed: a docs edit landing mid-run must not red-fail a code gate, and a
@@ -191,3 +221,13 @@ jobs:
 
       - name: test — cargo test -p notes-core -p xtask
         run: cargo test -p notes-core -p xtask
+
+      # Same verifier, on Linux, on purpose - not decoration. Manifest keys are flat
+      # filenames (a test asserts none contains a backslash), joined with Path::join, and
+      # verification is fs::read + sha256 over raw bytes with no text-mode translation, so
+      # this must pass here exactly when it passes on Windows. A red HERE under a green
+      # Windows gate means either a path-separator assumption leaked into the verifier or
+      # a Linux checkout normalised fixture bytes (the "binary" rule in .gitattributes
+      # stopped holding). check-arch and check-docs.ps1 stay Windows-only; see above.
+      - name: fixtures — cargo run -p xtask -- fixtures verify (encoding fixtures are byte-exact vs manifest)
+        run: cargo run -p xtask -- fixtures verify
