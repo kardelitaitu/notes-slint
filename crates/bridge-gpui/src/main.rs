@@ -826,7 +826,7 @@ fn main() {
             let Ok(handle) = opened else {
                 // No window means no UI to run: close the port - drain, final
                 // session write, join - instead of letting Drop abort it.
-                close(&gateway);
+                close(&gateway, &events);
                 cx.quit();
                 return;
             };
@@ -889,16 +889,17 @@ fn main() {
             // register, and this site plus STEP 3 above are exactly that pair.
             held.borrow_mut().push(cx.on_window_closed({
                 let unregistering = Rc::clone(&closing);
+                let events = Rc::clone(&events);
                 move |_cx| {
                     send(&unregistering, Command::UnregisterWindow);
-                    close(&closing);
+                    close(&closing, &events);
                 }
             }));
         }
     });
 
     // And the door that does not come through a window close.
-    close(&gateway);
+    close(&gateway, &events);
     // The pump died with its window, so anything the engine said during its own
     // shutdown has nowhere to be rendered. It is named in the trace instead of
     // being dropped in silence, which is what the previous two drains did.
@@ -1001,7 +1002,7 @@ fn send(gateway: &Rc<RefCell<Option<Gateway>>>, command: Command) {
     }
 }
 
-fn close(gateway: &Rc<RefCell<Option<Gateway>>>) {
+fn close(gateway: &Rc<RefCell<Option<Gateway>>>, events: &Rc<RefCell<EventRx>>) {
     if let Some(gateway) = gateway.borrow_mut().take() {
         // Blocking by contract: drain, final session write, join. Legal here
         // because this is the UI thread on its way out, not a frame, and not the
@@ -1010,14 +1011,62 @@ fn close(gateway: &Rc<RefCell<Option<Gateway>>>) {
         // The port hands back ONE error for two outcomes and the bridge cannot tell
         // them apart: either the queue was already closed, or the bounded join ran out
         // and the engine was ABANDONED inside its own exit. The second is the one a
-        // user can lose characters to, so the wording covers both instead of guessing
-        // which - and it names the trade: a 3 s abandoned shutdown beats the permanent
-        // hang this replaced, which was measured at 12 s timed out and >15 s lived
-        // through once with no panic, no log, and no event.
+        // user can lose characters to - and it names the trade: a 3 s abandoned
+        // shutdown beats the permanent hang this replaced, which was measured at 12 s
+        // timed out and >15 s lived through once with no panic, no log, and no event.
         if gateway.close().is_err() {
-            note_shutdown(
-                "the engine did not finish shutting down - your last edit may not be saved",
-            );
+            // Do not leave main on an assumption. The port documents Disconnected on
+            // the EventRx as the terminal signal that the engine thread is gone
+            // (crates/api/src/gateway.rs:312), so the bridge can ASK instead of guessing
+            // which of the two outcomes happened - once more, bounded, because the
+            // reviewer's interleaving is real: a Flush queued behind Shutdown runs a
+            // genuine save (temp write, fsync, rename), and on slow or network storage
+            // that can outrun 3 s and the process would otherwise exit mid-syscall. That
+            // is silent loss of the newest edit, the worst failure this app can have.
+            //
+            // 10 s is the price of not hanging forever, not an expectation: an
+            // abandoned-but-healthy engine finishes its exit in tens of milliseconds in
+            // practice, so the wait almost never runs anywhere near its budget. Parking
+            // here is legal precisely because this is not a frame - the rule AGENTS.md
+            // states is no blocking on a channel inside a GPUI frame, and by now the
+            // frame loop has ended and the pump died with its window.
+            if wait_for_engine_exit(events) {
+                note_shutdown(
+                    "the engine finished its exit after the join deadline had passed - the final save ran",
+                );
+            } else {
+                note_shutdown(
+                    "the engine never answered within 10 s of being abandoned - the last edit may not be saved",
+                );
+            }
+        }
+    }
+}
+
+/// Wait for the engine thread to actually go away, up to a bounded grace period,
+/// returning true only if the queue said Disconnected. Every event that arrives while
+/// waiting is kept, not swallowed: the exit trace has to name it later, and dropping
+/// it here would be exactly the silence this files contract forbids.
+fn wait_for_engine_exit(events: &Rc<RefCell<EventRx>>) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let outcome = {
+            let guard = events.borrow();
+            match guard.try_recv() {
+                Ok(event) => Ok(event),
+                Err(TryRecvError::Empty) => Err(false),
+                Err(TryRecvError::Disconnected) => Err(true),
+            }
+        };
+        match outcome {
+            Ok(event) => HOLDOVER.with(|held| held.borrow_mut().push(event)),
+            Err(true) => return true,
+            Err(false) => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
     }
 }
@@ -1028,6 +1077,11 @@ thread_local! {
     /// and traced immediately, because `windows_subsystem` means there is no console by
     /// then and the exit trace is the only surviving witness.
     static SHUTDOWN_NOTE: RefCell<Option<SharedString>> = const { RefCell::new(None) };
+
+    /// Events that arrived while the bridge was waiting out an abandoned engine. They
+    /// have no frame left to render them, so `final_drain` reports them alongside the
+    /// ones it finds itself rather than letting the wait consume them in silence.
+    static HOLDOVER: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
 }
 
 fn note_shutdown(words: &str) {
@@ -1042,7 +1096,7 @@ fn note_shutdown(words: &str) {
 /// The last look at the queue, once there is no loop and no renderer left. Same
 /// bounded, non-blocking shape as the pump; the result goes to the trace.
 fn final_drain(events: &Rc<RefCell<EventRx>>) -> Vec<Event> {
-    let mut out = Vec::new();
+    let mut out = HOLDOVER.with(|held| held.borrow_mut().drain(..).collect::<Vec<Event>>());
     let guard = events.borrow();
     drain_bounded(&guard, &mut out, MAX_DRAIN_PER_WAKE);
     out
