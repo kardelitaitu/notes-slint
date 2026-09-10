@@ -41,7 +41,11 @@ pub const SKIP_ENV: &str = "XTASK_NO_SELF_CHECK";
 
 /// The sources that produce the xtask binary itself.
 const SELF_DIRS: &[&str] = &["crates/xtask/src"];
-const SELF_FILES: &[&str] = &["crates/xtask/Cargo.toml", "Cargo.toml"];
+/// Cargo.lock is in the list because a dependency bump changes this binary too,
+/// and the lock is the one file other lanes touch constantly without touching
+/// xtask's source. A prebuilt exe from before such a bump is exactly as
+/// untrustworthy as one from before a source edit.
+const SELF_FILES: &[&str] = &["crates/xtask/Cargo.toml", "Cargo.toml", "Cargo.lock"];
 
 pub fn mtime_of(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok().and_then(|m| m.modified().ok())
