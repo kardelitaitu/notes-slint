@@ -276,6 +276,86 @@ fn a_fresh_install_writes_the_session_with_the_rect_the_host_reports() {
     );
 }
 
+/// MAJOR 2/5: the stored monitor facts are REFRESHED, not frozen at launch.
+/// The world changes under the window (the mock is told to move the monitor);
+/// the NEXT flush must name the new monitor in session.json. Red-before: the
+/// old code set monitor_id once at registration and never again, so the file
+/// named the launch-time monitor forever. Also the other side of the contract:
+/// an UNCHANGED world must not turn the idle tick into a disk write - the
+/// refresh is change-gated and only runs inside an already-pending write.
+#[test]
+fn the_flush_refreshes_monitor_facts_when_the_world_changes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        Answers {
+            monitor_id: 1,
+            ..Answers::default()
+        },
+    );
+
+    // (i) register on monitor 1, (ii) queue a change so the tick flushes.
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    gateway.send(Command::SetPinned(true)).expect("queued");
+
+    // The FILE is the signal: poll it (bounded) until the first flush has
+    // landed with the launch-time monitor.
+    let deadline = Instant::now() + ANSWER;
+    let first = loop {
+        if let Ok(session) = read_session(dir.path()) {
+            if session.monitor_id == 1 && session.pinned {
+                break session;
+            }
+        }
+        assert!(Instant::now() < deadline, "the first flush never landed");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(first.monitor_id, 1);
+
+    // IDLE WORLD, NO DISK WRITE: two tick periods with nothing changed must
+    // leave the file byte-identical - a refresh that made every 750 ms tick
+    // rewrite the file would be a battery-life bug in a notepad.
+    let before_idle = std::fs::read(dir.path().join("session.json")).expect("read");
+    std::thread::sleep(Duration::from_millis(750 * 2 + 100));
+    assert_eq!(
+        std::fs::read(dir.path().join("session.json")).expect("read again"),
+        before_idle,
+        "an unchanged world must not rewrite the session"
+    );
+
+    // (iii) THE WORLD CHANGES: the window now lives on monitor 2, a different
+    // work area, and the host reports a different restore rect.
+    host.set_answers(Answers {
+        monitor_id: 2,
+        work_area: FrameRect::new(1920, 0, 1920, 1040),
+        restore: Some(FrameRect::new(2000, 100, 800, 600)),
+        ..Answers::default()
+    });
+    // (iv) flush again - close() makes the final drain deterministic.
+    gateway.send(Command::SetPinned(false)).expect("queued");
+    gateway.close().expect("shutdown joins the engine");
+
+    let second = read_session(dir.path()).expect("the second flush wrote the session");
+    assert_eq!(
+        second.monitor_id, 2,
+        "the file must name the NEW monitor, not the launch-time one"
+    );
+    assert!(
+        !second.pinned,
+        "and the changed pin bit, from the same flush"
+    );
+    // Both flushes MEASURED (the restore rect was read at each one), which is
+    // what feeds the refresh.
+    assert!(
+        host.restore_reads() >= 2,
+        "each flush must have measured the restore rect"
+    );
+}
+
 /// MAJOR 3: the handle is a VALUE, not a lease. After UnregisterWindow, no
 /// host call may happen (nothing moves - a RECYCLED handle would pass IsWindow
 /// and name a stranger) and a post-unregister GeometryChanged is a no-op (no

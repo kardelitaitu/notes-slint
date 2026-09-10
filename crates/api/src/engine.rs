@@ -977,6 +977,23 @@ impl Engine {
             // and the measured normal position is the truth. Do not move this
             // call back to restore_and_pin.
             if self.measure_rect() {
+                // MAJOR 2/5: monitor identity is refreshed HERE, in the one
+                // moment the port's picture of the window updates - together
+                // with the rect, so it cannot half-refresh. A launch-time
+                // monitor_id frozen forever is a lie the moment the window is
+                // dragged to another monitor (README: 'including when a
+                // monitor has been unplugged [or] scaling has changed'). The
+                // refresh is CHANGE-GATED on the monitor field itself, and it
+                // only runs inside an already-pending write, so an idle world
+                // never turns a tick into a disk write.
+                if let Some(facts) = self.facts.as_ref() {
+                    if let Ok((_, monitor)) = facts.work_area_for_rect(to_frame(self.session.rect))
+                    {
+                        if self.session.monitor_id != monitor {
+                            self.session.monitor_id = monitor;
+                        }
+                    }
+                }
                 self.queue(Target::Session);
             }
             match write_session(&self.state_dir.0, &self.session) {

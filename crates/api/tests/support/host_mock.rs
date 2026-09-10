@@ -110,6 +110,16 @@ impl Host {
         lock(&self.shared.calls).clone()
     }
 
+    /// THE WORLD CHANGES UNDER THE WINDOW: replaces every answer (work area,
+    /// monitor, restore rect, codepage, refusals, block). A fake that answers
+    /// the same question forever cannot prove a REFRESH - which is exactly how
+    /// the frozen-at-launch session facts (MAJOR 2/5) stayed invisible: every
+    /// test saw one immutable world. Tests that need the world to move call
+    /// this between flushes.
+    pub fn set_answers(&self, answers: Answers) {
+        *lock(&self.shared.answers) = answers;
+    }
+
     /// Every [`set_frame_rect`]: (handle, rect, scale). The assertions in
     /// tests/geometry.rs are about this list - its length, its rect, and the scale.
     pub fn moves(&self) -> Vec<(isize, FrameRect, f32)> {

@@ -50,12 +50,24 @@ fn shutdown_survives_an_engine_blocked_in_a_window_op() {
             handle: notes_api::WindowHandle(0x100),
         })
         .expect("queued");
-    // Wait until the engine is provably inside the blocked call.
+    // Wait until the engine is provably inside the blocked call, and prove it
+    // is stuck BEFORE the pin and the measure: the mock recorded the move and
+    // nothing after it - the abandoned-at state the bounded join accepts.
     let deadline = Instant::now() + Duration::from_secs(2);
     while host.moves().is_empty() {
         assert!(Instant::now() < deadline, "the move never started");
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert!(
+        host.topmost().is_empty(),
+        "the engine is blocked inside the move, before the pin: {:?}",
+        host.topmost()
+    );
+    assert_eq!(
+        host.restore_reads(),
+        0,
+        "the measure happens after the move returns, so it never ran"
+    );
 
     // Edge B: the UI thread asks for shutdown WHILE the engine is blocked.
     let started = Instant::now();
@@ -75,7 +87,22 @@ fn shutdown_survives_an_engine_blocked_in_a_window_op() {
         matches!(outcome, Err(notes_api::Command::Shutdown)),
         "a timed-out shutdown must be reported as unfinished: {outcome:?}"
     );
-    // The abandoned engine finishes when the block lifts; its channel stays
-    // open until then, and draining it here would only wait out the block.
+
+    // ABANDONED IS NOT LOST - the documented trade-off, proven end to end:
+    // unblock the world, and the abandoned engine finishes its OWN exit. The
+    // pin it was stuck before gets applied, the flush measures, and the state
+    // lands - with no join and no hang anywhere in the caller.
+    host.set_answers(Answers {
+        block_move_ms: 0,
+        ..Answers::default()
+    });
+    let finish_by = Instant::now() + Duration::from_secs(10);
+    while host.topmost().is_empty() || host.restore_reads() == 0 {
+        assert!(
+            Instant::now() < finish_by,
+            "the abandoned engine never finished its own exit"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     drop(rx);
 }
