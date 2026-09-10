@@ -56,14 +56,21 @@ const WAIT: Duration = Duration::from_millis(1_500);
 /// A state directory that holds nothing at all: no session.json, so the engine
 /// starts from Session::default() and nothing in these tests can be reading a
 /// real user's profile.
-fn empty_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "notes-api-empty-{}-{}",
-        std::process::id(),
-        thread::current().name().unwrap_or("test").replace(':', "_")
-    ));
-    fs::create_dir_all(&dir).expect("create an empty state dir");
-    dir
+///
+/// The TempDir is a FIELD, not a side effect: it deletes itself on drop, so a
+/// finished (or failed) test leaves nothing behind. The previous version built
+/// `notes-api-empty-<pid>-<test>` with create_dir_all and removed nothing -
+/// one leaked directory per call, per run, forever.
+struct EmptyDir(tempfile::TempDir);
+
+impl EmptyDir {
+    fn new() -> Self {
+        EmptyDir(tempfile::tempdir().expect("a temp state dir"))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
 }
 
 /// The rect the hand-written session.json carries.
@@ -110,7 +117,9 @@ const DRAIN_SESSION_JSON: &str = concat!(
 #[cfg(debug_assertions)]
 #[test]
 fn reentrancy_trap_fires_when_the_port_is_called_from_the_engine_thread() {
-    let (mut gateway, _rx) = Gateway::start(StateDir(empty_dir()), Settings::default());
+    let dir = EmptyDir::new();
+    let (mut gateway, _rx) =
+        Gateway::start(StateDir(dir.path().to_path_buf()), Settings::default());
 
     // Control first: the identical call OFF an engine thread must not panic.
     // Without this, a panic from anything at all would make the test pass.
@@ -161,12 +170,12 @@ fn reentrancy_trap_fires_when_the_port_is_called_from_the_engine_thread() {
 /// 2. Shutdown drains: everything queued behind it is still carried out.
 #[test]
 fn shutdown_drains_commands_queued_behind_it() {
-    let dir = empty_dir();
-    fs::write(dir.join("session.json"), DRAIN_SESSION_JSON).expect("write session.json");
+    let dir = EmptyDir::new();
+    fs::write(dir.path().join("session.json"), DRAIN_SESSION_JSON).expect("write session.json");
     // No [`mut`]: on this toolchain Receiver::recv takes &self.
-    let (gateway, rx) = Gateway::start(StateDir(dir.clone()), Settings::default());
+    let (gateway, rx) = Gateway::start(StateDir(dir.path().to_path_buf()), Settings::default());
     assert!(
-        dir.join("session.json").exists(),
+        dir.path().join("session.json").exists(),
         "the fixture must be the file the engine actually read",
     );
 
@@ -211,7 +220,8 @@ fn shutdown_drains_commands_queued_behind_it() {
 /// 3. Drop is ABORT — and abort is not "lose what you accepted".
 #[test]
 fn drop_without_shutdown_aborts_but_buffered_events_survive() {
-    let (gateway, mut rx) = Gateway::start(StateDir(empty_dir()), Settings::default());
+    let dir = EmptyDir::new();
+    let (gateway, mut rx) = Gateway::start(StateDir(dir.path().to_path_buf()), Settings::default());
 
     for revision in 1..=10 {
         let _ = gateway.send(Command::Flush {
@@ -246,7 +256,8 @@ fn drop_without_shutdown_aborts_but_buffered_events_survive() {
 /// 4. A closed EventRx stops the events, not the engine.
 #[test]
 fn dropped_receiver_does_not_kill_the_engine() {
-    let (gateway, rx) = Gateway::start(StateDir(empty_dir()), Settings::default());
+    let dir = EmptyDir::new();
+    let (gateway, rx) = Gateway::start(StateDir(dir.path().to_path_buf()), Settings::default());
     let _ = gateway.send(Command::Flush {
         text: "x".into(),
         revision: 1,
@@ -376,7 +387,8 @@ fn startup_state_reads_the_state_files_and_never_the_note() {
 #[test]
 fn a_slow_consumer_never_blocks_the_producer() {
     const N: usize = 10_000;
-    let (gateway, rx) = Gateway::start(StateDir(empty_dir()), Settings::default());
+    let dir = EmptyDir::new();
+    let (gateway, rx) = Gateway::start(StateDir(dir.path().to_path_buf()), Settings::default());
 
     let started = Instant::now();
     // From 1, not 0: a flush at revision 0 is stale against a fresh engine and
