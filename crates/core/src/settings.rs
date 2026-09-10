@@ -24,16 +24,32 @@ pub struct Settings {
     /// The product premise is that the app never asks you to save: autosave
     /// starts ON.
     pub autosave_enabled: bool,
+    /// The ANSI default code page the bridge supplies from GetACP() and
+    /// passes to encoding::detect. Default = Some(1252) is the
+    /// Windows-English default and NOT a guess: it is the value the caller
+    /// is expected to overwrite with the machine's real code page. D27:
+    /// CP1252 is the only code page core can write back — anything else
+    /// opens read-only, so detect(bytes, None) (which cannot know the code
+    /// page) is never the shipped path.
+    #[serde(default = "default_codepage")]
+    pub codepage: Option<u16>,
     /// The recent-files list, capped by recent::MAX_RECENTS. Defaults to
     /// empty so a hand-trimmed settings.toml without the table still reads.
     #[serde(default)]
     pub recents: Vec<RecentEntry>,
 }
 
+/// The documented default code page: Windows-English ANSI 1252, expected
+/// to be overwritten by the bridge's GetACP() value.
+fn default_codepage() -> Option<u16> {
+    Some(1252)
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             autosave_enabled: true,
+            codepage: default_codepage(),
             recents: Vec::new(),
         }
     }
@@ -79,6 +95,7 @@ mod tests {
     fn canonical() -> Settings {
         Settings {
             autosave_enabled: false,
+            codepage: Some(1252),
             recents: vec![RecentEntry {
                 path: PathBuf::from("C:\\Notes\\idea.notes"),
                 display: "idea.notes".to_owned(),
@@ -96,7 +113,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("settings must serialise: {e}"));
         assert_eq!(
             rendered,
-            "autosave_enabled = false\n\n[[recents]]\npath = 'C:\\Notes\\idea.notes'\ndisplay = \"idea.notes\"\nexists = true\n"
+            "autosave_enabled = false\ncodepage = 1252\n\n[[recents]]\npath = 'C:\\Notes\\idea.notes'\ndisplay = \"idea.notes\"\nexists = true\n"
         );
     }
 
@@ -142,6 +159,11 @@ mod tests {
         assert!(
             s.recents.is_empty(),
             "serde default covers the missing table"
+        );
+        assert_eq!(
+            s.codepage,
+            Some(1252),
+            "a toml without the key defaults to the documented code page"
         );
     }
 
