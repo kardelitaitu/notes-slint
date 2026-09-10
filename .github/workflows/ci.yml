@@ -94,18 +94,24 @@ jobs:
       #                    tell those apart is noise that gets ignored. Advisory keeps the
       #                    signal without the false alarm.
       #
-      # Where this was measured (a promotion nobody ran is a lie): a clean worktree of
-      # HEAD 80c3d7d on windows-latest-equivalent, commands exactly as they appear below -
-      #   cargo build  -p notes-bridge-gpui --bin notes-gpui          -> exit 0 (1m13s, exe linked)
-      #   cargo clippy -p notes-bridge-gpui --all-targets -- -D warnings -> exit 0 (1m31s)
-      #   cargo fmt --all -- --check                                  -> exit 0 (covers the bridge)
-      # The SHARED working tree is red for the first two right now, and that is a transient
-      # owned by other workers, not a reason to leave the lane advisory: gateway.rs
-      # (committed) does not yet match the uncommitted Engine::new arity in crates/api and
-      # the uncommitted Settings::load change in crates/core. A CI run only ever sees
-      # committed state, so the gate would be green on this commit. If it is still red once
-      # those two land, steps 3b/3c are the honest place to look - fix the link, do not
-      # re-demote these to allow-fail.
+      # Where this was measured, because a promotion nobody ran is a lie: a CLEAN worktree
+      # of HEAD 14295b8 ("git worktree add --detach", its own target dir) - never the
+      # shared working tree, which is somebody else's half-landed edit - on Windows, with
+      # the commands exactly as they appear below:
+      #   cargo build  -p notes-bridge-gpui --bin notes-gpui              -> exit 0, 2m11s, notes-gpui.exe linked
+      #   cargo clippy -p notes-bridge-gpui --all-targets -- -D warnings   -> exit 0, 1m26s
+      #   cargo fmt --all -- --check                                       -> exit 0 (step 1 already covers the bridge)
+      #   cargo run -p xtask -- check-deps                                 -> exit 0, "5 member crates, 0 violations" (step 4a)
+      # Re-measure committed state before believing any of it, and mind that HEAD is a
+      # moving target: one commit earlier (b238f1e) notes-api did NOT compile in a pristine
+      # worktree - E0308 in gateway.rs against the then-uncommitted Engine::new arity and
+      # Settings::load change - so 3b and 3c were red there and promoting them then would
+      # have gated master on a lie. api landed at 14295b8 and both went green. Which is the
+      # standing instruction for the next reader:
+      #   * 3b/3c red with the error in ANOTHER crate: that crate's owner fixes it. Do not
+      #     re-demote these steps to continue-on-error to unblock a run; the link is fine.
+      #   * 3b/3c red with the error in the bridge, or rust-lld plus a duplicate resource:
+      #     the bridge is broken, and these two steps are the gate that exists to say so.
       #
       # future-incompat-report.frequency=never, on these two bridge steps and nowhere else:
       # gpui's graph pulls proc-macro-error2 v2.0.1, whose future-incompat footer cargo
@@ -197,6 +203,42 @@ jobs:
           esac
           exit $status
 
+      # --- 4a. dependency-declaration drift ----------------------------------
+      # "cargo run -p xtask -- check-deps" (crates/xtask/src/deps.rs) reads the manifests
+      # out of cargo metadata and rejects a member crate whose dependency declaration
+      # drifts from the workspace template, or whose version diverges from the pin. It
+      # guards the exact class of break this file exists to catch: the ROOT template's
+      # gpui line is what keeps default-features = false (and so gpui's windows-manifest
+      # feature) off, and a member that re-pins gpui by itself re-enables the second
+      # RT_MANIFEST id=1 - which then only surfaces as a linker error in 3b.
+      # Its OWN step even though 4c runs the same command: the named cell is where you
+      # look first, and the rule ids in the annotations below ([template-drift] /
+      # [version-conflict]) say which invariant broke without opening a long log.
+      # Exit codes: 0 clean | 1 at least one DEPS VIOLATION | 2 the checker could not run
+      # (cargo metadata failed to resolve - a missing pin, a broken manifest). 2 is
+      # neither a pass nor drift: it means drift was NOT judged. It still reddens this
+      # step, and it reddens it because of the set -o pipefail line below - a gate that
+      # goes green because its checker could not start is a gate nobody can trust. Read a
+      # red with exit 2 as "fix the manifests, then find out whether the drift was real".
+      - name: deps — cargo run -p xtask -- check-deps (member manifests match the workspace template)
+        id: deps
+        if: ${ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          cargo run -p xtask -- check-deps 2>&1 | tee "$RUNNER_TEMP/check-deps.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # One annotation per violation, straight from the checker's own line format.
+          while IFS= read -r line; do
+            echo "::error::$line"
+          done < <(grep -o 'DEPS VIOLATION: .*' "$RUNNER_TEMP/check-deps.log" || true)
+          case $status in
+            0) echo "check-deps: clean - every member manifest matches the workspace template and the pins." ;;
+            1) echo "::error::DEPENDENCY DECLARATION DRIFT (check-deps exit 1). The DEPS VIOLATION lines above name the file and the rule id. Put the member back to the inherited form (workspace = true); do not widen the checker to make a row pass." ;;
+            *) echo "::error::CHECK-DEPS COULD NOT RUN (exit $status) - cargo metadata did not resolve, so dependency drift was NOT judged; this is not a clean result. metadata's stderr is in the log above. Fix the manifest or the lock, then re-run: cargo xtask check-deps." ;;
+          esac
+          exit $status
       # --- 4b. byte-fidelity fixtures (the do-no-harm rule, whitepaper SS4.5) --
       # These 28 files ARE the proof that a load+save cycle leaves a foreign file
       # byte-identical: BOM present or absent, codepage, CRLF vs LF, trailing newline
@@ -229,22 +271,23 @@ jobs:
           exit $status
 
       # --- 4c. drift lock: run the developer command itself -------------------
-      # "cargo xtask check" (== cargo run -p xtask -- check) runs fmt, clippy, test,
-      # check-arch and fixtures verify, printing one verdict row per step, with the
-      # bridge check and the docs validator as ADVISORY rows that never gate. The
-      # explicit steps above stay: a named step points at one gate in the Actions UI.
-      # This step is what stops the two lists drifting apart - if the developer command
-      # grows a check, CI grows it in the same run. Full, not --quick: --quick skips
-      # clippy and test, i.e. exactly the coverage a drift check must not lose. Cheap,
-      # because target/ is warm from the steps above - this is re-verification, not a
-      # second cold build. Exit 1 = a gate row failed, 2 = a gate row could not run.
-      # What this step may name: only subcommands that exist at HEAD - check, check-arch,
-      # fixtures verify (crates/xtask/src/main.rs). FOLLOW-UP, deliberately not in this
-      # commit: a deps-hygiene subcommand ("cargo xtask deps") is landing in crates/xtask
-      # right now and is not wired at HEAD, so nothing here references it - naming it would
-      # break this step for every run until that worker lands. Whoever lands it adds the row
-      # to xtask's step table (crates/xtask/src/check.rs); this drift step then runs it in
-      # CI on the same commit, and a named step for its own verdict should land with it.
+      # "cargo xtask check" (the literal cargo run -p xtask -- check below) runs the row
+      # table in crates/xtask/src/check.rs: fmt, clippy, test, check-arch, check-deps and
+      # fixtures verify as GATE rows, plus the bridge compile check and the docs validator
+      # as ADVISORY rows that are reported and never gate. (That bridge row is a "cargo
+      # check", compile-only by design - the LINK is gated by 3b, not by xtask.) The
+      # explicit named steps above stay for that reason: a named cell points at one gate in
+      # the Actions UI, and xtask's table is the developer's list, not CI's shape. What this
+      # step buys is the lock between the two - when the table grows a check, CI grows it
+      # the same day, whether or not anyone remembers to add a step here. Full, not --quick:
+      # --quick skips clippy and test, exactly the coverage a drift lock must not lose.
+      # Cheap, because target/ is warm from the steps above - re-verification, not a second
+      # cold build. Exit 1 = a gate row failed, 2 = a gate row could not run; both are red
+      # here, and 2 stays red on purpose - a checker that could not start proves nothing
+      # about the thing it was meant to judge, so it must not read as a pass.
+      # Spell subcommands the way xtask defines them: check-deps. There is no "cargo xtask
+      # deps" and no alias for it (a cargo alias cannot rename an argument), so do not write
+      # that name into a step and then explain an exit 2.
       - name: drift — cargo run -p xtask -- check (the AGENTS.md gate as one command)
         id: xtask_check
         shell: bash
