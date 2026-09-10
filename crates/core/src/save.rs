@@ -63,8 +63,13 @@ pub enum SaveError {
         "the text contains characters that cannot be stored in this file's encoding — use Save As to a .notes file"
     )]
     Unencodable,
-    #[error("the path is not a usable file location")]
-    InvalidPath,
+    /// The path can never be written as named — no file-name component, or
+    /// a name Windows will alter: Win32 strips trailing dots and spaces from
+    /// the final component, so the bytes would land in a DIFFERENT file while
+    /// the app reports Ok for a path that does not exist. The message says
+    /// which and what to do.
+    #[error("{0}")]
+    InvalidPath(String),
     /// The target is a symlink, junction or other reparse point (OneDrive
     /// and other sync clients materialise files this way). The message
     /// names the link and, where it could be resolved, the real file behind
@@ -130,8 +135,21 @@ pub fn save_session_bytes(dir: &Path, bytes: &[u8]) -> Result<(), SaveError> {
 /// sibling temp, write, flush, fsync, rename over the target; on any failure
 /// remove the temp and classify the error. Never truncates the target.
 pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError> {
-    if target.file_name().is_none() {
-        return Err(SaveError::InvalidPath);
+    let file_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| SaveError::InvalidPath("the path has no file name component".to_owned()))?;
+    // Windows path hostility, PROVEN blocker: Win32 strips trailing dots and
+    // spaces from the final component, so saving "a.notes." lands in
+    // "a.notes" while the app reports Ok for a path that does not exist —
+    // and the caller keeps editing the name the app did not write. Refuse
+    // with the reason; silently rewriting a user-visible path is the same
+    // class of lie as reporting success for a different file.
+    if file_name.ends_with('.') || file_name.ends_with(' ') {
+        return Err(SaveError::InvalidPath(
+            "the file name ends with '.' or a space, which Windows strips — the file written would not be the one named; rename the target"
+                .to_owned(),
+        ));
     }
     refuse_reparse_point(target)?;
     // M3: the read-only pre-flight lives HERE so every caller — documents,
@@ -198,22 +216,37 @@ fn normalize_parent(target: &Path) -> PathBuf {
 /// would then fail for a file that exists.
 const SWEEP_MIN_AGE_SECS: u64 = 60;
 
+/// The retry budget of create_sibling_temp, shared with the sweep's shape
+/// check so the two can never drift: a temp whose attempt field is not a
+/// value this loop could have produced is, by definition, not ours.
+const MAX_TEMP_ATTEMPTS: u32 = 3;
+
 /// B1: the EXACT-SHAPE predicate for our own temp names. A prefix match is
 /// not a capability — "session.json.tmp-backup" (a user's copy of a corrupt
 /// file kept for diagnosis, exactly what D12 invites) would die to a plain
-/// starts_with. The remainder after ".tmp-" must parse as our documented
-/// "<pid>-<nanos>-<attempt>" form: three all-digit fields. Matching is
-/// case-SENSITIVE on purpose: we only reclaim names we could have created
-/// byte-exactly, never "X.notes.TMP-Mixed" (it cannot be ours).
+/// starts_with.
+///
+/// Round 2 (proven by test): even "three all-digit fields" is typeable by a
+/// human — "session.json.tmp-2026-09-10" parses as pid/nanos/attempt and a
+/// dated backup is by definition older than the age gate. The name must
+/// therefore also end in our ".part" marker, and the attempt field must be
+/// one the retry loop could actually have produced (0..MAX_TEMP_ATTEMPTS).
+/// Matching is case-SENSITIVE on purpose: we only reclaim names we could
+/// have created byte-exactly, never "X.notes.TMP-Mixed" (it cannot be ours).
 fn is_our_temp(file_name: &str, prefix: &str) -> bool {
     let Some(rest) = file_name.strip_prefix(prefix) else {
         return false;
     };
-    let parts: Vec<&str> = rest.split('-').collect();
+    let Some(body) = rest.strip_suffix(".part") else {
+        return false;
+    };
+    let parts: Vec<&str> = body.split('-').collect();
     parts.len() == 3
-        && parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && parts[0].parse::<u32>().is_ok()
+        && parts[1].parse::<u128>().is_ok()
+        && parts[2]
+            .parse::<u32>()
+            .is_ok_and(|attempt| attempt < MAX_TEMP_ATTEMPTS)
 }
 
 /// B2: refuse to rename over a symlink, junction or any other reparse point
@@ -279,18 +312,22 @@ fn create_sibling_temp(target: &Path) -> Result<(PathBuf, std::fs::File), SaveEr
     let parent = normalize_parent(target);
     let file_name = target
         .file_name()
-        .ok_or(SaveError::InvalidPath)?
-        .to_string_lossy()
-        .into_owned();
-    for attempt in 0..3u32 {
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            SaveError::InvalidPath("the target has no file name component".to_owned())
+        })?;
+    for attempt in 0..MAX_TEMP_ATTEMPTS {
         // Fresh jitter per attempt: nanos used to be computed once outside
         // the loop, overstating the entropy the comment claimed.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        // The ".part" marker is part of the SAFETY story, not decoration:
+        // the sweep's shape check requires it, so no name a human plausibly
+        // types (a dated backup, a word) can collide with our temp space.
         let candidate = parent.join(format!(
-            "{file_name}.tmp-{}-{nanos}-{attempt}",
+            "{file_name}.tmp-{}-{nanos}-{attempt}.part",
             std::process::id()
         ));
         match std::fs::OpenOptions::new()
@@ -398,7 +435,7 @@ pub fn classify_io_error(err: &std::io::Error, step: IoStep) -> SaveError {
         ErrorKind::NotFound => SaveError::NotFound,
         ErrorKind::PermissionDenied => SaveError::PermissionDenied,
         ErrorKind::StorageFull => SaveError::DiskFull,
-        ErrorKind::InvalidInput => SaveError::InvalidPath,
+        ErrorKind::InvalidInput => SaveError::InvalidPath(err.to_string()),
         _ => SaveError::Other(err.to_string()),
     }
 }
@@ -588,7 +625,6 @@ mod tests {
             (ErrorKind::NotFound, SaveError::NotFound),
             (ErrorKind::PermissionDenied, SaveError::PermissionDenied),
             (ErrorKind::StorageFull, SaveError::DiskFull),
-            (ErrorKind::InvalidInput, SaveError::InvalidPath),
         ];
         for (kind, want) in cases {
             assert_eq!(
@@ -600,6 +636,15 @@ mod tests {
             classify_io_error(&std::io::Error::from(ErrorKind::TimedOut), IoStep::Write),
             SaveError::Other(_)
         ));
+        // InvalidPath carries the OS message now (it has to say WHY a path is
+        // unusable), so it is asserted by shape, not equality.
+        assert!(matches!(
+            classify_io_error(
+                &std::io::Error::from(ErrorKind::InvalidInput),
+                IoStep::Write
+            ),
+            SaveError::InvalidPath(_)
+        ));
     }
 
     #[test]
@@ -607,9 +652,9 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let target = dir.path().join("note.notes");
         std::fs::write(&target, b"old")?;
-        // A REAL crash litter: our exact shape, with its mtime pushed back
-        // past the sweep age so the age gate lets it go.
-        let litter = dir.path().join("note.notes.tmp-4242-1726000000000-1");
+        // A REAL crash litter: our exact shape (pid-nanos-attempt.part),
+        // with its mtime pushed back past the sweep age so the gate lets go.
+        let litter = dir.path().join("note.notes.tmp-4242-1726000000000-1.part");
         std::fs::write(&litter, b"stale")?;
         age_file(&litter, 120)?;
         // The user's own files: a sweep that deletes either is a disaster.
@@ -654,6 +699,14 @@ mod tests {
         let recovery = dir.path().join("x.notes.tmp-999999999-not-our-shape");
         std::fs::write(&recovery, b"recovery data")?;
         age_file(&recovery, 120)?;
+        // Round 2: a dated backup — three digit fields WITHOUT the .part
+        // marker, and ancient by definition — plus the .part-less variant.
+        let dated = dir.path().join("x.notes.tmp-2026-09-10");
+        std::fs::write(&dated, b"MY ONLY COPY")?;
+        age_file(&dated, 2_592_000)?;
+        let partless = dir.path().join("x.notes.tmp-2026-09-10.part-less");
+        std::fs::write(&partless, b"dated and suffixed")?;
+        age_file(&partless, 2_592_000)?;
         save_document(&target, "new", det(TextEncoding::Utf8, false))?;
         assert_eq!(
             std::fs::read(&thesis)?,
@@ -661,6 +714,36 @@ mod tests {
             "the user's .tmp-backup must survive a save"
         );
         assert_eq!(std::fs::read(&recovery)?, b"recovery data");
+        assert!(dated.exists(), "a dated backup must never be swept");
+        assert!(partless.exists(), "a .part-less name is not our temp");
+        Ok(())
+    }
+
+    /// B2 (trailing names): Win32 strips trailing dots and spaces from the
+    /// final component, so "a.notes." would land in "a.notes" while the app
+    /// reports Ok for a path that does not exist. The save must REFUSE, and
+    /// the neighbour must be untouched.
+    #[test]
+    fn trailing_dot_or_space_names_are_refused_not_rewritten()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let neighbour = dir.path().join("a.notes");
+        std::fs::write(&neighbour, b"REAL NOTE")?;
+        for hostile in ["a.notes.", "a.notes ", "a.notes. "] {
+            let target = dir.path().join(hostile);
+            let Err(e) = save_document(&target, "new", det(TextEncoding::Utf8, false)) else {
+                panic!("{hostile:?}: a Win32-stripped name must be refused");
+            };
+            assert!(
+                matches!(e, SaveError::InvalidPath(_)),
+                "{hostile:?}: expected InvalidPath, got {e:?}"
+            );
+            assert_eq!(
+                std::fs::read(&neighbour)?,
+                b"REAL NOTE",
+                "{hostile:?}: the neighbour must be untouched"
+            );
+        }
         Ok(())
     }
 
@@ -674,10 +757,10 @@ mod tests {
         let target = dir.path().join("n.notes");
         std::fs::write(&target, b"old")?;
         // Instance A's live temp: our exact shape, seconds old.
-        let live = dir.path().join("n.notes.tmp-4242-1726000000000-0");
+        let live = dir.path().join("n.notes.tmp-4242-1726000000000-0.part");
         std::fs::write(&live, b"being written right now")?;
         // Instance-from-yesterday's litter: same shape, ancient.
-        let ancient = dir.path().join("n.notes.tmp-1717-1726000000000-2");
+        let ancient = dir.path().join("n.notes.tmp-1717-1726000000000-2.part");
         std::fs::write(&ancient, b"crash litter")?;
         age_file(&ancient, 3_600)?;
         save_document(&target, "new", det(TextEncoding::Utf8, false))?;
