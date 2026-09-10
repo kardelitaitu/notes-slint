@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  WHY THIS FILE IS NOT OPTIONAL (docs/architecture.md 5.5; M0 findings D1/D9):
+  without a declared DPI awareness Windows treats the process as dpi-unaware and
+  VIRTUALISES every coordinate it reports and accepts, so at 125% or 150% scaling
+  every persisted rect, every scale factor and the 8/19/8/20 chrome delta become
+  lies: the OS places the window, not us, and re-persisting what the OS then
+  reports drifts a little further on every launch.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="NotesGpui.App" type="win32"/>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and 11; without this the OS reports a pre-6.2 version. -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+  <asmv3:application>
+    <asmv3:windowsSettings>
+      <!-- Downlevel (pre-1703) readers honour dpiAware; 1703 and later read the
+           dpiAwareness list. Both are declared so neither generation guesses. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <!-- PerMonitorV2 first; system is the fallback an older shell can honour. -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, system</dpiAwareness>
+      <!-- Long paths: a note under a deep sync tree must not fail to save. -->
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>
