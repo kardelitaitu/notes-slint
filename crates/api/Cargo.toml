@@ -5,6 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dependencies]
+# notes-core: dto.rs re-exports the core types a Command or Event has to carry
+# (geometry::Rect, paths::StateDir), because a bridge may import api and nothing
+# else in this repo — so those types must be nameable from this crate.
+# thiserror: event::SaveError, whose Display text is the UI copy.
+# Deps are added only as used: unused_crate_dependencies + clippy -D warnings
+# make an unused dep a hard gate error.
+notes-core = { workspace = true }
+thiserror = { workspace = true }
+
 [lints]
 workspace = true
-
