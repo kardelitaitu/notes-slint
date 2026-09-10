@@ -5,6 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[dependencies]
+# serde (derive, from the workspace template) is used by the persisted geometry
+# type `geometry::Rect`; thiserror by the crate-wide typed error. Deps are
+# added only as used: unused_crate_dependencies + clippy -D warnings make an
+# unused dep a hard gate error.
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Used only by the serde round-trip test for `Rect`.
+serde_json = { workspace = true }
+
 # NOTE: cargo (measured 1.98.0) forbids overriding inherited workspace lints
 # ("cannot override `workspace.lints` in `lints`"), so the workspace set is
 # spelled out here to add the core-only clippy denies.
