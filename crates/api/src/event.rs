@@ -348,6 +348,20 @@ pub enum Event {
         /// What core said when the session write was refused, verbatim.
         reason: String,
     },
+    /// The state directory could not be created, or cannot be used as a
+    /// directory (it is a file, or a link). The launch proceeds - the engine
+    /// keeps running, and every state write fails and is reported through its
+    /// own channel - but this is the ONE event that says WHY nothing will
+    /// persist, at the moment it became true, instead of a status line after
+    /// the first save quietly failed (the fresh-install blocker the smoke run
+    /// caught: the app looked clean and remembered nothing). Emitted from
+    /// [`Gateway::start`], which owns the directory. [`reason`] is the OS's
+    /// sentence, or the factual sentence naming the path - never advice,
+    /// because there is nothing to advise yet.
+    StateDirUnusable {
+        /// What the OS said, or which path is not a directory.
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -415,6 +429,9 @@ mod tests {
             Event::SessionWriteFailed { reason } => Event::SessionWriteFailed {
                 reason: reason.clone(),
             },
+            Event::StateDirUnusable { reason } => Event::StateDirUnusable {
+                reason: reason.clone(),
+            },
         }
     }
 
@@ -430,6 +447,7 @@ mod tests {
             Event::GeometryNotRestored { .. } => "GeometryNotRestored",
             Event::SettingsCorrupt { .. } => "SettingsCorrupt",
             Event::SessionWriteFailed { .. } => "SessionWriteFailed",
+            Event::StateDirUnusable { .. } => "StateDirUnusable",
             Event::RecentsUpdated(_) => "RecentsUpdated",
         }
     }
@@ -487,6 +505,9 @@ mod tests {
             Event::SessionWriteFailed {
                 reason: "no space left on device".to_string(),
             },
+            Event::StateDirUnusable {
+                reason: "Access is denied. (os error 5)".to_string(),
+            },
         ]
     }
 
@@ -506,8 +527,8 @@ mod tests {
         );
         // Loaded, LoadFailed, Saved, GeometryNotRestored, SaveFailed,
         // ExternalChange, AutosaveSkipped, RecentsUpdated, SettingsCorrupt,
-        // SessionWriteFailed.
-        assert_eq!(all.len(), 11, "Event gained or lost a variant");
+        // SessionWriteFailed, StateDirUnusable.
+        assert_eq!(all.len(), 12, "Event gained or lost a variant");
 
         for event in &all {
             assert_eq!(event, &event.clone(), "{event:?} clone is not equal");

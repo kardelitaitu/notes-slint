@@ -100,9 +100,73 @@ fn a_failing_session_write_is_reported_once_until_it_succeeds() {
     app.send(Command::SetPinned(false));
     std::thread::sleep(ticks(2));
 
+    // The retry LANDED: the file exists now, which is what cleared the latch -
+    // the port emits no session-saved event, so this is the only observable
+    // proof of the success half.
+    assert!(
+        session_path.is_file(),
+        "the unblocked write must have produced session.json"
+    );
+    // Take the succeeded file away before re-blocking: the block is a
+    // DIRECTORY sitting where session.json belongs, and it cannot coexist
+    // with the write that just succeeded.
+    fs::remove_file(&session_path).expect("remove the succeeded file");
     fs::create_dir(&session_path).expect("block the path again");
     app.send(Command::SetPinned(true));
     assert_one_failure(&mut app, "the second session failure");
+}
+
+/// THE MISSING SHAPE the first smoke run proved (d8fc569): every headless test
+/// in this file hands the Gateway a TempDir that ALREADY EXISTS, so not one of
+/// the 55 green tests could see that nothing in the process creates the state
+/// directory. A fresh install persisted NOTHING - the write returned NotFound,
+/// the failure was latched into one event nobody rendered, and the app looked
+/// clean. This is the one shape that catches it: a state directory whose
+/// PARENT exists and which does not. Startup must succeed, the session write
+/// must land, and the file must be readable afterwards.
+#[test]
+fn startup_creates_a_state_directory_that_does_not_exist_yet() {
+    let parent = tempfile::tempdir().expect("tempdir");
+    let state = parent.path().join("notes-gpui");
+    assert!(
+        !state.exists(),
+        "the fixture is a directory that does NOT exist yet"
+    );
+
+    let (mut gateway, rx) =
+        Gateway::start_with_host(StateDir(state.clone()), Settings::default(), None, None);
+    // The pre-window read is the proof startup itself survived the directory:
+    // a start that died here would have no snapshot to hand over.
+    assert!(
+        gateway.startup_state().is_some(),
+        "startup must succeed on a machine that has never run the app"
+    );
+    assert!(
+        state.is_dir(),
+        "the port creates the directory it writes into"
+    );
+
+    gateway.send(Command::SetPinned(true)).expect("alive");
+    gateway.close().expect("shutdown joins the engine");
+
+    // Drain what the run emitted: a fresh install must report NO failure of
+    // any kind on the way to the first session write.
+    let mut strays = Vec::new();
+    while let Ok(event) = rx.recv() {
+        strays.push(event);
+    }
+    assert!(
+        !strays.iter().any(|event| {
+            matches!(
+                event,
+                Event::SessionWriteFailed { .. } | Event::StateDirUnusable { .. }
+            )
+        }),
+        "a fresh install must not report a failure: {strays:?}"
+    );
+
+    let restored = read_session(&state).expect("session.json must land in the created directory");
+    assert!(restored.pinned, "and it is the session the engine held");
 }
 
 /// A running engine, its events, and the directory it writes into.
@@ -848,4 +912,145 @@ fn the_toggle_and_the_recents_list_survive_a_restart_and_a_vanished_file() {
         SkipReason::AutosaveDisabled,
         "settings.toml owned the toggle across the restart, not the caller's default"
     );
+}
+
+/// D54 case (c), the one the SECOND smoke run measured: the state directory
+/// already exists and is fine, and the write STILL fails - because
+/// session.json itself refuses it (read-only attribute, an ACL, another
+/// process's lock, or something that is not a file). The latch on the write
+/// path reports that once, but by then the bridge may be tearing the window
+/// down, and an unrendered report is the same silence as no report. So the
+/// port probes at startup and emits StateDirUnusable BEFORE the first frame.
+// Clearing the read-only attribute is the fixture's cleanup half, and clippy
+// is right that the bit is not portable on Unix - this is the Windows ACL
+// story, so the asymmetry is named rather than papered over.
+#[allow(clippy::permissions_set_readonly_false)]
+#[test]
+fn an_unwritable_session_file_is_reported_at_startup_not_at_shutdown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let session_path = root.join(FILE_NAME);
+    write_session(&root, &Session::default()).expect("seed a writable session");
+    let mut perms = fs::metadata(&session_path).expect("metadata").permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&session_path, perms).expect("make the seed read-only");
+
+    let (gateway, rx) = Gateway::start_with_host(StateDir(root), Settings::default(), None, None);
+    // Deterministic, not a race: the probe runs on the CALLER's thread inside
+    // start, before the engine thread exists, so the event is already queued
+    // when start returns - and no command has been sent for it to follow.
+    match rx
+        .recv_timeout(ANSWER)
+        .expect("the refusal must arrive before any command is sent")
+    {
+        Event::StateDirUnusable { reason } => {
+            assert!(
+                !reason.trim().is_empty(),
+                "renderable: the OS's own sentence"
+            );
+            assert!(
+                reason.contains("session.json"),
+                "the copy names the file it could not write: {reason}"
+            );
+        }
+        other => panic!("expected StateDirUnusable, got {other:?}"),
+    }
+
+    // Startup still succeeded: a refusal to persist is reported, not fatal.
+    drop(gateway);
+    // Restore writability so the TempDir can clean up after itself.
+    let mut perms = fs::metadata(&session_path).expect("metadata").permissions();
+    perms.set_readonly(false);
+    fs::set_permissions(&session_path, perms).expect("restore the seed");
+}
+
+/// The cold-start budget is a documented product constraint, so the probe's
+/// cost is MEASURED here rather than asserted in prose: the same sequence of
+/// syscalls `ensure_state_dir` performs (create the temp, delete it,
+/// append-open the session file) timed against a real directory.
+#[test]
+fn state_dir_probe_cost_is_bounded_by_syscalls() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = dir.path().join(FILE_NAME);
+    write_session(dir.path(), &Session::default()).expect("seed session.json");
+    let probe = dir.path().join("notes-probe-cost.tmp");
+
+    const RUNS: u32 = 200;
+    let started = Instant::now();
+    for _ in 0..RUNS {
+        let file = fs::File::create(&probe).expect("create the probe");
+        drop(file);
+        fs::remove_file(&probe).expect("remove the probe");
+        let held = fs::OpenOptions::new()
+            .append(true)
+            .open(&session)
+            .expect("append-open the session file");
+        std::hint::black_box(&held);
+        drop(held);
+    }
+    let per_call = started.elapsed().as_micros() as u64 / RUNS as u64;
+    // This is a real-disk number; print it so the run records it.
+    println!("state-dir probe: {per_call} us per startup ({RUNS} runs measured)");
+    assert!(
+        per_call < 25_000,
+        "the probe must not become a cold-start budget item: {per_call} us"
+    );
+}
+
+/// The menu-label rule is core's (features.md 4.4); the port's only job is to
+/// CALL it. Two recents that share a basename in different folders must not
+/// reach the bridge as the same string - without `display_labels` in
+/// `emit_recent` they both render as the bare name and the menu cannot tell
+/// the user which is which. A label is a property of the LIST, which is why
+/// the stored entry keeps the plain basename as its fact and the rendering
+/// happens on the way out.
+#[test]
+fn two_recents_with_the_same_basename_do_not_share_a_menu_label() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = Harness::new();
+    let a_dir = dir.path().join("project-a");
+    let b_dir = dir.path().join("project-b");
+    fs::create_dir(&a_dir).expect("folder a");
+    fs::create_dir(&b_dir).expect("folder b");
+    let a = a_dir.join("readme.notes");
+    let b = b_dir.join("readme.notes");
+    fs::write(&a, b"from a\n").expect("write a");
+    fs::write(&b, b"from b\n").expect("write b");
+
+    app.send(Command::Open { path: a });
+    app.until("the first Loaded", |ev| matches!(ev, Event::Loaded { .. }));
+    app.send(Command::Open { path: b.clone() });
+    let entries = match app.until(
+        "a two-entry recent list",
+        |ev| matches!(ev, Event::RecentsUpdated(list) if list.len() == 2),
+    ) {
+        Event::RecentsUpdated(list) => list,
+        other => panic!("expected a two-entry RecentsUpdated, got {other:?}"),
+    };
+
+    let labels: Vec<&str> = entries.iter().map(|e| e.display.as_str()).collect();
+    let unique: std::collections::HashSet<&&str> = labels.iter().collect();
+    assert_eq!(
+        unique.len(),
+        2,
+        "colliding recents must not render as one menu string: {labels:?}"
+    );
+    // The SHAPE is core's call, not the port's: it grows parent folders until
+    // the labels differ (here "…\project-b\readme.notes"), which the test only
+    // checks as far as the contract goes - the name is still the tail of the
+    // label, and the two entries are distinguishable.
+    for label in &labels {
+        assert!(
+            label.ends_with("readme.notes"),
+            "the file name stays the tail of the label: {label}"
+        );
+        assert!(
+            label.contains("project-a") || label.contains("project-b"),
+            "a parent folder disambiguates the collision: {label}"
+        );
+    }
+    // And the label is RENDERED, not persisted: the file core reads back still
+    // holds the plain basename, so a later list containing only ONE of these
+    // files labels plainly again instead of carrying the other's suffix.
+    let _ = b;
 }

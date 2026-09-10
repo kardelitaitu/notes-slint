@@ -21,6 +21,7 @@
 //! reads the two state files once, on the calling thread, and those reads are the
 //! whole synchronous surface (see [`Gateway::startup_state`] for why).
 
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
@@ -87,6 +88,63 @@ pub struct Gateway {
     engine: Option<JoinHandle<()>>,
     /// Option because startup_state takes it: the snapshot is true exactly once.
     initial: Option<InitialState>,
+}
+
+/// The state directory: created if absent (case a), accepted as-is if it is
+/// already there (case b), and PROBED for the ability to persist (case c).
+/// [`Some`] is why it cannot, with the OS's own sentence - the port invents no
+/// copy, it only names the path the OS refused to tell us about. [`None`] means
+/// writes into this directory are expected to work.
+///
+/// The probe is one create+delete of a temp file and one append-open of
+/// session.json when it exists: two syscalls in the common case, no writes,
+/// no truncation, no clobbering (the temp name is unique and removed at once,
+/// and an append-open of an existing file changes nothing). It runs on the
+/// caller's thread in the same pre-window slot as the two state reads, so its
+/// cost is inside the cold-start budget and must be stated, not assumed: see
+/// `state_dir_probe_cost_is_bounded_by_syscalls` in tests/session.rs.
+fn ensure_state_dir(dir: &Path) -> Option<String> {
+    // (a)+(b): create_dir_all is idempotent and never clobbers - an existing
+    // directory with files in it is the normal case, not an error to survive.
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        // A FILE sitting where the directory belongs arrives here too, with
+        // the OS's own sentence.
+        return Some(format!("{}: {err}", dir.display()));
+    }
+    // create_dir_all FOLLOWS links, and core's save path refuses reparse
+    // points per save target - a state directory that IS a link would pass
+    // every probe below and have every write refused one file at a time.
+    // Named as the fact it is, with the path.
+    if let Ok(meta) = std::fs::symlink_metadata(dir) {
+        if meta.file_type().is_symlink() {
+            return Some(format!("the state directory is a link: {}", dir.display()));
+        }
+    }
+    // (c1): can anything be written into the directory at all? An ACL that
+    // grants read-only, or a directory that stopped existing between the
+    // create and now, fails here - and NOT in the append probe below, which
+    // would pass silently when session.json does not exist yet.
+    let probe = dir.join(format!("notes-probe-{}.tmp", std::process::id()));
+    if let Err(err) = std::fs::File::create(&probe) {
+        return Some(format!("{}: {err}", dir.display()));
+    }
+    // Leftover on a failed delete is cosmetic, not a persistence failure, and
+    // core's own temp sweep owns stale temps - so it is not reported.
+    let _ = std::fs::remove_file(&probe);
+    // (c2): can the file the app must replace actually be replaced? This is
+    // the case the second smoke run measured: the directory was there and
+    // writable, and session.json itself refused the write. An append-open
+    // with FILE_FLAG_WRITE_THROUGH semantics is what the rename will hit -
+    // read-only attribute, an ACL, another process's lock, or a target that
+    // is not a file at all all answer the same way here as they will at the
+    // save. Absent is NOT a failure: the first write creates it, and (c1)
+    // just proved that is possible.
+    let session = dir.join(notes_core::session::FILE_NAME);
+    match std::fs::OpenOptions::new().append(true).open(&session) {
+        Ok(_) => None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => Some(format!("{session:?}: {err}")),
+    }
 }
 
 /// The two host seams the port owns, built or absent together (D46). Named
@@ -175,6 +233,32 @@ impl Gateway {
         // never guessed (D27).
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
         let (event_tx, event_rx) = mpsc::channel::<Event>();
+        // D54, and the port owns it because the port is the code that writes
+        // into this directory. The first smoke run (d8fc569) proved the
+        // fresh-install half: nothing created the directory, every write
+        // returned NotFound, and the app silently never remembered anything.
+        // Why 55 green tests missed that: every headless test hands the Gateway
+        // a TempDir that ALREADY EXISTS - only a start from a non-existent
+        // directory can see the gap, so the suite now has exactly that test.
+        // THREE cases, and the middle smoke run proved they are not one:
+        // (a) the directory is absent -> create it; (b) it exists with files
+        // in it -> the normal case, nothing to do; (c) it exists and we still
+        // cannot persist into it -> an unwritable directory, or a session
+        // file that is not writable (read-only attribute, an ACL, a lock, or
+        // something that is not a file at all). Treating (b) as the whole
+        // story is the hole the smoke run measured as "Access is denied" on a
+        // machine where the directory already existed. So this does not stop
+        // at create_dir_all: it PROBES, once, and reports.
+        //
+        // The report is an Event emitted HERE, before the engine thread
+        // exists, so the bridge can render it while the window is still up. A
+        // once-per-process latch on the write path cannot do that: by the time
+        // the session write fails, the bridge may already be tearing the
+        // window down, and an unrendered report is the same silence as no
+        // report - which is exactly how D54 shipped.
+        if let Some(reason) = ensure_state_dir(&state_dir.0) {
+            let _ = event_tx.send(Event::StateDirUnusable { reason });
+        }
         let settings = match read_settings(&state_dir) {
             // Exactly what was written, machine locale included: it is the
             // user's own persisted choice.
