@@ -159,6 +159,19 @@ fn step_specs() -> Vec<StepSpec> {
             budget_secs: 60,
         },
         StepSpec {
+            name: "check-unsafe",
+            display: "cargo run -p xtask -- check-unsafe",
+            program: "cargo",
+            args: &["run", "-p", "xtask", "--quiet", "--", "check-unsafe"],
+            // Blocking and never --quick-skipped: AGENTS.md calls unsafe a hard
+            // invariant, and until this row existed the only thing enforcing it
+            // was the honesty of whoever wrote the block. Cheap to run, so there
+            // is no reason to skip it on any lane.
+            advisory: false,
+            quick_skippable: false,
+            budget_secs: 60,
+        },
+        StepSpec {
             name: "fixtures",
             display: "cargo run -p xtask -- fixtures verify",
             program: "cargo",
@@ -419,7 +432,13 @@ mod tests {
     #[test]
     fn every_in_repo_checker_is_wired_into_the_gate() {
         let names: Vec<&'static str> = step_specs().iter().map(|s| s.name).collect();
-        for expected in ["check-arch", "check-deps", "check-ci", "fixtures"] {
+        for expected in [
+            "check-arch",
+            "check-deps",
+            "check-ci",
+            "check-unsafe",
+            "fixtures",
+        ] {
             assert!(
                 names.contains(&expected),
                 "{expected} is not wired: {names:?}"

@@ -3,6 +3,7 @@
 mod arch;
 mod check;
 mod check_ci;
+mod check_unsafe;
 mod deps;
 mod fixtures;
 mod metadata;
@@ -18,6 +19,13 @@ fn usage() {
     eprintln!("usage: cargo xtask check-ci [path-to-workflow]");
     eprintln!(
         "       prove the CI workflow runs exactly this gate's step roster (exit 1 on drift)"
+    );
+    eprintln!("usage: cargo xtask check-unsafe");
+    eprintln!(
+        "       prove the unsafe ledger: unsafe only in notes-platform, every block preceded by a"
+    );
+    eprintln!(
+        "       SAFETY comment, no per-item allowances, and the workspace lint still forbids"
     );
     eprintln!("usage: cargo xtask smoke [--reuse-state] [--no-build]");
     eprintln!(
@@ -63,6 +71,7 @@ fn main() {
         Some("check-arch") => std::process::exit(arch::run()),
         Some("check-deps") => std::process::exit(deps::run()),
         Some("check-ci") => std::process::exit(check_ci::run(&args[1..])),
+        Some("check-unsafe") => std::process::exit(check_unsafe::run(&args[1..])),
         Some("smoke") => std::process::exit(smoke::run(&args[1..])),
         Some("fixtures") => match args.get(1).map(String::as_str) {
             Some("generate") => std::process::exit(fixtures::run_generate()),
