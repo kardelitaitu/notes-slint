@@ -11,8 +11,13 @@
 //! * on ANY failure the temp is removed and the target is untouched;
 //! * at the START of every save into a directory, stale temps of the same
 //!   target file (a crash can skip the removal) are swept best-effort with
-//!   errors ignored — a sweep failure never blocks a save, and only files
-//!   matching "<target file name>.tmp-" are ever touched.
+//!   errors ignored — a sweep failure never blocks a save. The sweep is
+//!   deliberately PARANOID (B1): a prefix match is not a capability, so a
+//!   file is only reclaimed when its name is EXACTLY our temp shape
+//!   ("<file>.tmp-<pid>-<digits>-<digits>") AND it is older than
+//!   SWEEP_MIN_AGE_SECS (M4). The user's "session.json.tmp-backup" — the
+//!   natural move when D12 preserves a corrupt file for diagnosis — and any
+//!   similarly-named file survive untouched.
 //!
 //! The bytes come from encoding::encode — the caller's Detected decides the
 //! encoding, the BOM, the line endings and the trailing newline; this engine
@@ -20,11 +25,18 @@
 //!
 //! Pure std: tempfile is DEV-ONLY in notes-core (D23 — as a normal dep it
 //! pulls windows-sys into core's closure and fails the core-no-os arch rule),
-//! so the tail below is hand-rolled, exactly like session.rs. session.rs
-//! still carries its own copy (its fence was closed when this was written);
-//! the temp naming matches ("<file>.tmp-..."), so this module's sweep also
-//! cleans session.json leftovers. Folding session.rs onto this tail is a
-//! later slice.
+//! so the tail is hand-rolled on std. session.rs and settings.rs share this
+//! ONE implementation via atomic_write — there is no second copy anywhere
+//! for a future cleanup to break.
+//!
+//! LINK SAFETY (B2): the rename refuses to run over a symlink, junction or
+//! any other reparse point (OneDrive and sync clients materialise files as
+//! reparse points). Replacing a link destroys the link and orphans the real
+//! file behind it while the app reports success — proven in review. A HARD
+//! LINK is not a reparse point and is NOT refused, deliberately: the rename
+//! replaces the target's directory entry with the new file, so the saved
+//! path always carries the newest bytes while sibling hard links keep the
+//! old inode's content.
 
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -53,6 +65,13 @@ pub enum SaveError {
     Unencodable,
     #[error("the path is not a usable file location")]
     InvalidPath,
+    /// The target is a symlink, junction or other reparse point (OneDrive
+    /// and other sync clients materialise files this way). The message
+    /// names the link and, where it could be resolved, the real file behind
+    /// it: replacing the link would orphan that file while the app reported
+    /// success. The user should save to the real file instead.
+    #[error("{0}")]
+    ReparsePoint(String),
     #[error("{0}")]
     Other(String),
 }
@@ -122,6 +141,7 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError>
     if target.file_name().is_none() {
         return Err(SaveError::InvalidPath);
     }
+    refuse_reparse_point(target)?;
     let parent = normalize_parent(target);
     if let Some(prefix) = temp_prefix(target) {
         sweep_stale_temps(&parent, &prefix);
@@ -157,17 +177,88 @@ fn normalize_parent(target: &Path) -> PathBuf {
     }
 }
 
-/// D12: best-effort sweep of crashed saves' temps for THIS target. Errors
-/// are ignored — a sweep failure must never block a save — and only files
-/// matching the prefix are touched, never the user's other files.
+/// How old a temp must be before the sweep will touch it (M4). A real write
+/// — create, write, fsync, rename — completes in far under a second even
+/// with antivirus and a sync client in the loop; 60s is orders of magnitude
+/// above that, while crash litter sits forever and is always older by the
+/// next save. Two instances of a single-window app (portable exe + installed
+/// exe, one user, one notes folder) are a real scenario: without this gate
+/// instance B would sweep instance A's live temp mid-write and A's rename
+/// would then fail for a file that exists.
+const SWEEP_MIN_AGE_SECS: u64 = 60;
+
+/// B1: the EXACT-SHAPE predicate for our own temp names. A prefix match is
+/// not a capability — "session.json.tmp-backup" (a user's copy of a corrupt
+/// file kept for diagnosis, exactly what D12 invites) would die to a plain
+/// starts_with. The remainder after ".tmp-" must parse as our documented
+/// "<pid>-<nanos>-<attempt>" form: three all-digit fields. Matching is
+/// case-SENSITIVE on purpose: we only reclaim names we could have created
+/// byte-exactly, never "X.notes.TMP-Mixed" (it cannot be ours).
+fn is_our_temp(file_name: &str, prefix: &str) -> bool {
+    let Some(rest) = file_name.strip_prefix(prefix) else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// B2: refuse to rename over a symlink, junction or any other reparse point
+/// (OneDrive and sync clients). Replacing one destroys the link and orphans
+/// the real file behind it while the app reports success. The error names
+/// the link and, where it could be resolved, the real target.
+fn refuse_reparse_point(target: &Path) -> Result<(), SaveError> {
+    let Ok(meta) = std::fs::symlink_metadata(target) else {
+        return Ok(()); // no target yet: the rename will create it
+    };
+    #[cfg(windows)]
+    let is_reparse = {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT catches symlinks, junctions and cloud
+        // placeholders. std only — no windows crate (core-no-os).
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse = meta.file_type().is_symlink();
+    if is_reparse {
+        let real = std::fs::read_link(target)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "an unresolvable target".to_owned());
+        return Err(SaveError::ReparsePoint(format!(
+            "{} is a link to {} — the app will not replace links; save to the real file instead",
+            target.display(),
+            real
+        )));
+    }
+    Ok(())
+}
+
+/// D12: best-effort sweep of crashed saves' temps for THIS target. A file is
+/// touched only when it is exactly our temp shape (B1) AND older than
+/// SWEEP_MIN_AGE_SECS (M4). Errors are ignored — a sweep failure must never
+/// block a save — and a future clock counts as "not old yet".
 fn sweep_stale_temps(dir: &Path, prefix: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with(prefix) {
-            let _ = std::fs::remove_file(entry.path());
+        if !is_our_temp(&entry.file_name().to_string_lossy(), prefix) {
+            continue;
         }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age.as_secs() >= SWEEP_MIN_AGE_SECS);
+        if !old_enough {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
     }
 }
 
@@ -427,21 +518,86 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let target = dir.path().join("note.notes");
         std::fs::write(&target, b"old")?;
-        // A temp left behind by a crash of a previous save of THIS file.
-        std::fs::write(dir.path().join("note.notes.tmp-999-1"), b"stale")?;
-        // The user's own file: a sweep that deletes this is a disaster.
+        // A REAL crash litter: our exact shape, with its mtime pushed back
+        // past the sweep age so the age gate lets it go.
+        let litter = dir.path().join("note.notes.tmp-4242-1726000000000-1");
+        std::fs::write(&litter, b"stale")?;
+        age_file(&litter, 120)?;
+        // The user's own files: a sweep that deletes either is a disaster.
         std::fs::write(dir.path().join("precious.txt"), b"user data")?;
         save_document(&target, "new", det(TextEncoding::Utf8, false))?;
         let names = dir_names(dir.path())?;
         assert!(
             !names.iter().any(|n| n.starts_with("note.notes.tmp-")),
-            "stale temp must be swept: {names:?}"
+            "aged crash litter must be swept: {names:?}"
         );
         assert!(
             names.contains(&"precious.txt".to_owned()),
             "other files untouched"
         );
         assert!(names.contains(&"note.notes".to_owned()));
+        Ok(())
+    }
+
+    /// Sets a file's mtime back by the given number of seconds so the sweep's
+    /// age gate sees it as old (test-only mtime manipulation, no sleeps).
+    fn age_file(path: &Path, seconds_ago: u64) -> Result<(), std::io::Error> {
+        let past = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(seconds_ago))
+            .ok_or_else(|| std::io::Error::other("cannot compute a past timestamp"))?;
+        let f = std::fs::OpenOptions::new().write(true).open(path)?;
+        f.set_times(std::fs::FileTimes::new().set_modified(past))
+    }
+
+    /// B1 mutation guard, the reviewer's exact scenario: a user keeping a
+    /// copy of a corrupt session file as "<target>.tmp-old" (exactly what D12
+    /// invites) and another file one character short of our temp shape. The
+    /// sweep must touch NEITHER — a prefix match is not a capability.
+    #[test]
+    fn sweep_never_touches_files_that_are_not_our_temp_shape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("x.notes");
+        std::fs::write(&target, b"current")?;
+        let thesis = dir.path().join("x.notes.tmp-old");
+        std::fs::write(&thesis, b"USER NOTE: my thesis draft")?;
+        age_file(&thesis, 120)?;
+        let recovery = dir.path().join("x.notes.tmp-999999999-not-our-shape");
+        std::fs::write(&recovery, b"recovery data")?;
+        age_file(&recovery, 120)?;
+        save_document(&target, "new", det(TextEncoding::Utf8, false))?;
+        assert_eq!(
+            std::fs::read(&thesis)?,
+            b"USER NOTE: my thesis draft",
+            "the user's .tmp-backup must survive a save"
+        );
+        assert_eq!(std::fs::read(&recovery)?, b"recovery data");
+        Ok(())
+    }
+
+    /// M4: the age gate. A temp of OUR shape but written seconds ago (a live
+    /// temp of another instance) is never swept; the same shape, old enough,
+    /// is.
+    #[test]
+    fn sweep_age_gate_spares_live_temps_and_reclaims_old_ones()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("n.notes");
+        std::fs::write(&target, b"old")?;
+        // Instance A's live temp: our exact shape, seconds old.
+        let live = dir.path().join("n.notes.tmp-4242-1726000000000-0");
+        std::fs::write(&live, b"being written right now")?;
+        // Instance-from-yesterday's litter: same shape, ancient.
+        let ancient = dir.path().join("n.notes.tmp-1717-1726000000000-2");
+        std::fs::write(&ancient, b"crash litter")?;
+        age_file(&ancient, 3_600)?;
+        save_document(&target, "new", det(TextEncoding::Utf8, false))?;
+        assert_eq!(
+            std::fs::read(&live)?,
+            b"being written right now",
+            "a live temp of another instance must survive (M4)"
+        );
+        assert!(!ancient.exists(), "aged litter must be reclaimed");
         Ok(())
     }
 
@@ -464,6 +620,115 @@ mod tests {
         let outcome = save_document_revision(&target, "x", det(TextEncoding::Utf8, false), 7)?;
         assert_eq!(outcome.revision, 7);
         assert_eq!(outcome.path, target);
+        Ok(())
+    }
+    /// B2: a junction target (the OneDrive/sync-client case, creatable
+    /// without privileges) must be REFUSED: the link and the real file
+    /// behind it both survive, and the message names the link and says what
+    /// to do.
+    #[cfg(windows)]
+    #[test]
+    fn junction_target_is_refused_and_link_and_body_survive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let dir = tempfile::tempdir()?;
+        let real_dir = dir.path().join("realdir");
+        std::fs::create_dir(&real_dir)?;
+        let real_file = real_dir.join("n.notes");
+        std::fs::write(&real_file, b"REAL CURRENT BYTES")?;
+        let jn = dir.path().join("jn.notes");
+        // mklink /J (a directory junction) needs no privilege, unlike file
+        // symlinks, so this proof runs on any Windows host.
+        let out = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&jn)
+            .arg(&real_dir)
+            .output()?;
+        assert!(out.status.success(), "mklink /J failed: {:?}", out.stderr);
+        let Err(e) = save_document(&jn, "new bytes", det(TextEncoding::Utf8, false)) else {
+            panic!("saving over a junction must be refused");
+        };
+        let SaveError::ReparsePoint(msg) = &e else {
+            panic!("expected ReparsePoint, got {e:?}");
+        };
+        assert!(
+            msg.contains("jn.notes"),
+            "the message names the link: {msg}"
+        );
+        assert!(
+            msg.contains("save to the real file"),
+            "the message says what to do: {msg}"
+        );
+        // The junction is still a link and the real file still holds the old
+        // bytes — nothing was orphaned.
+        assert!(std::fs::symlink_metadata(&jn)?.file_type().is_symlink());
+        assert_eq!(std::fs::read(&real_file)?, b"REAL CURRENT BYTES");
+        Ok(())
+    }
+
+    /// B2: the plain file-symlink case (the Linux/macOS case, and Windows
+    /// where creating one needs developer mode or admin). When the host
+    /// refuses symlink creation this test says so and passes vacuously; the
+    /// junction test above carries the refusal proof for those hosts — both
+    /// go through the same reparse check.
+    #[cfg(windows)]
+    #[test]
+    fn symlink_file_target_is_refused_when_creatable() -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, b"REAL BODY")?;
+        let fl = dir.path().join("fl.notes");
+        let out = Command::new("cmd")
+            .args(["/C", "mklink"])
+            .arg(&fl)
+            .arg(&real)
+            .output()?;
+        if !out.status.success() {
+            eprintln!(
+                "symlink_file_target_is_refused_when_creatable: host cannot create file                  symlinks (no privilege/dev mode); the junction test carries the proof"
+            );
+            return Ok(());
+        }
+        let Err(e) = save_document(&fl, "new", det(TextEncoding::Utf8, false)) else {
+            panic!("saving over a symlink must be refused");
+        };
+        assert!(matches!(e, SaveError::ReparsePoint(_)));
+        assert!(std::fs::symlink_metadata(&fl)?.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read(&real)?,
+            b"REAL BODY",
+            "the real file is untouched"
+        );
+        Ok(())
+    }
+
+    /// B2, hard-link behaviour (documented, chosen): a hard link is NOT a
+    /// reparse point, so the save replaces the target's directory entry —
+    /// the saved path carries the newest bytes while sibling links keep the
+    /// old inode's content. Asserting it exactly so a future change to
+    /// refuse is a conscious decision.
+    #[cfg(windows)]
+    #[test]
+    fn hard_link_target_is_replaced_by_design() -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("n.notes");
+        std::fs::write(&target, b"OLD CONTENT")?;
+        let sibling = dir.path().join("sibling.notes");
+        let out = Command::new("cmd")
+            .args(["/C", "mklink", "/H"])
+            .arg(&sibling)
+            .arg(&target)
+            .output()?;
+        assert!(out.status.success(), "mklink /H failed: {:?}", out.stderr);
+        save_document(&target, "new bytes", det(TextEncoding::Utf8, false))?;
+        assert_eq!(std::fs::read(&target)?, b"new bytes");
+        assert_eq!(
+            std::fs::read(&sibling)?,
+            b"OLD CONTENT",
+            "sibling links keep the old inode's content"
+        );
         Ok(())
     }
 }
