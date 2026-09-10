@@ -19,7 +19,7 @@ pub mod session;
 pub use document::{Document, FileKind, Skip};
 pub use encoding::{
     DecodeError, Detected, EncodeError, LineEnding, MAX_TEXT_BYTES, SUPPORTED_ANSI_CODEPAGES,
-    TextEncoding, decode, encode, is_oversize, round_trip,
+    TextEncoding, decode, detect, encode, is_oversize, round_trip,
 };
 pub use geometry::Rect;
 pub use paths::{StateDir, resolve_state_dir};
