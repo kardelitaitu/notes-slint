@@ -108,6 +108,7 @@ jobs:
       # verifier could not run (manifest missing/unreadable), which is not a violation.
       - name: fixtures — cargo run -p xtask -- fixtures verify (encoding fixtures are byte-exact vs manifest)
         id: fixtures
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
@@ -230,4 +231,5 @@ jobs:
       # a Linux checkout normalised fixture bytes (the "binary" rule in .gitattributes
       # stopped holding). check-arch and check-docs.ps1 stay Windows-only; see above.
       - name: fixtures — cargo run -p xtask -- fixtures verify (encoding fixtures are byte-exact vs manifest)
+        if: ${{ !cancelled() }}
         run: cargo run -p xtask -- fixtures verify
