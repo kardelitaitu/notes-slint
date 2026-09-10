@@ -125,7 +125,7 @@ pub fn path_policy(path: &Path) -> PathVerdict {
     // not be the name spelled, the same lie class as the strip rule.
     if body
         .split(['\\', '/'])
-        .last()
+        .next_back()
         .is_some_and(|last| last == "." || last == "..")
     {
         return PathVerdict::StrippedName;
