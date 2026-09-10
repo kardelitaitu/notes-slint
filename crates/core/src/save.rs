@@ -109,16 +109,8 @@ pub fn save_document_revision(
     // filesystem, so the previous good file survives an encoding failure
     // byte-for-byte.
     let bytes = encoding::encode(text, detected).map_err(|_| SaveError::Unencodable)?;
-    // Pre-flight: a read-only ATTRIBUTE is detectable before the write, and
-    // is the common, easily-fixed cause. A denied ACL is NOT distinguishable
-    // from the attribute at write time — both surface as ERROR_ACCESS_DENIED
-    // — so the classifier maps that code to PermissionDenied (see
-    // classify_io_error for the reasoning).
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.permissions().readonly() {
-            return Err(SaveError::ReadOnly);
-        }
-    }
+    // The read-only pre-flight and the link refusal live inside atomic_write
+    // so the session and settings paths get them too.
     atomic_write(path, &bytes)?;
     Ok(SaveOutcome {
         path: path.to_path_buf(),
@@ -142,6 +134,16 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError>
         return Err(SaveError::InvalidPath);
     }
     refuse_reparse_point(target)?;
+    // M3: the read-only pre-flight lives HERE so every caller — documents,
+    // sessions, settings — gets the same ReadOnly diagnosis. A denied ACL is
+    // not distinguishable at this point (both it and the attribute surface
+    // as code 5 once we write/rename); the classifier maps code 5 BY STEP,
+    // and the Rename step reports Locked.
+    if let Ok(meta) = std::fs::metadata(target) {
+        if meta.permissions().readonly() {
+            return Err(SaveError::ReadOnly);
+        }
+    }
     let parent = normalize_parent(target);
     if let Some(prefix) = temp_prefix(target) {
         sweep_stale_temps(&parent, &prefix);
@@ -156,7 +158,16 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError>
     drop(file);
     if let Err(e) = std::fs::rename(&temp_path, target) {
         let _ = std::fs::remove_file(&temp_path);
-        return Err(classify_io_error(&e));
+        return Err(classify_io_error(&e, IoStep::Rename));
+    }
+    // Unix prep (M7): fsync the parent directory so the rename itself is
+    // durable. Windows has no directory-handle fsync; the rename there is
+    // already durable, so this is cfg(unix)-only on purpose.
+    #[cfg(unix)]
+    {
+        if let Ok(parent_dir) = std::fs::File::open(target.parent().unwrap_or(Path::new("."))) {
+            let _ = parent_dir.sync_all();
+        }
     }
     Ok(())
 }
@@ -271,11 +282,13 @@ fn create_sibling_temp(target: &Path) -> Result<(PathBuf, std::fs::File), SaveEr
         .ok_or(SaveError::InvalidPath)?
         .to_string_lossy()
         .into_owned();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
     for attempt in 0..3u32 {
+        // Fresh jitter per attempt: nanos used to be computed once outside
+        // the loop, overstating the entropy the comment claimed.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let candidate = parent.join(format!(
             "{file_name}.tmp-{}-{nanos}-{attempt}",
             std::process::id()
@@ -287,7 +300,7 @@ fn create_sibling_temp(target: &Path) -> Result<(PathBuf, std::fs::File), SaveEr
         {
             Ok(file) => return Ok((candidate, file)),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(classify_io_error(&e)),
+            Err(e) => return Err(classify_io_error(&e, IoStep::Create)),
         }
     }
     Err(SaveError::Other(
@@ -296,10 +309,27 @@ fn create_sibling_temp(target: &Path) -> Result<(PathBuf, std::fs::File), SaveEr
 }
 
 fn write_flush_sync(file: &mut std::fs::File, bytes: &[u8]) -> Result<(), SaveError> {
-    file.write_all(bytes).map_err(|e| classify_io_error(&e))?;
-    file.flush().map_err(|e| classify_io_error(&e))?;
-    file.sync_all().map_err(|e| classify_io_error(&e))?;
+    file.write_all(bytes)
+        .map_err(|e| classify_io_error(&e, IoStep::Write))?;
+    // No flush() here: File is unbuffered, so sync_all IS the durability
+    // point — flush() was a no-op that implied buffering we do not have.
+    file.sync_all()
+        .map_err(|e| classify_io_error(&e, IoStep::Write))?;
     Ok(())
+}
+
+/// Where in the atomic write an io::Error came from. The same Win32 code
+/// means different things at different steps: ACCESS_DENIED (5) during the
+/// RENAME is the locked-file case (the target is open elsewhere without
+/// share-delete — the single most common real autosave failure), while 5
+/// during Create/Write is an ACL problem. The diagnosis IS the product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoStep {
+    Stat,
+    Create,
+    Write,
+    Rename,
+    Remove,
 }
 
 /// Maps an std::io::Error to the reason a USER can act on. This is the whole
@@ -312,7 +342,7 @@ fn write_flush_sync(file: &mut std::fs::File, bytes: &[u8]) -> Result<(), SaveEr
 /// other OSes the same numbers are errno values with different meanings
 /// (32 is EPIPE on Linux, not a sharing violation), and the io::ErrorKind
 /// fallback below handles those hosts.
-pub fn classify_io_error(err: &std::io::Error) -> SaveError {
+pub fn classify_io_error(err: &std::io::Error, step: IoStep) -> SaveError {
     if cfg!(windows) {
         if let Some(code) = err.raw_os_error() {
             const ERROR_INVALID_FUNCTION: i32 = 1;
@@ -329,15 +359,21 @@ pub fn classify_io_error(err: &std::io::Error) -> SaveError {
                 ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => {
                     return SaveError::NotFound;
                 }
-                // DELIBERATE CHOICE, per the review brief: ACCESS_DENIED maps
-                // to PermissionDenied, not ReadOnly. A read-only ATTRIBUTE
-                // is caught by the pre-flight in save_document (std exposes
-                // it as permissions().readonly(), which is exactly
-                // FILE_ATTRIBUTE_READONLY on Windows); a denied ACL is not
-                // distinguishable from the attribute by code alone, and both
-                // reach the classifier as 5. Labelling 5 as ReadOnly would
-                // tell a user to clear an attribute that is not set; the
-                // pre-flight keeps genuine attribute cases on ReadOnly.
+                // DELIBERATE CHOICE: ACCESS_DENIED is classified BY STEP.
+                // A read-only ATTRIBUTE is caught by the pre-flight in
+                // atomic_write (std exposes it as permissions().readonly(),
+                // which is exactly FILE_ATTRIBUTE_READONLY on Windows), and
+                // that path owns ReadOnly. Of the code-5 errors reaching this
+                // classifier, the RENAME step is the locked-file case:
+                // renaming over a target another program holds open without
+                // share-delete reports ACCESS_DENIED, not a sharing
+                // violation — proven in review — so Rename+5 maps to Locked
+                // ("close it in the other program"), the copy the UI could
+                // never show before. Create/Write+5 stays PermissionDenied
+                // (a denied ACL on the folder or file).
+                ERROR_ACCESS_DENIED if matches!(step, IoStep::Rename) => {
+                    return SaveError::Locked;
+                }
                 ERROR_ACCESS_DENIED => return SaveError::PermissionDenied,
                 // Another program holds the file open without write sharing
                 // — the single most common real autosave failure on Windows.
@@ -450,31 +486,81 @@ mod tests {
     #[test]
     fn win32_codes_classify_to_user_actionable_reasons() {
         let exact = [
-            (2u16, SaveError::NotFound),
-            (3u16, SaveError::NotFound),
-            (5u16, SaveError::PermissionDenied),
-            (32u16, SaveError::Locked),
-            (33u16, SaveError::Locked),
-            (39u16, SaveError::DiskFull),
-            (112u16, SaveError::DiskFull),
+            (2u16, IoStep::Write, SaveError::NotFound),
+            (3u16, IoStep::Write, SaveError::NotFound),
+            (5u16, IoStep::Write, SaveError::PermissionDenied),
+            (32u16, IoStep::Rename, SaveError::Locked),
+            (33u16, IoStep::Rename, SaveError::Locked),
+            (39u16, IoStep::Write, SaveError::DiskFull),
+            (112u16, IoStep::Write, SaveError::DiskFull),
         ];
-        for (code, want) in exact {
+        for (code, step, want) in exact {
             assert_eq!(
-                classify_io_error(&std::io::Error::from_raw_os_error(i32::from(code))),
+                classify_io_error(&std::io::Error::from_raw_os_error(i32::from(code)), step),
                 want,
-                "win32 code {code}"
+                "win32 code {code} at {step:?}"
             );
         }
+        // M1, the reviewer's proven case: ACCESS_DENIED arriving from the
+        // RENAME step is a LOCKED file (open elsewhere without share-delete),
+        // not an ACL problem — the Locked copy must be reachable.
+        assert_eq!(
+            classify_io_error(&std::io::Error::from_raw_os_error(5), IoStep::Rename),
+            SaveError::Locked,
+            "rename-time ACCESS_DENIED is the locked-file diagnosis"
+        );
+        assert_eq!(
+            classify_io_error(&std::io::Error::from_raw_os_error(5), IoStep::Stat),
+            SaveError::PermissionDenied
+        );
         // The Other family keeps the lossless OS message.
         for code in [1u16, 53u16, 1392u16] {
             assert!(
                 matches!(
-                    classify_io_error(&std::io::Error::from_raw_os_error(i32::from(code))),
+                    classify_io_error(
+                        &std::io::Error::from_raw_os_error(i32::from(code)),
+                        IoStep::Write
+                    ),
                     SaveError::Other(_)
                 ),
                 "win32 code {code} must map to Other with the OS message"
             );
         }
+    }
+
+    /// M1, end to end: a target held open by another PROCESS with share-read
+    /// only (PowerShell's File::Open with FileShare::Read — std cannot set
+    /// share modes) fails the save with Locked, and the previous bytes
+    /// survive. This is the real Windows autosave failure, not a synthesis.
+    #[cfg(windows)]
+    #[test]
+    fn locked_target_reports_locked_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("n.notes");
+        std::fs::write(&target, b"previous good bytes")?;
+        let path_for_ps = target.display().to_string();
+        let mut holder = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "$f = [System.IO.File]::Open('{path_for_ps}', 'Open', 'Read', 'Read'); Start-Sleep -Seconds 30; $f.Close()",
+                ),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        // Give the holder a moment to actually open the file.
+        std::thread::sleep(std::time::Duration::from_millis(2_000));
+        let result = save_document(&target, "new", det(TextEncoding::Utf8, false));
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let Err(e) = result else {
+            panic!("a target held open without share-delete must refuse the save");
+        };
+        assert_eq!(e, SaveError::Locked, "the Locked copy must be reachable");
+        assert_eq!(std::fs::read(&target)?, b"previous good bytes");
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -505,10 +591,13 @@ mod tests {
             (ErrorKind::InvalidInput, SaveError::InvalidPath),
         ];
         for (kind, want) in cases {
-            assert_eq!(classify_io_error(&std::io::Error::from(kind)), want);
+            assert_eq!(
+                classify_io_error(&std::io::Error::from(kind), IoStep::Write),
+                want
+            );
         }
         assert!(matches!(
-            classify_io_error(&std::io::Error::from(ErrorKind::TimedOut)),
+            classify_io_error(&std::io::Error::from(ErrorKind::TimedOut), IoStep::Write),
             SaveError::Other(_)
         ));
     }

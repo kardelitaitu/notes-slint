@@ -62,6 +62,11 @@ pub enum SessionError {
     /// untouched on disk for diagnosis.
     #[error("session file corrupt: {0}")]
     Corrupt(String),
+    /// The shared atomic write tail failed. The classified SaveError is
+    /// preserved as-is — no string round-trip through io::Error::other — so
+    /// the UI renders the real reason (AGENTS.md: the enum IS the contract).
+    #[error(transparent)]
+    Save(#[from] crate::save::SaveError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -105,12 +110,11 @@ pub fn write_session(dir: &Path, s: &Session) -> Result<(), SessionError> {
     // the filesystem, so the previous file — corrupt or not — survives.
     let bytes = serde_json::to_vec_pretty(s).map_err(|e| SessionError::Corrupt(e.to_string()))?;
     // The shared D12/D23 tail (save::atomic_write): sibling temp in the same
-    // directory, exclusive create, write, flush, fsync, rename, leftovers
-    // swept at the start of the next save. SessionError's frozen shape has no
-    // Save variant, so the classified reason rides in Io with its message
-    // retained.
-    crate::save::atomic_write(&dir.join(FILE_NAME), &bytes)
-        .map_err(|e| SessionError::Io(std::io::Error::other(e.to_string())))
+    // directory, exclusive create, write, fsync, rename, leftovers swept at
+    // the start of the next save. The SaveError crosses as itself — variant
+    // fidelity is the contract the UI renders.
+    crate::save::atomic_write(&dir.join(FILE_NAME), &bytes)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -240,6 +244,28 @@ mod tests {
         };
         write_session(dir.path(), &s)?;
         assert_eq!(read_session(dir.path())?, s);
+        Ok(())
+    }
+
+    /// M3: a read-only session.json must report ReadOnly — the pre-flight
+    /// lives in save::atomic_write now — and the SaveError crosses as itself
+    /// (no string round-trip through io::Error::other).
+    #[test]
+    fn readonly_session_file_reports_read_only() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join(FILE_NAME);
+        std::fs::write(&target, b"previous")?;
+        let mut perms = std::fs::metadata(&target)?.permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&target, perms)?;
+        let Err(e) = write_session(dir.path(), &sample()) else {
+            panic!("a read-only session file must refuse the write");
+        };
+        assert!(
+            matches!(e, SessionError::Save(crate::save::SaveError::ReadOnly)),
+            "got {e:?}"
+        );
+        assert_eq!(std::fs::read(&target)?, b"previous");
         Ok(())
     }
 

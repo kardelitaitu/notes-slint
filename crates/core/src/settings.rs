@@ -151,6 +151,28 @@ mod tests {
         Ok(())
     }
 
+    /// M3: the read-only pre-flight lives in save::atomic_write, so a
+    /// read-only settings.toml reports ReadOnly (not PermissionDenied), and
+    /// the classified reason crosses the hop without string round-tripping.
+    #[test]
+    fn readonly_settings_file_reports_read_only() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let state = crate::paths::StateDir(dir.path().to_path_buf());
+        let target = state.0.join(SETTINGS_FILE_NAME);
+        std::fs::write(&target, b"keep")?;
+        let mut perms = std::fs::metadata(&target)?.permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&target, perms)?;
+        let Err(e) = write_settings(&state, &Settings::default()) else {
+            panic!("a read-only settings file must refuse the write");
+        };
+        assert!(
+            matches!(e, SettingsError::Save(crate::save::SaveError::ReadOnly)),
+            "got {e:?}"
+        );
+        assert_eq!(std::fs::read(&target)?, b"keep");
+        Ok(())
+    }
     #[test]
     fn toml_without_a_recents_table_still_reads() {
         let s: Settings = toml::from_str("autosave_enabled = false\n")
