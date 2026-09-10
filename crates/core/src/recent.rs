@@ -30,7 +30,7 @@
 //! top. core never probes the filesystem for this — that would be a second
 //! fs-touching function.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, MAIN_SEPARATOR_STR, Path, PathBuf};
 
 /// The recent-files cap (docs 4.5: at most 10).
 pub const MAX_RECENTS: usize = 10;
@@ -110,6 +110,111 @@ pub fn clear() -> Vec<RecentEntry> {
     Vec::new()
 }
 
+/// How many parent folders a colliding label may show. The judgement: one
+/// folder settles the common "two readme.txt in different folders", two
+/// settles nested clones (Project\ vs Project copy\); past that the label
+/// is becoming the path, which is what the title bar already shows.
+const MAX_LABEL_PARENTS: usize = 2;
+/// The hard character cap for any label. The component bound above cannot
+/// bound a label by itself — a single folder NAME has no length limit — so
+/// this cap is what makes "never an unbounded path in a menu" true.
+const MAX_LABEL_CHARS: usize = 64;
+
+/// The menu-label rule (features.md 4.4), owned here because it is a RULE,
+/// not a rendering detail — a label decision living in the port would be
+/// the silent architecture change AGENTS.md calls out. Pure: names in,
+/// labels out, no canonicalisation, no filesystem — the label is judged
+/// from the stored spellings alone.
+///
+/// * One label per entry, parallel to the input. The label is the file
+///   NAME, case-preserved: identity is case-insensitive (AGENTS.md) and
+///   lives in identity_key, never in the label.
+/// * Entries that share a basename CASE-INSENSITIVELY (two "readme.txt")
+///   must not both render as the same bare word: the nearest parent
+///   folders are appended, growing jointly just until the labels differ.
+/// * The suffix is BOUNDED — at most MAX_LABEL_PARENTS folders — and "…"
+///   marks any parents above it that were cut; every label is then
+///   hard-capped at MAX_LABEL_CHARS chars. Residual ambiguity past the
+///   bounds is honest and harmless: a label is never an identity.
+/// * A vanished entry (exists = false) labels exactly like a present one:
+///   greying is the bridge's rendering of 'exists', not a naming rule.
+pub fn display_labels(entries: &[RecentEntry]) -> Vec<String> {
+    // The bare, case-preserved file name; the stored display string is the
+    // fallback for degenerate paths with no file-name component (a bare
+    // drive), which a recent list cannot normally hold.
+    let basenames: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            e.path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| e.display.clone())
+        })
+        .collect();
+    // Collision groups, keyed case-insensitively (full Unicode lowercase,
+    // the same philosophy as the identity key: a label that READS the same
+    // is the ambiguity, whatever the case trick).
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, b) in basenames.iter().enumerate() {
+        let key = b.to_lowercase();
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, g)) => g.push(i),
+            None => groups.push((key, vec![i])),
+        }
+    }
+    // The basenames stay intact as the composition base; labels is the
+    // output being grown. (Cloned: a group's take-2 suffix must compose
+    // onto the BASENAME, not onto its own take-1 label.)
+    let mut labels = basenames.clone();
+    for (_, group) in &groups {
+        if group.len() < 2 {
+            continue;
+        }
+        let chains: Vec<Vec<String>> = group
+            .iter()
+            .map(|&i| parent_chain(&entries[i].path))
+            .collect();
+        // Grow every member's suffix jointly; stop at the FIRST length
+        // where the labels come apart, or at the bound.
+        let mut shown = 0usize;
+        let mut resolved = false;
+        for take in 1..=MAX_LABEL_PARENTS {
+            let candidate: Vec<String> = group
+                .iter()
+                .zip(&chains)
+                .map(|(&i, chain)| compose(&parent_suffix(chain, take), &basenames[i]))
+                .collect();
+            let distinct = candidate
+                .iter()
+                .enumerate()
+                .all(|(a, l)| candidate[a + 1..].iter().all(|other| other != l));
+            for (&i, l) in group.iter().zip(&candidate) {
+                labels[i] = l.clone();
+            }
+            if distinct {
+                shown = take;
+                resolved = true;
+                break;
+            }
+        }
+        if !resolved {
+            shown = MAX_LABEL_PARENTS;
+            for (&i, chain) in group.iter().zip(&chains) {
+                labels[i] = compose(&parent_suffix(chain, MAX_LABEL_PARENTS), &basenames[i]);
+            }
+        }
+        // Mark the cut whenever real parent FOLDERS above the shown suffix
+        // were dropped — the drive and the root separator are never parents
+        // a menu needs, so they do not count as truncation.
+        for &i in group.iter() {
+            if parent_count(&entries[i].path) > shown {
+                labels[i] = format!("…{MAIN_SEPARATOR_STR}{}", labels[i]);
+            }
+        }
+    }
+    labels.into_iter().map(hard_cap).collect()
+}
+
 /// (identity key, was-canonicalised). The single filesystem touch in this
 /// module: canonicalise reads, nothing writes — and NEVER on a path the
 /// name-only policy has judged hostile: canonicalise on an unreachable UNC
@@ -170,6 +275,56 @@ fn lexical_normalisation(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// The parent folders of the path, NEAREST first, as display strings. Pure:
+/// component inspection only — no canonicalisation, no filesystem.
+fn parent_chain(path: &Path) -> Vec<String> {
+    let comps: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let names = comps.len().saturating_sub(1);
+    comps[..names].iter().rev().cloned().collect()
+}
+
+/// How many real parent folders the path has: the Normal components minus
+/// the file name itself.
+fn parent_count(path: &Path) -> usize {
+    path.components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .count()
+        .saturating_sub(1)
+}
+
+/// The nearest 'take' parents, re-joined root-first: ["b", "a"] -> "a\b".
+fn parent_suffix(chain: &[String], take: usize) -> String {
+    chain
+        .iter()
+        .take(take)
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(MAIN_SEPARATOR_STR)
+}
+
+fn compose(suffix: &str, basename: &str) -> String {
+    if suffix.is_empty() {
+        basename.to_owned()
+    } else {
+        format!("{suffix}{MAIN_SEPARATOR_STR}{basename}")
+    }
+}
+
+/// The hard character cap: keep the tail (the nearest folders and the file
+/// name), mark the cut. Bounded is the promise; this is where it is kept.
+fn hard_cap(label: String) -> String {
+    let count = label.chars().count();
+    if count <= MAX_LABEL_CHARS {
+        return label;
+    }
+    let tail: String = label.chars().skip(count - (MAX_LABEL_CHARS - 1)).collect();
+    format!("…{tail}")
 }
 
 #[cfg(test)]
@@ -319,5 +474,105 @@ mod tests {
         let list = push(Vec::new(), PathBuf::from("/data/NOTES/a.notes"), "a");
         let list = push(list, PathBuf::from("/data/notes/a.notes"), "a");
         assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn labels_are_the_case_preserved_file_name() {
+        let labels = display_labels(&[
+            entry(r"C:\Docs\ReadMe.NOTES", "whatever"),
+            entry(r"C:\other\idea.notes", "x"),
+        ]);
+        assert_eq!(
+            labels,
+            vec!["ReadMe.NOTES".to_owned(), "idea.notes".to_owned()]
+        );
+    }
+
+    #[test]
+    fn colliding_basenames_do_not_both_render_as_the_bare_word() {
+        // D33: the collision rule. Two identical basenames must not both
+        // render as the same bare word.
+        let labels = display_labels(&[
+            entry(r"C:\a\readme.txt", "r"),
+            entry(r"C:\b\readme.txt", "r"),
+        ]);
+        assert_eq!(labels, vec![r"a\readme.txt", r"b\readme.txt"]);
+    }
+
+    #[test]
+    fn colliding_labels_grow_jointly_until_they_differ() {
+        // The nearest folders agree; the second one distinguishes. Both
+        // folder chains fit inside the bound, so nothing was cut and no
+        // truncation marker is honest.
+        let labels = display_labels(&[
+            entry(r"C:\p\x\readme.txt", "r"),
+            entry(r"C:\q\x\readme.txt", "r"),
+        ]);
+        assert_eq!(labels, vec![r"p\x\readme.txt", r"q\x\readme.txt"]);
+    }
+
+    #[test]
+    fn the_parent_suffix_is_bounded_and_marks_the_cut() {
+        // The distinguishing folder is three up: past the bound the label
+        // caps at the two nearest parents and the ellipsis marks the cut.
+        // The residual ambiguity is honest: a label is never an identity.
+        let labels = display_labels(&[
+            entry(r"C:\a\b\c\readme.txt", "r"),
+            entry(r"C:\x\b\c\readme.txt", "r"),
+        ]);
+        assert_eq!(labels, vec![r"…\b\c\readme.txt", r"…\b\c\readme.txt"]);
+    }
+
+    #[test]
+    fn no_label_exceeds_the_hard_character_cap() {
+        // A folder NAME has no length limit, so the component bound alone
+        // cannot bound a label; the character cap keeps the promise.
+        let long = "f".repeat(100);
+        let labels = display_labels(&[
+            entry(&format!(r"C:\{long}\readme.txt"), "r"),
+            entry(r"C:\g\readme.txt", "r"),
+        ]);
+        assert_eq!(labels[1], r"g\readme.txt", "short labels untouched");
+        assert!(
+            labels[0].chars().count() <= 64 && labels[0].starts_with('…'),
+            "capped and marked: {labels:?}"
+        );
+        assert!(
+            labels[0].ends_with("readme.txt"),
+            "the name survives: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn case_only_twin_names_stay_case_preserved_and_distinct() {
+        // Same folder, different case: the suffix cannot help, but the
+        // case-preserved names are different words — display is not identity.
+        let labels = display_labels(&[
+            entry(r"C:\docs\README.txt", "r"),
+            entry(r"c:\docs\readme.txt", "r"),
+        ]);
+        assert_eq!(labels, vec![r"docs\README.txt", r"docs\readme.txt"]);
+    }
+
+    #[test]
+    fn vanished_entries_get_the_same_label_greyed_elsewhere() {
+        let mut entries = vec![
+            entry(r"C:\a\one.notes", "one"),
+            entry(r"C:\b\one.notes", "one"),
+        ];
+        entries[1].exists = false;
+        let labels = display_labels(&entries);
+        assert_eq!(labels, vec![r"a\one.notes", r"b\one.notes"]);
+    }
+
+    #[test]
+    fn degenerate_paths_fall_back_to_the_stored_display() {
+        let labels = display_labels(&[entry("C:", "C:")]);
+        assert_eq!(labels, vec!["C:"]);
+    }
+
+    #[test]
+    fn empty_list_yields_no_labels() {
+        assert!(display_labels(&[]).is_empty());
     }
 }

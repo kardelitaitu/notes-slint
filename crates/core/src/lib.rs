@@ -29,7 +29,9 @@ pub use format::{NoteParts, is_notes_path, rebuild, split};
 pub use geometry::Rect;
 pub use path_policy::{PathVerdict, path_policy};
 pub use paths::{StateDir, resolve_state_dir};
-pub use recent::{MAX_RECENTS, RecentEntry, RecentList, clear, identity_key, mark_missing, push};
+pub use recent::{
+    MAX_RECENTS, RecentEntry, RecentList, clear, display_labels, identity_key, mark_missing, push,
+};
 pub use save::{
     SaveError, SaveOutcome, classify_io_error, save_document, save_document_revision,
     save_session_bytes,

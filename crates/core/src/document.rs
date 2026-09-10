@@ -49,6 +49,11 @@ pub struct Document {
     /// The revision as of the last recorded save; flushes at or below it are
     /// stale and skip as Clean.
     saved_revision: u64,
+    /// The highest revision the bridge has NOTED (note_revision) — the
+    /// ceiling the save anchor is allowed to land on. D11: an anchor above
+    /// this ceiling is a revision the bridge never reached, and the
+    /// stale-flush gate would then judge real work Clean against it.
+    noted: u64,
     dirty: bool,
     armed: bool,
     read_only: bool,
@@ -64,6 +69,7 @@ impl Document {
             path: None,
             revision: 0,
             saved_revision: 0,
+            noted: 0,
             dirty: false,
             armed: true,
             read_only: false,
@@ -81,6 +87,7 @@ impl Document {
             path: Some(path.to_path_buf()),
             revision: 0,
             saved_revision: 0,
+            noted: 0,
             dirty: false,
             armed: kind == FileKind::Notes,
             read_only,
@@ -125,7 +132,22 @@ impl Document {
     /// Records a completed explicit save (the bridge did the I/O). Arms the
     /// document (ADR-0001 requirement 3: an explicit save arms) and anchors
     /// the saved revision, so stale flushes skip as Clean.
+    ///
+    /// D11 ANCHOR INVARIANT: saved_revision may only land on a revision the
+    /// bridge NOTED. debug_assert is the right strength here: it can fire
+    /// only on a programming error in the save wiring — anchoring a save
+    /// whose revision was never noted — never on bad user data, which cannot
+    /// choose when core anchors a save. The consequence it names is the
+    /// exact bug D11 exists to stop: a stale Flush judged Clean against an
+    /// invented anchor, a real save silently skipped. (It compiles out in
+    /// release; the typed gate in should_flush still holds there.)
     pub fn mark_saved(&mut self) {
+        debug_assert!(
+            self.revision <= self.noted,
+            "D11 anchor: mark_saved anchored revision {} but the bridge only noted up to {} — an un-noted anchor makes the next stale Flush read as Clean, silently skipping a real save",
+            self.revision,
+            self.noted
+        );
         self.dirty = false;
         self.saved_revision = self.revision;
         self.armed = true;
@@ -139,7 +161,10 @@ impl Document {
     /// never un-saves a document (saved_revision only ever moves at
     /// mark_saved, and the counter it is anchored to cannot go backwards).
     /// This is an observation, not an edit: the dirty flag is untouched.
+    /// It also raises the NOTED ceiling that mark_saved's D11 anchor assert
+    /// checks: an anchor is only allowed on a revision the bridge noted.
     pub fn note_revision(&mut self, revision: u64) {
+        self.noted = self.noted.max(revision);
         self.revision = self.revision.max(revision);
     }
 
@@ -248,6 +273,8 @@ mod tests {
         let mut d = foreign();
         assert!(!d.is_armed());
         d.apply_edit();
+        // The save carried this revision: the bridge notes before the anchor.
+        d.note_revision(d.revision());
         d.mark_saved();
         assert!(d.is_armed(), "an explicit save arms the document");
         assert!(!d.is_dirty());
@@ -259,6 +286,8 @@ mod tests {
         let mut d = foreign();
         assert!(!d.is_armed());
         d.apply_edit();
+        // The Save As carried this revision: noted before the anchor (D11).
+        d.note_revision(d.revision());
         d.save_as(Path::new("C:/notes/renamed.notes"));
         assert!(d.is_armed(), "Save As arms the new path");
         assert_eq!(d.path(), Some(Path::new("C:/notes/renamed.notes")));
@@ -317,6 +346,7 @@ mod tests {
         assert_eq!(d.revision(), 1);
         d.apply_edit();
         assert_eq!(d.revision(), 2);
+        d.note_revision(2); // the save carried revision 2 (D11: noted first)
         d.mark_saved(); // saved at revision 2
         assert!(d.revision() > 1 && d.revision() >= 2);
         d.apply_edit(); // third edit
@@ -339,6 +369,7 @@ mod tests {
     fn flush_at_or_below_saved_revision_is_clean() {
         let mut d = native();
         d.apply_edit(); // revision 1
+        d.note_revision(1); // the save carried revision 1 (D11: noted first)
         d.mark_saved(); // saved at 1
         // A stale flush that observed revision 1 (or anything below): Clean,
         // no write, no error — even with autosave enabled and the doc dirty.
@@ -415,5 +446,19 @@ mod tests {
         assert!(!d.is_dirty());
         assert!(d.is_armed(), "an untitled note is native by definition");
         assert_eq!(d.should_autosave(true), Some(Skip::Clean));
+    }
+
+    /// D33: the D11 anchor assert exists to be TRIP-ABLE. The wiring bug it
+    /// catches: a save anchored at a revision the bridge never noted — the
+    /// next stale Flush is then judged Clean against the invented anchor
+    /// and a real save is silently skipped. debug_assert! compiles out in
+    /// release, so this trip test is cfg'd to debug builds (cargo test).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "D11 anchor")]
+    fn mark_saved_at_an_un_noted_revision_trips_the_d11_anchor() {
+        let mut d = native();
+        d.apply_edit(); // revision 1, core-local: the bridge never noted it
+        d.mark_saved(); // must panic: anchoring an un-noted revision
     }
 }
