@@ -18,7 +18,10 @@ fn usage() {
     eprintln!(
         "       launch the built binary, close its window with WM_CLOSE, prove it exits by itself"
     );
-    eprintln!("       (opens a real window; exits 3 when there is no desktop to test on)");
+    eprintln!(
+        "       (opens a real window; a pre-existing session.json is moved aside and put back;"
+    );
+    eprintln!("       exits 3 with no desktop, or when foreign state sits on the session path)");
     eprintln!("usage: cargo xtask check [--quick]");
     eprintln!(
         "       run the AGENTS.md gate with per-step verdicts (--quick skips the slow steps)"

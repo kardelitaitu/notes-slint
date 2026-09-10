@@ -44,7 +44,7 @@ impl Outcome {
             Outcome::CouldNotRun if advisory => "COULD NOT RUN (advisory — does not gate)",
             Outcome::CouldNotRun => "COULD NOT RUN",
             Outcome::Skipped => "SKIPPED (--quick)",
-            Outcome::Declined => "DECLINED (no desktop here)",
+            Outcome::Declined => "DECLINED (no desktop / foreign state on the session path)",
         }
     }
 

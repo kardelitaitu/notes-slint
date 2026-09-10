@@ -159,6 +159,36 @@ pub struct Artefact {
     pub fresh: bool,
     /// The stored rect, or why it could not be read.
     pub rect: String,
+    /// Some when the bytes could not be read at all. That is a verdict of its
+    /// own: it describes the machine (an ACL, a planted blocker, a filter
+    /// driver), not something the app did or failed to do.
+    pub read_error: Option<String>,
+}
+
+/// What stood in the way of a fresh-install run, and what was done about it.
+///
+/// Smoke tests ONE case that matters: an install with no session.json, which is
+/// what D54 is about. A pre-existing file is therefore MOVED ASIDE by default -
+/// it comes back at the end, hash-checked - rather than being allowed to make
+/// the run judge the wrong thing, and rather than being deleted, which is not
+/// this harness's to do. When the path holds something that cannot be moved (a
+/// directory planted on it, an access refusal), smoke says so and DECLINES.
+/// Reporting an app bug because of a blocker on the tester's own disk is the
+/// failure mode this enum exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Relocation {
+    /// Nothing was in the way: this is a real fresh-install run.
+    CleanSlate,
+    /// The user's file sits in a named temp path and is restored on exit.
+    Moved {
+        /// Where it went, printed both ways so a human can verify by eye.
+        to: PathBuf,
+    },
+    /// --reuse-state: the file stays exactly where it is, so only mtime
+    /// freshness can be judged (and the fresh-install case cannot).
+    Kept(String),
+    /// Something unmovable sits on the path: no verdict is available.
+    Blocked(String),
 }
 
 /// The outcome of a probe run. Skip is a deliberate third state: "no desktop"
@@ -170,25 +200,33 @@ pub enum Verdict {
     Fail(Vec<String>),
 }
 
-/// Every claim this harness makes, decided here, over parsed keys only.
-pub fn decide(p: &Probe, artefact: Option<&Artefact>) -> Verdict {
+/// Every claim this harness makes, decided here, over parsed keys and the
+/// relocation outcome only - decide() touches no filesystem.
+pub fn decide(p: &Probe, artefact: Option<&Artefact>, relocation: &Relocation) -> Verdict {
     let mut failures: Vec<String> = Vec::new();
+    if let Relocation::Blocked(why) = relocation {
+        // Before the desktop question: the run was already doomed to be
+        // unable to judge, and saying so is not a pass.
+        return Verdict::Skip(format!(
+            "the session path could not be cleared for a fresh-install run, so nothing about D54 can be judged here: {why}"
+        ));
+    }
     if p.get("DESKTOP") == Some("0") {
         return Verdict::Skip(
-            "no interactive desktop in this session (no windowed process, or the session is not              interactive) - a GUI smoke run cannot be had here"
+            "no interactive desktop in this session (no windowed process, or the session is not interactive) - a GUI smoke run cannot be had here"
                 .to_string(),
         );
     }
     if !p.flag("PROBE_DONE") {
         failures.push(format!(
-            "SMOKE FAIL: the probe did not finish (keys seen: [{}]) - it hit its own deadline or              died; a missing key is never a pass",
+            "SMOKE FAIL: the probe did not finish (keys seen: [{}]) - it hit its own deadline or died; a missing key is never a pass",
             p.keys()
         ));
         return Verdict::Fail(failures);
     }
     if !p.flag("SPAWN") {
         failures.push(format!(
-            "SMOKE FAIL: {BIN_REL} exists but could not be started - run {BUILD_HINT} and look              for an antivirus block"
+            "SMOKE FAIL: {BIN_REL} exists but could not be started - run {BUILD_HINT} and look for an antivirus block"
         ));
         return Verdict::Fail(failures);
     }
@@ -196,28 +234,28 @@ pub fn decide(p: &Probe, artefact: Option<&Artefact>) -> Verdict {
     let handle = p.number("HANDLE").unwrap_or(0);
     if handle == 0 {
         failures.push(format!(
-            "SMOKE FAIL: no top-level window handle within {WINDOW_SECS}s (MainWindowHandle stayed              0; pid={}, title={:?}) - the window was never created, so nothing downstream can be              credited",
+            "SMOKE FAIL: no top-level window handle within {WINDOW_SECS}s (MainWindowHandle stayed 0; pid={}, title={:?}) - the window was never created, so nothing downstream can be credited",
             p.get("PID").unwrap_or("?"),
             p.get("TITLE").unwrap_or("")
         ));
     } else if let Some(ms) = p.number("LAUNCH_MS") {
         if ms > COLD_START_BUDGET_MS {
             failures.push(format!(
-                "SMOKE FAIL: launch to window took {ms}ms, over the {COLD_START_BUDGET_MS}ms                  cold-start budget (whitepaper §2)"
+                "SMOKE FAIL: launch to window took {ms}ms, over the {COLD_START_BUDGET_MS}ms cold-start budget (whitepaper §2)"
             ));
         }
     }
 
     if !p.flag("CLOSE_REQUESTED") {
         failures.push(format!(
-            "SMOKE FAIL: CloseMainWindow (WM_CLOSE) was not accepted (handle={handle}) - the              graceful-shutdown path was never asked to run, so its silence proves nothing"
+            "SMOKE FAIL: CloseMainWindow (WM_CLOSE) was not accepted (handle={handle}) - the graceful-shutdown path was never asked to run, so its silence proves nothing"
         ));
     }
 
     let forced = p.flag("FORCED");
     if forced || !p.flag("EXITED_WITHOUT_KILL") {
         failures.push(format!(
-            "SMOKE FAIL: the app did NOT exit by itself within {CLOSE_SECS}s of WM_CLOSE and was              force-killed (code after the kill: {:?}) - a force-kill is not a graceful shutdown and              cannot PASS whatever code it ends with",
+            "SMOKE FAIL: the app did NOT exit by itself within {CLOSE_SECS}s of WM_CLOSE and was force-killed (code after the kill: {:?}) - a force-kill is not a graceful shutdown and cannot PASS whatever code it ends with",
             p.get("EXIT_CODE_AFTER_FORCE")
         ));
     } else {
@@ -232,11 +270,30 @@ pub fn decide(p: &Probe, artefact: Option<&Artefact>) -> Verdict {
     }
 
     match artefact {
+        Some(a) if a.read_error.is_some() && a.fresh => {
+            // Own verdict, and not a pass: the app wrote something this run,
+            // but it cannot be read back, so what is stored is unknown.
+            failures.push(format!(
+                "SMOKE FAIL: this run created {} but it CANNOT BE READ BACK ({}) - the rect is unverified. This is a statement about the machine, not about the app; the ACL and attributes are printed above.",
+                a.path.display(),
+                a.read_error.clone().unwrap_or_default()
+            ));
+        }
         None => failures.push(format!(
-            "SMOKE FAIL: this run wrote no {SESSION_FILE}"
+            "SMOKE FAIL: this run wrote no {SESSION_FILE} ({})",
+            match relocation {
+                Relocation::Moved { to } => format!(
+                    "the user's own file was moved aside to {} first, so this was a genuine fresh-install run",
+                    to.display()
+                ),
+                Relocation::Kept(what) => format!(
+                    "{what} was left in place by --reuse-state, and this run wrote nothing into it"
+                ),
+                _ => "nothing was in the way - there was no session.json to begin with".to_string(),
+            }
         )),
         Some(a) if !a.fresh => failures.push(format!(
-            "SMOKE FAIL: {} exists but is OLDER than this launch, so this run never wrote it and              the fresh-install behaviour is not proven (rect={})",
+            "SMOKE FAIL: {} exists but is OLDER than this launch, so this run never wrote it and the fresh-install behaviour is not proven (rect={}) - if this file was left in place on purpose (--reuse-state), the fresh-install case cannot be judged from this run at all",
             a.path.display(),
             a.rect
         )),
@@ -265,8 +322,26 @@ fn candidate_state_dirs(exe: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// sha256 of a file, using the hasher the fixtures verifier already ships
+/// (same crate, so no new dependency and no second implementation to drift).
+fn sha_of(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(crate::fixtures::sha256_hex(&bytes))
+}
+
 fn read_artefact(path: &Path, launched: SystemTime) -> Option<Artefact> {
-    let mtime = fs::metadata(path).ok()?.modified().ok()?;
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    if !meta.is_file() {
+        // Not a file at all (a directory planted on the path). find_artefact
+        // reports it; clear_session_path is what turns it into a verdict.
+        return Some(Artefact {
+            path: path.to_path_buf(),
+            fresh: false,
+            rect: format!("<not a regular file: {}>", describe_kind(path)),
+            read_error: Some("the path is not a regular file".to_string()),
+        });
+    }
     let rect = match fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(value) => match value.get("rect") {
@@ -280,11 +355,27 @@ fn read_artefact(path: &Path, launched: SystemTime) -> Option<Artefact> {
         },
         Err(e) => format!("<unreadable: {e}>"),
     };
+    let read_error = if rect.starts_with("<unreadable") {
+        Some(rect.clone())
+    } else {
+        None
+    };
     Some(Artefact {
         path: path.to_path_buf(),
         fresh: mtime >= launched,
         rect,
+        read_error,
     })
+}
+
+/// What a path actually is, for the message that says WHY it cannot be judged.
+fn describe_kind(path: &Path) -> String {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => "a DIRECTORY sitting on the session file's path".to_string(),
+        Ok(meta) if !meta.file_type().is_file() => "not a regular file".to_string(),
+        Ok(meta) => format!("a file of {} bytes", meta.len()),
+        Err(e) => format!("unreadable metadata ({e})"),
+    }
 }
 
 /// The artefact this run produced, plus every path searched (printed on a miss).
@@ -315,6 +406,93 @@ fn temp_path(stem: &str, ext: &str) -> PathBuf {
         std::process::id()
     ));
     p
+}
+
+/// ACL / attribute diagnostics. A REPORTER only: it prints what Windows says,
+/// and decide() owns the verdict. Its whole reason to exist is that a red row
+/// caused by "Access is denied (os error 5)" on the tester's own profile is
+/// unreadable without it - with it, the log says who holds the path.
+const ACL_PROBE: &str = r#"
+param([Parameter(Mandatory)][string]$Target)
+$ErrorActionPreference = 'SilentlyContinue'
+$item = Get-Item -LiteralPath $Target -Force
+"kind=$($item.Attributes)"
+"size=$($item.Length)"
+"mtime=$($item.LastWriteTime.ToString('s'))"
+"file_owner=$((Get-Acl -LiteralPath $Target).Owner)"
+foreach ($a in (Get-Acl -LiteralPath $Target).Access) {
+    "file_ace=$($a.AccessControlType) $($a.IdentityReference) $($a.FileSystemRights)"
+}
+$parent = Split-Path -Parent $Target
+"dir=$parent"
+"dir_owner=$((Get-Acl -LiteralPath $parent).Owner)"
+foreach ($a in (Get-Acl -LiteralPath $parent).Access) {
+    "dir_ace=$($a.AccessControlType) $($a.IdentityReference) $($a.FileSystemRights)"
+}
+'DONE=1'
+"#;
+
+/// One line of Windows-side diagnostics for a path smoke cannot use. Empty on
+/// any failure: the absence of an ACL note must never change a verdict.
+fn acl_note(path: &Path) -> String {
+    let script = temp_path("acl", "ps1");
+    let written = fs::File::create(&script).and_then(|mut f| f.write_all(ACL_PROBE.as_bytes()));
+    let note = match written {
+        Err(e) => return format!("<could not write the ACL probe: {e}>"),
+        Ok(()) => Command::new("pwsh")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .arg("-Target")
+            .arg(path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .or_else(|_| {
+                Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                    ])
+                    .arg(&script)
+                    .arg("-Target")
+                    .arg(path)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+            })
+            .and_then(|mut child| match wait_bounded(&mut child, 15) {
+                Ok(_) => Ok(read_pipe(child.stdout.as_mut())),
+                Err(e) => Err(std::io::Error::other(e)),
+            }),
+    };
+    let _ = fs::remove_file(&script);
+    match note {
+        Err(e) => format!("<ACL probe could not run: {e}>"),
+        Ok(text) => {
+            let mut bits: Vec<String> = Vec::new();
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with("dir=") || line == "DONE=1" {
+                    continue;
+                }
+                bits.push(line.to_string());
+            }
+            if bits.is_empty() {
+                "<the ACL probe printed nothing>".to_string()
+            } else {
+                bits.join(" | ")
+            }
+        }
+    }
 }
 
 /// Spawn the probe. pwsh first, then Windows PowerShell 5.1: a runner may ship
@@ -398,52 +576,139 @@ fn report_captured(path: &Path, label: &str) {
     }
 }
 
-/// Move a pre-existing session.json aside, so this run really is a fresh
-/// install. Returns (live path, temp backup). Never deleted, never quiet.
-fn stage_fresh_install(exe: &Path) -> Option<(PathBuf, PathBuf)> {
+/// Brings the user's session.json back. Drop does it, so a panic, an early
+/// return or a force-killed probe cannot leave the profile holding nothing -
+/// the copy is only ever in a named temp path for the length of the run.
+struct Restore {
+    live: PathBuf,
+    aside: PathBuf,
+    before: Option<String>,
+    done: bool,
+    /// True when the bytes did not come back identical, or could not come back.
+    failed: bool,
+}
+
+impl Restore {
+    fn finish(&mut self) {
+        if !self.done {
+            self.done = true;
+            self.restore("at the end of the run");
+        }
+    }
+
+    fn restore(&mut self, when: &str) {
+        match fs::rename(&self.aside, &self.live) {
+            Ok(()) => {
+                let after = sha_of(&self.live);
+                let identical = matches!((&self.before, &after), (Some(b), Some(a)) if b == a);
+                println!(
+                    "smoke: {when} - restored {} from {}",
+                    self.live.display(),
+                    self.aside.display()
+                );
+                println!(
+                    "smoke: user state sha256 before={:?} after={:?} identical={identical}",
+                    self.before, after
+                );
+                if !identical {
+                    self.failed = true;
+                    eprintln!(
+                        "SMOKE FAIL: the relocated user state did not come back byte-identical"
+                    );
+                }
+            }
+            Err(e) => {
+                self.failed = true;
+                eprintln!(
+                    "SMOKE FAIL: could not restore {} from {} - the user's file is at that temp path, put it back by hand: {e}",
+                    self.live.display(),
+                    self.aside.display()
+                );
+            }
+        }
+    }
+}
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            self.restore("while unwinding");
+        }
+    }
+}
+
+/// Clear the session path so the run judges the case D54 is about, and hand
+/// back the guard that puts the user's file back. Anything that is not a plain
+/// movable FILE becomes Blocked: a directory planted on the path (which is what
+/// an api test does to prove the write path handles a blocked target) is not
+/// stale state and not this harness's to move.
+fn clear_session_path(exe: &Path) -> (Option<Restore>, Relocation) {
     for dir in candidate_state_dirs(exe) {
         let path = dir.join(SESSION_FILE);
-        if !path.is_file() {
-            continue;
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            let acl = acl_note(&path);
+            return (
+                None,
+                Relocation::Blocked(format!(
+                    "{} is {} (mtime {}); it was not moved, and no verdict about the fresh-install write is available while something sits on that path. Diagnostics: {}",
+                    path.display(),
+                    describe_kind(&path),
+                    meta.modified()
+                        .ok()
+                        .and_then(|t| t.elapsed().ok().map(|d| format!("{}s ago", d.as_secs())))
+                        .unwrap_or_else(|| "mtime unknown".to_string()),
+                    acl
+                )),
+            );
         }
         let tag = dir
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "state".to_string());
         let aside = temp_path(&format!("session-backup-{tag}"), "json");
+        let before = sha_of(&path);
         if let Err(e) = fs::rename(&path, &aside) {
-            println!(
-                "smoke: could not move {} aside ({e}); freshness is judged by mtime instead",
-                path.display()
+            let acl = acl_note(&path);
+            return (
+                None,
+                Relocation::Blocked(format!(
+                    "{} is a file but could not be renamed aside ({e}); it stays exactly where it is. Diagnostics: {}",
+                    path.display(),
+                    acl
+                )),
             );
-            return None;
         }
         println!(
-            "smoke: fresh-install run - moved the existing {} aside to {}",
+            "smoke: relocated the user's {} -> {} (sha256 {:?}); every exit path restores it",
             path.display(),
-            aside.display()
+            aside.display(),
+            before
         );
         println!(
-            "smoke: it is restored at the end of this run; if this process is killed, copy it              back from that temp path"
+            "smoke: nothing is being deleted; if this process is killed, the file is at the temp path above"
         );
-        return Some((path, aside));
+        let guard = Restore {
+            live: path,
+            aside,
+            before,
+            done: false,
+            failed: false,
+        };
+        let relocation = Relocation::Moved {
+            to: guard.aside.clone(),
+        };
+        return (Some(guard), relocation);
     }
-    None
-}
-
-fn restore(path: &Path, aside: &Path) {
-    match fs::rename(aside, path) {
-        Ok(()) => println!("smoke: restored the user's {} unchanged", path.display()),
-        Err(e) => eprintln!(
-            "smoke: COULD NOT RESTORE {} from {} - copy it back by hand: {e}",
-            path.display(),
-            aside.display()
-        ),
-    }
+    (None, Relocation::CleanSlate)
 }
 
 /// One summary line, readable on its own in a CI log.
-fn summary(verdict: &Verdict, p: &Probe, elapsed: Duration) -> String {
+fn summary(verdict: &Verdict, p: &Probe, elapsed: Duration, relocation: &Relocation) -> String {
     let secs = format!("{:.1}s", elapsed.as_secs_f64());
     let window = if p.number("HANDLE").unwrap_or(0) != 0 {
         "OK"
@@ -452,7 +717,13 @@ fn summary(verdict: &Verdict, p: &Probe, elapsed: Duration) -> String {
     };
     match verdict {
         Verdict::Pass => format!("smoke: window=OK close=0 session=OK {secs}"),
-        Verdict::Skip(_) => "smoke: window=SKIP close=SKIP session=SKIP (no desktop)".to_string(),
+        Verdict::Skip(_) => {
+            let what = match relocation {
+                Relocation::Blocked(_) => "path blocked by foreign state",
+                _ => "no desktop",
+            };
+            format!("smoke: window=DECLINED close=DECLINED session=DECLINED ({what}) {secs}")
+        }
         Verdict::Fail(_) => {
             let close = if p.flag("FORCED") || !p.flag("EXITED_WITHOUT_KILL") {
                 "FORCED".to_string()
@@ -506,12 +777,31 @@ pub fn run(args: &[String]) -> i32 {
 
     let started = Instant::now();
     let launched = SystemTime::now();
-    let backup = if reuse {
-        println!("smoke: --reuse-state - a pre-existing session.json stays where it is");
-        None
+    // The guard restores on EVERY exit path: normal end, early return, panic.
+    let (mut guard, relocation) = if reuse {
+        let what = describe_existing(&exe);
+        println!("smoke: --reuse-state - {what} stays exactly where it is");
+        (None, Relocation::Kept(what))
     } else {
-        stage_fresh_install(&exe)
+        clear_session_path(&exe)
     };
+
+    // A blocked path is decided before anything is launched: no verdict about
+    // the D54 write exists while foreign state sits on the path, so there is no
+    // reason to open a window on the way to saying so.
+    if let Relocation::Blocked(why) = &relocation {
+        println!("smoke: DECLINED - {why}");
+        println!(
+            "{}",
+            summary(
+                &Verdict::Skip(why.clone()),
+                &Probe::default(),
+                started.elapsed(),
+                &relocation
+            )
+        );
+        return 3;
+    }
 
     let script = temp_path("probe", "ps1");
     let out_file = temp_path("stdout", "txt");
@@ -571,15 +861,24 @@ pub fn run(args: &[String]) -> i32 {
                                 .join(", ")
                         ),
                     }
-                    let verdict = decide(&probe, artefact.as_ref());
+                    let verdict = decide(&probe, artefact.as_ref(), &relocation);
+                    if let Relocation::Moved { to } = &relocation {
+                        println!(
+                            "smoke: the fresh-install case was judged with the user's file held at {}",
+                            to.display()
+                        );
+                    }
                     for failure in match &verdict {
                         Verdict::Fail(list) => list.clone(),
-                        Verdict::Skip(why) => vec![format!("smoke: SKIPPED - {why}")],
+                        Verdict::Skip(why) => vec![format!("smoke: DECLINED - {why}")],
                         Verdict::Pass => Vec::new(),
                     } {
                         println!("{failure}");
                     }
-                    println!("{}", summary(&verdict, &probe, started.elapsed()));
+                    println!(
+                        "{}",
+                        summary(&verdict, &probe, started.elapsed(), &relocation)
+                    );
                     match verdict {
                         Verdict::Pass => 0,
                         Verdict::Skip(_) => 3,
@@ -591,13 +890,30 @@ pub fn run(args: &[String]) -> i32 {
         },
     };
 
-    if let Some((path, aside)) = &backup {
-        restore(path, aside);
+    if let Some(guard) = guard.as_mut() {
+        // Explicit here so the verdict can see a failed restore; Drop is the
+        // backstop for every path that does not reach this line.
+        guard.finish();
+        if guard.failed && code == 0 {
+            println!("smoke: DECLINED TO PASS - user state did not come back byte-identical");
+            return 1;
+        }
     }
     for junk in [&script, &out_file, &err_file] {
         let _ = fs::remove_file(junk);
     }
     code
+}
+
+/// One-line description of whatever already sits on the session path.
+fn describe_existing(exe: &Path) -> String {
+    for dir in candidate_state_dirs(exe) {
+        let path = dir.join(SESSION_FILE);
+        if path.exists() {
+            return format!("{} (which is {})", path.display(), describe_kind(&path));
+        }
+    }
+    "nothing (no session.json in any candidate state dir)".to_string()
 }
 
 #[cfg(test)]
@@ -619,6 +935,7 @@ mod tests {
             path: PathBuf::from("C:/Users/u/AppData/Roaming/notes-gpui/session.json"),
             fresh: true,
             rect: "x=120 y=90 w=800 h=600".to_string(),
+            read_error: None,
         }
     }
 
@@ -645,8 +962,12 @@ mod tests {
         p
     }
 
+    fn judge(p: &Probe, a: Option<&Artefact>, r: &Relocation) -> Verdict {
+        decide(p, a, r)
+    }
+
     fn failures_of(p: &Probe) -> Vec<String> {
-        match decide(p, Some(&artefact())) {
+        match judge(p, Some(&artefact()), &Relocation::CleanSlate) {
             Verdict::Fail(list) => list,
             other => panic!("expected a failure, got {other:?}"),
         }
@@ -654,9 +975,17 @@ mod tests {
 
     #[test]
     fn a_graceful_exit_with_a_fresh_artefact_passes() {
-        assert_eq!(decide(&clean_gui(), Some(&artefact())), Verdict::Pass);
         assert_eq!(
-            summary(&Verdict::Pass, &clean_gui(), Duration::from_millis(2100)),
+            judge(&clean_gui(), Some(&artefact()), &Relocation::CleanSlate),
+            Verdict::Pass
+        );
+        assert_eq!(
+            summary(
+                &Verdict::Pass,
+                &clean_gui(),
+                Duration::from_millis(2100),
+                &Relocation::CleanSlate
+            ),
             "smoke: window=OK close=0 session=OK 2.1s"
         );
     }
@@ -671,7 +1000,13 @@ mod tests {
             "a force-kill must FAIL: {list:?}"
         );
         assert!(
-            summary(&Verdict::Fail(list), &p, Duration::from_secs(11)).contains("close=FORCED")
+            summary(
+                &Verdict::Fail(list),
+                &p,
+                Duration::from_secs(11),
+                &Relocation::CleanSlate
+            )
+            .contains("close=FORCED")
         );
     }
 
@@ -681,21 +1016,33 @@ mod tests {
         let list = failures_of(&p);
         assert!(list.iter().any(|f| f.contains("code 3")), "{list:?}");
         assert_eq!(
-            summary(&Verdict::Fail(list), &p, Duration::from_millis(2100)),
+            summary(
+                &Verdict::Fail(list),
+                &p,
+                Duration::from_millis(2100),
+                &Relocation::CleanSlate
+            ),
             "smoke: window=OK close=3 session=FAILED 2.1s"
         );
     }
 
     #[test]
-    fn no_window_or_a_missing_key_fails_rather_than_skipping() {
+    fn no_window_or_a_missing_key_fails_rather_than_declining() {
         let p = with(clean_gui(), "HANDLE", "0");
         assert!(
             failures_of(&p)
                 .iter()
                 .any(|f| f.contains("no top-level window"))
         );
-        assert!(summary(&Verdict::Fail(vec![]), &p, Duration::ZERO).contains("window=MISSING"));
-        // A probe that died half-way is not a pass and not a decline either.
+        assert!(
+            summary(
+                &Verdict::Fail(vec![]),
+                &p,
+                Duration::ZERO,
+                &Relocation::CleanSlate
+            )
+            .contains("window=MISSING")
+        );
         let truncated = Probe {
             kv: clean_gui()
                 .kv
@@ -704,7 +1051,7 @@ mod tests {
                 .collect(),
         };
         assert!(matches!(
-            decide(&truncated, Some(&artefact())),
+            judge(&truncated, Some(&artefact()), &Relocation::CleanSlate),
             Verdict::Fail(_)
         ));
     }
@@ -716,20 +1063,97 @@ mod tests {
             ..artefact()
         };
         assert!(matches!(
-            decide(&clean_gui(), Some(&stale)),
+            judge(&clean_gui(), Some(&stale), &Relocation::CleanSlate),
             Verdict::Fail(_)
         ));
-        assert!(matches!(decide(&clean_gui(), None), Verdict::Fail(_)));
+        assert!(matches!(
+            judge(&clean_gui(), None, &Relocation::CleanSlate),
+            Verdict::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn a_run_that_moved_the_users_file_aside_still_fails_for_real() {
+        // The relocation must not become an excuse: with the path cleared and
+        // nothing written, this is exactly the D54 bug and it must be red.
+        let moved = Relocation::Moved {
+            to: PathBuf::from("C:/Temp/notes-gpui-smoke-session-backup.json"),
+        };
+        let Verdict::Fail(list) = judge(&clean_gui(), None, &moved) else {
+            panic!("a cleared path with no write must FAIL");
+        };
+        assert!(list.iter().any(|f| f.contains("moved aside")), "{list:?}");
+    }
+
+    #[test]
+    fn foreign_state_on_the_session_path_declines_and_says_why() {
+        // A directory planted on the path (or an unmovable file) is a fact about
+        // the tester's machine. Reporting that as an app bug is what this guards.
+        let blocked = Relocation::Blocked(
+            "C:/Users/u/AppData/Roaming/notes-gpui/session.json is a DIRECTORY sitting on the session file's path"
+                .to_string(),
+        );
+        let Verdict::Skip(why) = judge(&clean_gui(), None, &blocked) else {
+            panic!("a blocked path must DECLINE, not pass and not fail");
+        };
+        assert!(why.contains("could not be cleared"), "{why}");
+        assert!(why.contains("D54"), "{why}");
+        assert!(
+            summary(&Verdict::Skip(why), &clean_gui(), Duration::ZERO, &blocked)
+                .contains("path blocked by foreign state")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_artefact_is_its_own_verdict_not_a_silent_pass() {
+        let unreadable = Artefact {
+            read_error: Some("Access is denied (os error 5)".to_string()),
+            ..artefact()
+        };
+        let Verdict::Fail(list) = judge(&clean_gui(), Some(&unreadable), &Relocation::CleanSlate)
+        else {
+            panic!("an artefact that cannot be read back cannot PASS");
+        };
+        assert!(
+            list.iter()
+                .any(|f| f.contains("CANNOT BE READ BACK") && f.contains("os error 5")),
+            "{list:?}"
+        );
+    }
+
+    #[test]
+    fn kept_state_by_request_still_fails_when_nothing_fresh_was_written() {
+        let kept = Relocation::Kept("C:/x/session.json".to_string());
+        let stale = Artefact {
+            fresh: false,
+            ..artefact()
+        };
+        assert!(matches!(
+            judge(&clean_gui(), Some(&stale), &kept),
+            Verdict::Fail(_)
+        ));
+        let Verdict::Fail(list) = judge(&clean_gui(), None, &kept) else {
+            panic!("no write is a failure even with --reuse-state");
+        };
+        assert!(list.iter().any(|f| f.contains("--reuse-state")), "{list:?}");
     }
 
     #[test]
     fn an_absent_desktop_declines_instead_of_faking_either_verdict() {
         let headless = probe(&[("DESKTOP", "0"), ("PROBE_DONE", "1")]);
-        let Verdict::Skip(why) = decide(&headless, None) else {
-            panic!("no desktop must SKIP, not pass and not fail");
+        let Verdict::Skip(why) = judge(&headless, None, &Relocation::CleanSlate) else {
+            panic!("no desktop must DECLINE, not pass and not fail");
         };
         assert!(why.contains("desktop"), "{why}");
-        assert!(summary(&Verdict::Skip(why), &headless, Duration::ZERO).contains("SKIP"));
+        assert!(
+            summary(
+                &Verdict::Skip(why),
+                &headless,
+                Duration::ZERO,
+                &Relocation::CleanSlate
+            )
+            .contains("DECLINED")
+        );
     }
 
     #[test]
@@ -752,5 +1176,36 @@ mod tests {
             dirs.iter().any(|d| d.ends_with("notes-gpui")),
             "the installed candidate must be searched too: {dirs:?}"
         );
+    }
+
+    /// THE point of the guard: the user's bytes come back even when nobody
+    /// calls finish() - a panic, an early return, a killed probe.
+    #[test]
+    fn the_restore_guard_returns_the_users_file_without_being_asked() {
+        let tag = format!("xtask-smoke-guard-test-{}", std::process::id());
+        let live_dir = std::env::temp_dir().join(&tag);
+        let _ = fs::create_dir(&live_dir);
+        let live = live_dir.join(SESSION_FILE);
+        let aside = live_dir.join("aside.json");
+        let body = b"{\"rect\":{\"x\":7,\"y\":8,\"w\":9,\"h\":10}}";
+        fs::write(&live, body).expect("write the stand-in user state");
+        let before = sha_of(&live).expect("hashable");
+        fs::rename(&live, &aside).expect("relocate it");
+        assert!(!live.exists(), "the relocation really moved it");
+        {
+            let guard = Restore {
+                live: live.clone(),
+                aside: aside.clone(),
+                before: Some(before.clone()),
+                done: false,
+                failed: false,
+            };
+            drop(guard);
+        }
+        let restored = fs::read(&live).expect("Drop must have restored the user's file");
+        assert_eq!(restored, body, "byte-identical, or it says so");
+        assert_eq!(sha_of(&live).as_deref(), Some(before.as_str()));
+        assert!(!aside.exists(), "the temp copy is gone once it is back");
+        let _ = fs::remove_dir_all(&live_dir);
     }
 }
