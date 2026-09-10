@@ -17,9 +17,11 @@
 //!   port". Dropping a Gateway that was also told to Shutdown is harmless: the
 //!   join just waits for an exit that is already under way.
 //!
-//! No disk I/O happens on the engine thread in this slice. [`Gateway::start`]
-//! reads the two state files once, on the calling thread, and those reads are the
-//! whole synchronous surface (see [`Gateway::startup_state`] for why).
+//! Disk I/O is deliberately SPLIT: the pre-window reads of the two state files
+//! happen here, on the calling thread (see [`Gateway::startup_state`] for why
+//! that is the whole synchronous surface), while every write - session,
+//! settings, documents - happens on the engine thread, from which the bounded
+//! join protects shutdown.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -91,15 +93,18 @@ pub struct Gateway {
 }
 
 /// The state directory: created if absent (case a), accepted as-is if it is
-/// The bounded wait on the engine thread, and WHY 3 s: a healthy shutdown is
-/// the drain (bounded at MAX_DRAIN cheap commands) plus two small state-file
-/// writes - tens of milliseconds, measured. 3 s is four idle ticks and orders
-/// of magnitude above that, and it is under the 5 s the port's own suite
-/// allows any answer: if shutdown has not completed in 3 s, an engine is
-/// blocked in something that will outlive any reasonable wait - the measured
-/// case being a synchronous window op whose owner thread is parked and cannot
-/// pump (12 s timed, >15 s reproduced). The deadline turns that from a hang
-/// into an abandonment and a report.
+/// The bounded wait on the engine thread, and WHY 3 s - WITH THE HONEST WORST
+/// CASE: the drain executes Flush and SaveAs as FULL document saves on this
+/// thread, so a shutdown carrying a large SaveAs can legitimately take longer
+/// than 3 s and be ABANDONED here while perfectly healthy - the consequence is
+/// a spurious Err(Shutdown) from close() and an engine that finishes its own
+/// exit later (the bridge waits for it; that trade was accepted). A healthy
+/// IDLE shutdown is tens of milliseconds; 3 s is four idle ticks. The only
+/// thing observed to block indefinitely is the engine inside a synchronous
+/// window op whose owner is parked (12 s timed, >15 s reproduced), and the
+/// deadline turns that from a hang into an abandonment. It cannot be cheaply
+/// widened by queue inspection: mpsc cannot be peeked without consuming, so
+/// "the queue still holds a Flush/SaveAs" is unknowable without a redesign.
 const JOIN_DEADLINE: Duration = Duration::from_secs(3);
 
 /// The std shape for a bounded join: the actual join moves to a helper thread

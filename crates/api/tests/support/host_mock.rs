@@ -65,6 +65,11 @@ pub struct Answers {
     /// pump, so a blocked move is exactly what the real seam does to an engine
     /// whose owner is parked.
     pub block_move_ms: u64,
+    /// The DPI scale of the monitor owning the queried rect. The platform
+    /// seam landed (scale_for_rect); the port's scale_factor refresh is a
+    /// follow-up once the verbatim signature is handed over - the mock
+    /// carries the answer so that follow-up is testable when it lands.
+    pub scale: f32,
 }
 
 impl Default for Answers {
@@ -79,6 +84,7 @@ impl Default for Answers {
             fail_restore: None,
             fail_work_area: None,
             block_move_ms: 0,
+            scale: 1.0,
         }
     }
 }
@@ -226,6 +232,11 @@ impl HostFacts for Host {
     fn ansi_codepage(&self) -> u16 {
         self.record(Call::Codepage);
         self.answers().codepage
+    }
+
+    fn scale_for_rect(&self, _rect: FrameRect) -> PlatformResult<f32> {
+        let scale = self.answers().scale;
+        Ok(scale)
     }
 
     fn work_area_for_rect(&self, rect: FrameRect) -> PlatformResult<(FrameRect, u32)> {

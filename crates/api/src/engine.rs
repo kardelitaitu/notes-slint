@@ -251,8 +251,16 @@ pub(crate) struct Engine {
     /// MAJOR 6: the flush-tick re-measure can fail forever (an IsWindow
     /// refusal does not heal), and an unlatched report is one event per tick.
     /// Same discipline as the state-file latches: one report per failure
-    /// episode, cleared by the next successful measurement.
+    /// failure, cleared by the NEXT SUCCESS - "episode" means exactly that,
+    /// nothing more: one failure, silence until a write succeeds, then a new
+    /// failure is news again.
     measure_failure_latched: bool,
+    /// MAJOR 5: the instant the most recent async move was ISSUED. The move
+    /// has not necessarily landed when the call returns, so for two idle
+    /// periods afterwards a measured rect may be the PRE-MOVE or MID-DRAG
+    /// position - true of the screen for a moment, poison for the file. The
+    /// flush refuses to store a rect measured inside that window.
+    last_move_issued: Option<Instant>,
 }
 
 impl Engine {
@@ -323,6 +331,7 @@ impl Engine {
             settings_failure_latched: false,
             draining: false,
             measure_failure_latched: false,
+            last_move_issued: None,
             backend,
             facts,
             deadline: Instant::now() + AUTOSAVE_IDLE,
@@ -339,6 +348,19 @@ impl Engine {
         // the_real_engine_thread_arms_the_latch fails - which is the point of it.
         #[cfg(test)]
         latch_probe::record(on_engine_thread());
+        // THE STARTUP ANNOUNCE: the recents list is the menu's opening state,
+        // and "no change has happened yet" must never read as "no recents" -
+        // core may hold ten entries from last launch while the bridge renders
+        // an empty menu on every launch until something changes. Announced
+        // ONCE, before any command is handled, and only when there is
+        // something to announce: a fresh install's empty list IS the bridge's
+        // default, so the no-event-before-any-command contract that
+        // tests/reentrancy.rs pins on an empty state dir still holds. The
+        // rendering goes through [`Self::emit_recent`], so the label rule is
+        // applied in exactly one place.
+        if !self.settings.recents.is_empty() {
+            self.emit_recent();
+        }
         loop {
             match self.receive() {
                 Ok(command) => {
@@ -759,8 +781,9 @@ impl Engine {
     ///   drain_never_recurses_on_a_queued_shutdown.
     /// * **A bound.** try_recv succeeds for as long as anyone keeps sending, so the
     ///   drain stops at [`MAX_DRAIN`] and the excess dies with the thread. A
-    ///   truncated exit loses events; a hung one loses the process, because
-    ///   Gateway::drop waits in join() with no timeout anywhere on that path.
+    ///   truncated exit loses events; a hung one USED to lose the process, when
+    ///   Gateway::drop joined without a timeout - the bounded join in
+    ///   gateway.rs now abandons the engine after JOIN_DEADLINE instead.
     ///   Pinned by drain_stops_at_its_budget_instead_of_hanging_shutdown.
     fn drain(&mut self) {
         self.draining = true;
@@ -852,6 +875,10 @@ impl Engine {
                     // window's space; anything else is the double conversion the seam
                     // documents against.
                     Ok(()) => {
+                        // MAJOR 5: an async move has NOT landed when this
+                        // returns; stamping when it was issued is what lets the
+                        // flush tick refuse to persist a pre-move read-back.
+                        self.last_move_issued = Some(Instant::now());
                         self.session.monitor_id = monitor_id;
                         if clamped != rect {
                             // The clamp moved it: store where it actually is, so the
@@ -922,7 +949,16 @@ impl Engine {
                 // failure is news again.
                 self.measure_failure_latched = false;
                 let rect = to_rect(frame);
-                if rect != self.session.rect {
+                // MAJOR 5: within two idle periods of issuing an async move,
+                // this read-back may be the PRE-MOVE or MID-DRAG position - the
+                // call returns before the move lands. Trust it for the latch
+                // bookkeeping, never for storage: the stored rect is protected
+                // from the stale read, and the next GeometryChanged persists
+                // the landed position.
+                let move_in_flight = self
+                    .last_move_issued
+                    .is_some_and(|at| at.elapsed() < 2 * AUTOSAVE_IDLE);
+                if !move_in_flight && rect != self.session.rect {
                     self.session.rect = rect;
                 }
                 true
@@ -930,7 +966,11 @@ impl Engine {
             Err(err) => {
                 // MAJOR 6: this runs every flush tick while the bit stays set,
                 // and an IsWindow refusal does not heal - one report per
-                // failure episode, not one per 750 ms.
+                // failure, cleared by the next success, not one per 750 ms.
+                // (Known oscillation, accepted: with a session write pending
+                // every tick - a continuous drag - an intermittently failing
+                // measure reports every OTHER tick, because each success re-arms
+                // the report.)
                 if !self.measure_failure_latched {
                     self.measure_failure_latched = true;
                     self.emit(Event::GeometryNotRestored {
@@ -956,9 +996,9 @@ impl Engine {
     /// Writes whichever state files are dirty. Atomicity, the temp sweep and the
     /// TOML rendering are core's ([`write_session`] and [`write_settings`]);
     /// this decides WHEN, keeps the failed bit set so the next tick retries, and
-    /// reports a failure rather than hiding it - ONCE per failure episode for
-    /// the session (M5: the tick would otherwise report forever), per attempt
-    /// for settings and documents.
+    /// reports a failure rather than hiding it - ONCE per failure, until the
+    /// next success, for the session (M5: the tick would otherwise report
+    /// forever), per attempt for settings and documents.
     fn flush_state(&mut self) {
         let pending = self.pending;
         if !pending.session && !pending.settings {
@@ -982,19 +1022,44 @@ impl Engine {
                 // with the rect, so it cannot half-refresh. A launch-time
                 // monitor_id frozen forever is a lie the moment the window is
                 // dragged to another monitor (README: 'including when a
-                // monitor has been unplugged [or] scaling has changed'). The
-                // refresh is CHANGE-GATED on the monitor field itself, and it
-                // only runs inside an already-pending write, so an idle world
-                // never turns a tick into a disk write.
-                if let Some(facts) = self.facts.as_ref() {
-                    if let Ok((_, monitor)) = facts.work_area_for_rect(to_frame(self.session.rect))
-                    {
-                        if self.session.monitor_id != monitor {
-                            self.session.monitor_id = monitor;
+                // monitor has been unplugged [or] scaling has changed').
+                // Skipped while a move is in flight, for the same reason the
+                // rect overwrite is: the read-back names the OLD monitor. No
+                // queue call here: flush_state only runs with the session bit
+                // already pending, and the write below clears it - a queue at
+                // this spot cannot change anything.
+                let move_in_flight = self
+                    .last_move_issued
+                    .is_some_and(|at| at.elapsed() < 2 * AUTOSAVE_IDLE);
+                if !move_in_flight {
+                    if let Some(facts) = self.facts.as_ref() {
+                        if let Ok((_, monitor)) =
+                            facts.work_area_for_rect(to_frame(self.session.rect))
+                        {
+                            if self.session.monitor_id != monitor {
+                                self.session.monitor_id = monitor;
+                            }
+                        }
+                        // SCALE: the same rect, resolved with the same
+                        // MONITOR_DEFAULTTONEAREST rule as work_area_for_rect,
+                        // so the scale and the work area name the SAME monitor
+                        // even when ids renumber. Why this number can be
+                        // trusted at all: gpui 0.2.2 computes its own
+                        // scale_factor with the identical call and divisor
+                        // (GetDpiForMonitor, MDT_EFFECTIVE_DPI / 96.0), and
+                        // app.manifest declares PerMonitorV2 - so what we
+                        // persist can never disagree with what the toolkit
+                        // converts physical to logical with. Err means "do not
+                        // refresh this field": a dead or garbage monitor must
+                        // not silently become a 1.0 default - a default scale
+                        // is the lie a derivation would have been.
+                        if let Ok(scale) = facts.scale_for_rect(to_frame(self.session.rect)) {
+                            if (self.session.scale_factor - scale).abs() > f32::EPSILON {
+                                self.session.scale_factor = scale;
+                            }
                         }
                     }
                 }
-                self.queue(Target::Session);
             }
             match write_session(&self.state_dir.0, &self.session) {
                 Ok(()) => {
@@ -1032,7 +1097,7 @@ impl Engine {
                     // The last `revision: 0` lie (engine.rs:933, the site core
                     // named): a settings file HAS no revision, and SaveFailed
                     // is a DOCUMENT event. Same latch discipline as the session
-                    // arm above - one report per failure episode, retried every
+                    // arm above - one report per failure, retried every
                     // tick, cleared on success - and core's own sentence
                     // (SettingsError's Display) as the reason.
                     if !self.settings_failure_latched {

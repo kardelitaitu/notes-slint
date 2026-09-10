@@ -247,8 +247,22 @@ fn a_fresh_install_writes_the_session_with_the_rect_the_host_reports() {
         })
         .expect("queued");
     wait_for_calls(&host, 1, "the registration's first platform call");
-    // The session write rides the existing single tick, and the shutdown drain
-    // flushes it: no new timer, no second thread, and no sleeping in the test.
+    // The move is ASYNC: the measured rect only becomes trustworthy after the
+    // move-in-flight guard expires (MAJOR 5), so the write that carries the
+    // measured rect is the one queued after that window - still the existing
+    // single tick, no second timer.
+    std::thread::sleep(Duration::from_millis(750 * 2 + 100));
+    gateway.send(Command::SetPinned(true)).expect("queued");
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        if let Ok(session) = read_session(dir.path()) {
+            if session.rect == Rect::new(11, 22, 333, 222) {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "the measured rect never landed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     gateway
         .close()
         .expect("shutdown flushes the queued session write");
@@ -294,7 +308,7 @@ fn the_flush_refreshes_monitor_facts_when_the_world_changes() {
         },
     );
 
-    // (i) register on monitor 1, (ii) queue a change so the tick flushes.
+    // First: register on monitor 1 and queue a change so the tick flushes.
     gateway
         .send(Command::RegisterWindow {
             handle: WindowHandle(0x100),
@@ -327,15 +341,16 @@ fn the_flush_refreshes_monitor_facts_when_the_world_changes() {
         "an unchanged world must not rewrite the session"
     );
 
-    // (iii) THE WORLD CHANGES: the window now lives on monitor 2, a different
-    // work area, and the host reports a different restore rect.
+    // Next, THE WORLD CHANGES: the window now lives on monitor 2 at 175%, a
+    // different work area, and the host reports a different restore rect.
     host.set_answers(Answers {
         monitor_id: 2,
         work_area: FrameRect::new(1920, 0, 1920, 1040),
         restore: Some(FrameRect::new(2000, 100, 800, 600)),
+        scale: 1.75,
         ..Answers::default()
     });
-    // (iv) flush again - close() makes the final drain deterministic.
+    // Finally: flush again - close() makes the final drain deterministic.
     gateway.send(Command::SetPinned(false)).expect("queued");
     gateway.close().expect("shutdown joins the engine");
 
@@ -343,6 +358,10 @@ fn the_flush_refreshes_monitor_facts_when_the_world_changes() {
     assert_eq!(
         second.monitor_id, 2,
         "the file must name the NEW monitor, not the launch-time one"
+    );
+    assert_eq!(
+        second.scale_factor, 1.75,
+        "the file must name the NEW scale, not the launch-time one"
     );
     assert!(
         !second.pinned,
@@ -445,6 +464,144 @@ fn the_shutdown_drain_does_not_replay_the_restore() {
         1,
         "the drain replayed the restore: a second move happened at exit"
     );
+}
+
+/// MAJOR 5: an async move returns BEFORE it lands, so the flush that runs
+/// inside two idle periods of issuing one measures the PRE-MOVE position - and
+/// persisting that wrote a rect the window was only PASSING through. The guard
+/// refuses to store a rect measured inside that window: the file keeps the
+/// last good rect, and the landed rect persists on the next GeometryChanged
+/// once the guard expires.
+#[test]
+fn a_measure_taken_before_a_move_lands_is_never_persisted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pre_move = Rect::new(120, 90, 800, 600);
+    write_session(
+        dir.path(),
+        &Session {
+            rect: pre_move,
+            ..Session::default()
+        },
+    )
+    .expect("write the session fixture");
+    // The host answers the PRE-MOVE normal position first: until the move
+    // lands, that is what GetWindowPlacement reports.
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(FrameRect::new(120, 90, 800, 600)),
+            ..Answers::default()
+        },
+    );
+
+    // Register: the move is issued and stamped. The queued session write
+    // flushes inside the guard window - with the pre-move rect in the air.
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    wait_for_calls(&host, 1, "the registration's move");
+
+    // The tick (or close) flushes while the move is still in flight.
+    gateway.send(Command::SetPinned(true)).expect("queued");
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        if let Ok(session) = read_session(dir.path()) {
+            if session.pinned {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "the guarded flush never landed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        read_session(dir.path()).expect("read").rect,
+        pre_move,
+        "the pre-move measure must NOT be persisted over the stored rect"
+    );
+
+    // The move lands, the guard expires, and the host now reports the landed
+    // position: the next flush persists THAT (a pin toggle queues the write).
+    host.set_answers(Answers {
+        restore: Some(FrameRect::new(200, 150, 800, 600)),
+        ..Answers::default()
+    });
+    std::thread::sleep(Duration::from_millis(750 * 2 + 100));
+    gateway.send(Command::SetPinned(false)).expect("queued");
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        if let Ok(session) = read_session(dir.path()) {
+            if session.rect == (Rect::new(200, 150, 800, 600)) {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "the landed rect never persisted");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    gateway.close().expect("shutdown joins the engine");
+}
+
+/// THE STARTUP ANNOUNCE: a launch whose state holds recents must announce the
+/// list BEFORE any command, or the menu renders empty until something changes
+/// (silently wrong on every launch, and invisible to any test that triggers a
+/// change first). The entries are core's stored facts with core's rendered
+/// labels; the empty case stays silent because the bridge's default IS empty,
+/// which is why the reentrancy no-event contract survives.
+#[test]
+fn the_first_event_names_the_persisted_recents_before_any_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Two persisted recents, written by core's own writer - exactly what a
+    // second launch finds on disk.
+    let settings = Settings {
+        recents: vec![
+            notes_core::recent::RecentEntry {
+                path: Path::new("C:/notes/one.notes").to_path_buf(),
+                display: "one.notes".to_string(),
+                exists: false,
+            },
+            notes_core::recent::RecentEntry {
+                path: Path::new("C:/notes/two.notes").to_path_buf(),
+                display: "two.notes".to_string(),
+                exists: false,
+            },
+        ],
+        ..Settings::default()
+    };
+    notes_core::settings::write_settings(&StateDir(dir.path().to_path_buf()), &settings)
+        .expect("seed settings.toml");
+
+    let (gateway, rx) = Gateway::start_with_host(
+        StateDir(dir.path().to_path_buf()),
+        Settings::default(),
+        None,
+        None,
+    );
+    // NO COMMAND HAS BEEN SENT. The first thing the port says must be the
+    // list, with the stored paths in order and labels rendered.
+    let first = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the recents announce must precede every command");
+    match first {
+        Event::RecentsUpdated(entries) => {
+            assert_eq!(entries.len(), 2, "the stored list, verbatim in count");
+            assert_eq!(
+                entries[0].path,
+                Path::new("C:/notes/one.notes"),
+                "most-recent-first order as persisted"
+            );
+            assert!(
+                entries.iter().all(|e| !e.display.is_empty()),
+                "labels are rendered, not blank"
+            );
+            assert!(
+                entries.iter().all(|e| !e.exists),
+                "exists is the stored fact - the files were never created"
+            );
+        }
+        other => panic!("expected RecentsUpdated as the FIRST event, got {other:?}"),
+    }
+    gateway.close().expect("shutdown joins the engine");
 }
 
 /// The settings contract's middle case, through the port's OWN seam: the
