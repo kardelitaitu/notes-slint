@@ -6,6 +6,7 @@ mod check_ci;
 mod check_unsafe;
 mod deps;
 mod fixtures;
+mod identity;
 mod metadata;
 mod smoke;
 
@@ -57,6 +58,13 @@ fn usage() {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // One line about who is running, printed before anything else can be
+    // believed. Stale is a warning, never a refusal: a checker that will not
+    // start over a timestamp quirk takes the whole gate down with it.
+    if let Ok(cwd) = std::env::current_dir() {
+        let root = crate::metadata::find_workspace_root(&cwd).unwrap_or(cwd);
+        identity::print_startup_stamp(&root);
+    }
     match args.first().map(String::as_str) {
         Some("check") => {
             let rest = &args[1..];

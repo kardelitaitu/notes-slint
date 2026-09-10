@@ -877,50 +877,20 @@ pub const BUILD_FAILED_EXIT: i32 = 4;
 pub const STALE_BINARY_EXIT: i32 = 5;
 
 fn mtime_of(path: &Path) -> Option<std::time::SystemTime> {
-    fs::metadata(path).ok().and_then(|m| m.modified().ok())
+    crate::identity::mtime_of(path)
 }
 
-/// Newest mtime among the sources that build the binary, and the file carrying
-/// it. Unreadable directories are skipped rather than fatal: an odd scratch dir
-/// must not be reported as a stale binary.
+/// The sources that produce notes-gpui.exe: the shared walk from
+/// [crate::identity], with this crate's scope. Deliberately not a second
+/// implementation - "is this artefact older than its sources" is one rule that
+/// smoke and the tool's own self-check both apply, and two copies of it is how
+/// one of them drifts.
 pub fn newest_source(root: &Path) -> Option<(std::time::SystemTime, PathBuf)> {
-    fn consider(path: &Path, best: &mut Option<(std::time::SystemTime, PathBuf)>) {
-        if let Some(m) = mtime_of(path) {
-            if best.as_ref().is_none_or(|(bm, _)| m > *bm) {
-                *best = Some((m, path.to_path_buf()));
-            }
-        }
-    }
-    fn walk(dir: &Path, best: &mut Option<(std::time::SystemTime, PathBuf)>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_dir() {
-                let name = path.file_name().map(|s| s.to_string_lossy().to_string());
-                if name.as_deref() != Some("target") && name.as_deref() != Some(".git") {
-                    walk(&path, best);
-                }
-                continue;
-            }
-            let ext = path.extension().map(|s| s.to_string_lossy().to_string());
-            if matches!(ext.as_deref(), Some("rs") | Some("toml")) {
-                consider(&path, best);
-            }
-        }
-    }
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for dir in SOURCE_ROOTS {
-        walk(&root.join(dir), &mut best);
-    }
-    for file in SOURCE_FILES {
-        consider(&root.join(file), &mut best);
-    }
-    best
+    crate::identity::newest_mtime(root, SOURCE_ROOTS, SOURCE_FILES)
 }
 
+/// smoke's own verdict type: a stale GUI binary is a HARD failure (exit 5),
+/// unlike the tool's self-check, which can only warn.
 /// The first thing a reader of a red build wants: the error, not the spinner.
 fn first_error(text: &str) -> Option<String> {
     text.lines()
