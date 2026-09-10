@@ -839,6 +839,43 @@ mod tests {
         Ok(())
     }
 
+    /// THE CLASS ANSWER (MAJOR-2), as a table: what the predicate now does
+    /// to every human-typeable shape the auditor class asked about. The
+    /// nanos range is the load-bearing bound; the pid cannot be bounded (a
+    /// real pid is any u32) and the attempt is already bounded by the retry
+    /// loop. A forged-but-plausible name IS reclaimed if old — accepted: the
+    /// name is ours by shape, and shape-matching has always been the
+    /// capability.
+    #[test]
+    fn the_temp_shape_class_answer() {
+        const P: &str = "sw.notes.tmp-";
+        let cases: &[(&str, bool)] = &[
+            // A real temp: accepted, swept when old.
+            ("4242-1770000000000000000-0", true),
+            // A plausible-today nanos with a bogus pid: accepted (see above).
+            ("999999-1770000000000000000-0", true),
+            // Plausible nanos, attempt 0: accepted — attempt 0 is real.
+            ("4242-1770000000000000000-0", true),
+            // An extra separator: four fields, not ours.
+            ("4242-1770000000000000000-0-0", false),
+            // A 2099 timestamp: plausible digits, accepted as a shape — the
+            // digits are decoration; aging is decided by the file's mtime,
+            // so a stale file by this name is still reclaimed.
+            ("4242-4070908800000000000-0", true),
+            // The human dates that started this: all dead at the gate.
+            ("2026-1-1", false),
+            ("4242-20260101-0", false),
+            ("4242-123456-0", false),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(
+                is_our_temp(&format!("{P}{body}.part"), P),
+                *expected,
+                "shape {body:?}"
+            );
+        }
+    }
+
     /// M4: the age gate. A temp of OUR shape but written seconds ago (a live
     /// temp of another instance) is never swept; the same shape, old enough,
     /// is.

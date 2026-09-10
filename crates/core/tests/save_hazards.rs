@@ -233,7 +233,11 @@ fn sweep_spares_a_dated_backup_of_the_target() -> Result<(), Box<dyn Error>> {
 fn sweep_spares_a_live_temp_of_another_instance() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     let target = dir.path().join("x.notes");
-    let live = dir.path().join("x.notes.tmp-999999-123456-0.part");
+    // Plausible unix nanos: a real temp cannot carry anything smaller, so
+    // this test exercises the AGE gate (not the plausibility gate).
+    let live = dir
+        .path()
+        .join("x.notes.tmp-999999-1770000000000000000-0.part");
     fs::write(&live, b"another instance is writing this")?;
     save_document(&target, "new", utf8_det())?;
     assert!(
@@ -249,9 +253,13 @@ fn sweep_spares_a_live_temp_of_another_instance() -> Result<(), Box<dyn Error>> 
 fn sweep_reclaims_old_crash_litter() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     let target = dir.path().join("x.notes");
+    // Plausible unix nanos (MAJOR-2): 123456 was a 1970 timestamp no real
+    // temp can carry, and the plausibility gate rightly called the old
+    // fixture "not our temp". The claim under test is unchanged: genuine
+    // litter of our shape, old enough, is reclaimed.
     let litter = put(
         dir.path(),
-        "x.notes.tmp-999999-123456-0.part",
+        "x.notes.tmp-999999-1770000000000000000-0.part",
         b"crashed mid-write",
     )?;
     age_file(&litter, Duration::from_secs(3600))?;
