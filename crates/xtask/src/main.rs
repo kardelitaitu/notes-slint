@@ -19,7 +19,14 @@ fn usage() {
     eprintln!(
         "       prove the CI workflow runs exactly this gate's step roster (exit 1 on drift)"
     );
-    eprintln!("usage: cargo xtask smoke [--reuse-state]");
+    eprintln!("usage: cargo xtask smoke [--reuse-state] [--no-build]");
+    eprintln!(
+        "       builds notes-gpui first (exit 4 if it does not compile) and proves the exe is"
+    );
+    eprintln!(
+        "       newer than its sources (exit 5 if it is not); --no-build skips the build but"
+    );
+    eprintln!("       never the freshness check");
     eprintln!(
         "       launch the built binary, close its window with WM_CLOSE, prove it exits by itself"
     );

@@ -23,6 +23,13 @@
 //! script prints KEY=VALUE lines and decides NOTHING: every verdict comes from
 //! `decide()`, a pure function under test.
 //!
+//! Scope of that rule, stated because it generalises: notes-gpui.exe is the
+//! ONLY long-lived artefact this crate launches, so it is the only one that can
+//! be stale. fixtures verify reads fixture files and compares bytes - no binary,
+//! no staleness exposure - and every other gate row is a cargo invocation, which
+//! rebuilds from the current source by definition. If a second launched artefact
+//! ever appears, it gets the same build-then-prove-freshness treatment.
+//!
 //! # What makes this honest rather than decorative
 //!
 //! * an exit counts only if the process ended WITHOUT being killed: a forced
@@ -46,7 +53,13 @@
 //!   came back different, or the restore could not run at all - the message
 //!   names the temp path holding the user's file either way;
 //! * 2 - the harness itself could not run: no PowerShell, no binary, the probe
-//!   script could not be written, or the outer deadline fired;
+//!   script could not be written, freshness could not be read at all, or the
+//!   outer deadline fired;
+//! * 4 - the TARGET DID NOT COMPILE. Nothing was launched and no verdict about
+//!   the app exists; this is never a decline (3) and never a silent fallback to
+//!   the stale exe sitting in target/debug;
+//! * 5 - the binary is OLDER THAN ITS SOURCES: the build no-oped or --no-build
+//!   was used, so whatever would be tested is not this tree.
 //! * 3 - DECLINED for a reason that is not the app's fault: no interactive
 //!   desktop (no sessions win32k user32.dll), no window handle even though the
 //!   app kept running, or the session path holding foreign state this harness
@@ -841,16 +854,190 @@ fn summary(verdict: &Verdict, p: &Probe, elapsed: Duration, relocation: &Relocat
     }
 }
 
-/// Entry point for "cargo xtask smoke [--reuse-state]".
+/// The build smoke depends on. Launching whatever exe happens to be lying
+/// around proves a cached binary, not the tree it was run from, so the target
+/// is built first, a compile failure is a hard verdict with its own exit code,
+/// and the exe's mtime is then compared against the newest source that
+/// produces it. Freshness is proven, never trusted.
+const BUILD_ARGS: &[&str] = &["build", "-p", "notes-bridge-gpui", "--bin", "notes-gpui"];
+/// The crates whose sources end up inside that binary, plus the two manifests
+/// that decide the graph. Anything newer than the exe means the exe is not this
+/// tree.
+const SOURCE_ROOTS: &[&str] = &[
+    "crates/bridge-gpui",
+    "crates/api",
+    "crates/core",
+    "crates/platform",
+];
+const SOURCE_FILES: &[&str] = &["Cargo.toml", "Cargo.lock"];
+/// The target did not compile: its own verdict, not a decline (the desktop is
+/// fine) and not a step failure (nothing was launched).
+pub const BUILD_FAILED_EXIT: i32 = 4;
+/// The exe is older than the sources that produce it.
+pub const STALE_BINARY_EXIT: i32 = 5;
+
+fn mtime_of(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// Newest mtime among the sources that build the binary, and the file carrying
+/// it. Unreadable directories are skipped rather than fatal: an odd scratch dir
+/// must not be reported as a stale binary.
+pub fn newest_source(root: &Path) -> Option<(std::time::SystemTime, PathBuf)> {
+    fn consider(path: &Path, best: &mut Option<(std::time::SystemTime, PathBuf)>) {
+        if let Some(m) = mtime_of(path) {
+            if best.as_ref().is_none_or(|(bm, _)| m > *bm) {
+                *best = Some((m, path.to_path_buf()));
+            }
+        }
+    }
+    fn walk(dir: &Path, best: &mut Option<(std::time::SystemTime, PathBuf)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                let name = path.file_name().map(|s| s.to_string_lossy().to_string());
+                if name.as_deref() != Some("target") && name.as_deref() != Some(".git") {
+                    walk(&path, best);
+                }
+                continue;
+            }
+            let ext = path.extension().map(|s| s.to_string_lossy().to_string());
+            if matches!(ext.as_deref(), Some("rs") | Some("toml")) {
+                consider(&path, best);
+            }
+        }
+    }
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for dir in SOURCE_ROOTS {
+        walk(&root.join(dir), &mut best);
+    }
+    for file in SOURCE_FILES {
+        consider(&root.join(file), &mut best);
+    }
+    best
+}
+
+/// The first thing a reader of a red build wants: the error, not the spinner.
+fn first_error(text: &str) -> Option<String> {
+    text.lines()
+        .find(|l| l.starts_with("error[") || l.starts_with("error:"))
+        .map(|l| {
+            let l = l.trim();
+            if l.chars().count() > 180 {
+                l.chars().take(180).collect()
+            } else {
+                l.to_string()
+            }
+        })
+}
+
+/// Build the target. Err carries the first real error line and how many there
+/// were; cargo's own output is echoed (bounded) so nobody has to re-run it.
+pub fn build_target(root: &Path) -> Result<(), (String, usize)> {
+    let out = std::process::Command::new("cargo")
+        .args(BUILD_ARGS)
+        .current_dir(root)
+        .output()
+        .map_err(|e| (format!("could not run cargo build: {e}"), 1))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let count = text
+        .lines()
+        .filter(|l| l.starts_with("error[") || l.starts_with("error:"))
+        .count()
+        .max(1);
+    for line in text.lines().filter(|l| !l.trim().is_empty()).take(12) {
+        eprintln!("smoke: build | {line}");
+    }
+    Err((
+        first_error(&text).unwrap_or_else(|| "cargo printed no error line".to_string()),
+        count,
+    ))
+}
+
+/// Is the exe actually the product of the current sources? A pure decision so
+/// the stale case is testable without launching anything - the review finding
+/// was precisely that a green run said nothing about which tree it certified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stale {
+    Fresh,
+    /// One of the two mtimes could not be read. That is not "fresh", it is
+    /// unverifiable, and an instrument that cannot check itself says so.
+    Unknown(&'static str),
+    OlderThan {
+        source: PathBuf,
+        delta_secs: u64,
+        age_secs: u64,
+    },
+}
+
+pub fn staleness(
+    exe: Option<std::time::SystemTime>,
+    newest: Option<(std::time::SystemTime, PathBuf)>,
+) -> Stale {
+    let (Some(built_at), Some((source_at, source))) = (exe, newest) else {
+        return Stale::Unknown(if exe.is_none() {
+            "the exe mtime could not be read"
+        } else {
+            "no readable source files were found"
+        });
+    };
+    if source_at <= built_at {
+        return Stale::Fresh;
+    }
+    Stale::OlderThan {
+        delta_secs: source_at
+            .duration_since(built_at)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        age_secs: built_at.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+        source,
+    }
+}
+
+/// Say which binary was tested: path, age, and the HEAD it was built against.
+/// Without this line a green run cannot be attributed to a tree at all.
+fn report_binary(exe: &Path, root: &Path, built: bool) {
+    let age = mtime_of(exe)
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| format!("{}s old", d.as_secs()))
+        .unwrap_or_else(|| "mtime unknown".to_string());
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!(
+        "smoke: tested binary {} | {age} | built_by_this_run={} | git HEAD at that moment {}",
+        exe.display(),
+        if built { "yes" } else { "NO (--no-build)" },
+        head
+    );
+}
+
+/// Entry point for "cargo xtask smoke [--reuse-state] [--no-build]".
 pub fn run(args: &[String]) -> i32 {
     let unknown: Vec<&str> = args
         .iter()
         .map(String::as_str)
-        .filter(|a| *a != "--reuse-state")
+        .filter(|a| *a != "--reuse-state" && *a != "--no-build")
         .collect();
     if !unknown.is_empty() {
         eprintln!("smoke: unknown argument(s): {}", unknown.join(" "));
-        eprintln!("smoke: usage: cargo xtask smoke [--reuse-state]");
+        eprintln!("smoke: usage: cargo xtask smoke [--reuse-state] [--no-build]");
         return 2;
     }
     let reuse = args.iter().any(|a| a == "--reuse-state");
@@ -870,13 +1057,59 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     let exe = root.join(BIN_REL);
-    println!("smoke: binary {}", exe.display());
+    // BUILD FIRST. A harness that launches whatever exe happens to be lying
+    // around proves a cached binary, and a green line on a stale exe is the
+    // most dangerous output this repo can produce: it says the app works when
+    // what worked was three commits old. A compile failure is therefore its own
+    // hard verdict (4), never a decline and never a silent fallback to the old
+    // exe on disk.
+    let built = if args.iter().any(|a| a == "--no-build") {
+        println!(
+            "smoke: NOT building (--no-build): this run can only prove the exe already on disk"
+        );
+        false
+    } else {
+        match build_target(&root) {
+            Ok(()) => true,
+            Err((first, count)) => {
+                println!(
+                    "SMOKE FAIL: the target did not compile, so there is nothing honest to launch"
+                );
+                println!("SMOKE FAIL: {count} error line(s); first: {first}");
+                println!("smoke: window=NOBUILD close=NOBUILD session=NOBUILD 0.0s");
+                return BUILD_FAILED_EXIT;
+            }
+        }
+    };
+    report_binary(&exe, &root, built);
     if !exe.is_file() {
-        // Deliberately not built here: a harness that rebuilds what it tests
-        // hides a build break inside a smoke verdict.
-        println!("SMOKE FAIL: {BIN_REL} is missing - build it first with: {BUILD_HINT}");
+        println!(
+            "SMOKE FAIL: cargo succeeded but {} is still not there",
+            exe.display()
+        );
         println!("smoke: window=MISSING close=NOBIN session=NOBIN 0.0s");
         return 1;
+    }
+    match staleness(mtime_of(&exe), newest_source(&root)) {
+        Stale::OlderThan {
+            source,
+            delta_secs,
+            age_secs,
+        } => {
+            println!("SMOKE FAIL: the binary is older than its sources");
+            println!("SMOKE FAIL:   exe    {} is {age_secs}s old", exe.display());
+            println!(
+                "SMOKE FAIL:   source {} is {delta_secs}s newer than it",
+                source.display()
+            );
+            println!("smoke: window=STALE close=STALE session=STALE 0.0s");
+            return STALE_BINARY_EXIT;
+        }
+        Stale::Unknown(why) => {
+            println!("SMOKE FAIL: freshness cannot be proven - {why}");
+            return 2;
+        }
+        Stale::Fresh => {}
     }
 
     let started = Instant::now();
@@ -1414,5 +1647,103 @@ mod tests {
         assert!(!aside.exists(), "the temp copy is gone once it is back");
         assert_eq!(sha_of(&live).as_deref(), Some(before.as_str()));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// THE test that would have caught the review finding: a source newer than
+    /// the exe means smoke has nothing to certify, and the decision says so with
+    /// both names in it. Unreadable inputs are unverifiable, never silently fresh.
+    #[test]
+    fn an_exe_older_than_its_sources_is_never_fresh() {
+        let dir = std::env::temp_dir().join(format!("xtask-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for root in SOURCE_ROOTS {
+            fs::create_dir_all(dir.join(root).join("src")).expect("source tree");
+        }
+        let exe = dir.join("notes-gpui.exe");
+        fs::write(&exe, b"MZ").expect("write the exe");
+        let source = dir.join("crates/core/src/lib.rs");
+        fs::write(&source, "pub fn touched_without_a_rebuild() {}\n").expect("write source");
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        set_mtime(&exe, past);
+
+        let newest = newest_source(&dir).expect("a readable source mtime");
+        assert_eq!(
+            newest.1, source,
+            "the newest source must be the one just written"
+        );
+        match staleness(mtime_of(&exe), Some(newest.clone())) {
+            Stale::OlderThan {
+                source: s,
+                delta_secs,
+                age_secs,
+            } => {
+                assert_eq!(s, source);
+                assert!(
+                    delta_secs >= 3590,
+                    "delta {delta_secs} should be about an hour"
+                );
+                assert!(age_secs >= 3590, "the exe should read as about an hour old");
+            }
+            other => panic!("a one-hour-old exe against a new source must be stale: {other:?}"),
+        }
+        // The other direction: a build that really ran leaves a fresh exe.
+        let now = std::time::SystemTime::now();
+        set_mtime(&exe, now);
+        assert_eq!(
+            staleness(mtime_of(&exe), Some(newest.clone())),
+            Stale::Fresh
+        );
+        // Unverifiable is reported as unverifiable.
+        assert!(matches!(
+            staleness(None, Some(newest.clone())),
+            Stale::Unknown(_)
+        ));
+        assert!(matches!(staleness(Some(now), None), Stale::Unknown(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// newest_source must look at every crate that feeds the binary, not just
+    /// the bridge - an api edit is what made a cached exe lie here.
+    #[test]
+    fn the_freshness_scan_covers_every_crate_that_builds_the_binary() {
+        let dir = std::env::temp_dir().join(format!("xtask-scan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        for (i, root) in SOURCE_ROOTS.iter().enumerate() {
+            let file = dir.join(root).join("src").join("lib.rs");
+            fs::create_dir_all(file.parent().unwrap()).expect("tree");
+            fs::write(&file, "// newest candidate").expect("write");
+            if i == SOURCE_ROOTS.len() - 1 {
+                set_mtime(&file, future);
+            }
+        }
+        let newest = newest_source(&dir).expect("a source");
+        assert!(
+            newest.0 > std::time::SystemTime::now(),
+            "the last crate's future mtime must win the scan: {newest:?}"
+        );
+        assert!(
+            newest
+                .1
+                .starts_with(dir.join(SOURCE_ROOTS[SOURCE_ROOTS.len() - 1]))
+        );
+        // The two manifests count too: a lockfile bump changes the binary.
+        let lock = dir.join("Cargo.lock");
+        fs::write(&lock, "# bumped\n").expect("lock");
+        set_mtime(&lock, future + std::time::Duration::from_secs(60));
+        assert_eq!(
+            newest_source(&dir).map(|(m, p)| (m > future, p)),
+            Some((true, lock))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn set_mtime(path: &Path, when: std::time::SystemTime) {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for times");
+        file.set_times(fs::FileTimes::new().set_modified(when))
+            .expect("set mtime");
     }
 }

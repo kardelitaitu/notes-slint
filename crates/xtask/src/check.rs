@@ -226,6 +226,14 @@ fn step_specs() -> Vec<StepSpec> {
 /// gate: an environment without a desktop is not a broken repo.
 const DECLINED_EXIT: i32 = 3;
 
+fn joined(names: &[&str]) -> String {
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// The gate's own roster, in the shape check-ci compares against ci.yml. One
 /// source of truth on this side: it is derived from step_specs(), so the list
 /// CI is checked against cannot drift from the list check() actually runs.
@@ -305,13 +313,37 @@ pub fn run(quick: bool) -> i32 {
         }
     };
     println!("check: workspace root {}", root.display());
-    if quick {
-        println!(
-            "check: --quick — the workspace-wide clippy and test steps and the GUI smoke row are              SKIPPED; this is not a full verdict"
-        );
-    }
     let specs = step_specs();
     let total = specs.len();
+    if quick {
+        // A tool has to say what it did NOT check. --quick is not "the same
+        // gate, only faster": the bridge rows are deliberately out of it, so a
+        // local --quick green says nothing at all about the bridge compiling,
+        // and only a full cargo xtask check runs them. Name every skipped row,
+        // and separate the gating ones, because those are the difference between
+        // a fast lane and a verdict.
+        let skipped: Vec<&StepSpec> = specs.iter().filter(|s| s.quick_skippable).collect();
+        let gates: Vec<&str> = skipped
+            .iter()
+            .filter(|s| !s.advisory)
+            .map(|s| s.name)
+            .collect();
+        let advisories: Vec<&str> = skipped
+            .iter()
+            .filter(|s| s.advisory)
+            .map(|s| s.name)
+            .collect();
+        println!(
+            "check: --quick skipped {} of {} rows; this is NOT a full verdict",
+            skipped.len(),
+            total
+        );
+        println!(
+            "check:   GATING rows not run (only a full 'cargo xtask check' proves these): {}",
+            joined(&gates)
+        );
+        println!("check:   advisory rows not run: {}", joined(&advisories));
+    }
     let mut verdicts: Vec<Verdict> = Vec::new();
     for (i, spec) in specs.into_iter().enumerate() {
         let outcome = if quick && spec.quick_skippable {
@@ -320,12 +352,7 @@ pub fn run(quick: bool) -> i32 {
             println!("==> [{}/{}] {}", i + 1, total, spec.display);
             run_child(&spec, &root)
         };
-        println!(
-            "<== [{}] {}
-",
-            spec.name,
-            outcome.label(spec.advisory)
-        );
+        println!("<== [{}] {}", spec.name, outcome.label(spec.advisory));
         verdicts.push(Verdict {
             name: spec.name,
             outcome,

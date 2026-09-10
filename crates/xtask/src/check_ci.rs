@@ -412,12 +412,27 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    if let Some(extra) = args.get(1) {
-        eprintln!("check-ci: unexpected argument '{extra}'");
-        eprintln!("check-ci: usage: cargo xtask check-ci [path-to-workflow]");
-        return 2;
+    // An argument that starts with '-' is a FLAG, not a workflow path. Reading
+    // one as a path produces "cannot read --offline", which looks like a broken
+    // checkout rather than what it is: an unsupported option. Say what the one
+    // positional argument actually is.
+    let mut path_arg: Option<&String> = None;
+    for arg in args {
+        if arg.starts_with('-') {
+            eprintln!("check-ci: unsupported flag '{arg}' - this subcommand takes no flags");
+            eprintln!("check-ci: usage: cargo xtask check-ci [PATH-TO-WORKFLOW]");
+            eprintln!("check-ci:   the one optional argument is a path to a workflow file,");
+            eprintln!("check-ci:   default {WORKFLOW_REL}; a flag is never a path");
+            return 2;
+        }
+        if path_arg.is_some() {
+            eprintln!("check-ci: more than one workflow path given ('{arg}')");
+            eprintln!("check-ci: usage: cargo xtask check-ci [PATH-TO-WORKFLOW]");
+            return 2;
+        }
+        path_arg = Some(arg);
     }
-    let path: PathBuf = match args.first() {
+    let path: PathBuf = match path_arg {
         Some(p) => PathBuf::from(p),
         None => root.join(WORKFLOW_REL),
     };
