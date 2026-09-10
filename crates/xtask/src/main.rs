@@ -31,9 +31,12 @@ fn usage() {
     eprintln!(
         "       enforce the workspace layering rules via cargo metadata (exit 1 on a violation)"
     );
-    eprintln!("usage: cargo xtask fixtures generate|verify");
+    eprintln!("usage: cargo xtask fixtures generate|verify [--against-generator]");
     eprintln!(
-        "       write / check the byte-exact round-trip fixtures (verify exits 1 on any difference)"
+        "       write / check the byte-exact round-trip fixtures (verify exits 1 on any difference;"
+    );
+    eprintln!(
+        "       the generator comparison is always on; the flag merely states it explicitly)"
     );
 }
 
@@ -43,7 +46,7 @@ fn main() {
         Some("check-arch") => std::process::exit(arch::run()),
         Some("fixtures") => match args.get(1).map(String::as_str) {
             Some("generate") => std::process::exit(fixtures::run_generate()),
-            Some("verify") => std::process::exit(fixtures::run_verify()),
+            Some("verify") => std::process::exit(fixtures::run_verify(&args[2..])),
             _ => {
                 eprintln!("xtask: fixtures needs 'generate' or 'verify'");
                 usage();

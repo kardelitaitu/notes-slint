@@ -11,10 +11,11 @@
 //! Content derivation (reviewable by reading this file):
 //! * One documented base text, below — three lines, LF-terminated, containing
 //!   one non-ASCII character (é) so the ansi1252 rows are genuinely ANSI
-//!   (a pure-ASCII CP1252 file is indistinguishable from UTF-8) while every
-//!   character still occupies one or two UTF-8 bytes and exactly two UTF-16
-//!   bytes, so a UTF-16 fixture is precisely twice the UTF-8 length plus its
-//!   2-byte BOM.
+//!   (a pure-ASCII CP1252 file is indistinguishable from UTF-8). Every
+//!   character costs one or two UTF-8 bytes and exactly two UTF-16 bytes, so
+//!   the UTF-16 fixtures are two bytes per character plus their 2-byte BOM
+//!   (56 characters -> 114 bytes), the UTF-8 files are 57 bytes (é costs a
+//!   second UTF-8 byte), and the ansi1252 files are 56 bytes.
 //! * The fixed product crosses encoding x line-ending x trailing-newline:
 //!   5 encodings x 2 EOLs x 2 trailings = 20 files. The BOM field of the D8
 //!   name is determined by the encoding (utf8bom/utf16le/utf16be always carry
@@ -23,20 +24,36 @@
 //! * Hand-picked edge cases (empty, lone CR, BOM-only, mixed EOLs, a
 //!   character outside CP1252, the documented frontmatter block, and two
 //!   foreign .json files) are listed verbatim below.
-//! * manifest.json states the count and one entry per file with the SAME
-//!   vocabulary as core::encoding's Detected / api::FileMeta: encodings
-//!   utf8, utf8bom, utf16le, utf16be, ansi1252; line endings lf, crlf (the
-//!   dominant rule in core::encoding: lone CR and LF/CRLF mixes report lf).
-//!   Hashes are computed by this file's own SHA-256, never taken from Git.
+//! * manifest.json states the count, the ansi_codepage a core test must pass
+//!   to detect() for the ansi1252 rows to detect as ansi1252, and one entry
+//!   per file with the SAME vocabulary as core::encoding's Detected /
+//!   api::FileMeta: encodings utf8, utf8bom, utf16le, utf16be, ansi1252; line
+//!   endings lf, crlf (the dominant rule in core::encoding: lone CR and
+//!   LF/CRLF mixes report lf). Hashes are computed by this file's own
+//!   SHA-256, never taken from Git.
+//!
+//! The verifier is deliberately self-referential, because a gate that only
+//! checks disk-against-manifest dies with its own input file: verify rebuilds
+//! the expected manifest in memory from the same spec tables generate uses,
+//! diffs the on-disk manifest against it (rows, count, every metadata field),
+//! checks every file's bytes against the expected hash, and — always, not
+//! behind a flag — regenerates into a tempdir and byte-compares the whole
+//! tree. Hand-editing a fixture AND recomputing its hash still fails.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
 const FIXTURES_REL: &str = "crates/core/tests/fixtures";
 const MANIFEST_NAME: &str = "manifest.json";
+
+/// The code page a detect() call must be given for the ansi1252 rows to
+/// detect as ansi1252 (with None they report utf8 — see detect_encoding).
+/// core::roundtrip passes Some(1252); the eventual bridge passes GetACP().
+/// Recorded here so a test can assert the two agree.
+const ANSI_CODEPAGE: u64 = 1252;
 
 /// The one documented base text: pure lines, LF-terminated; see module docs.
 const BASE_TEXT: &str = "alpha bravo charlie\ndelta écho foxtrot\ngolf hotel india\n";
@@ -146,24 +163,42 @@ fn to_cp1252(text: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Apply the EOL rule to the base text, then the trailing rule. "nonl" strips
-/// the whole final terminator (\r\n for CRLF files, not just the \n).
-fn product_text(crlf: bool, keep_nl: bool) -> String {
-    let mut text = if crlf {
-        BASE_TEXT.replace('\n', "\r\n")
-    } else {
-        BASE_TEXT.to_string()
-    };
-    if !keep_nl {
-        if crlf {
-            if text.ends_with("\r\n") {
-                text.truncate(text.len() - 2);
-            }
-        } else if text.ends_with('\n') {
-            text.pop();
+/// Strip the WHOLE final line terminator — \r\n for CRLF text, \n for LF
+/// text. One function for every content source: "nonl" means NO terminator
+/// bytes remain, not merely "the last byte is not 0x0A" (a lone CR left
+/// behind is exactly the harm this gate exists to catch).
+fn strip_final_terminator(mut text: String, crlf: bool) -> String {
+    if crlf {
+        if text.ends_with("\r\n") {
+            text.truncate(text.len() - 2);
         }
+    } else if text.ends_with('\n') {
+        text.pop();
     }
     text
+}
+
+/// Apply the EOL rule to a source text, then the trailing rule.
+fn with_eol_and_trailing(source: &str, crlf: bool, keep_nl: bool) -> String {
+    let text = if crlf {
+        source.replace('\n', "\r\n")
+    } else {
+        source.to_string()
+    };
+    if keep_nl {
+        text
+    } else {
+        strip_final_terminator(text, crlf)
+    }
+}
+
+fn product_text(crlf: bool, keep_nl: bool) -> String {
+    with_eol_and_trailing(BASE_TEXT, crlf, keep_nl)
+}
+
+/// The base JSON under the EOL/trailing rules, for the foreign .json rows.
+fn product_json_text(crlf: bool, keep_nl: bool) -> String {
+    with_eol_and_trailing(BASE_JSON, crlf, keep_nl)
 }
 
 fn product_specs() -> Result<Vec<Spec>, String> {
@@ -278,7 +313,7 @@ fn edge_specs() -> Vec<Spec> {
         },
         Spec {
             file: "utf16le__crlf__bom__nonl.json".to_string(),
-            bytes: Enc::Utf16Le.encode(&product_json_text(true, false)).expect("base json is cp1252-free"),
+            bytes: Enc::Utf16Le.encode(&product_json_text(true, false)).expect("base json needs no CP1252"),
             encoding: "utf16le",
             line_ending: "crlf",
             trailing_newline: false,
@@ -286,19 +321,6 @@ fn edge_specs() -> Vec<Spec> {
             note: "foreign extension, UTF-16LE: the same no-rewrite rule for a file core detects as UTF-16".to_string(),
         },
     ]
-}
-
-/// The base JSON under the EOL/trailing rules, for the foreign .json rows.
-fn product_json_text(crlf: bool, keep_nl: bool) -> String {
-    let mut text = if crlf {
-        BASE_JSON.replace('\n', "\r\n")
-    } else {
-        BASE_JSON.to_string()
-    };
-    if !keep_nl && text.ends_with('\n') {
-        text.pop();
-    }
-    text
 }
 
 /// Every fixture, sorted by file name: the deterministic order used for both
@@ -314,28 +336,38 @@ fn extension_of(file: &str) -> &str {
     file.rsplit('.').next().unwrap_or("")
 }
 
-/// The manifest document: count + one entry per file, keys emitted in
-/// serde_json's deterministic (sorted) order, forward-slash file names.
+/// One manifest row. Keys are emitted in this literal's INSERTION order:
+/// serde_json's preserve_order feature is in the dependency graph (via
+/// gpui_util), so insertion order is what you get. The literal is kept
+/// alphabetical on purpose, and
+/// manifest_keys_are_alphabetical_regardless_of_feature_flags enforces it —
+/// insert new keys in alphabetical position, or -p xtask and --workspace
+/// builds will disagree about the manifest bytes.
+fn manifest_row(spec: &Spec) -> Value {
+    let extension = extension_of(&spec.file);
+    json!({
+        "bom_present": spec.bom_present,
+        "bytes": spec.bytes.len(),
+        "encoding": spec.encoding,
+        "extension": extension,
+        "file": spec.file,
+        "foreign": extension != "notes",
+        "line_ending": spec.line_ending,
+        "note": spec.note,
+        "sha256_hex": sha256_hex(&spec.bytes),
+        "trailing_newline": spec.trailing_newline,
+    })
+}
+
+/// The manifest document the generator writes — and the verifier rebuilds in
+/// memory to diff against the one on disk.
 fn manifest_document(specs: &[Spec]) -> Value {
-    let files: Vec<Value> = specs
-        .iter()
-        .map(|s| {
-            let extension = extension_of(&s.file);
-            json!({
-                "bom_present": s.bom_present,
-                "bytes": s.bytes.len(),
-                "encoding": s.encoding,
-                "extension": extension,
-                "file": s.file,
-                "foreign": extension != "notes",
-                "line_ending": s.line_ending,
-                "note": s.note,
-                "sha256_hex": sha256_hex(&s.bytes),
-                "trailing_newline": s.trailing_newline,
-            })
-        })
-        .collect();
-    json!({ "count": files.len(), "files": files })
+    let files: Vec<Value> = specs.iter().map(manifest_row).collect();
+    json!({
+        "ansi_codepage": ANSI_CODEPAGE,
+        "count": files.len(),
+        "files": files,
+    })
 }
 
 /// Write every fixture and the manifest into dir. Deterministic and
@@ -374,47 +406,140 @@ pub fn run_generate() -> i32 {
     }
 }
 
-/// One parsed manifest row: what verify actually checks.
+/// What verify checks a file against: the generator's expectation, not the
+/// manifest's self-description.
 struct Entry {
     file: String,
     sha256_hex: String,
     bytes: usize,
 }
 
-fn parse_manifest(value: &Value) -> Result<Vec<Entry>, String> {
-    let files = value
-        .get("files")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "manifest: missing 'files'".to_string())?;
-    files
+fn expected_entries(specs: &[Spec]) -> Vec<Entry> {
+    specs
         .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let file = e
-                .get("file")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("manifest: entry {i} has no file"))?
-                .to_string();
-            let sha256_hex = e
-                .get("sha256_hex")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("manifest: entry {i} ({file}) has no sha256_hex"))?
-                .to_string();
-            let bytes = e
-                .get("bytes")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| format!("manifest: entry {i} ({file}) has no byte count"))?
-                as usize;
-            Ok(Entry {
-                file,
-                sha256_hex,
-                bytes,
-            })
+        .map(|s| Entry {
+            file: s.file.clone(),
+            sha256_hex: sha256_hex(&s.bytes),
+            bytes: s.bytes.len(),
         })
         .collect()
 }
 
-/// The verifier proper: manifest rows vs the directory on disk. Returns one
+fn show(value: Option<&Value>) -> String {
+    value
+        .map(Value::to_string)
+        .unwrap_or_else(|| "absent".to_string())
+}
+
+/// Layer (a): the manifest on disk must BE the generator's manifest. Rows
+/// present exactly once, count == rows == generator count, ansi_codepage
+/// intact, and every metadata field equal — a manifest row that is merely
+/// self-consistent (bytes and hash edited together) still differs from what
+/// the generator produces.
+fn verify_manifest_against_generator(disk: &Value, specs: &[Spec]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let expected_count = specs.len() as u64;
+    if disk.get("ansi_codepage") != Some(&json!(ANSI_CODEPAGE)) {
+        violations.push(format!(
+            "manifest ansi_codepage is {}, generator says {ANSI_CODEPAGE} — the manifest is generator-owned",
+            show(disk.get("ansi_codepage"))
+        ));
+    }
+    let disk_count = disk.get("count").and_then(Value::as_u64);
+    match disk_count {
+        Some(c) if c == expected_count => {}
+        Some(c) => violations.push(format!(
+            "manifest count is {c}, generator says {expected_count} — the manifest is generator-owned"
+        )),
+        None => violations.push("manifest count is missing".to_string()),
+    }
+    let Some(rows) = disk.get("files").and_then(Value::as_array) else {
+        violations.push("manifest has no 'files' array".to_string());
+        return violations;
+    };
+    if let Some(c) = disk_count {
+        if rows.len() as u64 != c {
+            violations.push(format!(
+                "manifest count is {c} but 'files' has {} rows",
+                rows.len()
+            ));
+        }
+    }
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        let name = row
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or("<row without a file field>");
+        let count = seen.entry(name).or_insert(0);
+        *count += 1;
+        if *count == 2 {
+            violations.push(format!(
+                "duplicate manifest row for {name} (extra at row {i})"
+            ));
+        }
+        if !specs.iter().any(|s| s.file == name) {
+            violations.push(format!(
+                "manifest row the generator does not produce: {name} (row {i})"
+            ));
+        }
+    }
+    for spec in specs {
+        let matching: Vec<&Value> = rows
+            .iter()
+            .filter(|r| r.get("file").and_then(Value::as_str) == Some(spec.file.as_str()))
+            .collect();
+        if matching.is_empty() {
+            violations.push(format!(
+                "manifest row missing: {} — the manifest must be regenerated, not edited",
+                spec.file
+            ));
+            continue;
+        }
+        if matching.len() > 1 {
+            continue; // the duplicate is already reported above
+        }
+        let expected = manifest_row(spec);
+        let disk_row = matching[0];
+        if disk_row == &expected {
+            continue;
+        }
+        for key in [
+            "bom_present",
+            "bytes",
+            "encoding",
+            "extension",
+            "file",
+            "foreign",
+            "line_ending",
+            "note",
+            "sha256_hex",
+            "trailing_newline",
+        ] {
+            if disk_row.get(key) != expected.get(key) {
+                violations.push(format!(
+                    "manifest row {}: field {key} is {}, generator says {}",
+                    spec.file,
+                    show(disk_row.get(key)),
+                    show(expected.get(key))
+                ));
+            }
+        }
+        if let Some(object) = disk_row.as_object() {
+            for key in object.keys() {
+                if !expected.as_object().is_some_and(|e| e.contains_key(key)) {
+                    violations.push(format!(
+                        "manifest row {} has a field the generator does not write: {key}",
+                        spec.file
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// The verifier proper: expected rows vs the directory on disk. Returns one
 /// human-readable violation per problem, in a deterministic order.
 fn verify_dir(dir: &Path, entries: &[Entry]) -> Vec<String> {
     let mut violations = Vec::new();
@@ -478,44 +603,121 @@ fn verify_dir(dir: &Path, entries: &[Entry]) -> Vec<String> {
     violations
 }
 
-/// Entry point for "cargo xtask fixtures verify". No cargo, no network.
-pub fn run_verify() -> i32 {
+/// Layer (b): byte-compare the repo tree against a fresh generation in a
+/// tempdir. Closes the hand-edit-plus-rehash hole: even a fixture whose
+/// manifest row was edited to match cannot survive a regeneration diff.
+fn compare_tree_against_generator(dir: &Path, generated: &Path, specs: &[Spec]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for spec in specs {
+        match (
+            fs::read(dir.join(&spec.file)),
+            fs::read(generated.join(&spec.file)),
+        ) {
+            (Ok(repo), Ok(fresh)) => {
+                if repo != fresh {
+                    violations.push(format!(
+                        "{} differs from generator output (hand-edited?) — run: cargo xtask fixtures generate",
+                        spec.file
+                    ));
+                }
+            }
+            (Err(e), _) => violations.push(format!("fixture {} unreadable: {e}", spec.file)),
+            (_, Err(e)) => {
+                violations.push(format!("generator could not produce {}: {e}", spec.file))
+            }
+        }
+    }
+    match (
+        fs::read(dir.join(MANIFEST_NAME)),
+        fs::read(generated.join(MANIFEST_NAME)),
+    ) {
+        (Ok(repo), Ok(fresh)) => {
+            if repo != fresh {
+                violations.push(format!(
+                    "{MANIFEST_NAME} differs from generator output — the manifest is generator-owned; run: cargo xtask fixtures generate"
+                ));
+            }
+        }
+        (Err(e), _) => violations.push(format!("{MANIFEST_NAME} unreadable: {e}")),
+        (_, Err(e)) => violations.push(format!("generator could not write its manifest: {e}")),
+    }
+    violations
+}
+
+fn fresh_tempdir(tag: &str) -> Result<PathBuf, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("xtask-{tag}-{}-{nanos}", std::process::id()));
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create tempdir {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Entry point for "cargo xtask fixtures verify [args]". No cargo, no
+/// network. The generator comparison (the reviewer's --against-generator) is
+/// the DEFAULT and always runs; the flag is accepted so CI can ask for it
+/// explicitly. Exit 0 clean, 1 violation, 2 the check itself could not run.
+pub fn run_verify(rest: &[String]) -> i32 {
+    for arg in rest {
+        if arg != "--against-generator" {
+            eprintln!("fixtures verify: unknown argument '{arg}'");
+            return 2;
+        }
+    }
     let dir = match command_dir() {
         Ok(dir) => dir,
         Err(code) => return code,
     };
-    let manifest_path = dir.join(MANIFEST_NAME);
-    let manifest_bytes = match fs::read(&manifest_path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!(
-                "fixtures verify: cannot read {}: {e} (run: cargo xtask fixtures generate)",
-                manifest_path.display()
-            );
-            return 2;
-        }
-    };
-    let manifest: Value = match serde_json::from_slice(&manifest_bytes) {
-        Ok(value) => value,
-        Err(e) => {
-            eprintln!("fixtures verify: {MANIFEST_NAME} is not valid JSON: {e}");
-            return 2;
-        }
-    };
-    let entries = match parse_manifest(&manifest) {
-        Ok(entries) => entries,
+    let specs = match all_specs() {
+        Ok(specs) => specs,
         Err(e) => {
             eprintln!("fixtures verify: {e}");
             return 2;
         }
     };
-    let violations = verify_dir(&dir, &entries);
+    let mut violations: Vec<String> = Vec::new();
+
+    // Layer (a): manifest on disk vs the manifest the generator would write.
+    match fs::read(dir.join(MANIFEST_NAME)) {
+        Err(e) => violations.push(format!(
+            "{MANIFEST_NAME} missing or unreadable: {e} — run: cargo xtask fixtures generate"
+        )),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Err(e) => violations.push(format!("{MANIFEST_NAME} is not valid JSON: {e}")),
+            Ok(disk) => violations.extend(verify_manifest_against_generator(&disk, &specs)),
+        },
+    }
+
+    // Every file's bytes vs the generator's expected hash.
+    violations.extend(verify_dir(&dir, &expected_entries(&specs)));
+
+    // Layer (b): regenerate into a tempdir (never into the repo) and
+    // byte-compare the whole tree, manifest included.
+    let generated = match fresh_tempdir("verify-gen") {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("fixtures verify: {e}");
+            return 2;
+        }
+    };
+    match generate_tree(&generated) {
+        Ok(_) => violations.extend(compare_tree_against_generator(&dir, &generated, &specs)),
+        Err(e) => {
+            eprintln!("fixtures verify: generator failed in tempdir: {e}");
+            let _ = fs::remove_dir_all(&generated);
+            return 2;
+        }
+    }
+    let _ = fs::remove_dir_all(&generated);
+
     for v in &violations {
         println!("FIXTURES VIOLATION: {v}");
     }
     println!(
         "fixtures verify: {} files, {} violations",
-        entries.len(),
+        specs.len(),
         violations.len()
     );
     if violations.is_empty() { 0 } else { 1 }
@@ -542,7 +744,8 @@ fn command_dir() -> Result<std::path::PathBuf, i32> {
 
 /// SHA-256 (FIPS 180-4), hex-encoded. Hand-rolled on purpose: content
 /// addressing of fixture bytes, not a security primitive, and no new
-/// dependency is warranted for it. Proven against the standard vectors below.
+/// dependency is warranted for it (D31). Proven against the standard vectors
+/// below and differential-tested by review against Node and OpenSSL.
 pub fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -671,6 +874,10 @@ mod tests {
         files
     }
 
+    fn specs_or_die() -> Vec<Spec> {
+        all_specs().expect("spec tables must build")
+    }
+
     #[test]
     fn generate_is_idempotent_across_two_tempdirs() {
         let a = tempdir("idem-a");
@@ -690,7 +897,7 @@ mod tests {
 
     #[test]
     fn manifest_states_the_count_and_is_sorted_and_forward_slashed() {
-        let specs = all_specs().expect("specs");
+        let specs = specs_or_die();
         let doc = manifest_document(&specs);
         assert_eq!(
             doc.get("count").and_then(Value::as_u64),
@@ -715,8 +922,84 @@ mod tests {
         assert_eq!(unique.len(), files.len(), "no duplicate file names");
     }
 
-    /// Mini fixtures for the poison tests: two files plus a manifest built by
-    /// the same code path the generator uses.
+    /// MINOR 5/6: preserve_order is in the dependency graph, so manifest keys
+    /// are INSERTION-ordered; the json! literals are kept alphabetical on
+    /// purpose and this test pins that, whichever feature resolution wins.
+    #[test]
+    fn manifest_keys_are_alphabetical_regardless_of_feature_flags() {
+        let doc = manifest_document(&specs_or_die());
+        let object = doc.as_object().expect("manifest object");
+        let top: Vec<&String> = object.keys().collect();
+        let mut top_sorted = top.clone();
+        top_sorted.sort();
+        assert_eq!(
+            top, top_sorted,
+            "top-level manifest keys must be alphabetical"
+        );
+        for row in object
+            .get("files")
+            .and_then(Value::as_array)
+            .expect("files")
+        {
+            let keys: Vec<&String> = row.as_object().expect("row object").keys().collect();
+            let mut sorted_keys = keys.clone();
+            sorted_keys.sort();
+            assert_eq!(keys, sorted_keys, "manifest row keys must be alphabetical");
+        }
+    }
+
+    /// BLOCKER 1, as a permanent guard: a nonl fixture must not end in ANY
+    /// line-terminator byte, per the encoding's byte order. The UTF-16 forms
+    /// check the two-byte units, the single-byte encodings the raw byte. This
+    /// is the test that would have caught utf16le__crlf__bom__nonl.json
+    /// ending in a lone CR.
+    #[test]
+    fn nonl_fixtures_end_in_no_terminator_byte_in_any_encoding() {
+        let specs = specs_or_die();
+        for spec in &specs {
+            let is_nonl = spec.file.ends_with("__nonl.md") || spec.file.ends_with("__nonl.json");
+            if !is_nonl {
+                continue;
+            }
+            match spec.encoding {
+                "utf16le" => {
+                    assert!(
+                        !spec.bytes.ends_with(&[0x0A, 0x00])
+                            && !spec.bytes.ends_with(&[0x0D, 0x00]),
+                        "{} ends in a line terminator: {:?}",
+                        spec.file,
+                        &spec.bytes[spec.bytes.len().saturating_sub(4)..]
+                    );
+                }
+                "utf16be" => {
+                    assert!(
+                        !spec.bytes.ends_with(&[0x00, 0x0A])
+                            && !spec.bytes.ends_with(&[0x00, 0x0D]),
+                        "{} ends in a line terminator: {:?}",
+                        spec.file,
+                        &spec.bytes[spec.bytes.len().saturating_sub(4)..]
+                    );
+                }
+                _ => {
+                    let last = *spec.bytes.last().expect("a nonl fixture is never empty");
+                    assert!(
+                        last != 0x0A && last != 0x0D,
+                        "{} ends in a line terminator byte 0x{last:02X}",
+                        spec.file
+                    );
+                }
+            }
+        }
+        for enc in ["utf8", "utf8bom", "utf16le", "utf16be", "ansi1252"] {
+            assert!(
+                specs.iter().any(|s| s.encoding == enc
+                    && (s.file.ends_with("__nonl.md") || s.file.ends_with("__nonl.json"))),
+                "{enc} has no nonl fixture for the guard to check"
+            );
+        }
+    }
+
+    /// Mini fixtures for the verifier poison tests: two files plus a manifest.
     fn write_mini(dir: &Path) -> Vec<Entry> {
         fs::write(dir.join("a.txt"), b"hello\n").expect("write a");
         fs::write(dir.join("b.bin"), [0x00u8, 0xFF, 0x7F]).expect("write b");
@@ -732,7 +1015,18 @@ mod tests {
             serde_json::to_string_pretty(&manifest).expect("serialize mini manifest"),
         )
         .expect("write mini manifest");
-        parse_manifest(&manifest).expect("parse mini manifest")
+        vec![
+            Entry {
+                file: "a.txt".to_string(),
+                sha256_hex: sha256_hex(b"hello\n"),
+                bytes: 6,
+            },
+            Entry {
+                file: "b.bin".to_string(),
+                sha256_hex: sha256_hex([0x00u8, 0xFF, 0x7F].as_slice()),
+                bytes: 3,
+            },
+        ]
     }
 
     #[test]
@@ -775,30 +1069,26 @@ mod tests {
         assert!(violations[0].contains("b.bin"), "{violations:?}");
     }
 
-    /// The generated set itself must pass its own verifier — and the product
-    /// must be the honest size: 20 product files + 8 documented edge cases.
+    /// The generated set itself must pass its own verifier — all layers.
     #[test]
     fn the_generated_tree_verifies_clean() {
         let dir = tempdir("selfcheck");
         let count = generate_tree(&dir).expect("generate");
-        assert_eq!(count, 28);
-        let manifest: Value =
-            serde_json::from_slice(&fs::read(dir.join(MANIFEST_NAME)).expect("manifest"))
-                .expect("parse");
-        let entries = parse_manifest(&manifest).expect("entries");
-        assert_eq!(entries.len(), count);
-        assert!(
-            verify_dir(&dir, &entries).is_empty(),
-            "generated tree must self-verify"
-        );
+        let specs = specs_or_die();
+        assert_eq!(count, specs.len());
+        assert!(verify_dir(&dir, &expected_entries(&specs)).is_empty());
+        let generated = tempdir("selfcheck-gen");
+        generate_tree(&generated).expect("generate again");
+        assert!(compare_tree_against_generator(&dir, &generated, &specs).is_empty());
     }
 
-    /// The proof the brief asks for, pinned as a test: UTF-16 is exactly
-    /// twice the UTF-8 length plus the 2-byte BOM for the base text, and the
-    /// nonl variants really do not end in a newline byte.
+    /// The proof the brief asks for, pinned as a test: the UTF-16 fixtures
+    /// are two bytes per character plus the 2-byte BOM, the ansi1252 file is
+    /// one byte per character, and the nonl variants really do not end in a
+    /// newline byte.
     #[test]
     fn byte_length_invariants_hold() {
-        let specs = all_specs().expect("specs");
+        let specs = specs_or_die();
         let find = |name: &str| {
             specs
                 .iter()
@@ -822,5 +1112,163 @@ mod tests {
         let nonl_utf16 = find("utf16le__crlf__bom__nonl.md");
         assert!(!nonl_utf8.bytes.ends_with(b"\n"));
         assert!(!nonl_utf16.bytes.ends_with(&[0x0A, 0x00]));
+    }
+
+    // ---- mutation tests of the verifier itself (layer a) ----
+
+    fn mutated_disk(mutate: impl FnOnce(&mut Value)) -> (Value, Vec<Spec>) {
+        let specs = specs_or_die();
+        let mut disk = manifest_document(&specs);
+        mutate(&mut disk);
+        (disk, specs)
+    }
+
+    fn rows_mut(disk: &mut Value) -> &mut Vec<Value> {
+        disk.get_mut("files")
+            .and_then(Value::as_array_mut)
+            .expect("files array")
+    }
+
+    #[test]
+    fn a_deleted_manifest_row_is_reported() {
+        let (disk, specs) = mutated_disk(|d| {
+            rows_mut(d).remove(0);
+        });
+        let violations = verify_manifest_against_generator(&disk, &specs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("manifest row missing")),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.contains("'files' has")),
+            "count-vs-rows must also fire: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_duplicated_manifest_row_is_reported() {
+        let (disk, specs) = mutated_disk(|d| {
+            let first = rows_mut(d)[0].clone();
+            rows_mut(d).push(first);
+        });
+        let violations = verify_manifest_against_generator(&disk, &specs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("duplicate manifest row")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_flipped_count_is_reported() {
+        let (disk, specs) = mutated_disk(|d| {
+            d.as_object_mut()
+                .expect("manifest object")
+                .insert("count".to_string(), json!(5));
+        });
+        let violations = verify_manifest_against_generator(&disk, &specs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("manifest count is 5, generator says 28")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_flipped_metadata_field_is_reported() {
+        let (disk, specs) = mutated_disk(|d| {
+            rows_mut(d)[0]
+                .as_object_mut()
+                .expect("row object")
+                .insert("encoding".to_string(), json!("utf16le"));
+        });
+        let violations = verify_manifest_against_generator(&disk, &specs);
+        assert!(
+            violations.iter().any(|v| v.contains("field encoding is")),
+            "{violations:?}"
+        );
+    }
+
+    /// THE hand-edit-plus-rehash attack: the row is made self-consistent (the
+    /// hash matches the tampered bytes) — and the verifier still fails,
+    /// because the row must match what the GENERATOR produces.
+    #[test]
+    fn a_hand_edited_row_with_recomputed_hash_is_reported() {
+        let (disk, specs) = mutated_disk(|d| {
+            let rows = rows_mut(d);
+            let row = rows
+                .iter_mut()
+                .find(|r| r.get("file").and_then(Value::as_str) == Some("utf8__lf__nobom__nl.md"))
+                .expect("row exists");
+            let object = row.as_object_mut().expect("row object");
+            object.insert("bytes".to_string(), json!(999));
+            object.insert("sha256_hex".to_string(), json!(sha256_hex(b"tampered")));
+        });
+        let violations = verify_manifest_against_generator(&disk, &specs);
+        assert!(
+            violations.iter().any(|v| v.contains("field bytes is 999")),
+            "{violations:?}"
+        );
+        assert!(
+            violations.iter().any(|v| v.contains("field sha256_hex is")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_extra_manifest_row_is_reported() {
+        let (disk, specs) = mutated_disk(|d| {
+            rows_mut(d).push(json!({
+                "file": "sneaky.txt",
+                "sha256_hex": "00",
+                "bytes": 0,
+            }));
+        });
+        let violations = verify_manifest_against_generator(&disk, &specs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("the generator does not produce: sneaky.txt")),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_flipped_ansi_codepage_is_reported() {
+        let (disk, specs) = mutated_disk(|d| {
+            d.as_object_mut()
+                .expect("manifest object")
+                .insert("ansi_codepage".to_string(), json!(850));
+        });
+        let violations = verify_manifest_against_generator(&disk, &specs);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("ansi_codepage is 850")),
+            "{violations:?}"
+        );
+    }
+
+    /// Layer (b): a hand-edited file is caught by the regeneration diff even
+    /// if every manifest row were made to agree with it.
+    #[test]
+    fn generator_comparison_catches_a_hand_edited_file() {
+        let repo = tempdir("cmp-repo");
+        let generated = tempdir("cmp-gen");
+        generate_tree(&repo).expect("generate repo copy");
+        generate_tree(&generated).expect("generate fresh");
+        fs::write(repo.join("utf8__lf__nobom__nl.md"), b"tampered").expect("hand-edit");
+        let violations = compare_tree_against_generator(&repo, &generated, &specs_or_die());
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("utf8__lf__nobom__nl.md")
+                    && v.contains("differs from generator")),
+            "{violations:?}"
+        );
     }
 }

@@ -1,4 +1,5 @@
 {
+  "ansi_codepage": 1252,
   "count": 28,
   "files": [
     {
@@ -183,14 +184,14 @@
     },
     {
       "bom_present": true,
-      "bytes": 208,
+      "bytes": 206,
       "encoding": "utf16le",
       "extension": "json",
       "file": "utf16le__crlf__bom__nonl.json",
       "foreign": true,
       "line_ending": "crlf",
       "note": "foreign extension, UTF-16LE: the same no-rewrite rule for a file core detects as UTF-16",
-      "sha256_hex": "e5c7157ab04e1a999ff4e14fe22cd2adf4e4c1bb4c8d2338d2de6e9b6acc2333",
+      "sha256_hex": "1a6d522a9a8a9486080eddb9189411d8fe7cc017ee7a41af55ee159e2d93d857",
       "trailing_newline": false
     },
     {
