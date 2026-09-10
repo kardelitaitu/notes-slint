@@ -188,12 +188,29 @@ mod tests {
     }
 
     #[test]
+    fn codepage_is_persisted_and_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let state = crate::paths::StateDir(dir.path().to_path_buf());
+        // A machine whose ANSI is not 1252: the stored value is what the
+        // bridge will pass to encoding::detect.
+        let s = Settings {
+            codepage: Some(932),
+            ..Settings::default()
+        };
+        write_settings(&state, &s)?;
+        assert_eq!(read_settings(&state), s);
+        assert_eq!(read_settings(&state).codepage, Some(932));
+        Ok(())
+    }
+
+    #[test]
     fn recents_survive_the_toml_round_trip_with_paths_intact()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let state = crate::paths::StateDir(dir.path().to_path_buf());
         let s = Settings {
             autosave_enabled: true,
+            codepage: Some(1252),
             recents: vec![
                 RecentEntry {
                     path: PathBuf::from("C:\\a dir\\with spaces\\n.notes"),
