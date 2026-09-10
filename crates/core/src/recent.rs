@@ -230,7 +230,9 @@ pub fn display_labels(entries: &[RecentEntry]) -> Vec<String> {
 /// different. The path, the identity and the file are untouched — this is
 /// the label rule, not a refusal.
 fn visible_label(label: &str) -> String {
-    label.replace('\u{202E}', "[RTL]").replace('\u{200B}', "[ZWSP]")
+    label
+        .replace('\u{202E}', "[RTL]")
+        .replace('\u{200B}', "[ZWSP]")
 }
 
 /// (identity key, was-canonicalised). The single filesystem touch in this
