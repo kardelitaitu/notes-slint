@@ -13,6 +13,9 @@ publish.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# settings.toml — user preferences AND the recent-files list (the binding
+# storage split; session.json holds only window state).
+toml = { workspace = true }
 
 [dev-dependencies]
 # Test directories for the session round-trip tests. Stays a DEV dependency

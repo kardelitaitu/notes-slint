@@ -17,6 +17,7 @@ pub mod paths;
 pub mod recent;
 pub mod save;
 pub mod session;
+pub mod settings;
 
 pub use document::{Document, FileKind, Skip};
 pub use encoding::{
@@ -32,6 +33,7 @@ pub use save::{
     save_session_bytes,
 };
 pub use session::{Session, SessionError};
+pub use settings::{Settings, SettingsError, read_settings, write_settings};
 
 /// Crate-wide error for I/O-reachable operations. The UI has to be able to
 /// render the reason (AGENTS.md), so failures cross the seam as typed errors
