@@ -2,3 +2,4 @@
 xtask = "run -p xtask --"
 gate = ["test", "--workspace", "--exclude", "notes-bridge-gpui"]
 arch = "run -p xtask -- check-arch"
+deps = "run -p xtask -- check-deps"
