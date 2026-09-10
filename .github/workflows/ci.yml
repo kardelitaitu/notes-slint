@@ -176,6 +176,45 @@ jobs:
           fi
           exit $status
 
+      # --- 3d. the GUI smoke, which stays advisory ---------------------------
+      # "cargo run -p xtask -- smoke" (crates/xtask/src/smoke.rs) launches the real
+      # notes-gpui.exe that step 3b just linked, waits a bounded time for a window handle
+      # and a title, closes it with a REAL WM_CLOSE, asserts the process exited BY ITSELF
+      # with the observed code, then asserts that run wrote session.json. A forced kill
+      # can never print PASS even when the exit code reads 0 (pinned by a test), so this is
+      # the one row that says "the app shut down honestly and persisted" - no compile step
+      # can say that, and no headless unit test does either.
+      #
+      # ADVISORY (continue-on-error) on purpose, twice over: a runner with no interactive
+      # desktop is not a broken repo (exit 3 = DECLINED), and a GUI row that goes red for
+      # environmental reasons trains everyone to ignore the row. It is also a row in xtask's
+      # own step table (advisory and --quick-skippable), so the drift lock at 4c reports it
+      # too; this step exists to give it its own cell and its own annotation.
+      #
+      # Exit codes: 0 passed | 1 the app or its persistence is broken | 2 bad usage (no
+      # PowerShell to post WM_CLOSE with, or the probe could not be written) | 3 DECLINED,
+      # no desktop. Order matters: it MUST come after 3b, because with no exe built it
+      # prints close=NOBIN and exits 1, which would read as an app bug rather than as a
+      # missing artifact. And the step still ends exit $status although it is advisory - a
+      # step that always returned 0 would render a real shutdown failure as a green cell;
+      # continue-on-error is what keeps that red from turning the run red.
+      - name: smoke — cargo run -p xtask -- smoke (advisory - needs a desktop session)
+        id: xtask_smoke
+        continue-on-error: true
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          status=0
+          cargo run -p xtask --quiet -- smoke 2>&1 | tee "$RUNNER_TEMP/xtask-smoke.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          case "$status" in
+            0) echo "smoke: the window appeared, WM_CLOSE shut the app down by itself, session.json was written." ;;
+            1) echo "::error::GRACEFUL SHUTDOWN OR PERSISTENCE BROKEN (smoke exit 1). Read the smoke: window=.../close=.../session=... line in the log above - close=FORCED means the app had to be killed, session=FAILED means nothing was persisted (the log lists every path searched), close=NOBIN means the exe from 3b was never built, which is a step-order problem and not an app bug." ;;
+            3) echo "::notice::smoke DECLINED - no interactive desktop on this runner. Not a failure; the check was not possible here." ;;
+            *) echo "::error::SMOKE HARNESS FAILURE (exit $status) - no PowerShell to post WM_CLOSE with, or the probe could not be written. This is not an app failure." ;;
+          esac
+          exit $status
       # --- 4. architecture invariants (== the `cargo arch` alias) ------------
       # Replaces the six "cargo tree -p X -i Y | must be empty" probes in AGENTS.md,
       # evaluated from cargo metadata (crates/xtask/src/arch.rs). Exit codes:
@@ -273,9 +312,11 @@ jobs:
       # --- 4c. drift lock: run the developer command itself -------------------
       # "cargo xtask check" (the literal cargo run -p xtask -- check below) runs the row
       # table in crates/xtask/src/check.rs: fmt, clippy, test, check-arch, check-deps and
-      # fixtures verify as GATE rows, plus the bridge compile check and the docs validator
-      # as ADVISORY rows that are reported and never gate. (That bridge row is a "cargo
-      # check", compile-only by design - the LINK is gated by 3b, not by xtask.) The
+      # fixtures verify as GATE rows, plus the bridge compile check, the GUI smoke row and
+      # the docs validator as ADVISORY rows that are reported and never gate. (Two of those
+      # deserve a word: the bridge row is a "cargo check" - compile only, so the LINK is
+      # gated by 3b and not by xtask - and smoke is the row 3d names separately because a
+      # window bug is worth its own cell.) The
       # explicit named steps above stay for that reason: a named cell points at one gate in
       # the Actions UI, and xtask's table is the developer's list, not CI's shape. What this
       # step buys is the lock between the two - when the table grows a check, CI grows it
