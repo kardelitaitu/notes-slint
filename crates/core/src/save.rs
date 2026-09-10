@@ -145,7 +145,15 @@ pub(crate) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), SaveError>
     // and the caller keeps editing the name the app did not write. Refuse
     // with the reason; silently rewriting a user-visible path is the same
     // class of lie as reporting success for a different file.
-    if crate::path_policy::final_component_is_stripped(&file_name) {
+    // Carve-out, DELIBERATE and shared: under the \\?\ extended-length
+    // prefix Win32 strips NOTHING — the trailing dot is a literal character,
+    // the file written IS the one named, and display agrees with disk. The
+    // guard is the same shared predicate path_policy uses, so an openable
+    // path (policy Allowed) is exactly a writable path; a local
+    // re-derivation here is the drift the sharing exists to prevent.
+    if !crate::path_policy::under_extended_prefix(target)
+        && crate::path_policy::final_component_is_stripped(&file_name)
+    {
         return Err(SaveError::InvalidPath(
             "the file name ends with '.' or a space, which Windows strips — the file written would not be the one named; rename the target"
                 .to_owned(),
@@ -744,6 +752,31 @@ mod tests {
                 "{hostile:?}: the neighbour must be untouched"
             );
         }
+        Ok(())
+    }
+
+    /// B2 carve-out, proven: under the \\?\ extended-length prefix Win32
+    /// strips NOTHING, so the trailing dot is a literal character and the
+    /// file written IS the one named — save must accept what path_policy
+    /// allows (composition: open Allowed ⇔ save writes). The same name in
+    /// the plain form stays refused: one rule, two Win32 behaviours, one
+    /// shared predicate.
+    #[test]
+    fn extended_prefix_target_writes_the_literal_trailing_dot_name()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        // canonicalise returns the verbatim \\?\ form, which also rules out
+        // 8.3 short names in the composed target.
+        let verbatim_dir = std::fs::canonicalize(dir.path())?;
+        let verbatim_target = verbatim_dir.join("v.notes.");
+        atomic_write(&verbatim_target, b"kept")?;
+        assert_eq!(std::fs::read(&verbatim_target)?, b"kept");
+        // The plain form: the strip is real there, the write refuses.
+        let plain_target = dir.path().join("plain.notes.");
+        let Err(e) = atomic_write(&plain_target, b"x") else {
+            panic!("a plain trailing-dot target must still be refused");
+        };
+        assert!(matches!(e, SaveError::InvalidPath(_)), "got {e:?}");
         Ok(())
     }
 

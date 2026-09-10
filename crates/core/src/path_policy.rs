@@ -18,13 +18,18 @@ pub enum PathVerdict {
     /// No name-level hazard; the filesystem call may proceed.
     Allowed,
     /// A UNC path (\\no-such-host\share\x.notes, also //host/share and the extended \\?\UNC\host\share\x.notes
-    /// form). POLICY, not a bug: the first touch of an unreachable server
+    /// form — the prefix matched CASE-INSENSITIVELY, as Windows matches all
+    /// path prefixes: "\\?\unc\…" is the same prefix, and a case-sensitive
+    /// compare would let the cased spelling reach the filesystem). POLICY,
+    /// not a bug: the first touch of an unreachable server
     /// blocks for as long as the OS redirector pleases, and this engine is
     /// single-threaded — the app refuses the attempt instead of freezing
     /// the window. If a future build wants network notes, the lift is an
     /// async/timeout layer owned by api, not here.
     UnboundedNetwork,
-    /// NT device namespaces (\\.\PhysicalDrive0, \??\C:\x.notes, \.\x) and the classic DOS
+    /// NT device namespaces (\\.\PhysicalDrive0, \??\C:\x.notes, \.\x — and the device
+    /// namespace reached through the \\?\ root that \??\ shares: \\?\PhysicalDrive0
+    /// IS \\.\PhysicalDrive0) and the classic DOS
     /// device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9) WITHOUT an
     /// extension as the final component: opening CON reads the console
     /// (hangs, console bytes), writing NUL silently discards. WITH an
@@ -41,7 +46,10 @@ pub enum PathVerdict {
     /// The final component ends with '.' or ' ': Win32 strips both from the
     /// final component, so "a.notes." writes "a.notes" while the app reports
     /// Ok for a path that does not exist. One shared implementation with the
-    /// save engine (final_component_is_stripped) so the two can never drift.
+    /// save engine (final_component_is_stripped, plus the shared
+    /// under_extended_prefix carve-out: past \\?\ Win32 strips nothing, so
+    /// the rule does not apply there and policy-Allowed is save-writable)
+    /// so the two can never drift.
     StrippedName,
 }
 
@@ -65,19 +73,33 @@ pub fn path_policy(path: &Path) -> PathVerdict {
     if s.starts_with("\\\\.\\") || s.starts_with("\\??\\") || s.starts_with("\\.\\") {
         return PathVerdict::ReservedDevice;
     }
-    // Network: the extended UNC form first, then the plain ones.
-    if s.starts_with("\\\\?\\UNC\\") {
+    // Network: the extended UNC form first, then the plain ones. The prefix
+    // compare is CASE-INSENSITIVE because Windows matches path prefixes that
+    // way: "\\?\unc\host\share\x.notes" is the same path as the uppercase
+    // spelling, and a case-sensitive strip would let it fall through to the
+    // drive rules and reach the filesystem — the exact 2.68 s freeze this
+    // module exists to prevent, unlocked by one changed letter.
+    if starts_with_ignore_ascii_case(s, "\\\\?\\UNC\\") {
         return PathVerdict::UnboundedNetwork;
     }
     // Extended-length prefix: legitimate, and it BYPASSES Win32 name
     // mangling — so the StrippedName rule does not apply past it (a trailing
     // dot is a real character there). Everything else is judged normally.
-    let (body, extended) = match s.strip_prefix("\\\\?\\") {
-        Some(rest) => (rest, true),
-        None => (s, false),
-    };
+    // The prefix fact is the SHARED predicate (save::atomic_write carves the
+    // same case out with it), not a local re-derivation.
+    let extended = under_extended_prefix(path);
+    let body = s.strip_prefix("\\\\?\\").unwrap_or(s);
     if body.starts_with("\\\\") || body.starts_with("//") {
         return PathVerdict::UnboundedNetwork;
+    }
+    // Under the extended prefix the body may legitimately start only with a
+    // drive ("X:"), a UNC (returned above), or a rooted path ("\dir\x" — the
+    // current drive's root). Anything else is the device namespace reached
+    // through the same object-manager root "\??\" shares: "\\?\PhysicalDrive0"
+    // IS "\\.\PhysicalDrive0", and the NAME proves it — no note is ever named
+    // PhysicalDrive0 or GLOBALROOT. Refuse without a filesystem call.
+    if extended && drive_separator(body).is_none() && !body.starts_with('\\') {
+        return PathVerdict::ReservedDevice;
     }
     // The drive separator is the ONE legitimate colon; anything after it
     // starts a stream. A relative colon ("a.notes:sneaky") is a stream from
@@ -98,7 +120,7 @@ pub fn path_policy(path: &Path) -> PathVerdict {
     // makes an ordinary file (the tester's probe created and read back
     // CON.notes), so only the bare stem is refused — stated honestly, not
     // defensively. COM10+ was never in the reserved set.
-    if !name.contains('.') && is_dos_device(&name) {
+    if is_dos_device(&name) {
         return PathVerdict::ReservedDevice;
     }
     // Trailing dot/space mangling — skipped under the extended prefix.
@@ -126,14 +148,34 @@ pub(crate) fn final_component_is_stripped(name: &str) -> bool {
     name.ends_with('.') || name.ends_with(' ')
 }
 
+/// True when the path sits under the \\\\?\\ extended-length prefix, where
+/// Win32 performs NO name mangling: trailing dots and spaces in the final
+/// component are literal characters, so the StrippedName rule does not
+/// apply and what policy allows, save can write. THE shared predicate —
+/// path_policy and save::atomic_write both call this; a local re-derivation
+/// in either half is exactly the drift the sharing exists to prevent.
+pub(crate) fn under_extended_prefix(path: &Path) -> bool {
+    path.as_os_str().to_string_lossy().starts_with("\\\\?\\")
+}
+
+/// Case-insensitive ASCII prefix test. Windows matches path prefixes
+/// case-insensitively, so a case-sensitive compare is a hole: "\\\\?\\unc\\…"
+/// is the same prefix as "\\\\?\\UNC\\…".
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= prefix.len() && b[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
 /// The classic MS-DOS device names. Modern Windows keeps the bare stem
-/// reserved in every directory; COM/LPT take single digits 1-9.
+/// reserved in every directory; COM/LPT take single digits 1-9 — COM0 and
+/// LPT0 were never in the reserved set, so they are ordinary file names and
+/// must not be over-rejected.
 fn is_dos_device(name: &str) -> bool {
     let up = name.to_ascii_uppercase();
     matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || ((up.starts_with("COM") || up.starts_with("LPT"))
             && up.len() == 4
-            && up.as_bytes()[3].is_ascii_digit())
+            && matches!(up.as_bytes()[3], b'1'..=b'9'))
 }
 
 #[cfg(test)]
@@ -168,6 +210,8 @@ mod tests {
             r"\\no-such-host\share\x.notes",
             "//host/share/x.notes",
             r"\\?\UNC\host\share\x.notes",
+            // The BLOCKER's exact input: same prefix, different casing.
+            r"\\?\unc\host\share\x.notes",
         ] {
             assert_eq!(v(Path::new(p)), PathVerdict::UnboundedNetwork, "{p}");
         }
@@ -215,15 +259,101 @@ mod tests {
             v(Path::new(r"\\?\UNC\host\share\x")),
             PathVerdict::UnboundedNetwork
         );
+        // The device namespace under the same \\?\ root is refused: the
+        // name proves it, no filesystem call needed.
+        assert_eq!(
+            v(Path::new(r"\\?\PhysicalDrive0")),
+            PathVerdict::ReservedDevice
+        );
+        assert_eq!(
+            v(Path::new(r"\\?\GLOBALROOT\Device\HarddiskVolume3\x")),
+            PathVerdict::ReservedDevice
+        );
+        // COM0/LPT0 were never reserved: ordinary names.
+        assert_eq!(v(Path::new("COM0")), PathVerdict::Allowed);
+        assert_eq!(v(Path::new("LPT0")), PathVerdict::Allowed);
     }
 
+    /// The stripped-name fact is spelled exactly ONCE, in
+    /// path_policy::final_component_is_stripped, and save::atomic_write
+    /// calls it — with the extended-prefix carve-out from the same shared
+    /// predicate. Behaviour tests alone cannot pin this (a fork passes them
+    /// all), so the pin is SOURCE-level: include_str! reads the sibling
+    /// module at test-compile time and fails HERE, not at review time, if
+    /// save ever re-forks an inline copy.
     #[test]
-    fn the_shared_stripped_rule_is_the_one_save_uses() {
+    fn save_writes_through_the_shared_stripped_rule_not_a_fork() {
+        const SAVE: &str = include_str!("save.rs");
+        const POLICY: &str = include_str!("path_policy.rs");
+        // save calls THE shared helper for both halves of the decision.
+        assert!(
+            SAVE.contains("path_policy::final_component_is_stripped(&file_name)"),
+            "save::atomic_write must call the shared helper — an inline fork is the drift this pin exists to catch"
+        );
+        assert!(
+            SAVE.contains("path_policy::under_extended_prefix(target)"),
+            "the extended-prefix carve-out must be the shared predicate, not a local re-derivation"
+        );
+        // The facts themselves are spelled only here. The needles are built
+        // with concat! so this test's own source — part of POLICY, via the
+        // include_str! above — cannot count as a second occurrence.
+        assert_eq!(
+            POLICY
+                .matches(concat!("pub(crate) fn final", "_component_is_stripped"))
+                .count(),
+            1,
+            "the stripped-name rule must have exactly one definition"
+        );
+        assert_eq!(
+            POLICY
+                .matches(concat!("pub(crate) fn under", "_extended_prefix"))
+                .count(),
+            1,
+            "the extended-prefix fact must have exactly one definition"
+        );
+        // And no inline re-derivation in save: the strip predicate's byte
+        // shape may not appear outside the helper.
+        assert!(
+            !SAVE.contains("ends_with('.')") && !SAVE.contains("ends_with(' ')"),
+            "the trailing-strip fact may be spelled only in path_policy::final_component_is_stripped"
+        );
+        // The helper's own behaviour, for completeness.
         for name in ["a.notes.", "a.notes ", "a.notes. "] {
             assert!(final_component_is_stripped(name));
         }
         for name in ["a.notes", "a.notes..x"] {
             assert!(!final_component_is_stripped(name));
+        }
+    }
+
+    /// The reviewer's hostile-input table, kept as a fact sheet: every input
+    /// that once slipped through a hole, and the verdict that now names it.
+    /// Run against the pure predicate — no filesystem, no elevation — which
+    /// is also the only way to judge the \??\ forms without a real device.
+    #[test]
+    fn hostile_input_table() {
+        let cases: &[(&str, PathVerdict)] = &[
+            // The UNC prefix, any casing (the uncased form was ALLOWED once).
+            (r"\\?\UNC\host\share\x.notes", PathVerdict::UnboundedNetwork),
+            (r"\\?\unc\host\share\x.notes", PathVerdict::UnboundedNetwork),
+            (r"\\?\unc\HOST\share\x.notes", PathVerdict::UnboundedNetwork),
+            // The device namespace under the \\?\ root (was ALLOWED once).
+            (r"\\?\PhysicalDrive0", PathVerdict::ReservedDevice),
+            (
+                r"\\?\GLOBALROOT\Device\HarddiskVolume3\x",
+                PathVerdict::ReservedDevice,
+            ),
+            // COM0/LPT0 were never reserved (were OVER-REJECTED once).
+            ("COM0", PathVerdict::Allowed),
+            ("LPT0", PathVerdict::Allowed),
+            // The carve-outs that must SURVIVE these fixes.
+            (r"\\?\C:\a.notes.", PathVerdict::Allowed),
+            (r"\\?\\dir\x.notes", PathVerdict::Allowed), // rooted verbatim form
+            (r"\??\C:\x.notes", PathVerdict::ReservedDevice),
+            (r"\\.\PhysicalDrive0", PathVerdict::ReservedDevice),
+        ];
+        for (p, expected) in cases {
+            assert_eq!(v(Path::new(p)), *expected, "{p}");
         }
     }
 }
