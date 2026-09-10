@@ -17,7 +17,14 @@ serde_json = "1"
 thiserror = "2"
 toml = "0.9"
 tempfile = "3"
-gpui = "=0.2.2"
+# Pinned: 0.1.x is yanked and the API moved (docs/roadmap.md watch items).
+# default-features = false is REQUIRED, not tidiness: gpui supplies its own application manifest through
+# windows-manifest, and linking a second one into the executable is a hard linker error
+# ("duplicate resource: type MANIFEST (ID 24) / name ID 1 / language 1033"). An app that declares
+# longPathAware — a notes app is handed paths of arbitrary length — must therefore own the manifest and
+# turn that feature off. "font-kit" is the one default feature the bridge still needs. Measured by C4 at
+# 3fe7722: with default-features on, notes-gpui.exe does not link.
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
 raw-window-handle = "0.6"
 windows = { version = "0.61", features = ["Win32_Foundation","Win32_UI_WindowsAndMessaging","Win32_UI_Shell","Win32_Graphics_Gdi"] }
 

@@ -10,4 +10,7 @@ node_modules/
 Thumbs.db
 
 # agent working memory — never documentation, never committed
-manager-*-journal.md
+manager-*-journal.*
+# The journal is .txt on purpose: the docs validator scans every *.md in the tree and
+# correctly flags anything outside its placement map. Working memory is not documentation and must
+# not appear in its verdict.
