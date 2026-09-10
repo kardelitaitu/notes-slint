@@ -209,7 +209,7 @@ fn product_specs() -> Result<Vec<Spec>, String> {
                 let text = product_text(crlf, keep_nl);
                 specs.push(Spec {
                     file: format!(
-                        "{}__{}__{}__{}.md",
+                        "{}__{}__{}__{}.txt",
                         enc.name(),
                         eol_name,
                         enc.bom_field(),
@@ -274,7 +274,7 @@ fn edge_specs() -> Vec<Spec> {
             note: "mixed LF then CRLF then lone CR; core::encoding reports the dominant lf (a lone LF beats CRLF)".to_string(),
         },
         Spec {
-            file: "edge__outside-ansi1252.md".to_string(),
+            file: "edge__outside-ansi1252.txt".to_string(),
             bytes: "café — 😀\n".as_bytes().to_vec(),
             encoding: "utf8",
             line_ending: "lf",
@@ -957,7 +957,7 @@ mod tests {
     fn nonl_fixtures_end_in_no_terminator_byte_in_any_encoding() {
         let specs = specs_or_die();
         for spec in &specs {
-            let is_nonl = spec.file.ends_with("__nonl.md") || spec.file.ends_with("__nonl.json");
+            let is_nonl = spec.file.ends_with("__nonl.txt") || spec.file.ends_with("__nonl.json");
             if !is_nonl {
                 continue;
             }
@@ -993,7 +993,7 @@ mod tests {
         for enc in ["utf8", "utf8bom", "utf16le", "utf16be", "ansi1252"] {
             assert!(
                 specs.iter().any(|s| s.encoding == enc
-                    && (s.file.ends_with("__nonl.md") || s.file.ends_with("__nonl.json"))),
+                    && (s.file.ends_with("__nonl.txt") || s.file.ends_with("__nonl.json"))),
                 "{enc} has no nonl fixture for the guard to check"
             );
         }
@@ -1095,8 +1095,8 @@ mod tests {
                 .find(|s| s.file == name)
                 .unwrap_or_else(|| panic!("fixture {name} missing"))
         };
-        let utf8 = find("utf8__lf__nobom__nl.md");
-        let utf16 = find("utf16le__lf__bom__nl.md");
+        let utf8 = find("utf8__lf__nobom__nl.txt");
+        let utf16 = find("utf16le__lf__bom__nl.txt");
         assert_eq!(utf8.bytes.len(), 57, "56 chars + one extra byte for é");
         assert_eq!(
             utf16.bytes.len(),
@@ -1104,12 +1104,12 @@ mod tests {
             "2 bytes per char (56 chars) + the 2-byte BOM"
         );
         assert_eq!(
-            find("ansi1252__lf__nobom__nl.md").bytes.len(),
+            find("ansi1252__lf__nobom__nl.txt").bytes.len(),
             56,
             "one byte per char: é is a single 0xE9 byte in CP1252"
         );
-        let nonl_utf8 = find("utf8__lf__nobom__nonl.md");
-        let nonl_utf16 = find("utf16le__crlf__bom__nonl.md");
+        let nonl_utf8 = find("utf8__lf__nobom__nonl.txt");
+        let nonl_utf16 = find("utf16le__crlf__bom__nonl.txt");
         assert!(!nonl_utf8.bytes.ends_with(b"\n"));
         assert!(!nonl_utf16.bytes.ends_with(&[0x0A, 0x00]));
     }
@@ -1202,7 +1202,7 @@ mod tests {
             let rows = rows_mut(d);
             let row = rows
                 .iter_mut()
-                .find(|r| r.get("file").and_then(Value::as_str) == Some("utf8__lf__nobom__nl.md"))
+                .find(|r| r.get("file").and_then(Value::as_str) == Some("utf8__lf__nobom__nl.txt"))
                 .expect("row exists");
             let object = row.as_object_mut().expect("row object");
             object.insert("bytes".to_string(), json!(999));
@@ -1261,12 +1261,12 @@ mod tests {
         let generated = tempdir("cmp-gen");
         generate_tree(&repo).expect("generate repo copy");
         generate_tree(&generated).expect("generate fresh");
-        fs::write(repo.join("utf8__lf__nobom__nl.md"), b"tampered").expect("hand-edit");
+        fs::write(repo.join("utf8__lf__nobom__nl.txt"), b"tampered").expect("hand-edit");
         let violations = compare_tree_against_generator(&repo, &generated, &specs_or_die());
         assert!(
             violations
                 .iter()
-                .any(|v| v.contains("utf8__lf__nobom__nl.md")
+                .any(|v| v.contains("utf8__lf__nobom__nl.txt")
                     && v.contains("differs from generator")),
             "{violations:?}"
         );
