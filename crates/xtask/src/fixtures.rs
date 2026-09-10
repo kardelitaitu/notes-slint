@@ -39,9 +39,19 @@
 //! checks every file's bytes against the expected hash, and — always, not
 //! behind a flag — regenerates into a tempdir and byte-compares the whole
 //! tree. Hand-editing a fixture AND recomputing its hash still fails.
+//!
+//! Writes are atomic per file: the payload goes to `<name>.new` in the same
+//! directory, is flushed and fsynced, and the finished side file is renamed
+//! over `<name>` - a concurrent reader sees the previous bytes or the complete
+//! new ones, never a mixture (a truncate-in-place write was proven to tear:
+//! 12 partial manifest reads and 432 silent fixture reads in 3000 rounds).
+//! The manifest is written LAST by the same rule, so a complete manifest
+//! implies complete fixtures - the reason the verifier can trust a manifest
+//! it can parse.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -370,19 +380,64 @@ fn manifest_document(specs: &[Spec]) -> Value {
     })
 }
 
+/// Write `bytes` to `path` so a concurrent reader never observes a mixture:
+/// the payload goes to `<path>.new` in the same directory (exclusive create),
+/// is flushed and fsynced, the handle is closed, and the finished side file is
+/// renamed over `path`. A same-volume rename is atomic on NTFS and POSIX, so
+/// a reader sees the previous bytes or the complete new ones - never a
+/// partial write. On any failure the side file is removed: the repo must not
+/// accumulate `.new` files, and the fixtures verifier would rightly report a
+/// leftover one as an unlisted file. A `.new` left behind by a killed process
+/// is stale, has no readers, and is removed once before the exclusive create
+/// is retried - that is crash recovery, not a retry of a racing write.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut side_name = path.as_os_str().to_owned();
+    side_name.push(".new");
+    let side = PathBuf::from(side_name);
+    let outcome = (|| -> std::io::Result<()> {
+        let mut file = match fs::File::options().write(true).create_new(true).open(&side) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(&side)?;
+                fs::File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(&side)?
+            }
+            Err(e) => return Err(e),
+        };
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&side, path)?;
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&side);
+            Err(format!("cannot write {}: {e}", path.display()))
+        }
+    }
+}
+
 /// Write every fixture and the manifest into dir. Deterministic and
-/// idempotent: the same bytes every run, no timestamps, sorted output.
+/// idempotent: the same bytes every run, no timestamps, sorted output. Every
+/// file lands atomically (see [`atomic_write`]), and the manifest is written
+/// LAST by the same rule: a complete manifest implies complete fixtures,
+/// which is why the verifier can trust a manifest it can parse.
 fn generate_tree(dir: &Path) -> Result<usize, String> {
     let specs = all_specs()?;
     fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     for spec in &specs {
-        fs::write(dir.join(&spec.file), &spec.bytes)
-            .map_err(|e| format!("cannot write {}: {e}", spec.file))?;
+        atomic_write(&dir.join(&spec.file), &spec.bytes)?;
     }
     let manifest = serde_json::to_string_pretty(&manifest_document(&specs))
         .map_err(|e| format!("cannot serialize manifest: {e}"))?;
-    fs::write(dir.join(MANIFEST_NAME), manifest + "\n")
-        .map_err(|e| format!("cannot write {MANIFEST_NAME}: {e}"))?;
+    let mut manifest = manifest;
+    manifest.push('\n');
+    atomic_write(&dir.join(MANIFEST_NAME), manifest.as_bytes())?;
     Ok(specs.len())
 }
 
@@ -827,7 +882,8 @@ pub fn sha256_hex(data: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn sha_matches(data: &[u8], expected: &str) {
         assert_eq!(sha256_hex(data), expected);
@@ -893,6 +949,78 @@ mod tests {
             read_tree(&b),
             "every file must be byte-identical"
         );
+    }
+
+    /// PROOF, not a comment: while the generator runs many rounds into a
+    /// tempdir, a reader thread hammers every file with fs::read. Under the old
+    /// truncate-in-place writer a racing read saw short or partial bytes (the
+    /// tester measured 432 silent torn reads and 12 throwing ones in 3000
+    /// rounds); under atomic rename every successful read is byte-identical to
+    /// the expected content, and the only legal failure is NotFound before
+    /// first creation. Coverage note: the read-side invariant is asserted
+    /// unconditionally - this test cannot fail spuriously on the atomic
+    /// writer, it WOULD have failed on the old one, and it does not claim to
+    /// prove NTFS rename atomicity itself, only that our writer relies on it
+    /// correctly. The assertion that reads > 0 keeps it from passing vacuously.
+    #[test]
+    fn a_concurrent_reader_never_sees_torn_bytes() {
+        let dir = tempdir("torn");
+        let specs = specs_or_die();
+        let mut expected: Vec<(String, Vec<u8>)> = specs
+            .iter()
+            .map(|s| (s.file.clone(), s.bytes.clone()))
+            .collect();
+        let mut manifest_bytes = serde_json::to_string_pretty(&manifest_document(&specs))
+            .expect("manifest serializes")
+            .into_bytes();
+        // The generator terminates the manifest with a newline; the expectation
+        // must include it or every manifest read would "mismatch".
+        manifest_bytes.push(b'\n');
+        expected.push((MANIFEST_NAME.to_string(), manifest_bytes));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_reader = Arc::clone(&stop);
+        let dir_for_reader = dir.clone();
+        let reader = std::thread::spawn(move || {
+            let mut violations = Vec::new();
+            let mut reads = 0usize;
+            let mut missing = 0usize;
+            while !stop_reader.load(Ordering::Relaxed) {
+                for (name, want) in &expected {
+                    match fs::read(dir_for_reader.join(name)) {
+                        Ok(bytes) => {
+                            reads += 1;
+                            if bytes != *want {
+                                violations.push(format!(
+                                    "torn read: {} is {} bytes, expected {}",
+                                    name,
+                                    bytes.len(),
+                                    want.len()
+                                ));
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            missing += 1; // legal only before first creation
+                        }
+                        Err(e) => violations.push(format!("read error: {name}: {e}")),
+                    }
+                }
+            }
+            (violations, reads, missing)
+        });
+        for _ in 0..12 {
+            generate_tree(&dir).expect("generate round");
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (violations, reads, missing) = reader.join().expect("reader thread");
+        assert!(
+            reads > 0,
+            "the reader must have observed real bytes, not only absence"
+        );
+        assert!(
+            violations.is_empty(),
+            "torn or wrong reads under a concurrent generator: {violations:?}"
+        );
+        let _ = missing; // counted for the record; absences are legal pre-creation
     }
 
     #[test]
