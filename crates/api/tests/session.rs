@@ -1054,3 +1054,59 @@ fn two_recents_with_the_same_basename_do_not_share_a_menu_label() {
     // files labels plainly again instead of carrying the other's suffix.
     let _ = b;
 }
+
+/// M5/D54, third case of the same disease: settings.toml rode
+/// [`Event::SaveFailed`] with a `revision: 0` the file does not have - a
+/// settings file HAS no revision - and would have flooded one event per tick
+/// exactly as the session write did. Now it reports ONE
+/// SettingsWriteFailed per failure episode, latched, cleared by the next
+/// success. The block is the same shape the session test uses: a DIRECTORY
+/// sitting where settings.toml belongs, which the atomic write's rename
+/// refuses with an OS sentence.
+#[test]
+fn a_failing_settings_write_is_reported_once_until_it_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let settings_path = root.join("settings.toml");
+    let mut app = Harness::at(root, Settings::default());
+
+    let assert_one_failure = |app: &mut Harness, want: &str| {
+        match app.until(want, |ev| matches!(ev, Event::SettingsWriteFailed { .. })) {
+            Event::SettingsWriteFailed { reason } => {
+                assert!(!reason.trim().is_empty(), "renderable: core's sentence");
+            }
+            other => panic!("expected SettingsWriteFailed ({want}), got {other:?}"),
+        }
+        let quiet = Instant::now() + ticks(2);
+        while let Ok(event) = app
+            .rx
+            .recv_timeout(quiet.saturating_duration_since(Instant::now()))
+        {
+            assert!(
+                !matches!(event, Event::SettingsWriteFailed { .. }),
+                "the settings failure was reported more than once: {event:?}"
+            );
+        }
+    };
+
+    // The toggle CHANGES, so the write is queued (an equal value queues
+    // nothing).
+    fs::create_dir(&settings_path).expect("block settings.toml with a directory");
+    app.send(Command::SetAutosave(false));
+    assert_one_failure(&mut app, "the first settings failure");
+
+    // Success clears the latch - silently, and observably: the retry lands a
+    // real settings.toml where the directory was.
+    fs::remove_dir(&settings_path).expect("unblock");
+    app.send(Command::SetAutosave(true));
+    std::thread::sleep(ticks(2));
+    assert!(
+        settings_path.is_file(),
+        "the unblocked write must have produced settings.toml"
+    );
+
+    fs::remove_file(&settings_path).expect("remove the succeeded file");
+    fs::create_dir(&settings_path).expect("block again");
+    app.send(Command::SetAutosave(false));
+    assert_one_failure(&mut app, "the second settings failure");
+}

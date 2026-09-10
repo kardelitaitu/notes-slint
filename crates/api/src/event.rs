@@ -307,8 +307,21 @@ pub enum Event {
         meta: FileMeta,
         revision: u64,
     },
-    /// A save failed. The async one: `Flush` has no reply channel, so this is
-    /// how the failure reaches the status line (AGENTS.md).
+    /// A DOCUMENT save failed. The async one: `Flush` has no reply channel,
+    /// so this is how the failure reaches the status line (AGENTS.md).
+    ///
+    /// DOCUMENT-ONLY, and that is the contract this variant's old shape broke
+    /// (event.rs:312): `path` is the file the write was attempted on and
+    /// `revision` is the buffer revision that write would have anchored (D11),
+    /// and both are REAL, because a document has both. State files have
+    /// neither, and riding them here forced a `revision: 0` the UI could
+    /// render and the user could believe; they now report through their own
+    /// family
+    /// ([`Event::SessionWriteFailed`], [`Event::SettingsWriteFailed`],
+    /// [`Event::StateDirUnusable`]). The port builds this variant at exactly
+    /// one site - `Engine::document_save_failed` - whose assert is the
+    /// tripwire for the empty-path case core already refuses as InvalidPath
+    /// (save.rs:141) before any save outcome exists.
     SaveFailed {
         path: PathBuf,
         revision: u64,
@@ -360,6 +373,17 @@ pub enum Event {
     /// because there is nothing to advise yet.
     StateDirUnusable {
         /// What the OS said, or which path is not a directory.
+        reason: String,
+    },
+    /// settings.toml could not be written. The settings.toml twin of
+    /// [`Event::SessionWriteFailed`] - same latch discipline (one report per
+    /// failure episode, retried every tick, cleared on success), same no-
+    /// revision honesty: a settings file HAS no revision, and the old shape
+    /// claimed `revision: 0` through [`Event::SaveFailed`], which is a
+    /// document event. [`reason`] is core's own sentence (SettingsError's
+    /// Display), passed through untranslated.
+    SettingsWriteFailed {
+        /// What core said when the settings write was refused, verbatim.
         reason: String,
     },
 }
@@ -432,6 +456,9 @@ mod tests {
             Event::StateDirUnusable { reason } => Event::StateDirUnusable {
                 reason: reason.clone(),
             },
+            Event::SettingsWriteFailed { reason } => Event::SettingsWriteFailed {
+                reason: reason.clone(),
+            },
         }
     }
 
@@ -448,6 +475,7 @@ mod tests {
             Event::SettingsCorrupt { .. } => "SettingsCorrupt",
             Event::SessionWriteFailed { .. } => "SessionWriteFailed",
             Event::StateDirUnusable { .. } => "StateDirUnusable",
+            Event::SettingsWriteFailed { .. } => "SettingsWriteFailed",
             Event::RecentsUpdated(_) => "RecentsUpdated",
         }
     }
@@ -508,6 +536,9 @@ mod tests {
             Event::StateDirUnusable {
                 reason: "Access is denied. (os error 5)".to_string(),
             },
+            Event::SettingsWriteFailed {
+                reason: "settings could not be serialised: unsupported type".to_string(),
+            },
         ]
     }
 
@@ -527,8 +558,8 @@ mod tests {
         );
         // Loaded, LoadFailed, Saved, GeometryNotRestored, SaveFailed,
         // ExternalChange, AutosaveSkipped, RecentsUpdated, SettingsCorrupt,
-        // SessionWriteFailed, StateDirUnusable.
-        assert_eq!(all.len(), 12, "Event gained or lost a variant");
+        // SessionWriteFailed, StateDirUnusable, SettingsWriteFailed.
+        assert_eq!(all.len(), 13, "Event gained or lost a variant");
 
         for event in &all {
             assert_eq!(event, &event.clone(), "{event:?} clone is not equal");

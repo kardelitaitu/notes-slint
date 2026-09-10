@@ -20,14 +20,14 @@
 use std::cell::Cell;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use notes_core::geometry::Rect;
 use notes_core::save::IoStep;
 use notes_core::session::write_session;
-use notes_core::settings::{SETTINGS_FILE_NAME, write_settings};
+use notes_core::settings::write_settings;
 use notes_core::{
     DecodeError, Detected, Document, FileKind, LineEnding as CoreLineEnding, NoteParts,
     SaveError as CoreSaveError, Session, Settings, Skip, StateDir, TextEncoding, classify_io_error,
@@ -230,6 +230,9 @@ pub(crate) struct Engine {
     /// has no user action to attach to, and the tick retries it forever, so
     /// per-tick reporting is an unbounded stream of toasts.
     session_failure_latched: bool,
+    /// The settings.toml twin of [`Self::session_failure_latched`] (M5/D54):
+    /// same per-tick retry, same flood without a latch, same clear-on-success.
+    settings_failure_latched: bool,
 }
 
 impl Engine {
@@ -297,6 +300,7 @@ impl Engine {
             pending: Pending::default(),
             load_refused: false,
             session_failure_latched: false,
+            settings_failure_latched: false,
             backend,
             facts,
             deadline: Instant::now() + AUTOSAVE_IDLE,
@@ -558,11 +562,11 @@ impl Engine {
             // screen is not this file, so writing it would destroy a document the
             // app never read. Refusing is the only answer that cannot cost the user
             // their note, and the named path is the file being protected.
-            self.emit(Event::SaveFailed {
-                path: path.to_path_buf(),
+            self.emit(Self::document_save_failed(
+                path.to_path_buf(),
                 revision,
-                reason: SaveError::NoTarget,
-            });
+                SaveError::NoTarget,
+            ));
             return;
         }
         // If the target already exists, ITS bytes win: overwriting a UTF-16 file
@@ -596,11 +600,11 @@ impl Engine {
                 });
                 self.remember(path);
             }
-            Err(reason) => self.emit(Event::SaveFailed {
-                path: path.to_path_buf(),
+            Err(reason) => self.emit(Self::document_save_failed(
+                path.to_path_buf(),
                 revision,
                 reason,
-            }),
+            )),
         }
     }
 
@@ -674,11 +678,7 @@ impl Engine {
                 self.doc.mark_saved();
                 self.emit(Event::Saved { path, revision });
             }
-            Err(reason) => self.emit(Event::SaveFailed {
-                path,
-                revision,
-                reason,
-            }),
+            Err(reason) => self.emit(Self::document_save_failed(path, revision, reason)),
         }
     }
 
@@ -760,6 +760,18 @@ impl Engine {
     /// moving a maximized window means un-maximizing it first, a decision platform
     /// explicitly leaves above itself. It is still pinned, because the pin is
     /// orthogonal to placement.
+    /// WHAT THE GEOMETRY TESTS DO AND DO NOT PROVE, so the next reader does
+    /// not mistake the fake for the desktop: `tests/geometry.rs` proves the
+    /// port ASKED - that the persisted rect is the one `restore_frame_rect`
+    /// RETURNED (`a_fresh_install_writes_the_session_with_the_rect_the_host_reports`
+    /// feeds the fake an answer different from the input rect and asserts the
+    /// stored value is the answer), and that `set_frame_rect` was called ONCE
+    /// with the CLAMPED rect at scale 1.0
+    /// (`the_first_registration_moves_the_window_once_at_the_clamped_frame_rect`).
+    /// What no fake can prove is whether `SetWindowPos` on a REAL window sticks
+    /// (gpui may re-apply stashed placement, and a recording backend has no
+    /// window to lie about). That half is the smoke run's on-screen check
+    /// (persisted rect vs the rect the user actually sees), not this suite's.
     fn restore_and_pin(&mut self, handle: WindowHandle) {
         let rect = self.session.rect;
         if self.session.maximized || self.backend.is_none() || self.facts.is_none() {
@@ -929,12 +941,25 @@ impl Engine {
         }
         if pending.settings {
             match write_settings(&self.state_dir, &self.settings) {
-                Ok(()) => self.pending.settings = false,
-                Err(err) => self.emit(Event::SaveFailed {
-                    path: self.state_dir.0.join(SETTINGS_FILE_NAME),
-                    revision: 0,
-                    reason: SaveError::Other(err.to_string()),
-                }),
+                Ok(()) => {
+                    self.pending.settings = false;
+                    // Success re-arms the report, exactly as the session's does.
+                    self.settings_failure_latched = false;
+                }
+                Err(err) => {
+                    // The last `revision: 0` lie (engine.rs:933, the site core
+                    // named): a settings file HAS no revision, and SaveFailed
+                    // is a DOCUMENT event. Same latch discipline as the session
+                    // arm above - one report per failure episode, retried every
+                    // tick, cleared on success - and core's own sentence
+                    // (SettingsError's Display) as the reason.
+                    if !self.settings_failure_latched {
+                        self.settings_failure_latched = true;
+                        self.emit(Event::SettingsWriteFailed {
+                            reason: err.to_string(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -950,6 +975,29 @@ impl Engine {
         let queued = !*bit;
         *bit = true;
         queued
+    }
+
+    /// The DOCUMENT save-failure event, and the only place one is built.
+    /// [`Event::SaveFailed`] carries a real path - the file the write was
+    /// attempted on - and a real revision - the buffer revision that write
+    /// would have anchored (D11) - and this helper is the guarantee's single
+    /// point: state files have neither fact, which is exactly why they ride
+    /// their own events ([`Event::SessionWriteFailed`],
+    /// [`Event::SettingsWriteFailed`], [`Event::StateDirUnusable`]) instead of
+    /// this one with a revision of 0 - a number the UI could render and the
+    /// user could believe. Core refuses a nameless target as InvalidPath
+    /// before any save outcome exists (save.rs:141), so an empty path here
+    /// could only mean the port built the lie itself; the assert is the tripwire.
+    fn document_save_failed(path: PathBuf, revision: u64, reason: SaveError) -> Event {
+        debug_assert!(
+            !path.as_os_str().is_empty(),
+            "SaveFailed is a document event: the path must name a file"
+        );
+        Event::SaveFailed {
+            path,
+            revision,
+            reason,
+        }
     }
 
     /// Records a file as opened: into the session (so the next launch restores it,
