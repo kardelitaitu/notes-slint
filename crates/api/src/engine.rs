@@ -958,6 +958,14 @@ impl Engine {
     fn remember(&mut self, path: &Path) {
         self.session.path = Some(path.to_path_buf());
         self.queue(Target::Session);
+        // What goes INTO the file is the bare, case-preserved name: a FACT about
+        // this path, stored per entry. The menu label is not that - a label is a
+        // RENDERING of the whole list (two "readme.txt" entries disambiguate each
+        // other), which is exactly why core's [`display_labels`] takes a slice
+        // and not an entry, and why it is called in [`Engine::emit_recent`] and
+        // nowhere on this path. Storing a rendered label here would freeze one
+        // list's collisions into every future list that contains only one of
+        // them. (AGENTS.md rule 5: the rule lives in core; this routes.)
         let display = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -972,15 +980,23 @@ impl Engine {
         self.emit_recent();
     }
 
-    /// core's entries to the port's, at the one place they become UI data.
+    /// core's entries to the port's, at the one place they become UI data - and
+    /// the ONE place the label rule is applied: [`display_labels`] is core's
+    /// (features.md 4.4), a pure function of the WHOLE list, because two entries
+    /// that share a basename disambiguate each other and no per-entry field can
+    /// see that. `path` and `exists` travel as the stored facts they are; only
+    /// `display` is rendered. Greying a vanished entry stays the bridge's job -
+    /// a label is a naming rule, `exists` is a state (D13).
     fn emit_recent(&mut self) {
+        let labels = notes_core::recent::display_labels(&self.settings.recents);
         let list = self
             .settings
             .recents
             .iter()
-            .map(|entry| RecentEntry {
+            .zip(labels)
+            .map(|(entry, label)| RecentEntry {
                 path: entry.path.clone(),
-                display: entry.display.clone(),
+                display: label,
                 exists: entry.exists,
             })
             .collect();
