@@ -160,6 +160,16 @@ jobs:
       #     on demand. If a SECOND package ever joins that footer, that is new information
       #     and this suppression should be revisited, not inherited silently.
       #
+      # Is 3b redundant now that smoke builds its own target (5e905c5: exit 4 when the
+      # target will not compile, exit 5 when the exe on disk is older than its sources)?
+      # No - keep it, and the argument is which verdict each step OWNS. 3b is the LINK gate:
+      # it is the only cell whose entire job is to go red on rust-lld refusing a duplicate
+      # RT_MANIFEST, and it does that with a name attached. Smoke compiles as a
+      # PRECONDITION for a runtime verdict, so its 4 says "I could not run", not "the link
+      # is broken", and its 5 refuses to judge a stale binary at all. Delete 3b and a link
+      # break moves from a named red cell into an annotation on an advisory step - which is
+      # the exact downgrade this file was written to prevent. (Both also dodge the stale-
+      # exe trap by going through cargo run; no step in this file invokes an exe path.)
       # --- 3b. the bridge LINKS ------------------------------------------------
       - name: bridge — cargo build -p notes-bridge-gpui --bin notes-gpui (the exe must link)
         id: bridge
@@ -459,6 +469,52 @@ jobs:
             0) echo "check-ci: the gate job and the xtask roster agree." ;;
             1) echo "::error::CI AND THE LOCAL GATE DISAGREE (check-ci exit 1). Each annotation above carries its rule id: step-missing = add the step here or delete the row in check.rs; step-extra = add the row or drop the step; advisory-mismatch = one side gated what the other parked; no-pipefail / no-shell-bash = the step cannot be trusted to report its own colour. Fix the side that is WRONG - a step in this file is a decision with a comment behind it, not a default to be silenced." ;;
             *) echo "::error::CHECK-CI COULD NOT JUDGE (exit $status) - it could not read ci.yml, or its reader refused a construct it would have to guess at. That is not a pass: fix the workflow text." ;;
+          esac
+          exit $status
+      # --- 4e. the unsafe ledger, now a rule instead of a claim ----------------
+      # "cargo run -p xtask -- check-unsafe" (crates/xtask/src/check_unsafe.rs) scans the
+      # platform sources and enforces the six rules AGENTS.md states as an invariant that
+      # nothing used to prove: [unsafe-outside-platform], [unsafe-without-safety],
+      # [local-allowance], [ledger-imbalance], [lint-missing], [lint-escape]. It BLOCKS:
+      # unsafe is the one place where a polite mistake is a memory-safety bug, and until
+      # this row existed the only enforcement was the honesty of whoever wrote the block.
+      # The roster makes it non-quick-skippable, so the drift lock at 4c runs it too - the
+      # named cell here exists to say WHICH rule escaped, in its own red.
+      #
+      # THE PRINT IS THE AUTHORITY, not any number in a prose file. The ratio quoted in
+      # planning for weeks (14 blocks : 16 SAFETY comments) was wrong in every direction it
+      # could be wrong, and two lanes repeating it honestly proved nothing - which is why a
+      # checker replaced the manager. Measured at 04da77c, and re-printed into this log on
+      # every run including a pass:
+      #   unsafe: 17 blocks, 26 SAFETY comments in notes-platform (45 source files scanned,
+      #   4 unsafe declarations) + both module-root #![allow(unsafe_code)] sites printed by
+      #   path and line rather than assumed absent (crates/platform/src/windows/mod.rs and
+      #   crates/platform/tests/geometry_live.rs). If a document disagrees with that line,
+      #   the document is stale. Quote the run, never this comment.
+      #
+      # Exit codes: 0 clean | 1 a rule was violated | 2 the checker REFUSED to judge
+      # (metadata unreadable, no platform member, no readable sources). 2 is red on
+      # purpose: a ledger nobody counted is not a balanced ledger.
+      - name: unsafe — cargo run -p xtask -- check-unsafe (the unsafe ledger balances and stays in platform)
+        id: check_unsafe
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          status=0
+          cargo run -p xtask -- check-unsafe 2>&1 | tee "$RUNNER_TEMP/check-unsafe.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          # One annotation per violation, each carrying its bracketed rule id.
+          while IFS= read -r line; do
+            echo "::error::$line"
+          done < <(grep -o 'UNSAFE VIOLATION: .*' "$RUNNER_TEMP/check-unsafe.log" || true)
+          # Re-print the authoritative tally even on a pass, so the number lives in the log
+          # of the run that earned it instead of in somebody memory.
+          grep -E '^unsafe: ' "$RUNNER_TEMP/check-unsafe.log" | head -4 || true
+          case $status in
+            0) echo "check-unsafe: clean - the ledger balances, and every unsafe is in platform with a SAFETY comment." ;;
+            1) echo "::error::UNSAFE LEDGER RULE VIOLATED (check-unsafe exit 1). The bracketed id above names which of the six escaped: unsafe-outside-platform (an unsafe where it may not be), unsafe-without-safety (no SAFETY comment near the block), local-allowance (a per-item allow is a loophole by definition), ledger-imbalance (more blocks than SAFETY comments), lint-missing / lint-escape (the workspace unsafe_code deny was dropped or overridden somewhere). Fix the code and the ledger - never edit a count, an allow, or this step to make the row pass." ;;
+            *) echo "::error::CHECK-UNSAFE COULD NOT JUDGE (exit $status) - it refused to read cargo metadata, found no notes-platform member, or had no readable sources. An uncounted ledger is NOT a balanced one; fix the instrument before believing any green here." ;;
           esac
           exit $status
       # --- 5. docs placement validator ---------------------------------------
