@@ -224,21 +224,31 @@ jobs:
       # own step table (advisory and --quick-skippable), so the drift lock at 4c reports it
       # too; this step exists to give it its own cell and its own annotation.
       #
-      # Two mechanical rules carry the rest of this step. It MUST come after 3b: with no
-      # exe built, smoke prints close=NOBIN and exits 1, which reads as an app bug instead
-      # of a missing artifact. And it ends exit $status even though it is advisory: a step
-      # whose last command is an echo always returns 0, so a real shutdown failure would
-      # render as a green cell - continue-on-error is what keeps that red from turning the
-      # run red. What each code covers now is the table below, not folklore.
+      # Two mechanical rules carry the rest of this step. As of 5e905c5 smoke BUILDS ITS
+      # OWN target before it launches anything - so it no longer depends on 3b having run
+      # (3b still owns the link verdict, and stays first so a link break is named there).
+      # And the step ends exit $status even though it is advisory: a step whose last
+      # command is an echo always returns 0, so a real shutdown failure would render as a
+      # green cell - continue-on-error keeps that red from turning the run red.
       #
-      # The exit-code contract as of 5efde6b (smoke relocates foreign user state before it
-      # judges, and declines instead of failing when it cannot). Three of the four codes
-      # now mean more than one thing, so the arms below keep the readings apart - an
-      # infrastructure emergency must never be cited as a product bug:
+      # The exit-code contract as of 5e905c5. Six codes, and several mean more than one
+      # thing, so the arms below keep the readings apart - "your code does not build" and
+      # "this runner has no desktop" are not the same story, and an infrastructure
+      # emergency must never be cited as a product bug:
       #   0  passed, AND the user state it moved aside came back byte-identical
-      #   1  app or persistence failure, OR the harness damaged a user profile, OR no exe
-      #   2  the harness could not run at all (no PowerShell, probe unwritable, bad usage)
+      #   1  app or persistence failure, OR the harness damaged a user profile,
+      #      OR the exe vanished mid-run (window=MISSING close=NOBIN)
+      #   2  it could not JUDGE at all: no PowerShell, probe unwritable, bad usage, or
+      #      unreadable source mtimes (a broken instrument, not a stale artefact)
       #   3  declined: no interactive desktop, OR foreign state on the session path
+      #   4  THE TARGET DID NOT COMPILE - nothing launched, no cached exe run; it surfaces
+      #      the first real cargo error line (smoke: build | error[...])
+      #   5  STALE BINARY - the exe on disk is older than the sources that build it, and
+      #      the --no-build diagnostic path refuses to judge against it
+      #
+      # Every arm is attributable because the step prints its own identity line: "smoke:
+      # tested binary <path> | <age> | built_by_this_run=YES|NO | git HEAD at that moment
+      # <sha>" - so a green cell names the exact artifact and commit it proved.
       #
       # And one reason its colour is not its value: smoke is the ONLY step in this file that
       # has ever caught a wrote-nothing persistence failure on a real machine - it found the
@@ -254,11 +264,19 @@ jobs:
       # experiment. Leftover local state - not an app bug, not a red build, and not part of
       # the smoke verdict, which is the exit code alone. So the log is tee-d whole and
       # nothing here greps, filters, or fails on stderr text.
+      #
+      # timeout-minutes: 15, and it is that number because smoke now pays for its own
+      # compile (5e905c5): the worst measured cold cost of building this graph in this repo
+      # is 2m11s with a private target dir, on CI the same graph is already warm from steps
+      # 1-3c so this is normally seconds, and the harness adds only bounded waits (xtask
+      # kills its pwsh child at 40 s, the row budget is 120 s). 15 min is ~7x that worst
+      # measured compile and a third of the 45-minute job timeout - a hung GUI or a stuck
+      # link now dies with THIS step named, instead of eating the whole job in silence.
       - name: smoke — cargo run -p xtask -- smoke (advisory - needs a desktop session)
         id: xtask_smoke
         continue-on-error: true
         shell: bash
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           set -o pipefail
           status=0
@@ -266,9 +284,11 @@ jobs:
           echo "status=$status" >> "$GITHUB_OUTPUT"
           case "$status" in
             0) echo "smoke: PASS - a window appeared, WM_CLOSE shut the app down by itself, that run wrote session.json, and the user state the harness relocated is accounted for - byte-identical by the harness's own contract, which is what makes exit 1 below possible. Citable as written: graceful shutdown, real persistence, no profile left damaged. The outcome_note on the line above says WHICH pass it was - kept-app-artefact (this run wrote it, the user bytes parked aside) or restored-user-state (the user file came back unchanged) - so quote that token, not just the green." ;;
-            1) echo "::error::SMOKE EXIT 1 - three unrelated readings share this code; separate them before citing it. Look at the smoke: window=.../close=.../session=... line and the SMOKE FAIL line above it. close=FORCED means the app had to be killed to stop it (shutdown bug). session=FAILED, with every path searched printed, means nothing was persisted (product bug). close=NOBIN means the exe from step 3b was never built (step order, not the app). But if the log says the relocated user state did not come back byte-identical, or could not restore it and names a temp path, then THE HARNESS DAMAGED A USER PROFILE - an infrastructure emergency: put that file back by hand and fix the harness before this row is read as the app failing to persist." ;;
+            1) echo "::error::SMOKE EXIT 1 - three unrelated readings share this code; separate them before citing it. Look at the smoke: window=.../close=.../session=... line and the SMOKE FAIL line above it. close=FORCED means the app had to be killed to stop it (shutdown bug). session=FAILED, with every path searched printed, means nothing was persisted (product bug). window=MISSING close=NOBIN means the exe disappeared between its build and the launch (an artifact that vanished, not a shutdown bug) - a TARGET THAT DOES NOT COMPILE IS EXIT 4, not this one. But if the log says the relocated user state did not come back byte-identical, or could not restore it and names a temp path, then THE HARNESS DAMAGED A USER PROFILE - an infrastructure emergency: put that file back by hand and fix the harness before this row is read as the app failing to persist." ;;
             3) echo "::notice::smoke DECLINED - the summary line above says which of the two it was: (no desktop) means no interactive session to open a window in; (BLOCKED BY FOREIGN STATE) means something that is not a session file occupies the state path, which is machine pollution and not the app - the DECLINED line prints what is sitting there, with ACLs, and says clear the occupant. Neither is a failure; the check was simply not possible on this machine." ;;
-            *) echo "::error::SMOKE HARNESS FAILURE (exit $status) - no PowerShell to post WM_CLOSE with, or the probe could not be written. This is not an app failure." ;;
+            4) echo "::error::SMOKE EXIT 4 - THE TARGET DID NOT COMPILE. Nothing was launched and no cached exe was run, so this says nothing about shutdown or persistence: it is a build failure, reported as an annotation only because a GUI step must not gate a headless runner. The line above (smoke: build | error[E...]) is the first real cargo error, and the step BEFORE this one (3b/3c) usually carries the same verdict with a name - fix the code, then re-read 1 and 3; do not treat a green 3b as proof this 4 is wrong, smoke builds the test profile itself." ;;
+            5) echo "::error::SMOKE EXIT 5 - STALE BINARY: the notes-gpui.exe on disk is older than the sources that build it, so smoke refused to judge the running app against a build nobody compiled from this commit (window=STALE close=STALE session=STALE, and the identity line prints the age plus built_by_this_run=NO). This is an infrastructure/instrument problem, not a product bug and NOT a pass - a verdict on a stale exe would be a lie about code that no longer exists. The --no-build diagnostic path asked for this; rebuild, do not force a run." ;;
+            *) echo "::error::SMOKE COULD NOT JUDGE (exit $status) - the harness itself failed before any verdict: no PowerShell to post WM_CLOSE with, the probe script could not be written or run, unreadable mtimes on the sources (a broken instrument, deliberately not reported as 5/stale), or a bad invocation of cargo xtask smoke. Codes 0-5 are all named elsewhere in this case, so anything reaching here is an unknown contract change: read it as no information about the app, never as a pass and never as a missing desktop." ;;
           esac
           exit $status
 
