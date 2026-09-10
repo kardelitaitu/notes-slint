@@ -1154,3 +1154,34 @@ fn scratch_note_roams_with_the_state_and_clear_recents_spares_it() -> Result<(),
     );
     Ok(())
 }
+
+/// TWO DISTINCT REAL FILES, ONE MRU IDENTITY KEY (the auditor's U+0130
+/// finding): NTFS does not fold U+0130 (I-with-dot) with i+U+0307 the way
+/// full-Unicode to_lowercase does, so both names EXIST on disk as separate
+/// files while the old key rule called them one — a silent shadow that made
+/// the MRU drop a slot and reopen the stored path, not the opened file.
+/// The canonicalise-SUCCESS arm now keys with the OS's own casing verbatim.
+#[test]
+#[cfg(windows)]
+fn dotted_capital_i_and_i_combining_dot_are_two_files_two_keys() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let dotted_capital = dir.path().join("\u{0130}.notes");
+    let i_combining = dir.path().join("i\u{0307}.notes");
+    fs::write(verb(&dotted_capital), b"A")?;
+    fs::write(verb(&i_combining), b"B")?;
+    assert!(
+        fs::symlink_metadata(verb(&dotted_capital)).is_ok()
+            && fs::symlink_metadata(verb(&i_combining)).is_ok(),
+        "the host must really hold two distinct files for this proof"
+    );
+    let key_a = identity_key(&dotted_capital);
+    let key_b = identity_key(&i_combining);
+    assert_ne!(
+        key_a, key_b,
+        "two distinct on-disk files must have two identity keys"
+    );
+    // And both reopen: the MRU would not hold a row pointing at a shadow.
+    assert_eq!(fs::read(verb(&dotted_capital))?, b"A");
+    assert_eq!(fs::read(verb(&i_combining))?, b"B");
+    Ok(())
+}

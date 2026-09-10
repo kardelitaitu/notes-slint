@@ -265,12 +265,28 @@ fn identity_of(path: &Path) -> (String, bool) {
         );
     }
     match std::fs::canonicalize(path) {
-        Ok(canonical) => (key_from_raw(&canonical.to_string_lossy()), true),
+        Ok(canonical) => (
+            // The OS answered with ITS OWN casing for a REAL file — key it
+            // verbatim. Folding here (the old rule) merged distinct NTFS
+            // files: NTFS does not fold U+0130 with i+U+0307 the way full
+            // Unicode to_lowercase does, so two real documents collapsed to
+            // one identity and the MRU held a shadow (auditor finding).
+            key_from_canonical(&canonical.to_string_lossy()),
+            true,
+        ),
         Err(_) => (
             key_from_raw(&lexical_normalisation(path).to_string_lossy()),
             false,
         ),
     }
+}
+
+/// The key for a CANONICALISED path: verbatim prefix-stripped, no case
+/// folding — the spelling is the OS's own answer for a real file, so two
+/// spellings of one file still meet (both canonicalise to the same on-disk
+/// casing) while two distinct files stay distinct.
+fn key_from_canonical(raw: &str) -> String {
+    strip_verbatim(raw)
 }
 
 fn key_from_raw(raw: &str) -> String {
