@@ -46,8 +46,8 @@
 //! * Dev edges are still not followed, but the allowance is a LIST now, not a
 //!   mood: DEV_TRANSITIVE_EXEMPTIONS names every dev-dependency whose own
 //!   closure carries a forbidden crate (today: tempfile, which pulls
-//!   windows-sys on Windows and is dev-only in BOTH notes-core and notes-api
-//!   - decision D23, and run() prints each measured pairing rather than
+//!   windows-sys on Windows and is dev-only in BOTH notes-core and notes-api,
+//!   which is decision D23; run() prints each measured pairing rather than
 //!   trusting the list). A dev dep that does the same and
 //!   is not on the list is reported as [dev-transitive], and run() prints the
 //!   exemptions it applied, so the allowance is visible where violations are.
