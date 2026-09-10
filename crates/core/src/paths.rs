@@ -150,27 +150,6 @@ mod tests {
         assert_eq!(empty_appdata.0, Path::new("C:/apps/notes").join("data"));
     }
 
-    /// Pure determinism: identical inputs give identical outputs, every call.
-    #[test]
-    fn state_dir_resolution_is_deterministic() {
-        let cases = [
-            (Path::new("C:/apps/notes"), None),
-            (
-                Path::new("C:/Program Files/Notes"),
-                Some(Path::new("C:/Users/u/AppData/Roaming")),
-            ),
-            (Path::new(""), Some(Path::new(""))),
-            (Path::new("C:/apps/notes"), Some(Path::new(""))),
-        ];
-        for (exe_dir, appdata) in cases {
-            assert_eq!(
-                resolve_state_dir(exe_dir, appdata),
-                resolve_state_dir(exe_dir, appdata),
-                "nondeterministic for {exe_dir:?} / {appdata:?}"
-            );
-        }
-    }
-
     /// THE PIN (D69): our own default must pass our own predicate for every
     /// StateDir shape core can produce. If the scratch name failed
     /// path_policy, the save path would refuse a file we invented — exactly

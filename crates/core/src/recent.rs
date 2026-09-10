@@ -229,6 +229,11 @@ pub fn display_labels(entries: &[RecentEntry]) -> Vec<String> {
 /// hiding it, and two labels that differed only invisibly become visibly
 /// different. The path, the identity and the file are untouched — this is
 /// the label rule, not a refusal.
+///
+/// ACCEPTED COLLISION: "[RTL]"/"[ZWSP]" are legal in NTFS names, so a file
+/// literally named x[RTL]y is indistinguishable from an escaped U+202E.
+/// Escaping the brackets would uglify every label to dodge a contrived
+/// case; the path, identity and file are never affected. Recorded decision.
 fn visible_label(label: &str) -> String {
     label
         .replace('\u{202E}', "[RTL]")
@@ -247,11 +252,11 @@ fn visible_label(label: &str) -> String {
 ///   "normalise to what the OS would write". Without this, one real file
 ///   occupies two recent slots and the refused spelling can never be
 ///   reopened — the list refuses the name it displays.
-/// * StreamName / DriveRelative — NO: a stream is another file's storage,
-///   and a drive-relative name resolves against invisible process state;
-///   both stay lexical (and drive-relative names are refused outright).
-///   The lexical fallback is pure and instant, and was-canonicalised=false
-///   is the honest answer (core did not touch the filesystem).
+/// * StreamName / DriveRelative — canonicalise is ATTEMPTED like any other
+///   local name (the auditor's re-read fixed this comment to match the
+///   code, which is the better behaviour): on success the OS's own answer
+///   is the identity, on failure the pure lexical fallback answers and
+///   was-canonicalised=false is the honest "core did not touch the disk".
 fn identity_of(path: &Path) -> (String, bool) {
     use crate::path_policy::PathVerdict;
     let canonicalisable = !matches!(
@@ -378,6 +383,10 @@ fn compose(suffix: &str, basename: &str) -> String {
 
 /// The hard character cap: keep the tail (the nearest folders and the file
 /// name), mark the cut. Bounded is the promise; this is where it is kept.
+///
+/// ACCEPTED AMBIGUITY: keeping the tail means two long paths differing only
+/// in the middle can render identically. A label is never an identity (see
+/// the module docs), so this is a display quirk, not a data hazard.
 fn hard_cap(label: String) -> String {
     let count = label.chars().count();
     if count <= MAX_LABEL_CHARS {
@@ -399,10 +408,18 @@ mod tests {
         }
     }
 
+    /// The OLD version asserted f(x)==f(x) — the definition — and stayed
+    /// green while the U+0130 shadow lived underneath it (D45). The pinned
+    /// value makes the lexical rule itself load-bearing: change the folding,
+    /// the verbatim stripping, or the fallback, and this fails.
     #[test]
-    fn identity_key_is_stable_across_repeated_calls() {
-        let p = Path::new(r"C:\some\where\note.notes");
-        assert_eq!(identity_key(p), identity_key(p));
+    fn the_lexical_identity_key_pins_the_folding_rule() {
+        let p = Path::new(r"C:\Some\WHERE\note.notes");
+        assert_eq!(
+            identity_key(p),
+            r"c:\some\where\note.notes",
+            "the lexical fallback folds case (Windows) and strips verbatim prefixes"
+        );
         assert_eq!(identity_key(p), identity_of(p).0);
     }
 

@@ -501,6 +501,12 @@ mod tests {
             // component) is still Allowed past the prefix.
             (r"\\?\C:\a.notes.", PathVerdict::StrippedName),
             (r"\\?\\dir\x.notes", PathVerdict::Allowed), // rooted verbatim form
+            // ACCEPTED (audit item 4): Allowed-but-unwritable shapes. Win32
+            // refuses both on write; no data moves; refusing them here would
+            // need traversal semantics the name-only policy deliberately
+            // does not own. Documented so no reader rediscovers them.
+            (r"\\?\C:\x\..\y.notes", PathVerdict::Allowed), // mid-path
+            (concat!(r"\\?\C:\x.notes", r"\"), PathVerdict::Allowed), // trailing backslash
             (r"\??\C:\x.notes", PathVerdict::ReservedDevice),
             (r"\\.\PhysicalDrive0", PathVerdict::ReservedDevice),
         ];

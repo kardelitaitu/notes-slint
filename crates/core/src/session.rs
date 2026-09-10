@@ -519,6 +519,15 @@ mod tests {
         let per = start.elapsed() / runs;
         eprintln!("writability probe: {per:?} per call");
         assert!(per.as_millis() < 10, "probe regressed: {per:?}");
+        // Correctness, not only cost: the probe is a create-and-delete, so
+        // 100 runs must leave ZERO litter — otherwise startup would slowly
+        // fill the state dir with junk.
+        let litter: Vec<_> = std::fs::read_dir(&state)?.collect();
+        assert!(
+            litter.is_empty(),
+            "the probe left {} entries behind",
+            litter.len()
+        );
         Ok(())
     }
 
