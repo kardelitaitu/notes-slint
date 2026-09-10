@@ -121,6 +121,30 @@
 //! and the session write that [`Command::GeometryChanged`] queues is performed on
 //! the tick arm and once more inside the shutdown drain.
 //!
+//! The startup order this API supports, in the shape docs/architecture.md §5.5
+//! fixes it, with the call each step makes:
+//!
+//! ```text
+//! 1. query session       Gateway::startup_state() -> Option<InitialState>  (once)
+//! 2. create the window   bridge, AT the rect from step 1
+//! 3. register the handle Gateway::send(Command::RegisterWindow { .. })
+//! 4. apply topmost       bridge, from InitialState.pinned (notes-platform)
+//!
+//! ```
+//! Step 1 is consume-once on purpose: [`Gateway::startup_state`] is the snapshot
+//! [`Gateway::start`] took, not a live query - a second call would hand back a
+//! pin bit and autosave toggle that [`Command::SetPinned`] has since changed. The
+//! port's part of the order is that the rect and the pin arrive BEFORE the first
+//! frame; steps 2 and 4 are bridge work.
+//!
+//! **What to do with an [`Err`] from [`Gateway::send`]**: the [`Err`] carries
+//! the command back, meaning the engine never took it, so no [`Event`] for it can
+//! EVER arrive. Render it as a failed action and consult
+//! [`Gateway::is_closed`](crate::Gateway::is_closed) - do NOT [`let _`] it,
+//! because a silently dropped Flush is data loss with the label removed. [`Ok`]
+//! means QUEUED, not done: the answer is still an [`Event`], later, on the
+//! channel.
+//!
 //! Still unwired: the registered [`WindowHandle`] is stored and unused —
 //! applying topmost goes through notes-platform, which this crate has no
 //! dependency on and which check-arch keeps out.
@@ -230,12 +254,12 @@ mod event;
 mod gateway;
 
 pub use command::{Command, WindowHandle};
-pub use dto::{Rect, Session, StateDir};
+pub use dto::{Rect, Session, Settings, StateDir};
 pub use engine::mark_current_thread_as_engine;
 pub use event::{
     Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason,
 };
-pub use gateway::{EventRx, Gateway, InitialState, Settings};
+pub use gateway::{EventRx, Gateway, InitialState};
 
 #[cfg(test)]
 mod tests {

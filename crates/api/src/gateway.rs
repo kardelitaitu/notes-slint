@@ -25,7 +25,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use notes_core::session::read_session_or_default;
-use notes_core::{Session, StateDir};
+use notes_core::{Session, Settings, StateDir};
 
 use crate::command::Command;
 use crate::engine::{Engine, on_engine_thread};
@@ -42,36 +42,13 @@ pub type EventRx = Receiver<Event>;
 /// the role instead of repeating a bare type.
 pub(crate) type EventTx = Sender<Event>;
 
-/// The deliberate preferences the engine starts with.
-///
-/// A placeholder with a future owner. Settings are notes-core's (settings.toml:
-/// autosave on/off, interval, recents) and that module does not exist yet - core
-/// is being written in parallel with this slice. What the port needs right now is
-/// exactly one value, to honour [`Command::SetAutosave`], so this declares the
-/// smallest thing that compiles instead of inventing a settings format inside the
-/// port (rule 1).
-///
-/// CONTRACT for the next slice: delete this struct, re-export the core type from
-/// dto.rs. [`Gateway::start`] keeps the parameter named `Settings`, so no
-/// bridge code changes when the swap happens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Settings {
-    /// The GLOBAL auto-save toggle - the menu item. Not per-document arming
-    /// (ADR-0001, [`FileMeta::armed`](crate::FileMeta::armed)) and not the pin bit
-    /// (D10, session.json).
-    /// Three different states, three different homes.
-    pub autosave_enabled: bool,
-}
-
-impl Default for Settings {
-    /// Autosave ON. It is the product premise ("never asks you to save"), so off
-    /// has to be chosen, not discovered.
-    fn default() -> Self {
-        Settings {
-            autosave_enabled: true,
-        }
-    }
-}
+// The engine's starting preferences are [`Settings`], and this slice stopped
+// defining it: the type belongs to notes_core::settings (settings.toml) and
+// reaches a bridge through dto.rs. The parameter keeps the name [`Settings`],
+// which is what the placeholder's CONTRACT comment promised, so
+// [`Gateway::start`]'s signature is unchanged in shape. Plain comments rather
+// than doc comments: there is no item left below to document - the stopgap struct
+// this sat on is gone, and a doc comment on nothing is a hard error.
 
 /// What the bridge needs BEFORE it creates the window (docs/architecture.md §5.5
 /// step 1), in one read that costs one file.
@@ -234,6 +211,17 @@ impl Gateway {
         result
     }
 
+    /// True once this Gateway cannot accept anything: [`Self::close`] ran, it was
+    /// dropped, or the engine thread finished.
+    ///
+    /// [`Self::send`] handing the command back is the fact; this is the
+    /// explanation a caller can ask for without firing a probe command, and it is
+    /// what the M2 bridge should show next to a failed action.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.cmd_tx.is_none() || self.engine.as_ref().is_some_and(|h| h.is_finished())
+    }
+
     /// True while the engine thread is still running. A test seam worth keeping:
     /// the honest alternative is polling EventRx until it goes Disconnected.
     #[must_use]
@@ -393,6 +381,7 @@ mod tests {
         assert!(Settings::default().autosave_enabled);
         let off = Settings {
             autosave_enabled: false,
+            ..Settings::default()
         };
         assert!(!off.autosave_enabled);
     }

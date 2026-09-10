@@ -49,9 +49,15 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Harness::with_settings(Settings::default())
+    }
+
+    /// The same engine with a caller-supplied [`Settings`] - which since this
+    /// slice is core's type, means the ANSI code page is a test input too.
+    fn with_settings(settings: Settings) -> Self {
         let dir = tempfile::tempdir().expect("a temp state dir");
         let root = dir.path().to_path_buf();
-        let (gateway, rx) = Gateway::start(StateDir(root.clone()), Settings::default());
+        let (gateway, rx) = Gateway::start(StateDir(root.clone()), settings);
         // 5.5 step 3, once per scenario: the window exists before anything is
         // asked of it, so the engine is in the state a bridge would leave it in.
         let _ = gateway.send(Command::RegisterWindow {
@@ -515,4 +521,57 @@ fn the_recent_list_is_reported_cleared_and_rebuilt() {
         "D13's cap holds from outside the crate: {}",
         list.len()
     );
+}
+
+/// MINOR 4 / D27, and the reason [`detect`] is now handed a code page at all:
+/// an ANSI file must be read at the page the CALLER supplied. With 1252 it decodes
+/// to the right characters; with a page core cannot write back it must be refused
+/// rather than guessed - guessing is how a French note turns into mojibake on a
+/// Japanese machine and then gets SAVED that way.
+#[test]
+fn an_ansi_file_is_decoded_at_the_configured_codepage_not_by_assumption() {
+    // "caf" + 0xE9 + " notes": 0xE9 is e-acute in CP1252 and is not valid UTF-8,
+    // so by the time detection runs this really is an ANSI file. No trailing
+    // newline either, so the same fixture pins the unterminated case of §4.5.
+    let e_acute = char::from_u32(0xE9).expect("e-acute");
+    let bytes: Vec<u8> = [b"caf".as_slice(), &[0xE9u8], b" notes"].concat();
+
+    let mut app = Harness::with_settings(Settings {
+        codepage: Some(1252),
+        ..Settings::default()
+    });
+    let native = app.file("fr.notes", &bytes);
+    let (text, meta) = app.open(&native);
+    assert_eq!(
+        meta.encoding,
+        Encoding::Ansi(1252),
+        "read at the given page"
+    );
+    assert_eq!(text, format!("caf{e_acute} notes"), "decoded, not replaced");
+    assert_eq!(app.bytes(&native), bytes, "and reading changed nothing");
+    assert!(!meta.trailing_newline);
+
+    let mut other = Harness::with_settings(Settings {
+        codepage: Some(932),
+        ..Settings::default()
+    });
+    let same = other.file("fr.notes", &bytes);
+    other.send(Command::Open { path: same.clone() });
+    let event = other.until("a verdict on the ANSI file", |ev| {
+        matches!(ev, Event::LoadFailed { path, .. } | Event::Loaded { path, .. } if path == &same)
+    });
+    match event {
+        Event::LoadFailed { reason, .. } => {
+            assert!(
+                !reason.to_string().trim().is_empty(),
+                "the refusal must be renderable"
+            );
+            assert_eq!(
+                app.bytes(&native),
+                bytes,
+                "a refused code page must not have rewritten anything"
+            );
+        }
+        loaded => panic!("a page core cannot write back must not decode silently: {loaded:?}"),
+    }
 }

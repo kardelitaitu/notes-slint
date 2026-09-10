@@ -47,3 +47,25 @@ pub use notes_core::paths::StateDir;
 /// window is the bridge's. The port moves the value and interprets nothing - and
 /// note that the pin bit lives HERE, one home, per D10.
 pub use notes_core::session::Session;
+
+/// The user preferences the engine starts with, and the ANSI default it decodes
+/// with. Owned by `notes_core::settings` (settings.toml, written atomically,
+/// and the home of the recents list that is deliberately NOT in session.json),
+/// re-exported here so a bridge can name what it hands
+/// [`Gateway::start`](crate::Gateway::start).
+///
+/// This replaced the api-side placeholder the lifecycle slice declared, which is
+/// exactly what that placeholder's CONTRACT comment asked for: delete the stopgap,
+/// re-export the core type, keep the parameter named `Settings` so no future
+/// bridge call site changes. Two fields the stopgap never had now matter here:
+///
+/// * `codepage` is threaded into every `detect` call, so an ANSI file is
+///   read at the code page the caller supplied - the bridge's GetACP value -
+///   instead of CP1252 being assumed. That closes reviewer MINOR 4 and is how D27
+///   reaches a real file.
+/// * `recents` is the persisted list. The engine does NOT seed itself from it
+///   yet, because that would make cold start read a second file and
+///   tests/reentrancy.rs pins that startup reads session.json alone.
+///
+/// No longer `Copy`: it carries a Vec, so the port moves it.
+pub use notes_core::settings::Settings;

@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use notes_core::session::write_session;
 use notes_core::{
     DecodeError, Detected, Document, FileKind, LineEnding as CoreLineEnding, NoteParts,
-    SaveError as CoreSaveError, Session, SessionError, Skip, StateDir, TextEncoding,
+    SaveError as CoreSaveError, Session, SessionError, Settings, Skip, StateDir, TextEncoding,
     classify_io_error, clear as clear_recents, decode, detect, is_notes_path, is_oversize,
     push as push_recent, rebuild, save_document_revision, split,
 };
@@ -36,7 +36,7 @@ use crate::command::{Command, WindowHandle};
 use crate::event::{
     Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason,
 };
-use crate::gateway::{EventTx, Settings};
+use crate::gateway::EventTx;
 
 /// The autosave idle cadence, in its temporary home.
 ///
@@ -171,9 +171,14 @@ pub(crate) struct Engine {
     /// could write stale text to a new path while the editor showed something
     /// else. That is data loss with a nicer name, so the command vocabulary grew
     /// the missing fields (D30) and the fields below disappeared with them.
-    /// The last revision that reached disk. D11's rule in one u64: a Flush at or
-    /// below it is Clean and no write is attempted.
-    last_saved_revision: u64,
+    /// The ANSI default from [`Settings::codepage`], threaded into every
+    /// [`detect`] call. None means nobody told us, and core then refuses to
+    /// guess: an ANSI file whose code page we were not handed comes back
+    /// undecodable rather than being read as CP1252 by assumption (reviewer
+    /// MINOR 4, and D27's rule that core refuses what it cannot write back). The
+    /// bridge supplies its GetACP value here, because this crate may not call a
+    /// platform API to get one.
+    codepage: Option<u16>,
     /// Coalesced "session.json needs writing": a bool, not a queue, so 65 geometry
     /// updates before the next tick cost ONE write (D11's spirit - no disk churn).
     pending_session_write: bool,
@@ -203,6 +208,7 @@ impl Engine {
             event_tx: Some(event_tx),
             state_dir,
             autosave_enabled: settings.autosave_enabled,
+            codepage: settings.codepage,
             window: None,
             doc: match session.path.as_ref() {
                 Some(path) => Document::open(path, file_kind(path), false, false),
@@ -210,7 +216,6 @@ impl Engine {
             },
             detected: new_file_detected(),
             frontmatter: None,
-            last_saved_revision: 0,
             pending_session_write: false,
             recents: Vec::new(),
             deadline: Instant::now() + AUTOSAVE_IDLE,
@@ -354,7 +359,6 @@ impl Engine {
             // autosave would write a truncated file over the user's real one.
             self.doc = Document::open(path, file_kind(path), true, true);
             self.frontmatter = None;
-            self.last_saved_revision = 0;
             self.emit(Event::Loaded {
                 path: path.to_path_buf(),
                 text: String::new(),
@@ -378,10 +382,7 @@ impl Engine {
             }
         };
 
-        // The ANSI default is None on purpose: the system codepage is a
-        // GetACP-style platform call and api may not import notes-platform. The
-        // settings slice replaces this with a loaded codepage.
-        let detected = detect(&bytes, None);
+        let detected = detect(&bytes, self.codepage);
         let raw = match decode(&bytes, detected) {
             Ok(text) => text,
             Err(err) => {
@@ -406,7 +407,6 @@ impl Engine {
         );
         self.detected = detected;
         let body = self.body_for_ui(&raw);
-        self.last_saved_revision = 0;
         self.emit(Event::Loaded {
             path: path.to_path_buf(),
             text: body,
@@ -456,13 +456,14 @@ impl Engine {
     fn save_as(&mut self, path: &Path, text: &str, revision: u64) {
         // If the target already exists, ITS bytes win: overwriting a UTF-16 file
         // with the source's UTF-8 is exactly the silent change §4.5 forbids.
-        let detected = existing_detected(path);
+        let detected = existing_detected(path, self.codepage);
         let disk_text = self.text_for_disk(text);
         match self.write(path, &disk_text, detected, revision) {
             Ok(()) => {
                 self.doc.save_as(path);
                 self.detected = detected;
-                self.last_saved_revision = revision;
+                // save_as already anchored core's saved_revision at this document
+                // revision; there is no second counter left to update.
                 let read_only = fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly());
                 self.emit(Event::Saved {
                     path: path.to_path_buf(),
@@ -494,7 +495,25 @@ impl Engine {
 
     /// Flush: an explicit save or an autosave trigger, gated by core's order.
     ///
-    /// The stale check runs FIRST, before Document is consulted at all, because
+    /// [`Document::should_flush`] is the ONLY place this build decides that a
+    /// Flush is stale (D11). The port keeps no second counter - the field this
+    /// replaced is deleted - because two gates in two crates is how a future fix
+    /// lands in one and not the other. Core's order is also the rendered order:
+    /// stale outranks everything, so a stale autosave on a read-only file says
+    /// Clean, which is true, rather than ReadOnly, which explains a write nobody
+    /// needed.
+    ///
+    /// [`Document::note_revision`] is what makes that gate usable at all: the
+    /// bridge owns the revision space, so core is TOLD where the document stands,
+    /// monotonically. The [`Document::revision`] comparison below is NOT a second
+    /// D11 gate - it never decides whether to write. It turns "a revision core has
+    /// not been told about" into a dirty document, because core's only
+    /// dirty-setters bump the counter, and marking dirty AFTER the gate would make
+    /// a stale Flush look like an edit.
+    ///
+    /// Why this used to be a port-side counter, kept as the record of an API gap
+    /// that core has since closed: [`should_flush`] compared the flush revision
+    /// against core's own counter, and the bridge owns the revision space.
     /// "this flush is old" outranks every other reason (D11): a stale autosave on
     /// a read-only file must report Clean, not ReadOnly, or the status line
     /// explains a write that was never needed. Everything after that is
@@ -504,13 +523,17 @@ impl Engine {
     /// Why should_flush is not the gate: it compares the flush revision against
     /// core's own counter, and the two are different spaces while the bridge owns
     /// the buffer (§10.4, decision (ii)) - core has no setter for it. So the port
-    /// carries the counter it was handed ([`Self::last_saved_revision`]) and asks
+    /// carries the counter it was handed (`last_saved_revision`) and asks
     /// core the questions core can answer. When core owns the buffer, this line
     /// becomes [`Document::should_flush`] and the field disappears.
     fn flush(&mut self, text: String, revision: u64) {
-        if revision <= self.last_saved_revision {
+        if revision > self.doc.revision() {
+            self.doc.apply_edit();
+        }
+        self.doc.note_revision(revision);
+        if let Some(skip) = self.doc.should_flush(revision, self.autosave_enabled) {
             self.emit(Event::AutosaveSkipped {
-                reason: SkipReason::Clean,
+                reason: api_skip(skip),
             });
             return;
         }
@@ -524,22 +547,15 @@ impl Engine {
             });
             return;
         };
-        // A revision above the last saved one IS the change signal (D11): no
-        // stored text is needed to know the buffer moved.
-        self.doc.mark_dirty();
-        if let Some(skip) = self.doc.should_autosave(self.autosave_enabled) {
-            self.emit(Event::AutosaveSkipped {
-                reason: api_skip(skip),
-            });
-            return;
-        }
 
         let detected = self.detected;
         let disk_text = self.text_for_disk(&text);
         match self.write(&path, &disk_text, detected, revision) {
             Ok(()) => {
+                // Anchors core's saved_revision to the document revision that
+                // note_revision just aligned, so the next stale flush is decided
+                // in this same place.
                 self.doc.mark_saved();
-                self.last_saved_revision = revision;
                 self.emit(Event::Saved { path, revision });
             }
             Err(reason) => self.emit(Event::SaveFailed {
@@ -800,7 +816,7 @@ fn decode_offset(err: &DecodeError) -> usize {
 /// TARGET's format rather than imposing the source's (§4.5). Unreadable, empty or
 /// oversize targets fall back to the product default: replacing something we
 /// cannot read is the user's explicit choice, made in a dialog.
-fn existing_detected(path: &Path) -> Detected {
+fn existing_detected(path: &Path, codepage: Option<u16>) -> Detected {
     let Ok(meta) = fs::metadata(path) else {
         return new_file_detected();
     };
@@ -810,7 +826,7 @@ fn existing_detected(path: &Path) -> Detected {
     let Ok(bytes) = fs::read(path) else {
         return new_file_detected();
     };
-    detect(&bytes, None)
+    detect(&bytes, codepage)
 }
 #[cfg(test)]
 mod tests {
@@ -949,8 +965,8 @@ mod tests {
     fn drain_stops_at_its_budget_instead_of_hanging_shutdown() {
         let (mut engine, cmd_tx, events) = wired();
         let excess = MAX_DRAIN + 5;
-        // From 1, not 0: revision 0 would be stale against a fresh engine's
-        // last_saved_revision and answer Clean instead of echoing the flush.
+        // From 1, not 0: revision 0 is stale against a fresh engine's
+        // core's saved revision and answer Clean instead of echoing the flush.
         for revision in 1..=excess as u64 {
             cmd_tx.send(flush(revision)).expect("unbounded");
         }
