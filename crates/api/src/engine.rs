@@ -719,15 +719,83 @@ impl Engine {
             return;
         }
         let Some(path) = self.doc.path().map(Path::to_path_buf) else {
-            // Nothing to write to. Reported, not swallowed: a flush the engine
-            // cannot honour is a fact the status line needs.
-            // A note with no path is not an error, so it is answered as the skip it
-            // is (M9): the menu's Save item is the user's next move, and an error
-            // toast about a file that does not exist teaches nobody anything. The
-            // copy for that lives in SkipReason::NeedsPath, not in a string here.
-            self.emit(Event::AutosaveSkipped {
-                reason: SkipReason::NeedsPath,
-            });
+            // D69: an untitled buffer is not an error, it is a note nobody has
+            // named yet - the first-run user types, autosave fires, and the text
+            // MUST land somewhere real instead of being dropped with a skip.
+            // Core owns WHERE (scratch_note_path + ensure_scratch_dir, the same
+            // judge and probe every other state path uses); the port owns the
+            // write, through the SAME machinery Save As uses (sibling temp,
+            // fsync, rename - no second writer). Then the document is rebound:
+            // Saved announces the bytes, Rebound announces the new identity,
+            // and the scratch joins the recents like any other file.
+            //
+            // This mirrors save_as's body minus its load_refused guard: the
+            // refused-load state protects a FOREIGN file from a blind overwrite,
+            // and the scratch is this port's own freshly created file - the
+            // guard has no jurisdiction here. NeedsPath survives as the FALLBACK
+            // (its meaning is now "we could not make a file for it": a scratch
+            // directory that cannot be created, or a refused write), and the
+            // startup StateDirUnusable event has usually already said why.
+            //
+            // An EMPTY untitled buffer is the one case D69 does not cover: there
+            // is no text to lose, so creating (and re-writing) a zero-byte
+            // scratch file on every flush would be pure churn. NeedsPath stays
+            // its answer until the user actually types something.
+            if text.is_empty() {
+                self.emit(Event::AutosaveSkipped {
+                    reason: SkipReason::NeedsPath,
+                });
+                return;
+            }
+            if let Err(err) = notes_core::paths::ensure_scratch_dir(&self.state_dir) {
+                let _ = err; // the reason reached the user at startup, or rides the next one
+                self.emit(Event::AutosaveSkipped {
+                    reason: SkipReason::NeedsPath,
+                });
+                return;
+            }
+            let scratch = notes_core::paths::scratch_note_path(&self.state_dir);
+            let detected = self.detected;
+            let disk_text = self.text_for_disk(&text);
+            match self.write(&scratch, &disk_text, detected, revision) {
+                Ok(()) => {
+                    self.doc.save_as(&scratch);
+                    self.detected = detected;
+                    let read_only =
+                        fs::metadata(&scratch).is_ok_and(|meta| meta.permissions().readonly());
+                    self.emit(Event::Saved {
+                        path: scratch.clone(),
+                        revision,
+                    });
+                    // Saved THEN Rebound: Rebound's contract is literally "the
+                    // open document is now a DIFFERENT file", which is only
+                    // true once Saved has announced the bytes.
+                    self.emit(Event::Rebound {
+                        path: scratch.clone(),
+                        meta: FileMeta {
+                            encoding: api_encoding(detected.encoding),
+                            line_ending: api_line_ending(detected.line_ending),
+                            trailing_newline: detected.trailing_newline,
+                            // The port just wrote this file successfully; it
+                            // was not read-only a moment ago.
+                            read_only,
+                            oversize: false,
+                            // A brand-new scratch note is armed: autosave owns
+                            // it from this moment (ADR-0001 requirement 4).
+                            armed: self.doc.is_armed(),
+                        },
+                        revision,
+                    });
+                    self.remember(&scratch);
+                }
+                Err(_) => {
+                    // The write was refused (locked, ACL, full disk): the
+                    // fallback skip, and NO file was created.
+                    self.emit(Event::AutosaveSkipped {
+                        reason: SkipReason::NeedsPath,
+                    });
+                }
+            }
             return;
         };
 

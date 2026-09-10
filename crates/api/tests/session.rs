@@ -789,18 +789,74 @@ fn an_oversize_file_is_refused_from_the_stat_and_cannot_be_overwritten() {
     assert!(!on_disk.is_empty(), "and above all, not zero bytes");
 }
 
-/// M9: a brand-new note that has never been saved is not an error.
+/// D69: a brand-new note that has never been saved gets a REAL scratch file
+/// instead of being dropped with a skip - the first-run user types, autosave
+/// fires, and the text must land on disk. The path is core's
+/// (scratch_note_path), the write is the Save As machinery, the events are
+/// Saved THEN Rebound, the document is rebound to the scratch, and the scratch
+/// joins the recents like any other file.
 #[test]
-fn a_note_without_a_path_skips_instead_of_reporting_an_invented_error() {
-    let mut app = Harness::new();
-    assert_eq!(
-        app.flush_skipped("the first draft", 1),
-        SkipReason::NeedsPath,
-        "the user's next move is Save As, so the reason must say that"
+fn an_untitled_note_is_written_to_a_scratch_file_instead_of_dropped() {
+    let app = Harness::new();
+    let scratch = notes_core::paths::scratch_note_path(&StateDir(app.root.clone()));
+
+    app.send(Command::Flush {
+        // A real buffer ends with a newline; the port preserves it verbatim
+        // (4.5 - it never normalises), so the fixture types it too.
+        text: "the first draft\n".to_string(),
+        revision: 1,
+    });
+
+    // Event order: Saved THEN Rebound, both naming the scratch.
+    let mut saved_at = None;
+    let mut rebound_at = None;
+    let mut recents_after = None;
+    let mut index = 0usize;
+    let deadline = Instant::now() + ANSWER;
+    while saved_at.is_none() || rebound_at.is_none() || recents_after.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "Saved/Rebound/recents never all arrived (saved={saved_at:?} rebound={rebound_at:?})"
+        );
+        let event = app
+            .rx
+            .recv_timeout(ANSWER)
+            .expect("the engine owed an event");
+        match event {
+            Event::Saved { path, .. } if path == scratch => saved_at = Some(index),
+            Event::Rebound { path, .. } if path == scratch => rebound_at = Some(index),
+            Event::RecentsUpdated(entries) if entries.len() == 1 => {
+                assert_eq!(entries[0].path, scratch, "the scratch joins the recents");
+                recents_after = Some(index);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    assert!(
+        saved_at.expect("saved") < rebound_at.expect("rebound"),
+        "Saved announces the bytes BEFORE Rebound announces the new identity"
     );
-    // SkipReason carries no copy by design, so what M9 pins is that the engine
-    // answered with a named variant instead of a string it invented at the call site.
-    assert!(format!("{:?}", notes_api::SkipReason::NeedsPath).contains("NeedsPath"));
+
+    // The bytes on disk: UTF-8, LF, and the trailing newline the new-file
+    // rules give - read back, not assumed.
+    let bytes = fs::read(&scratch).expect("the scratch file must exist");
+    assert_eq!(bytes, b"the first draft\n", "the typed text, verbatim");
+
+    // The session now names the scratch, so a relaunch reopens the same note.
+    // The session write rides the 750 ms tick behind the events, so poll the
+    // file (bounded) rather than assuming it exists yet.
+    let deadline = Instant::now() + ANSWER;
+    while !app.root.join(FILE_NAME).exists() {
+        assert!(Instant::now() < deadline, "session.json never landed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let session = read_session(&app.root).expect("session readable");
+    assert_eq!(
+        session.path,
+        Some(scratch.clone()),
+        "session.path must name the scratch so a relaunch reopens it"
+    );
 }
 
 /// M4: a Save As observed at an OLD revision must not rewind the gate, or the
@@ -1107,4 +1163,80 @@ fn a_failing_settings_write_is_reported_once_until_it_succeeds() {
     fs::create_dir(&settings_path).expect("block again");
     app.send(Command::SetAutosave(false));
     assert_one_failure(&mut app, "the second settings failure");
+}
+
+/// D69's fallback: when the scratch place cannot be made, NeedsPath is the
+/// honest answer ("we could not make a file for it") and NO file is written.
+/// The startup StateDirUnusable event has usually already said why.
+#[test]
+fn an_unusable_scratch_location_still_skips_and_writes_nothing() {
+    let mut app = Harness::new();
+    // A FILE sitting where the notes directory belongs: ensure_scratch_dir
+    // refuses, and the flush falls back to the skip.
+    fs::write(app.root.join("notes"), b"not a directory").expect("block");
+
+    assert_eq!(
+        app.flush_skipped("the first draft", 1),
+        SkipReason::NeedsPath,
+        "the fallback skip, with its real new meaning"
+    );
+    assert!(
+        !notes_core::paths::scratch_note_path(&StateDir(app.root.clone())).exists(),
+        "no scratch file may be written when the place cannot be made"
+    );
+}
+
+/// D69 edge: once the note HAS a path (Save As), later edits write THERE and
+/// the abandoned scratch keeps its stale text forever. That is accepted
+/// behaviour - call the leftover a DRAFT the user can still open, not a leak
+/// to clean up; nothing in the vocabulary says "delete user content".
+#[test]
+fn a_note_saved_away_stops_using_the_scratch_and_the_draft_is_kept() {
+    let app = Harness::new();
+    let scratch = notes_core::paths::scratch_note_path(&StateDir(app.root.clone()));
+
+    app.send(Command::Flush {
+        text: "draft one\n".to_string(),
+        revision: 1,
+    });
+    let deadline = Instant::now() + ANSWER;
+    while !scratch.exists() {
+        assert!(Instant::now() < deadline, "the scratch write never landed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let draft_bytes = fs::read(&scratch).expect("read the draft");
+
+    let elsewhere = app.root.join("named.notes");
+    app.send(Command::SaveAs {
+        path: elsewhere.clone(),
+        text: "named now\n".to_string(),
+        revision: 2,
+    });
+    app.send(Command::Flush {
+        text: "named now, edited\n".to_string(),
+        revision: 3,
+    });
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        if let Ok(session) = read_session(&app.root) {
+            if session.path.as_deref() == Some(elsewhere.as_path()) {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "the Save As never landed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Wait out one full flush cycle: the edit must go to the NAMED file, and
+    // the scratch must not gain a second copy of the text.
+    std::thread::sleep(Duration::from_millis(750 * 2 + 100));
+    assert_eq!(
+        fs::read(&scratch).expect("read the draft again"),
+        draft_bytes,
+        "the abandoned scratch keeps its stale draft - a draft, not a leak"
+    );
+    assert_eq!(
+        fs::read(&elsewhere).expect("read the named file"),
+        b"named now, edited\n",
+        "edits after Save As land in the named file"
+    );
 }
