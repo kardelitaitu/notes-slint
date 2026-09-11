@@ -582,10 +582,28 @@ impl TextState {
     /// contains one: gpui `shape_line` debug-asserts that its input has none,
     /// src/text_system.rs:372, and the newline is the separator, not content to draw).
     pub(crate) fn line_range_at(&self, byte: usize) -> Range<usize> {
-        line_ranges(&self.content)
-            .into_iter()
-            .nth(self.line_index_at(byte))
-            .unwrap_or(0..self.content.len())
+        let byte = byte.min(self.content.len());
+        // Scan OUT from the byte to the two newlines that bound it, not from byte 0 to
+        // the byte. The old form counted the whole prefix to name the line, then built
+        // the full line index and walked it with `nth` to get the range - O(note) twice
+        // over, measured at 17,456 us per call on a 20,000-line note in this profile,
+        // i.e. one keystroke eating a whole 60 Hz frame. This is O(line length), which
+        // for a note is a few dozen bytes whatever the note grows to.
+        let start = match self.content.as_bytes()[..byte]
+            .iter()
+            .rposition(|b| *b == b'\n')
+        {
+            Some(newline) => newline + 1,
+            None => 0,
+        };
+        let end = match self.content.as_bytes()[byte..]
+            .iter()
+            .position(|b| *b == b'\n')
+        {
+            Some(offset) => byte + offset,
+            None => self.content.len(),
+        };
+        start..end
     }
 
     /// The grapheme column of a byte offset within its line - the sticky target up and
@@ -740,6 +758,123 @@ impl LineGeometry {
     }
 }
 
+/// WHICH LINES A FRAME MAY LOOK AT - the retention set.
+///
+/// `visible` is the contiguous window the painter walks. `pinned` is the set of single
+/// lines that something OTHER than the screen asks about, and those are three different
+/// askers, not one:
+///
+/// * the SELECTION lines, because that is what the operating system positions against:
+///   `retrieve_caret_position` (gpui-pre-windows-0.3.4/src/events.rs:647-655) calls
+///   `selected_text_range(false)` - `prefer_marked_text = false` - so the marked range is
+///   not consulted for position at all; the OS takes the selection range to
+///   `bounds_for_range` and asks where that is;
+///
+///   (A correction to an earlier version of this comment, which said the mark is what the
+///   candidate window follows. It is not, and the distinction decides which lines are
+///   load-bearing: the selection is what must always be shapeable.)
+/// * the CARET line, because that is where the selection is about to be: every mutation
+///   that collapses a selection leaves the caret there, so a frame that can answer for the
+///   caret is not caught short by the next keystroke;
+/// * every line the MARKED range touches - not because the OS positions by it, which it
+///   does not, but because it is a range we are about to commit and underline, and a mark
+///   with no slot cannot be drawn, measured or replaced.
+///
+/// What a missing line costs is worth being exact about, because the sloppy version of
+/// this sentence teaches the wrong lesson. A `None` from `bounds_for_range` does NOT
+/// become a rect at the origin: the `?` in events.rs:649-650 propagates it out of
+/// `retrieve_caret_position`, `handle_ime_position` (:658-662) sees `None`, and it simply
+/// does not call `update_ime_position`. The toolkit declines to move. So the composition
+/// and candidate windows STAY AT THE LAST POSITION THEY WERE GIVEN - over the wrong text,
+/// at a line the user has since scrolled past, or off-screen - while typing continues into
+/// a range we can no longer locate. That is a SILENT failure where an origin jump would
+/// have been a visible one, which is exactly why it survived a rewrite and a review:
+/// nothing on screen is ever obviously wrong.
+///
+/// Pinned lines are retained ONE AT A TIME, never by widening the window to reach them.
+/// The first version widened a contiguous range, and that is wrong twice over: it made the
+/// number of lines examined depend on how far the caret was from the viewport - the
+/// O(buffer) this file was rewritten to remove, re-entering through a different door - and
+/// it made the window a moving target, so a frame that changed nothing else still had a
+/// different predicate to converge on. A caret 1,990 rows above the viewport is one line
+/// to keep, not 1,990 lines to walk.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Retention {
+    /// The rows on screen, contiguous.
+    pub(crate) visible: Range<usize>,
+    /// Single lines held outside the window, sorted and free of anything already visible.
+    pub(crate) pinned: Vec<usize>,
+}
+
+impl Retention {
+    /// Every line the rebuild walks: the window, then the pins, in index order, no
+    /// duplicates. `lines` clamps so a shrunken buffer cannot ask for a slot that is gone.
+    pub(crate) fn rows(&self, lines: usize) -> Vec<usize> {
+        let mut rows: Vec<usize> = self
+            .visible
+            .clone()
+            .chain(self.pinned.iter().copied())
+            .filter(|index| *index < lines)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+}
+
+/// The lines a byte span touches, retained WHOLE when it is no taller than the window that
+/// is already being walked, and at its two ENDS when it is longer. The ends are the lines
+/// `bounds_for_range` and the caret can be asked about; nothing asks for the rect of a line
+/// in the middle of a 400-line selection, and drawing it is viewport-clipped anyway. That
+/// is what keeps `select_all` on a 20,000-line note from turning retention back into a walk:
+/// the cap is the size of the window, so the set stays a small multiple of the viewport
+/// whatever the note and whatever the selection are.
+fn retain_span<Line>(
+    cache: &ShapeCache<Line>,
+    span: &Range<usize>,
+    content_len: usize,
+    cap: usize,
+) -> Vec<usize> {
+    let start = cache.line_index_at(span.start.min(content_len));
+    let end = cache.line_index_at(span.end.max(span.start).min(content_len));
+    let (lo, hi) = match (start, end) {
+        (Some(a), Some(b)) => (a.min(b), a.max(b)),
+        (Some(a), None) | (None, Some(a)) => (a, a),
+        (None, None) => return Vec::new(),
+    };
+    if hi - lo <= cap {
+        (lo..=hi).collect()
+    } else {
+        vec![lo, hi]
+    }
+}
+
+pub(crate) fn retained_window<Line>(
+    cache: &ShapeCache<Line>,
+    visible: &Range<usize>,
+    content_len: usize,
+    caret_line: usize,
+    marked: &Option<Range<usize>>,
+    selection: &Range<usize>,
+) -> Retention {
+    // The cap on a retained span is the window itself: the frame is already walking that
+    // many lines, so the worst case stays a small multiple of the viewport.
+    let cap = visible.len();
+    let mut pinned: Vec<usize> = vec![caret_line];
+    if let Some(marked) = marked {
+        pinned.extend(retain_span(cache, marked, content_len, cap));
+    }
+    if !selection.is_empty() {
+        pinned.extend(retain_span(cache, selection, content_len, cap));
+    }
+    pinned.retain(|index| !visible.contains(index));
+    pinned.sort_unstable();
+    pinned.dedup();
+    Retention {
+        visible: visible.clone(),
+        pinned,
+    }
+}
 /// What one rebuild of the shape cache did, counted rather than inferred.
 ///
 /// The load-bearing claim is NOT the microseconds, which belong to the machine that ran
@@ -751,6 +886,10 @@ impl LineGeometry {
 pub(crate) struct PaintStats {
     /// Lines the rebuild looked at, whether or not it re-shaped them.
     pub(crate) lines_examined: usize,
+    /// Rows whose slot did not answer and had to be filled this frame - from the pool or
+    /// from the shaper. The convergence number: one scroll exposes its own rows once, and
+    /// a frame that changed nothing fills nothing.
+    pub(crate) window_rebuilds: usize,
     /// Lines that went through `shape_line`, because neither the slot nor the pool could
     /// answer for them.
     pub(crate) lines_shaped: usize,
@@ -824,6 +963,14 @@ pub(crate) struct ShapeCache<Line> {
     /// every text change and on nothing else, so a caret move, a click, a wheel notch and
     /// a repaint of an unchanged note all read it as clean.
     edits: u64,
+    /// The retention set the slots were last walked for, and the composition they were
+    /// walked under. Equal, with `edits` unmoved, is the frame that has nothing to do:
+    /// nothing is examined at all. Cleared by `align` and by `clear`, so a text change or
+    /// a new document always re-walks. The mark is part of the key because a composition
+    /// can GROW on a line without changing which lines are retained, and a slot holding
+    /// the old underline would be a wrong answer, not a slow one.
+    retained: Option<Retention>,
+    marked: Option<Range<usize>>,
 }
 
 impl<Line> Default for ShapeCache<Line> {
@@ -834,6 +981,8 @@ impl<Line> Default for ShapeCache<Line> {
             starts: Vec::new(),
             len: 0,
             edits: u64::MAX,
+            retained: None,
+            marked: None,
         }
     }
 }
@@ -847,6 +996,8 @@ impl<Line> ShapeCache<Line> {
         self.starts.clear();
         self.len = 0;
         self.edits = u64::MAX;
+        self.retained = None;
+        self.marked = None;
     }
 
     pub(crate) fn lines(&self) -> usize {
@@ -909,6 +1060,10 @@ impl<Line> ShapeCache<Line> {
         self.slots.resize(self.starts.len(), None);
         self.edits = edits;
         self.len = content.len();
+        // A text change forces the next frame to walk its retention set again, even if
+        // the set is unchanged: which lines are looked at is not the same question as
+        // whether the line it is looking at is still the same text.
+        self.retained = None;
         true
     }
 
@@ -922,28 +1077,43 @@ impl<Line> ShapeCache<Line> {
 
 /// THE shape loop, extracted so it runs with no window and no GPU.
 ///
-/// `window` is the set of lines this frame must be able to answer for - the visible rows,
-/// plus the caret line, plus the line a composition sits on. Nothing outside it is read,
-/// hashed, moved or written, which is the whole of the size-independence claim and the
-/// thing `tests/paint_cost.rs` asserts on. `shape` is the one thing a headless test cannot
-/// supply: the call into the platform text system.
+/// `retention` is the set of lines this frame may look at - see `Retention`. Nothing
+/// outside it is read, hashed, moved or written, which is the whole of the
+/// size-independence claim and the thing `tests/paint_cost.rs` asserts on. `shape` is the
+/// one thing a headless test cannot supply: the call into the platform text system.
 pub(crate) fn rebuild_shapes<Line>(
     content: &str,
     marked: Option<Range<usize>>,
-    window: Range<usize>,
+    retention: &Retention,
     cache: &mut ShapeCache<Line>,
     stats: &mut PaintStats,
     shape: &mut dyn FnMut(&str, Option<Range<usize>>) -> Line,
 ) {
-    // The pool is bounded by the note, not by the session: a cache that only ever grows
-    // is the 64 MB at 20,000 lines this exists to stop. Dropping it is a re-shape, never a
-    // wrong answer, and it happens when the working set has doubled rather than once per
-    // frame - which is the difference between this and what it replaced.
+    // CONVERGENCE. Same retention set, same composition, text unmoved: there is nothing
+    // this frame could learn, so it examines nothing. This is the predicate a scrolled-only
+    // frame settles on - the scroll itself rebuilds the rows it exposed, once - and it is
+    // why the set has to be stable: a window that widens toward the caret is never the
+    // same window twice, so a settled frame would keep walking.
+    if cache.retained.as_ref() == Some(retention) && cache.marked == marked {
+        return;
+    }
+    cache.retained = Some(retention.clone());
+    cache.marked = marked.clone();
+    // The pool is bounded by the NOTE, not by the session: a cache that only ever grows is
+    // the 64 MB at 20,000 lines this exists to stop. The arithmetic exactly, because a wrong
+    // reason here invites someone to "fix" a thing that is not broken: the drop fires when
+    // the entry count passes the number of lines in the buffer (floor 64), it is a `clear`,
+    // and there is ONE test of it per frame - so at most one drop per frame, and the count
+    // it resets to is zero. Nothing here thrashes against the cap the way a per-entry
+    // fill-and-evict loop would. An entry can only be over that line count if it is text
+    // the buffer no longer contains, so what a drop costs is a re-shape and never a wrong
+    // answer - and the re-shape is bounded by the window the loop below walks, not by the
+    // note.
     if cache.pool.len() > cache.lines().max(64) {
         cache.pool.clear();
         stats.pool_rebuilds += 1;
     }
-    for index in window {
+    for index in retention.rows(cache.lines()) {
         let Some(bytes) = cache.bytes_of(content, index) else {
             continue;
         };
@@ -952,7 +1122,10 @@ pub(crate) fn rebuild_shapes<Line>(
         let mark = marked.as_ref().and_then(|m| {
             let start = m.start.max(bytes.start);
             let end = m.end.min(bytes.end);
-            (end > start).then_some(start - bytes.start..end - bytes.start)
+            // `then_some` evaluates its argument EAGERLY, so writing it that way here is a
+            // debug panic on every line below the mark: `end - bytes.start` underflows before
+            // the boolean ever gets to discard the value. `then(|| ..)` is lazy.
+            (end > start).then(|| start - bytes.start..end - bytes.start)
         });
         // Three answers, in order of what they cost: the slot already holds this line (a
         // compare and NO write), the pool has shaped this text (a hash and a refcount), or
@@ -963,6 +1136,7 @@ pub(crate) fn rebuild_shapes<Line>(
         {
             continue;
         }
+        stats.window_rebuilds += 1;
         let pooled = mark
             .is_none()
             .then(|| cache.pool.get(text).cloned())
@@ -1390,6 +1564,18 @@ impl EntityInputHandler for Editor {
     /// If the cache does not describe the current buffer the answer is `None`. A
     /// rectangle built from a stale layout is not a rough guess, it is a lie the
     /// candidate window will sit on top of.
+    ///
+    /// `None` is therefore not a harmless answer, and it is worth naming what it does
+    /// rather than what it does not. It does NOT put the candidate window at the screen
+    /// origin: `retrieve_caret_position` (gpui-pre-windows-0.3.4/src/events.rs:647-655)
+    /// propagates it with `?` and `handle_ime_position` (:658-662) skips
+    /// `update_ime_position` altogether - the toolkit declines to move. So the composition
+    /// and candidate windows freeze at the last position they were given, which after a
+    /// scroll is over different text, or off-screen. Silent wrongness, and the reason the
+    /// caret line, the marked range and the selection are all in the retention set: every
+    /// line any of those three can name has to answer. Note also that the OS asks with
+    /// `selected_text_range(false)`, `prefer_marked_text = false`, so it is asking for the
+    /// CARET range even while a mark is live elsewhere - the caret needs its own slot.
     fn bounds_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -1867,33 +2053,26 @@ impl Element for EditorElement {
             shown_line = Some(caret_line);
             sel_probe = (selection.start, selection.end);
             caret_probe = cursor;
-            // THE WINDOW the rebuild is allowed to look at: the rows that can be seen, plus
-            // the caret line (the quad and the IME rect both need it), plus the line a
-            // composition sits on (the candidate window needs it even when the user has
-            // scrolled away). Nothing outside it is examined, which is the entire claim
-            // tests/paint_cost.rs makes.
+            // THE RETENTION SET: which lines this frame may look at. Out of here and into a
+            // free function, because the BOUNDARY of that set is the whole design - it is
+            // what decides whether the IME can be answered at all - and a predicate that
+            // lives inside `prepaint` can only be read through a window.
             let visible = geom.visible_lines(lines);
-            let mut first = visible.start;
-            let mut last = visible.end;
-            for edge in [
-                Some(caret_line),
-                marked
-                    .as_ref()
-                    .and_then(|m| input.cache.line_index_at(m.start)),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                first = first.min(edge);
-                last = last.max(edge + 1);
-            }
+            let retention = retained_window(
+                &input.cache,
+                &visible,
+                input.state.content.len(),
+                caret_line,
+                &marked,
+                &selection,
+            );
             // THE LOOP, out of here and into rebuild_shapes. The one thing that cannot
             // exist without a window is passed IN as the closure: the call into the
             // platform text system.
             rebuild_shapes(
                 &input.state.content,
                 marked,
-                first..last,
+                &retention,
                 &mut input.cache,
                 &mut stats,
                 &mut |text, mark| {
@@ -1973,7 +2152,7 @@ impl Element for EditorElement {
                 let from = input.cache.line_index_at(selection.start);
                 let to = input.cache.line_index_at(selection.end);
                 if let (Some(from), Some(to)) = (from, to) {
-                    for index in first.max(from)..last.min(to + 1) {
+                    for index in visible.start.max(from)..visible.end.min(to + 1) {
                         let Some(frame) = input.cache.slot(index) else {
                             continue;
                         };
