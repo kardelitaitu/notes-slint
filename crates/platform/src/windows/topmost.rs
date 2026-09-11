@@ -16,15 +16,33 @@ use crate::PinOutcome;
 /// How long the style read-back waits for an async reband to land before it
 /// declares NotApplied. The geometry_live probe measures three different
 /// quantities, which the old prose blurred into one: an owner-thread reband
-/// is visible on the first read (~300 ns, phase C2); a cross-queue async
-/// MOVE lands in ~1-2 ms (phase B) - the number this text used to quote;
-/// but a cross-queue async Z-ORDER reband, the event this read-back waits
-/// for, waits on the owner's scheduler and pump and landed at 11-13 ms in
-/// the probe's runs - load-dependent, and past this 10 ms window at the top
-/// of the range. A parked owner never lands it at all, which is exactly the
-/// failure the verdict exists to report. The wait must be long enough for
-/// the first truth and short enough not to stall the caller.
-const BAND_LAND_WINDOW: Duration = Duration::from_millis(10);
+/// is visible on the first read (100-400 ns, phase C2); a cross-queue async
+/// MOVE lands in ~1-2 ms (phase B); and a cross-queue async Z-ORDER reband,
+/// the event this read-back waits for, is BIMODAL on this host. Across N=20
+/// probe runs: 16 landings at 1.0-1.5 ms (8 on the host as found, 8 under a
+/// manufactured 32-core saturated load - CPU load does NOT move it), and 4
+/// at 11.3-12.7 ms in one earlier window whose trigger was not reproduced.
+/// The spacing fits the default 15.6 ms scheduler tick quantizing the
+/// owner's wake - a hypothesis, not a finding: proving it needs a
+/// timeBeginPeriod experiment the frozen unsafe ledger does not allow here.
+/// The window is sized on the SLOW mode, the one you cannot dismiss: 25 ms,
+/// about twice its observed maximum, and above the tick-quantized bound plus
+/// pump latency. That is a cover of the observed tail, not a proof that no
+/// landing is ever later. A parked owner never lands at all, which is
+/// exactly the failure the verdict exists to report; past this window the
+/// verdict says what the style WAS, which is the only truth a bounded wait
+/// can give, and the caller owns what to do with it.
+const BAND_LAND_WINDOW: Duration = Duration::from_millis(25);
+
+/// The yield-spin phase of the wait: where the fast landings live and
+/// microsecond resolution is worth a core for one millisecond, and not a
+/// millisecond more.
+const SPIN_PHASE: Duration = Duration::from_millis(1);
+
+/// The sleep between re-reads once the spin phase is spent: coarse polling
+/// of a millisecond-scale event, so a wide window costs wall time, not a
+/// core - a parked owner must not spin for the whole of BAND_LAND_WINDOW.
+const SLEEP_PER_POLL: Duration = Duration::from_millis(2);
 
 /// `SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS`, spelled as one
 /// const so a reviewer can see the bits that confine this call to a z-order change
@@ -72,9 +90,10 @@ pub fn set_topmost(handle: isize, on: bool) -> PinOutcome {
     // the window's own style is read back, and because the reband is ASYNC it is
     // read back until it lands or until BAND_LAND_WINDOW expires. A single
     // immediate read would misreport every cross-queue reband (measured: the
-    // bit lands on the owner's pump ~11-13 ms after the call returns by
-    // load, printed by the geometry_live probe).
-    let deadline = Instant::now() + BAND_LAND_WINDOW;
+    // bit lands on the owner's pump 1-13 ms after the call returns, bimodally
+    // by machine state - see BAND_LAND_WINDOW).
+    let started = Instant::now();
+    let deadline = started + BAND_LAND_WINDOW;
     loop {
         // SAFETY: GetWindowLongPtrW is a pure style query on the HWND `to_hwnd`
         // accepted at check time and that SetWindowPos just answered for; it
@@ -90,10 +109,18 @@ pub fn set_topmost(handle: isize, on: bool) -> PinOutcome {
                 actual,
             };
         }
-        // Yield-spin rather than sleep: the landing is a millisecond-scale
-        // event (observed ~1-13 ms by load) and the wait is bounded, so a spin
-        // gives microsecond resolution without a timer-granularity overshoot.
-        thread::yield_now();
+        // Two-phase wait. The first millisecond yield-spins: the fast
+        // landings (~1-1.5 ms cross-queue, ~300 ns owner-thread) live there
+        // and microsecond resolution is real where it matters. After that it
+        // sleeps between re-reads - a late-but-successful band must not cost
+        // a core for the whole window, and a parked owner must not spin past
+        // the first millisecond. The deadline above bounds the whole wait,
+        // so the overshoot past the window is one poll at most.
+        if started.elapsed() < SPIN_PHASE {
+            thread::yield_now();
+        } else {
+            thread::sleep(SLEEP_PER_POLL);
+        }
     }
 }
 

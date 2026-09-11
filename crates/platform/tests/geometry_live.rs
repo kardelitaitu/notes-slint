@@ -405,6 +405,7 @@ fn an_async_move_and_reband_land_when_the_owner_pumps() {
     match reband_landing {
         Some(landing) => {
             let lag = parked_elapsed + landing;
+            eprintln!("[phase C] cross-queue landing alone (owner pumping): {landing:?}");
             eprintln!(
                 "[phase C] WS_EX_TOPMOST became visible {lag:?} after the call returned \
                  (owner pumping continuously)"
