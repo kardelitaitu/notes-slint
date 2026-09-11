@@ -25,6 +25,7 @@
 //! read-only (S7), undo (S8).
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -680,9 +681,98 @@ impl TextState {
 // The view: the state, plus the focus handle the toolkit needs
 // ---------------------------------------------------------------------------
 
-/// One shaped visual line and where it was drawn. Owned by the Editor, written in
-/// `paint`, read by the two geometry methods and by the next frame's shape cache.
-pub(crate) struct LineFrame {
+/// Where the text sits on the screen. Every line is exactly one row high - the editor
+/// does not wrap, and never will (word wrap is out of scope for the whole project) - so
+/// an index plus this struct is the WHOLE of a line's geometry. That is also what makes
+/// the two hit tests arithmetic instead of walks: a row height and a scroll offset
+/// answer "which line is this pixel on" in constant time, where the first version walked
+/// every line in the buffer per mouse event - per mouse MOTION, so a drag was O(note)
+/// per pixel of drag.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LineGeometry {
+    /// Window y of the first line of the buffer, before scrolling.
+    pub(crate) top: Pixels,
+    pub(crate) left: Pixels,
+    pub(crate) right: Pixels,
+    /// One row, i.e. `window.line_height()` at the last paint.
+    pub(crate) row: Pixels,
+    /// Pixels of the buffer scrolled above the top of the element.
+    pub(crate) scroll_y: Pixels,
+    /// The height of the element box.
+    pub(crate) viewport_h: Pixels,
+}
+
+impl LineGeometry {
+    /// The rect line `index` occupies after scrolling. Its bottom is the baseline the
+    /// caret and the IME rect are measured from - the same rect the frame used to carry.
+    pub(crate) fn bounds_of(&self, index: usize) -> Bounds<Pixels> {
+        let row = f32::from(self.row);
+        let top = f32::from(self.top) + row * index as f32 - f32::from(self.scroll_y);
+        Bounds::from_corners(point(self.left, px(top)), point(self.right, px(top + row)))
+    }
+
+    /// The first and last VISIBLE line, as a Rust range (end exclusive), clamped into the
+    /// buffer. This is the window the painter walks and the window the rebuild is allowed
+    /// to examine; its width is the viewport height over the row height, never the length
+    /// of the note - which is the difference between O(screen) and O(buffer).
+    pub(crate) fn visible_lines(&self, lines: usize) -> Range<usize> {
+        let row = f32::from(self.row);
+        if lines == 0 || row <= 0.0 {
+            return 0..0;
+        }
+        let first = (f32::from(self.scroll_y) / row).floor().max(0.0) as usize;
+        let last = ((f32::from(self.scroll_y) + f32::from(self.viewport_h)) / row)
+            .ceil()
+            .max(0.0) as usize;
+        first.min(lines)..last.min(lines)
+    }
+
+    /// Which line a window y falls on, clamped the way `frame_at` always has: above the
+    /// first line is the first line, below the last is the last line. `None` only when
+    /// there is no geometry to ask - before the first paint.
+    pub(crate) fn line_at_y(&self, y: Pixels, lines: usize) -> Option<usize> {
+        let row = f32::from(self.row);
+        if lines == 0 || row <= 0.0 {
+            return None;
+        }
+        let index = ((f32::from(y) - f32::from(self.top) + f32::from(self.scroll_y)) / row).floor();
+        Some(index.clamp(0.0, lines as f32 - 1.0) as usize)
+    }
+}
+
+/// What one rebuild of the shape cache did, counted rather than inferred.
+///
+/// The load-bearing claim is NOT the microseconds, which belong to the machine that ran
+/// them; it is that `lines_examined` does not grow with the size of the buffer. A
+/// 20,000-line note that examines 20,000 lines a frame is the bug this counter exists to
+/// catch, and it is read by an assertion in `tests/paint_cost.rs` rather than printed
+/// into a probe nobody watches - a counter behind a window and a GPU is a decoration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PaintStats {
+    /// Lines the rebuild looked at, whether or not it re-shaped them.
+    pub(crate) lines_examined: usize,
+    /// Lines that went through `shape_line`, because neither the slot nor the pool could
+    /// answer for them.
+    pub(crate) lines_shaped: usize,
+    /// Times the shape pool was thrown away and built again from the previous frame.
+    /// One per frame is the bug; zero is the goal.
+    pub(crate) pool_rebuilds: usize,
+}
+/// One line of the buffer as the painter needs it: the bytes it stands for, the exact
+/// text handed to `shape_line`, whether a composition underline sits inside it, and the
+/// shaped result. Generic over the shaped payload ON PURPOSE: the loop that builds these
+/// (`rebuild_shapes`) is what the paint cost is made of, and a loop that needs a window
+/// and a GPU cannot be measured in CI. With the payload as a parameter the SAME loop runs
+/// against a stand-in in `tests/paint_cost.rs` and against `ShapedLine` in `prepaint`.
+///
+/// `line` is shared rather than owned, which is the fix the numbers below describe:
+/// `ShapedLine` is 2,984 bytes in this kit generation - the inline
+/// `SmallVec<[DecorationRun; 32]>` at gpui-pre-0.3.4/src/text_system/line.rs:49 is what
+/// makes it that - so every reuse that MOVES one pays 2,984 bytes of memcpy to avoid a
+/// shape that costs a fraction of that. Measured headless on a 2,000-line note, debug
+/// profile, reusing a pool of values: 11,631 us a frame, of which the shaping is zero.
+/// The same loop over `Arc<ShapedLine>`: a refcount per line.
+pub(crate) struct Shaped<Line> {
     /// The bytes of the buffer this line shapes, newline excluded.
     pub(crate) bytes: Range<usize>,
     /// The text that was handed to `shape_line`, kept by value so a cache hit can be
@@ -692,12 +782,213 @@ pub(crate) struct LineFrame {
     /// Part of the cache key: reuse by text alone would hand back an underline that
     /// belongs to another frame.
     pub(crate) mark: Option<Range<usize>>,
-    pub(crate) line: ShapedLine,
-    /// The rect this line occupies after scrolling, in window coordinates. Its bottom
-    /// is the baseline the caret and the IME rect are measured from.
-    pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) line: Arc<Line>,
 }
 
+/// Whether a cached line can answer for `text` under `mark`. By VALUE, on purpose: a slot
+/// that survived a shift is ADDRESSED differently than the line it now answers for, and
+/// the only way to know it is the same line is to look at it.
+fn line_matches<Line>(
+    cached: &Shaped<Line>,
+    bytes: &Range<usize>,
+    text: &str,
+    mark: Option<&Range<usize>>,
+) -> bool {
+    cached.text == text && &cached.bytes == bytes && cached.mark.as_ref() == mark
+}
+
+/// The shape cache: dense, index-addressed, and ALIVE BETWEEN FRAMES.
+///
+/// Two levels, because they answer two different questions. `slots` answers "what is on
+/// line i" for the lines a frame actually needed. `pool` answers "has this text been
+/// shaped before, anywhere", which is the question a SHIFTED buffer asks: press Enter at
+/// the top of a note and every line below moves down one slot without changing a byte of
+/// itself, so an index alone would re-shape the note and a text pool rebuilt every frame
+/// would move 3 KB per line to avoid it. Both together mean one keystroke costs one
+/// shape and one refcount per visible row.
+pub(crate) struct ShapeCache<Line> {
+    /// One slot per VISUAL LINE, so `slots.len()` is the line count and every index into
+    /// it is a line number. `None` is a line no frame has asked for since the note opened
+    /// or since it last scrolled out; it is not an error and it is not a re-shape.
+    slots: Vec<Option<Arc<Shaped<Line>>>>,
+    /// Text -> shape. Keyed by the exact text handed to `shape_line`, never by the byte
+    /// range, because the range is the thing an edit above it changes. A line carrying a
+    /// composition underline is never pooled in either direction.
+    pool: std::collections::HashMap<String, Arc<Line>>,
+    /// The byte each line starts at, one per line, so a byte offset finds its line by
+    /// binary search instead of by counting newlines from the top of the buffer.
+    starts: Vec<usize>,
+    /// The length of the buffer `starts` was cut from. A cheap guard under the counter.
+    len: usize,
+    /// The mutation counter `starts` was cut at. THIS is the dirty flag: `edits` moves on
+    /// every text change and on nothing else, so a caret move, a click, a wheel notch and
+    /// a repaint of an unchanged note all read it as clean.
+    edits: u64,
+}
+
+impl<Line> Default for ShapeCache<Line> {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            pool: std::collections::HashMap::new(),
+            starts: Vec::new(),
+            len: 0,
+            edits: u64::MAX,
+        }
+    }
+}
+
+impl<Line> ShapeCache<Line> {
+    /// Drop everything. `Editor::load` calls this: a new document is not an edit of the
+    /// old one, and a pool carried across it would be a pool of another note's lines.
+    pub(crate) fn clear(&mut self) {
+        self.slots.clear();
+        self.pool.clear();
+        self.starts.clear();
+        self.len = 0;
+        self.edits = u64::MAX;
+    }
+
+    pub(crate) fn lines(&self) -> usize {
+        self.starts.len()
+    }
+
+    /// The line count the cache is CURRENT for, i.e. the one `align` was last called
+    /// with. `None` when the cache does not describe the buffer, which is what
+    /// `display_desynced` asks.
+    pub(crate) fn current(&self, content: &str, edits: u64) -> bool {
+        self.edits == edits && self.len == content.len()
+    }
+
+    pub(crate) fn slot(&self, index: usize) -> Option<&Shaped<Line>> {
+        self.slots.get(index).and_then(|slot| slot.as_deref())
+    }
+
+    /// The byte range of line `index`, cut out of `starts`. `None` past the end.
+    pub(crate) fn bytes_of(&self, content: &str, index: usize) -> Option<Range<usize>> {
+        let start = *self.starts.get(index)?;
+        let end = match self.starts.get(index + 1) {
+            // The next line starts one past this line's line feed, and a line never
+            // contains its own - `shape_line` debug-asserts that.
+            Some(next) => next - 1,
+            None => content.len(),
+        };
+        Some(start..end)
+    }
+
+    /// Which line a byte offset is on, by binary search over `starts`. This is the
+    /// caret/mouse path that used to count newlines from byte 0 on every call, which at
+    /// 20,000 lines is a walk through the note per arrow key.
+    pub(crate) fn line_index_at(&self, byte: usize) -> Option<usize> {
+        self.starts
+            .partition_point(|start| *start <= byte)
+            .checked_sub(1)
+    }
+
+    /// Re-cut the line index if, and only if, the text moved. Returns true when it did
+    /// work, i.e. when the buffer changed since the last call - the answer a repaint, a
+    /// scroll, a click and an arrow key all get as false, and the reason a frame can be
+    /// O(viewport) at all.
+    pub(crate) fn align(&mut self, content: &str, edits: u64) -> bool {
+        if self.current(content, edits) {
+            return false;
+        }
+        self.starts.clear();
+        self.starts.push(0);
+        for (index, byte) in content.bytes().enumerate() {
+            if byte == b'\n' {
+                self.starts.push(index + 1);
+            }
+        }
+        // Keep the slot count and the line count in step, so an index into `slots` is
+        // always a line number and `frames.len() == lines` holds at every read. Lines that
+        // moved out of range are dropped; new lines start out empty, which is the same
+        // state as "never asked for". Nothing here re-shapes: a line that shifted keeps
+        // its slot contents until something asks for it, and what asks is checked by value
+        // before it is believed.
+        self.slots.resize(self.starts.len(), None);
+        self.edits = edits;
+        self.len = content.len();
+        true
+    }
+
+    /// The one place a slot is written.
+    fn set_slot(&mut self, index: usize, cached: Arc<Shaped<Line>>) {
+        if let Some(slot) = self.slots.get_mut(index) {
+            *slot = Some(cached);
+        }
+    }
+}
+
+/// THE shape loop, extracted so it runs with no window and no GPU.
+///
+/// `window` is the set of lines this frame must be able to answer for - the visible rows,
+/// plus the caret line, plus the line a composition sits on. Nothing outside it is read,
+/// hashed, moved or written, which is the whole of the size-independence claim and the
+/// thing `tests/paint_cost.rs` asserts on. `shape` is the one thing a headless test cannot
+/// supply: the call into the platform text system.
+pub(crate) fn rebuild_shapes<Line>(
+    content: &str,
+    marked: Option<Range<usize>>,
+    window: Range<usize>,
+    cache: &mut ShapeCache<Line>,
+    stats: &mut PaintStats,
+    shape: &mut dyn FnMut(&str, Option<Range<usize>>) -> Line,
+) {
+    // The pool is bounded by the note, not by the session: a cache that only ever grows
+    // is the 64 MB at 20,000 lines this exists to stop. Dropping it is a re-shape, never a
+    // wrong answer, and it happens when the working set has doubled rather than once per
+    // frame - which is the difference between this and what it replaced.
+    if cache.pool.len() > cache.lines().max(64) {
+        cache.pool.clear();
+        stats.pool_rebuilds += 1;
+    }
+    for index in window {
+        let Some(bytes) = cache.bytes_of(content, index) else {
+            continue;
+        };
+        stats.lines_examined += 1;
+        let text = &content[bytes.clone()];
+        let mark = marked.as_ref().and_then(|m| {
+            let start = m.start.max(bytes.start);
+            let end = m.end.min(bytes.end);
+            (end > start).then_some(start - bytes.start..end - bytes.start)
+        });
+        // Three answers, in order of what they cost: the slot already holds this line (a
+        // compare and NO write), the pool has shaped this text (a hash and a refcount), or
+        // nothing has ever seen this line (a shape).
+        if cache
+            .slot(index)
+            .is_some_and(|cached| line_matches(cached, &bytes, text, mark.as_ref()))
+        {
+            continue;
+        }
+        let pooled = mark
+            .is_none()
+            .then(|| cache.pool.get(text).cloned())
+            .flatten();
+        let line = match pooled {
+            Some(line) => line,
+            None => {
+                stats.lines_shaped += 1;
+                let fresh = Arc::new(shape(text, mark.clone()));
+                if mark.is_none() {
+                    cache.pool.insert(text.to_string(), fresh.clone());
+                }
+                fresh
+            }
+        };
+        cache.set_slot(
+            index,
+            Arc::new(Shaped {
+                bytes,
+                text: text.to_string(),
+                mark,
+                line,
+            }),
+        );
+    }
+}
 /// The editor widget's model. In S1 it is never rendered; S2 paints what is in here.
 pub(crate) struct Editor {
     /// Content, selection and composition. Read it as the five fields the plan names:
@@ -709,29 +1000,39 @@ pub(crate) struct Editor {
     /// geometry methods. Caching it in paint rather than shaping it on demand is what
     /// keeps the IME answer and the pixels in agreement, and it is what the example
     /// does (examples/input.rs:555-559, reading :404-415).
-    /// One entry PER VISUAL LINE, in line order: the shaped line, the bytes of the
-    /// buffer it shapes, and the bounds it was actually drawn at, already scroll
-    /// offset. Line-ADDRESSED is the point - y has to choose a line before x can
-    /// choose a character - and writing the drawn bounds back is what keeps the IME
-    /// rect and the pixels from ever disagreeing (examples/input.rs:555-559 reads the
-    /// cache written at :404-415; here both are per line).
-    frames: Vec<LineFrame>,
-    /// The WHOLE buffer this frame set was shaped from, compared by value. Never
-    /// against one line of it: the examples single-line assert cannot hold once a
-    /// newline exists, because shape_line refuses to take one.
-    frame_text: String,
-    /// Pixels of the buffer scrolled above the top of the element. The rule is the
-    /// boring one every text widget uses: the caret is always visible. No animation,
-    /// no scrollbar, no horizontal scroll (word wrap is out of scope for the whole
-    /// project - a note wider than the window is a note you resize the window for).
-    scroll_y: Pixels,
+    /// One entry PER VISUAL LINE, in line order, so the index IS the line number: the
+    /// shaped line, the bytes of the buffer it shapes, and the text it was shaped from.
+    /// Line-ADDRESSED is the point - y has to choose a line before x can choose a
+    /// character - and what it no longer stores is the rect, because with one row height
+    /// for every line the rect is `geom.bounds_of(index)`. Storing it meant writing n
+    /// rects every frame and re-writing all of them on every wheel notch; deriving it
+    /// means the scroll is one number and the hit tests are arithmetic.
+    ///
+    /// THE CACHE, not a per-frame vector. This is the field the paint cost was hiding:
+    /// the first version took the whole previous frame set, moved every `ShapedLine`
+    /// (2,984 bytes each, gpui-pre-0.3.4/src/text_system/line.rs:43-50) into a fresh
+    /// HashMap, and moved them back out again - once per frame, for every line in the
+    /// note. Measured headless at 2,000 lines, debug: 11,631 us a frame with ZERO lines
+    /// re-shaped, because shaping was not the cost and never was. The cache lives between
+    /// frames, is addressed by line index and keyed by text, holds `Arc`s so a reuse is a
+    /// refcount, and is touched only inside the window a frame can show.
+    cache: ShapeCache<ShapedLine>,
+    /// The mutation counter of the last buffer that reached a SCREEN, compared against
+    /// `state.edits` by `display_desynced`. It used to be a copy of the whole buffer
+    /// compared by value, which is O(note) on every geometry call and every frame; the
+    /// counter answers the same question - has the text moved since the last paint - in
+    /// one integer, and it is the counter the wire already trusts (main.rs, `Wire`).
+    painted_edits: u64,
+    /// Where the shapes sit. Written in `paint` beside the cache, never before it, so
+    /// the rect the IME is answered with is the rect the pixels were drawn at.
+    geom: LineGeometry,
+    /// What the last rebuild did, counted. Read by `tests/paint_cost.rs` without a window
+    /// and printed by the probe with one, so "it only touches the viewport" is a number
+    /// the build checks rather than a claim in a comment.
+    stats: PaintStats,
     /// What the last frames shaping cost, in microseconds, so the typing budget is a
     /// number from the binary rather than an argument about the source.
     shape_us: u128,
-    /// The height of the element box at the last paint, i.e. the viewport the scroll is
-    /// clamped against. The model needs it because the wheel listener sits on the Div
-    /// and the clamp rule lives here.
-    viewport_h: Pixels,
     /// The caret line the last painted frame showed. The caret rule compares against
     /// this; the wheel never writes it, which is the whole reason a scroll survives.
     caret_line_shown: Option<usize>,
@@ -746,31 +1047,28 @@ impl Editor {
     /// (examples/input.rs:703-704).
     /// No font, no shaping, no layout: S1/S2 construct cheap and shape on first paint
     /// (the cold-start budget, whitepaper section 2). This is the whole reason
-    /// `frames` starts empty.
+    /// `shapes` starts empty.
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
-        Self {
-            state: TextState::default(),
-            focus_handle: cx.focus_handle(),
-            frames: Vec::new(),
-            frame_text: String::new(),
-            scroll_y: px(0.0),
-            shape_us: 0,
-            viewport_h: px(0.0),
-            caret_line_shown: None,
-            dragging: false,
-        }
+        Self::build(TextState::default(), cx)
     }
 
     #[allow(dead_code)] // S3 onward: the buffer arrives from the port in S6
     pub(crate) fn with_content(content: String, cx: &mut Context<Self>) -> Self {
+        Self::build(TextState::new(content), cx)
+    }
+
+    /// The one constructor. `geom` is all zeroes until the first paint, and every reader
+    /// of it goes through a length or a `None` check, so an unpainted editor answers "no
+    /// line" rather than dividing by a row height of 0.0.
+    fn build(state: TextState, cx: &mut Context<Self>) -> Self {
         Self {
-            state: TextState::new(content),
+            state,
             focus_handle: cx.focus_handle(),
-            frames: Vec::new(),
-            frame_text: String::new(),
-            scroll_y: px(0.0),
+            cache: ShapeCache::default(),
+            painted_edits: u64::MAX,
+            geom: LineGeometry::default(),
+            stats: PaintStats::default(),
             shape_us: 0,
-            viewport_h: px(0.0),
             caret_line_shown: None,
             dragging: false,
         }
@@ -779,17 +1077,34 @@ impl Editor {
     /// True when the cached layout no longer describes what we would paint. A stale
     /// layout is not a crash waiting to happen, it is a WRONG IME RECT waiting to
     /// happen, so both geometry methods check this instead of trusting the cache.
+    ///
+    /// A COUNTER, not a string compare. The first version kept a copy of the whole
+    /// buffer on the model and compared it by value on every geometry call - O(note) on
+    /// the IME path, per keystroke - for a question `edits` already answers, which is the
+    /// same counter the wire trusts for exactly this (main.rs, `Wire`). Text is the only
+    /// thing that can desync the layout, and the only thing that moves the counter.
     fn display_desynced(&self) -> bool {
-        self.frame_text != self.state.content
+        self.painted_edits != self.state.edits
     }
 
-    /// The line a byte offset belongs to, for the geometry methods. A byte at the very - the caret after the last character, which is where typing
-    /// leaves it - has no line that CONTAINS it, so it falls to the last line.
-    fn frame_for(&self, byte: usize) -> Option<&LineFrame> {
-        self.frames
-            .iter()
-            .find(|frame| frame.bytes.contains(&byte))
-            .or_else(|| self.frames.last())
+    /// The line a byte offset belongs to, for the geometry methods. A byte at the very
+    /// end - the caret after the last character, which is where typing leaves it - has no
+    /// line that CONTAINS it, so it falls to the last line.
+    ///
+    /// BINARY SEARCH, not a scan. This is called on the caret path and the IME path; the
+    /// first version walked every line in the note to answer it, which is the same
+    /// O(buffer) tax the paint path was paying.
+    fn frame_for(&self, byte: usize) -> Option<&Shaped<ShapedLine>> {
+        // Past the end of the last line is the last line - the clamp the geometry
+        // methods have always had, and the reason the caret after the final character
+        // still gets a rect. The search is over the line starts, not over the frames:
+        // a line nobody has looked at yet has no frame and still has a number.
+        let byte = byte.min(self.state.content.len());
+        let index = self
+            .cache
+            .line_index_at(byte)
+            .unwrap_or(self.cache.lines().saturating_sub(1));
+        self.cache.slot(index)
     }
 
     /// The line a PIXEL y falls on, with the clamp S4 was asked for: below the last line
@@ -798,16 +1113,14 @@ impl Editor {
     /// first paint. This is what makes "click in the empty space under a short note" put
     /// the caret at the END of the text instead of doing nothing, which is how every
     /// text control on Windows behaves.
-    fn frame_at(&self, y: Pixels) -> Option<&LineFrame> {
-        let mut chosen = self.frames.first()?;
-        for frame in &self.frames {
-            if frame.bounds.top() <= y {
-                chosen = frame;
-            } else {
-                break;
-            }
-        }
-        Some(chosen)
+    ///
+    /// O(1) now, and it is the one of the seven O(buffer) sites a user actually feels:
+    /// this runs on every mouse MOTION while a drag is open, so the walk it used to do
+    /// was per-pixel-of-drag over the whole note. One row height for every line turns the
+    /// walk into a division.
+    fn frame_at(&self, y: Pixels) -> Option<&Shaped<ShapedLine>> {
+        let index = self.geom.line_at_y(y, self.cache.lines())?;
+        self.cache.slot(index)
     }
 
     /// WHEEL AND TRACKPAD. gpui routes `PlatformInput::ScrollWheel` to any `Div` with a
@@ -831,10 +1144,7 @@ impl Editor {
     fn scroll_by(&mut self, delta: &ScrollDelta, cx: &mut Context<Self>) {
         const WHEEL_LINES_PER_NOTCH: f32 = 3.0;
         const WHEEL_UNITS_PER_NOTCH: f32 = 120.0;
-        let row = self
-            .frames
-            .first()
-            .map_or(0.0, |frame| f32::from(frame.bounds.size.height));
+        let row = f32::from(self.geom.row);
         let lines = match delta {
             ScrollDelta::Lines(point) => point.y * WHEEL_LINES_PER_NOTCH,
             ScrollDelta::Pixels(point) => {
@@ -842,17 +1152,19 @@ impl Editor {
             }
         };
         let raw = lines * row;
-        let content = row * self.frames.len().max(1) as f32;
-        let max = (content - f32::from(self.viewport_h)).max(0.0);
+        let content = row * self.cache.lines().max(1) as f32;
+        let max = (content - f32::from(self.geom.viewport_h)).max(0.0);
         // The platform reports scroll-down as positive y and the offset is measured the
         // other way, so the sign flips exactly once, here.
-        let next = (f32::from(self.scroll_y) + raw).clamp(0.0, max);
+        let before = f32::from(self.geom.scroll_y);
+        let next = (before + raw).clamp(0.0, max);
         probe(format!(
-            "wheel raw={raw:.1} lines={lines:.1} offset_before={:.1} offset_after={next:.1} row={row:.1}",
-            f32::from(self.scroll_y)
+            "wheel raw={raw:.1} lines={lines:.1} offset_before={before:.1} offset_after={next:.1} row={row:.1}",
         ));
-        if next != f32::from(self.scroll_y) {
-            self.scroll_y = px(next);
+        if next != before {
+            // ONE NUMBER MOVES. The lines are untouched: their rects are derived from this
+            // offset, so a scroll walks nothing and re-shapes nothing.
+            self.geom.scroll_y = px(next);
             cx.notify();
         }
     }
@@ -861,7 +1173,7 @@ impl Editor {
     /// line is the last line, past the end of a line is that line's end.
     fn byte_at(&self, point: Point<Pixels>) -> Option<usize> {
         let frame = self.frame_at(point.y)?;
-        let x = point.x - frame.bounds.left();
+        let x = point.x - self.geom.left;
         let utf8 = frame.line.index_for_x(x).unwrap_or(frame.text.len());
         Some((frame.bytes.start + utf8).min(frame.bytes.end))
     }
@@ -943,15 +1255,11 @@ impl Editor {
     /// PAGE MOTION. A page is the element's own height in rows, not a magic line count,
     /// so it follows the window when the window is resized and needs no constant.
     fn page(&mut self, pages: isize, shift: bool, cx: &mut Context<Self>) {
-        let row = f32::from(
-            self.frames
-                .first()
-                .map_or(px(0.0), |frame| frame.bounds.size.height),
-        );
+        let row = f32::from(self.geom.row);
         if row <= 0.0 {
             return;
         }
-        let rows = ((f32::from(self.viewport_h) / row).floor() as isize).max(1);
+        let rows = ((f32::from(self.geom.viewport_h) / row).floor() as isize).max(1);
         let delta = rows * pages;
         if shift {
             self.state.select_vertical(delta);
@@ -993,9 +1301,11 @@ impl Editor {
     pub(crate) fn load(&mut self, content: String, cx: &mut Context<Self>) {
         self.state = TextState::new(content);
         self.state.move_to(0);
-        self.frames.clear();
-        self.frame_text.clear();
-        self.scroll_y = px(0.0);
+        // The cache goes with it. A new document is not an edit of the old one, and a
+        // pool of the old note's lines would be memory spent on text that is gone.
+        self.cache.clear();
+        self.painted_edits = u64::MAX;
+        self.geom.scroll_y = px(0.0);
         self.caret_line_shown = None;
         self.dragging = false;
         cx.notify();
@@ -1104,16 +1414,24 @@ impl EntityInputHandler for Editor {
             .clamp(start, len);
         let left = frame.line.x_for_index(start);
         let right = frame.line.x_for_index(end);
+        // The rect this line ACTUALLY occupies, scroll included - the same derivation the
+        // painter uses, which is the whole reason the candidate window cannot disagree
+        // with the pixels.
+        // The cache knows this index already, by binary search; `state.line_index_at`
+        // counts newlines from byte 0, which is the O(note) caret scan this file is about
+        // and which the index makes unnecessary. They agree by construction: the cache is
+        // aligned to this buffer or the desync check above has already refused to answer.
+        let index = self.cache.line_index_at(range.start).unwrap_or(0);
+        let drawn = self.geom.bounds_of(index);
         probe(format!(
-            "bounds_for_range units {range_utf16:?} -> line {} local {start}..{end}, x {:.1}..{:.1} y {:.1}",
-            self.state.line_index_at(range.start),
+            "bounds_for_range units {range_utf16:?} -> line {index} local {start}..{end}, x {:.1}..{:.1} y {:.1}",
             f32::from(left),
             f32::from(right),
-            f32::from(frame.bounds.top())
+            f32::from(drawn.top())
         ));
         Some(Bounds::from_corners(
-            point(element_bounds.left() + left, frame.bounds.top()),
-            point(element_bounds.left() + right, frame.bounds.bottom()),
+            point(element_bounds.left() + left, drawn.top()),
+            point(element_bounds.left() + right, drawn.bottom()),
         ))
     }
 
@@ -1135,19 +1453,19 @@ impl EntityInputHandler for Editor {
         // build still panics loudly at the frame the cache and the buffer diverged.
         debug_assert!(
             !self.display_desynced(),
-            "editor: cached frames describe {:?} but the buffer is {:?}",
-            self.frame_text,
-            self.state.content
+            "editor: the shape cache is at edit {:?} but the buffer is at {:?}",
+            self.cache.edits,
+            self.state.edits
         );
         if self.display_desynced() {
             probe("character_index_for_point: no answer, the cached layout is stale");
             return None;
         }
-        let frame = self
-            .frames
-            .iter()
-            .find(|frame| frame.bounds.contains(&point))?;
-        let local = frame.bounds.localize(&point)?;
+        // One division to choose the line, one rect to check it, instead of a walk over
+        // every line in the note per event.
+        let index = self.geom.line_at_y(point.y, self.cache.lines())?;
+        let frame = self.cache.slot(index)?;
+        let local = self.geom.bounds_of(index).localize(&point)?;
         let utf8 = frame.line.index_for_x(local.x)?;
         let byte = (frame.bytes.start + utf8).min(frame.bytes.end);
         let units = offset_to_utf16(&self.state.content, byte);
@@ -1365,27 +1683,21 @@ impl Editor {
 // underlined, and the scroll that keeps the caret on screen
 // ---------------------------------------------------------------------------
 
-/// One line on its way from text to pixels: its bytes in the buffer, the text itself,
-/// the underline if a composition sits inside it, and the shape. Named because clippy is
-/// right that this tuple is doing four jobs at once, and prepaint is not the place to
-/// read a 60-character type.
-type ShapedEntry = (Range<usize>, String, Option<Range<usize>>, ShapedLine);
-
 /// What prepaint worked out and paint draws, so nothing is shaped twice and the
 /// quads come from the SAME lines the geometry methods will answer with.
 pub(crate) struct PrepaintState {
-    /// One per visual line, already offset by `scroll_y`.
-    frames: Vec<LineFrame>,
+    /// Where this frame draws, including the scroll offset the caret rule settled on.
+    /// Committed by `paint`, never before: the rect the IME is answered with and the
+    /// rect the pixels were drawn at must come from the same frame.
+    geom: LineGeometry,
+    /// What the rebuild counted, carried so the model reports what was PAINTED rather
+    /// than what a prepaint that never reached the screen guessed at.
+    stats: PaintStats,
     cursor: Option<PaintQuad>,
     /// ONE QUAD PER SPANNED LINE. The example's single selection rect cannot describe
     /// a selection across a line break, so this is a list. What S3 draws is stated in
     /// the acceptance report; per-line rects, not one bounding box.
     selections: Vec<PaintQuad>,
-    /// Carried to `paint`, which writes the model's cache in ONE assignment: frames,
-    /// the text they describe, the offset they were drawn at and the shaping cost. A
-    /// half-updated cache is exactly the stale-rect bug the desync check exists for.
-    scroll_y: Pixels,
-    frame_text: String,
     shape_us: u128,
     /// The caret line this frame intends to have shown; written to the model only by
     /// paint, because only paint proves the frame reached the screen.
@@ -1463,6 +1775,12 @@ impl Element for EditorElement {
 
     /// The only shaping in the app, and it happens HERE - first paint, not startup
     /// (whitepaper section 2: cold start is a budget).
+    ///
+    /// What this function no longer contains is the shape LOOP: that is
+    /// `rebuild_shapes`, a free function over a payload type, so the loop that decides
+    /// the paint cost can be run - and timed, and asserted on - with no window and no
+    /// GPU. What is left here is the part that genuinely needs a window: the platform
+    /// text system, the resolved style, the active state.
     fn prepaint(
         &mut self,
         _id: Option<&GlobalElementId>,
@@ -1477,129 +1795,59 @@ impl Element for EditorElement {
         let font_size = style.font_size.to_pixels(window.rem_size());
         let lh = f32::from(window.line_height());
         let viewport = f32::from(bounds.size.height);
-        let left = bounds.left();
-        let right = bounds.right();
-        let mut frames: Vec<LineFrame> = Vec::new();
+        let mut shape_us = 0u128;
         let mut cursor_quad = None;
         let mut selections: Vec<PaintQuad> = Vec::new();
-        let mut scroll_y = px(0.0);
-        let mut shape_us = 0u128;
-        let mut caret_line = 0usize;
-        let mut frame_text = String::new();
+        let mut stats = PaintStats::default();
         let mut shown_line: Option<usize> = None;
         let mut sel_probe = (0usize, 0usize);
         let mut focused_probe = false;
         let mut caret_probe = 0usize;
+        // The geometry this frame draws at. scroll_y starts where the model is and the
+        // caret rule below may move it; nothing else does, and no line carries a rect of
+        // its own.
+        let mut geom = LineGeometry {
+            top: bounds.top(),
+            left: bounds.left(),
+            right: bounds.right(),
+            row: px(lh),
+            scroll_y: px(0.0),
+            viewport_h: bounds.size.height,
+        };
         // The whole prepaint, timed: shape_us alone cannot show the rebuild cost, which
-        // is what the quadratic first draft of the cache was. This is the number the
-        // wheel moves, because scrolling walks lines that were never shaped.
-        // IS THIS WINDOW EVEN ACTIVE? The answer to S5's open deviation, and it was a
-        // wrong QUERY, not a missing repaint: `FocusHandle::is_focused` is `window.focus
-        // == Some(*self)` (src/window.rs:237-239), which is gpui's internal focus ring
-        // WITHIN a window and stays true when the operating system puts another app in
-        // front - measured, `focused=true` across every frame while the OS foreground
-        // window was a foreign handle. What reports the OS state is
-        // `Window::is_window_active` (src/window.rs:1721-1723, "focused by the operating
-        // system (receiving key events)"), read once here because `window` cannot be
-        // borrowed inside the update closure below.
+        // is what the quadratic first draft of the cache was.
+        // IS THIS WINDOW EVEN ACTIVE? What reports the OS state is
+        // Window::is_window_active (src/window.rs:1721-1723); FocusHandle::is_focused is
+        // gpui's internal focus ring WITHIN a window and stays true when the operating
+        // system puts another app in front - measured. Read once here because window
+        // cannot be borrowed inside the update closure below.
         let active = window.is_window_active();
         let began = std::time::Instant::now();
         self.input.update(cx, |input, _cx| {
-            let lines = line_ranges(&input.state.content);
             let cursor = input.state.cursor_offset();
             let selection = input.state.selected_range.clone();
             let marked = input.state.marked_range.clone();
-            caret_line = input.state.line_index_at(cursor);
-            // Reuse keyed by the line TEXT and its underline, never by the byte range:
-            // a newline inserted at the top shifts every following line, and a key that
-            // includes the offset would re-shape the whole note for one keystroke.
-            // ONE PASS, not a search per line: the old frames are moved into a pool
-            // keyed by the exact text, so a keystroke at the top of a 2000-line note
-            // costs a linear walk instead of the quadratic scan the first draft of this
-            // had (Vec::remove(position) inside a per-line loop). Composition is excluded
-            // from the pool on both sides: one marked line re-shaping per frame is worth
-            // never handing back an underline that belongs to another row.
-            let mut pool: std::collections::HashMap<String, ShapedLine> =
-                std::mem::take(&mut input.frames)
-                    .into_iter()
-                    .filter(|frame| frame.mark.is_none())
-                    .map(|frame| (frame.text, frame.line))
-                    .collect();
-            let mut shaped: Vec<ShapedEntry> = Vec::new();
-            for range in lines.into_iter() {
-                let text = input.state.content[range.clone()].to_string();
-                let mark = marked.as_ref().and_then(|m| {
-                    let start = m.start.max(range.start);
-                    let end = m.end.min(range.end);
-                    (end > start).then_some(start - range.start..end - range.start)
-                });
-                let cached = mark.is_none().then(|| pool.remove(&text)).flatten();
-                let line = match cached {
-                    Some(line) => line,
-                    None => {
-                        let run = TextRun {
-                            len: text.len(),
-                            font: style.font(),
-                            color: style.color,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        let runs = match mark.clone() {
-                            Some(mark) => {
-                                let mark = clamp_range(&text, &mark);
-                                vec![
-                                    TextRun {
-                                        len: mark.start,
-                                        ..run.clone()
-                                    },
-                                    TextRun {
-                                        len: mark.end - mark.start,
-                                        underline: Some(UnderlineStyle {
-                                            color: Some(run.color),
-                                            thickness: px(1.0),
-                                            wavy: false,
-                                        }),
-                                        ..run.clone()
-                                    },
-                                    TextRun {
-                                        len: text.len() - mark.end,
-                                        ..run
-                                    },
-                                ]
-                                .into_iter()
-                                .filter(|run| run.len > 0)
-                                .collect()
-                            }
-                            None => vec![run],
-                        };
-                        let at = std::time::Instant::now();
-                        let line = text_system.shape_line(
-                            SharedString::from(text.clone()),
-                            font_size,
-                            &runs,
-                            None,
-                        );
-                        shape_us += at.elapsed().as_micros();
-                        line
-                    }
-                };
-                shaped.push((range, text, mark, line));
-            }
-            // Whatever is left in `old` is a line that no longer exists; dropping it is
-            // the whole invalidation story.
-
+            geom.scroll_y = input.geom.scroll_y;
+            // THE DIRTY FLAG. Re-cut the line index ONLY if the text moved; a caret move,
+            // a click, a wheel notch and a repaint of an unchanged note all answer false
+            // here and touch nothing. There was no flag anywhere before this, which is
+            // why the rebuild ran unconditionally.
+            input.cache.align(&input.state.content, input.state.edits);
+            let lines = input.cache.lines();
+            let caret_line = input
+                .cache
+                .line_index_at(cursor)
+                .unwrap_or(lines.saturating_sub(1));
             // THE CARET IS VISIBLE WHEN THE CARET MOVED, not every frame. The first form
             // of this rule ran unconditionally and made a wheel delta unobservable: every
             // frame after it snapped the view back onto the caret line, so the user
             // scrolled and nothing had happened. Comparing against the line the last PAINT
-            // showed - not the last prepaint, because a prepaint that never painted must
-            // not claim to have shown anything - gives the rule both directions: scroll
-            // away and it stays, move the caret and the view follows.
-            let content_height = lh * (shaped.len() + 1) as f32;
+            // showed gives the rule both directions: scroll away and it stays, move the
+            // caret and the view follows.
+            let content_height = lh * (lines + 1) as f32;
             let caret_top = lh * caret_line as f32;
             let mut offset = if follow_required(input.caret_line_shown, caret_line) {
-                let mut offset = f32::from(input.scroll_y);
+                let mut offset = f32::from(input.geom.scroll_y);
                 if caret_top - offset + lh > viewport {
                     offset = caret_top + lh - viewport;
                 }
@@ -1610,28 +1858,90 @@ impl Element for EditorElement {
             } else {
                 // The wheel owns the offset: no line changed, so the user's scroll is left
                 // exactly where they put it.
-                f32::from(input.scroll_y)
+                f32::from(input.geom.scroll_y)
             };
             // The clamp is not conditional on who moved the view: content can shrink under
             // a scroll the wheel owns, and an offset past the end is a blank page.
             offset = offset.max(0.0).min((content_height - viewport).max(0.0));
-            scroll_y = px(offset);
+            geom.scroll_y = px(offset);
             shown_line = Some(caret_line);
             sel_probe = (selection.start, selection.end);
             caret_probe = cursor;
-            for (index, (range, text, mark, line)) in shaped.into_iter().enumerate() {
-                let top = f32::from(bounds.top()) + lh * index as f32 - offset;
-                let frame_bounds =
-                    Bounds::from_corners(point(left, px(top)), point(right, px(top + lh)));
-                frames.push(LineFrame {
-                    bytes: range,
-                    text,
-                    mark,
-                    line,
-                    bounds: frame_bounds,
-                });
+            // THE WINDOW the rebuild is allowed to look at: the rows that can be seen, plus
+            // the caret line (the quad and the IME rect both need it), plus the line a
+            // composition sits on (the candidate window needs it even when the user has
+            // scrolled away). Nothing outside it is examined, which is the entire claim
+            // tests/paint_cost.rs makes.
+            let visible = geom.visible_lines(lines);
+            let mut first = visible.start;
+            let mut last = visible.end;
+            for edge in [
+                Some(caret_line),
+                marked
+                    .as_ref()
+                    .and_then(|m| input.cache.line_index_at(m.start)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                first = first.min(edge);
+                last = last.max(edge + 1);
             }
-            if let Some(frame) = frames.get(caret_line).filter(|_| active) {
+            // THE LOOP, out of here and into rebuild_shapes. The one thing that cannot
+            // exist without a window is passed IN as the closure: the call into the
+            // platform text system.
+            rebuild_shapes(
+                &input.state.content,
+                marked,
+                first..last,
+                &mut input.cache,
+                &mut stats,
+                &mut |text, mark| {
+                    let run = TextRun {
+                        len: text.len(),
+                        font: style.font(),
+                        color: style.color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    let runs = match mark {
+                        Some(mark) => {
+                            let mark = clamp_range(text, &mark);
+                            vec![
+                                TextRun {
+                                    len: mark.start,
+                                    ..run.clone()
+                                },
+                                TextRun {
+                                    len: mark.end - mark.start,
+                                    underline: Some(UnderlineStyle {
+                                        color: Some(run.color),
+                                        thickness: px(1.0),
+                                        wavy: false,
+                                    }),
+                                    ..run.clone()
+                                },
+                                TextRun {
+                                    len: text.len() - mark.end,
+                                    ..run
+                                },
+                            ]
+                            .into_iter()
+                            .filter(|run| run.len > 0)
+                            .collect()
+                        }
+                        None => vec![run],
+                    };
+                    let at = std::time::Instant::now();
+                    let line =
+                        text_system.shape_line(SharedString::from(text), font_size, &runs, None);
+                    shape_us += at.elapsed().as_micros();
+                    line
+                },
+            );
+            if let Some(frame) = input.cache.slot(caret_line).filter(|_| active) {
+                let drawn = geom.bounds_of(caret_line);
                 let x = frame.line.x_for_index(
                     cursor
                         .saturating_sub(frame.bytes.start)
@@ -1639,8 +1949,8 @@ impl Element for EditorElement {
                 );
                 cursor_quad = Some(fill(
                     Bounds::new(
-                        point(frame.bounds.left() + x, frame.bounds.top()),
-                        size(px(2.0), frame.bounds.size.height),
+                        point(drawn.left() + x, drawn.top()),
+                        size(px(2.0), drawn.size.height),
                     ),
                     rgb(0x0033_99ff),
                 ));
@@ -1648,7 +1958,7 @@ impl Element for EditorElement {
             // FOCUSED OR NOT: a grey bar, not a live blue selection, and no caret at all
             // while the window is inactive - what Windows itself does, and the reason a
             // selection in a background window must not look like the thing you are
-            // editing. See `active` above for why this is the window and not the handle.
+            // editing.
             let selection_colour = if active && input.focus_handle.is_focused(window) {
                 rgb(0x2d_4a_6b)
             } else {
@@ -1656,55 +1966,57 @@ impl Element for EditorElement {
             };
             focused_probe = active;
             if !selection.is_empty() {
-                for frame in &frames {
-                    // VIEWPORT CLIP: a selection across 400 lines would draw 400 quads,
-                    // and every one outside the visible rows is work nobody can see. The
-                    // frames stay complete - the IME rect and the click hit-test still
-                    // need a line that is scrolled off - only the QUADS are clipped.
-                    if frame.bounds.bottom() <= bounds.top()
-                        || frame.bounds.top() >= bounds.bottom()
-                    {
-                        continue;
-                    }
-                    let start = selection.start.max(frame.bytes.start);
-                    let end = selection.end.min(frame.bytes.end);
-                    if end <= start {
-                        continue;
-                    }
-                    selections.push(fill(
-                        Bounds::from_corners(
-                            point(
-                                frame.bounds.left()
-                                    + frame.line.x_for_index(start - frame.bytes.start),
-                                frame.bounds.top(),
+                // THE VISIBLE WINDOW ONLY, not the whole buffer with a clip inside the
+                // loop. A selection across 400 lines used to walk 400 frames to draw the
+                // twenty-eight quads anybody could see; the range is arithmetic now, so the
+                // walk covers only the rows that can produce a quad at all.
+                let from = input.cache.line_index_at(selection.start);
+                let to = input.cache.line_index_at(selection.end);
+                if let (Some(from), Some(to)) = (from, to) {
+                    for index in first.max(from)..last.min(to + 1) {
+                        let Some(frame) = input.cache.slot(index) else {
+                            continue;
+                        };
+                        let start = selection.start.max(frame.bytes.start);
+                        let end = selection.end.min(frame.bytes.end);
+                        if end <= start {
+                            continue;
+                        }
+                        let drawn = geom.bounds_of(index);
+                        selections.push(fill(
+                            Bounds::from_corners(
+                                point(
+                                    drawn.left()
+                                        + frame.line.x_for_index(start - frame.bytes.start),
+                                    drawn.top(),
+                                ),
+                                point(
+                                    drawn.left() + frame.line.x_for_index(end - frame.bytes.start),
+                                    drawn.bottom(),
+                                ),
                             ),
-                            point(
-                                frame.bounds.left()
-                                    + frame.line.x_for_index(end - frame.bytes.start),
-                                frame.bounds.bottom(),
-                            ),
-                        ),
-                        selection_colour,
-                    ));
+                            selection_colour,
+                        ));
+                    }
                 }
             }
-            frame_text = input.state.content.clone();
         });
         let prepaint_us = began.elapsed().as_micros();
         probe(format!(
-            "prepaint lines={} h={:.1} caret={caret_probe} sel={:?}..{:?} focused={focused_probe} scroll={:.1} caret_line={caret_line} shape_us={shape_us} prepaint_us={prepaint_us}",
-            frames.len(),
-            f32::from(bounds.size.height),
+            "prepaint examined={} shaped={} pool_rebuilds={} h={:.1} caret={caret_probe} sel={:?}..{:?} focused={focused_probe} scroll={:.1} shape_us={shape_us} prepaint_us={prepaint_us}",
+            stats.lines_examined,
+            stats.lines_shaped,
+            stats.pool_rebuilds,
+            viewport,
             sel_probe.0,
             sel_probe.1,
-            f32::from(scroll_y)
+            f32::from(geom.scroll_y)
         ));
         PrepaintState {
-            frames,
+            geom,
+            stats,
             cursor: cursor_quad,
             selections,
-            scroll_y,
-            frame_text,
             shape_us,
             shown_line,
         }
@@ -1732,30 +2044,41 @@ impl Element for EditorElement {
         for selection in prepaint.selections.drain(..) {
             window.paint_quad(selection);
         }
-        let frames = std::mem::take(&mut prepaint.frames);
-        let mut visible = 0usize;
-        for frame in &frames {
-            // The same clip the selection quads use: the cache holds every line so the
-            // IME and a click can be answered for a scrolled-off row, but only the rows
-            // inside the box are drawn.
-            if frame.bounds.bottom() <= bounds.top() || frame.bounds.top() >= bounds.bottom() {
-                continue;
-            }
-            visible += 1;
+        let geom = prepaint.geom;
+        // ONLY THE ROWS INSIDE THE BOX ARE DRAWN, and the range comes out of the geometry
+        // instead of a clip tested against every line: at 20,000 lines the old loop looked
+        // at 19,972 rows to paint the twenty-eight it could show. The shapes come out as
+        // Arcs first - one refcount per visible row - because painting needs the app while
+        // the cache belongs to the model.
+        let painted_edits = self.input.read(cx).state.edits;
+        let rows: Vec<(usize, std::sync::Arc<ShapedLine>)> = {
+            let model = self.input.read(cx);
+            geom.visible_lines(model.cache.lines())
+                .filter_map(|index| {
+                    model
+                        .cache
+                        .slot(index)
+                        .map(|frame| (index, frame.line.clone()))
+                })
+                .collect()
+        };
+        for (index, line) in &rows {
             // A failed line is a blank row for one frame, not an aborted editor.
             //
-            // THE NEW TWO ARGUMENTS, passed as the geometry IS and not as whatever
-            // silences the compiler (gpui-pre-0.3.4/src/text_system/line.rs:83 - align:
-            // TextAlign, align_width: Option<Pixels>): this editor does not word-wrap, every
-            // line lays out left-aligned, and the box it was shaped into is `frame.bounds`.
-            // So align is Left and align_width is that box's width - the width the line was
-            // measured against. Left alignment adds no offset, which is also why this cannot
-            // move a glyph by a pixel: it states the box, it does not re-flow it.
-            let _ = frame.line.paint(
-                frame.bounds.origin,
-                frame.bounds.size.height,
+            // THE TWO ARGUMENTS the kit generation added, passed as the geometry IS and
+            // not as whatever silences the compiler (gpui-pre-0.3.4/src/text_system/line.rs:83
+            // - align: TextAlign, align_width: Option<Pixels>): this editor does not
+            // word-wrap, every line lays out left-aligned, and the box it was shaped into is
+            // the row this line occupies. So align is Left and align_width is that box width
+            // - the width the line was measured against. Left alignment adds no offset,
+            // which is also why this cannot move a glyph by a pixel: it states the box, it
+            // does not re-flow it.
+            let drawn = geom.bounds_of(*index);
+            let _ = line.paint(
+                drawn.origin,
+                drawn.size.height,
                 TextAlign::Left,
-                Some(frame.bounds.size.width),
+                Some(drawn.size.width),
                 window,
                 cx,
             );
@@ -1765,29 +2088,36 @@ impl Element for EditorElement {
                 window.paint_quad(cursor);
             }
         }
-        // ONE WRITE, all four fields, so the cache the platform is answered from can
-        // never be half-updated: frames, the text they describe, the offset they were
-        // drawn at, and what shaping cost.
-        let frame_text = std::mem::take(&mut prepaint.frame_text);
-        let scroll_y = prepaint.scroll_y;
+        // ONE WRITE, all of it, so the geometry the platform is answered from can never
+        // be half-updated. The shapes are already in the model - prepaint put them there,
+        // and they are content-only, so a prepaint that never painted cannot lie about a
+        // rect. What is committed HERE is the rect, the counters, and the epoch: that the
+        // frame reached a screen.
         let shape_us = prepaint.shape_us;
-        let count = frames.len();
-        let scroll_probe = scroll_y;
+        let stats = prepaint.stats;
+        let count = rows.len();
+        let scroll_probe = geom.scroll_y;
         self.input.update(cx, |input, _cx| {
-            input.frames = frames;
-            input.frame_text = frame_text;
-            input.scroll_y = scroll_y;
+            input.geom = geom;
+            input.stats = stats;
             input.shape_us = shape_us;
-            input.viewport_h = bounds.size.height;
+            input.painted_edits = painted_edits;
             input.caret_line_shown = prepaint.shown_line.take();
         });
-        let focused_out = self.input.read(cx).focus_handle.is_focused(window);
+        let (focused_out, painted) = {
+            let model = self.input.read(cx);
+            (model.focus_handle.is_focused(window), model.stats)
+        };
         probe(format!(
-            "paint lines={count} visible={visible} quads={quad_count} focused={focused_out} scroll={:.1} shape_us={shape_us}",
-            f32::from(scroll_probe)
+            "paint visible={count} quads={quad_count} focused={focused_out} scroll={:.1} shape_us={shape_us} examined={} shaped={} pool_rebuilds={}",
+            f32::from(scroll_probe),
+            painted.lines_examined,
+            painted.lines_shaped,
+            painted.pool_rebuilds,
         ));
     }
 }
+
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let wheel_target = cx.entity();
