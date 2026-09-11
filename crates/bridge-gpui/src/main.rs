@@ -478,6 +478,10 @@ struct Surface {
     /// Whether we have asked for the keyboard yet - first frame only, so that
     /// focusing the editor cannot fight something the user clicks into later.
     focus_requested: bool,
+    /// Whether the first-paint stamp has been written (see `first_paint_stamp`).
+    /// The same first-frame-only pattern as `focus_requested`: one render pays
+    /// for the probe, every later one costs a branch.
+    first_paint_stamped: bool,
     /// Has the port been told once that a window exists? See the first-reading rule in
     /// the pump.
     signalled_once: bool,
@@ -504,6 +508,7 @@ impl Surface {
             editor,
             wire,
             focus_requested: false,
+            first_paint_stamped: false,
             signalled_once: false,
         };
         this.start_pump(cx);
@@ -647,6 +652,13 @@ impl Render for Surface {
             self.focus_requested = true;
             let handle = Focusable::focus_handle(self.editor.read(cx), cx);
             window.focus(&handle, cx);
+        }
+        // THE FIRST-PAINT STAMP: one render pays for it, every later one costs a
+        // branch. See `first_paint_stamp` for the gating and the chosen moment -
+        // this frame's element tree is the first one that contains the editor.
+        if !self.first_paint_stamped {
+            self.first_paint_stamped = true;
+            first_paint_stamp();
         }
         // Nothing invented here: GPUI 0.2.2 has no `Label` widget (its own text
         // elements are in src/elements/text.rs - `impl Element for &'static str` at
@@ -875,6 +887,30 @@ impl Surface {
             drag = if stats.drag_open { " (drag open)" } else { "" },
         ))
     }
+}
+
+/// THE FIRST-PAINT STAMP (debug probe for the startup budget): when the
+/// environment variable `NOTES_STAMP_FIRST_PAINT` names a path, write that file
+/// ONCE, at the first render pass of the root view - the frame whose element
+/// tree contains the editor, which paints as a child within it. GPUI exposes no
+/// post-present callback through the kit surface this bridge uses, and the
+/// editor's own paint path is performance-critical (8404b566 made it
+/// O(viewport)), so the closest observable moment WITHOUT touching editor.rs is
+/// this one: a tight lower bound on typeable, one present short of it.
+///
+/// GATING: the environment variable IS the gate. It is read once per process
+/// lifetime - the caller fires once - and absent, as in production, the probe
+/// writes nothing. A failed write stays silent on purpose: a probe that panics
+/// or logs would be a production surface.
+fn first_paint_stamp() {
+    let Ok(path) = std::env::var("NOTES_STAMP_FIRST_PAINT") else {
+        return;
+    };
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    let _ = std::fs::write(path, format!("first-paint {millis}\n"));
 }
 
 /// Collapse the rendered line to one physical line.
