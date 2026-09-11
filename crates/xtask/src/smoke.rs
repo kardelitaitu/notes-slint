@@ -1062,18 +1062,29 @@ fn report_binary(exe: &Path, root: &Path, built: bool) {
         if built { "yes" } else { "NO (--no-build)" },
         head
     );
+    let embed = match build_embeds_manifest(root) {
+        Some(true) => "build.rs EMBEDS app.manifest at link time",
+        Some(false) => {
+            "build.rs does NOT embed anything, so these bytes did not come \
+                       from cargo build - they came from a post-link 'cargo xtask manifest' \
+                       run, or from the toolkit's own manifest"
+        }
+        None => "build.rs could not be read, so the cause is unknown",
+    };
     match manifest_of(root, exe) {
         Ok(m) => {
             println!(
-                "smoke: manifest in that exe: identity={} longPathAware={} PerMonitorV2={}",
-                m.identity, m.long_path, m.per_monitor
+                "smoke: manifest in that exe: identity={} longPathAware={} PerMonitorV2={} | {}",
+                m.identity, m.long_path, m.per_monitor, embed
             );
             if let crate::manifest::ReadBack::Missing(absent) = crate::manifest::read_back(&m) {
                 println!(
-                    "SMOKE WARN: this exe does NOT carry our manifest - no {:?}. On a development \
-                     machine that is the normal state (nobody ran the post-link step); it is a \
-                     WARNING, not a red, because smoke must not train people to skip it. In CI run \
-                     smoke with --require-ours and this becomes exit 8.",
+                    "SMOKE WARN: this exe does NOT carry our manifest - no {:?}. Since the kit \
+                     migration build.rs embeds NOTHING, so a plain cargo build is NOT compliant: the \
+                     post-link 'cargo xtask manifest' step is required and CI gates on it. Locally \
+                     this stays a warning, because a bare cargo run still gets PerMonitorV2 from the \
+                     toolkit - byte-identical DPI semantics - and a red nobody can clear without \
+                     learning a new command trains people to ignore red. --require-ours makes it 8.",
                     absent
                 );
             }
@@ -1869,6 +1880,34 @@ pub fn resolve_exe(root: &Path, target_dir: Option<&str>) -> (PathBuf, &'static 
         "CARGO_TARGET_DIR, honoured as asked",
     )
 }
+
+/// Does the tree still embed the manifest at LINK time? Read from the bridge's
+/// own build script, because that is the only place the answer lives, and a
+/// reader must never have to infer a CAUSE from a STATE.
+///
+/// This clause exists because a true triple on an exe was read as "cargo build
+/// already ships our declaration". It did not: the migration removed the
+/// /MANIFEST:EMBED line, and the markers were in that exe because somebody ran
+/// 'cargo xtask manifest' on it afterwards. An exe can prove what its resource
+/// says. It cannot prove who put it there - only build.rs can say whether the
+/// build had the chance.
+pub fn build_embeds_manifest(root: &Path) -> Option<bool> {
+    let text = fs::read_to_string(root.join(BUILD_RS_REL)).ok()?;
+    // COMMENT LINES DO NOT COUNT. Measured tonight: the migrated build.rs mentions
+    // /MANIFEST:EMBED three times, all in //! prose explaining why it stopped, and
+    // a plain substring test read that as "the build embeds" - the exact
+    // state-as-cause error this clause exists to prevent, reproduced by the clause
+    // itself. Only a line that could emit the flag to cargo is evidence.
+    Some(text.lines().any(|line| {
+        let t = line.trim_start();
+        !t.starts_with("//")
+            && !t.starts_with('#')
+            && t.contains("rustc-link-arg")
+            && (t.contains("MANIFEST:EMBED") || t.contains("MANIFESTINPUT"))
+    }))
+}
+/// The build script whose behaviour explains the exe's manifest.
+pub const BUILD_RS_REL: &str = "crates/bridge-gpui/build.rs";
 
 /// Read the manifest back out of the exe we are about to launch. Same discipline
 /// as the tested-binary line: name the thing, do not assume it. smoke JUDGES and
@@ -3071,5 +3110,70 @@ mod tests {
             8,
             "the default-invocation codes, unchanged by this slice"
         );
+    }
+
+    /// The clause that stops a STATE being read as a CAUSE: the exe cannot say
+    /// who embedded its manifest, so smoke asks build.rs whether the build even
+    /// had the chance. Three answers, and the unreadable one is unknown rather
+    /// than a default that would silently claim either cause.
+    #[test]
+    fn the_tool_can_say_whether_the_build_had_a_chance_to_embed() {
+        let dir = std::env::temp_dir().join(format!("xtask-embed-{}", std::process::id()));
+        let bd = dir.join("crates/bridge-gpui");
+        fs::create_dir_all(&bd).expect("dir");
+        fs::write(
+            bd.join("build.rs"),
+            "fn main() { println!(\"cargo:rustc-link-arg-bins=/MANIFEST:EMBED\"); }",
+        )
+        .expect("embed");
+        assert_eq!(build_embeds_manifest(&dir), Some(true));
+        fs::write(
+            bd.join("build.rs"),
+            "// NO LONGER EMBEDS ANYTHING, ON PURPOSE\nfn main() {}",
+        )
+        .expect("no embed");
+        assert_eq!(
+            build_embeds_manifest(&dir),
+            Some(false),
+            "the kit-migration state must be reported as such"
+        );
+        fs::remove_file(bd.join("build.rs")).expect("rm");
+        assert_eq!(build_embeds_manifest(&dir), None, "missing file is unknown");
+        assert_eq!(build_embeds_manifest(&dir.join("nowhere")), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The trap this function fell into while being written: prose about a flag
+    /// is not the flag. A file that explains its own removal must read as NOT
+    /// embedding, or the clause becomes a lie generator.
+    #[test]
+    fn a_comment_about_the_flag_does_not_count_as_emitting_it() {
+        let dir = std::env::temp_dir().join(format!("xtask-embed2-{}", std::process::id()));
+        let bd = dir.join("crates/bridge-gpui");
+        fs::create_dir_all(&bd).expect("dir");
+        let path = bd.join("build.rs");
+        // A raw string: this fixture is Rust source that contains quotes, and the
+        // escape layer has already cost this slice twice.
+        fs::write(
+            &path,
+            r#"//! used to add /MANIFEST:EMBED plus /MANIFESTINPUT=x.manifest
+//!     rust-lld: error: duplicate resource: type MANIFEST (ID 24)
+fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
+"#,
+        )
+        .expect("prose only");
+        assert_eq!(
+            build_embeds_manifest(&dir),
+            Some(false),
+            "doc comments about a removed flag are not evidence it is still emitted"
+        );
+        fs::write(
+            &path,
+            r#"fn main() { println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED"); }
+"#,
+        )
+        .expect("real flag");
+        assert_eq!(build_embeds_manifest(&dir), Some(true));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
