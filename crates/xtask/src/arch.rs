@@ -43,6 +43,12 @@
 //!   under-report - the right direction for a gate, since a precise reading
 //!   would have to evaluate every cfg expression, and a checker that quietly
 //!   drops edges is worse than one that keeps too many.
+//! * Name lists are FAMILIES: [in_family] matches gpui, gpui-pre, gpui-pre-platform,
+//!   gpui-base, gpui-kit-assets and friends against the single root gpui, because an
+//!   upstream rename must not be able to turn a structural rule off by renaming
+//!   itself. And one toolkit lineage per resolved graph is a rule of its own:
+//!   [LINEAGE_RULE].
+//!
 //! * Dev edges are still not followed, but the allowance is a LIST now, not a
 //!   mood: DEV_TRANSITIVE_EXEMPTIONS names every dev-dependency whose own
 //!   closure carries a forbidden crate (today: tempfile, which pulls
@@ -62,13 +68,20 @@ const NOTES_PLATFORM: &str = "notes-platform";
 const NOTES_BRIDGE: &str = "notes-bridge-gpui";
 const XTASK: &str = "xtask";
 
-/// UI toolkit and browser-boundary crates: belong only behind the api port,
-/// inside bridges.
+/// UI toolkit and browser-boundary FAMILIES: belong only behind the api port,
+/// inside bridges. These are roots, not the complete name list - see [in_family].
+/// Bringing in a toolkit wrapper renames every package these rules key on:
+/// gpui-kit installs gpui-pre, gpui-base, gpui-component and some thirty
+/// gpui-pre-* companions, and none of them is named gpui. A list that has to
+/// be edited on every upstream rename is a list that will be forgotten, and a
+/// gate that stops firing while still printing 0 violations is the worst
+/// instrument failure available. So the match is by family, not by equality.
 const UI_TOOLKITS: &[&str] = &[
     "gpui", "winit", "egui", "eframe", "iced", "slint", "tauri", "gtk", "gdk", "web-sys",
 ];
 
-/// Win32 / browser FFI crates: belong only in notes-platform.
+/// Win32 / browser FFI families: belong only in notes-platform. Roots as well,
+/// so a renamed fork of windows-sys cannot slip past platform containment.
 const OS_FFI: &[&str] = &[
     "windows",
     "windows-sys",
@@ -79,6 +92,18 @@ const OS_FFI: &[&str] = &[
     "raw-window-handle",
     "web-sys",
 ];
+
+/// Is NAME part of the family rooted at any of ROOTS? True for the root itself,
+/// and for root-something or root_something. Deliberately NOT a substring test:
+/// notes-bridge-gpui contains gpui and must not match the gpui family, and a
+/// crate named not-gpui belongs to somebody else entirely.
+pub fn in_family(roots: &[&str], name: &str) -> bool {
+    roots.iter().any(|root| {
+        name == *root
+            || name.starts_with(&format!("{root}-"))
+            || name.starts_with(&format!("{root}_"))
+    })
+}
 
 /// What a rule forbids. Name lists cover external crates; the structural
 /// variant covers "every other workspace member", whatever it is named.
@@ -307,6 +332,25 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Every package name the graph knows about: each key of each edge map and
+    /// every edge target. Family roots are expanded against this set, so an
+    /// upstream rename cannot switch the rules off by changing its own name.
+    pub(crate) fn universe(&self) -> BTreeSet<String> {
+        let mut out: BTreeSet<String> = self.members.clone();
+        for (from, deps) in &self.direct {
+            out.insert(from.clone());
+            for dep in deps {
+                out.insert(dep.clone());
+            }
+        }
+        for deps in self.closure.values() {
+            for dep in deps {
+                out.insert(dep.clone());
+            }
+        }
+        out
+    }
+
     /// Everything reachable from 'start' over normal/build edges WITHOUT ever
     /// expanding one of 'boundaries' - the rule's allowed members. Their own
     /// payload is sanctioned by construction (that is what "bridge may import
@@ -349,10 +393,14 @@ impl Graph {
 /// become concrete name sets here, so evaluate() stays a single scan.
 fn banned_names(rule: &Rule, graph: &Graph) -> BTreeSet<String> {
     let mut banned: BTreeSet<String> = BTreeSet::new();
+    let universe = graph.universe();
     match rule.forbidden {
-        Forbidden::Names(names) => {
-            for name in names {
-                banned.insert(name.to_string());
+        Forbidden::Names(roots) => {
+            for root in roots {
+                for found in universe.iter().filter(|n| in_family(&[*root], n)) {
+                    banned.insert(found.clone());
+                }
+                banned.insert(root.to_string());
             }
         }
         Forbidden::Members { allowed, also } => {
@@ -361,8 +409,11 @@ fn banned_names(rule: &Rule, graph: &Graph) -> BTreeSet<String> {
                     banned.insert(member.clone());
                 }
             }
-            for name in also {
-                banned.insert(name.to_string());
+            for root in also {
+                for found in universe.iter().filter(|n| in_family(&[*root], n)) {
+                    banned.insert(found.clone());
+                }
+                banned.insert(root.to_string());
             }
         }
     }
@@ -472,7 +523,80 @@ pub fn evaluate(graph: &Graph) -> Vec<Violation> {
             }
         }
     }
+    // The single-toolkit invariant is graph-wide, so it is folded into the same
+    // verdict rather than printed as a separate report nobody has to read.
+    violations.extend(lineage_findings(graph));
     violations
+}
+
+/// One gpui in the resolved graph is an invariant of this project, not a
+/// preference: one window, one Application, one Window type. Two lineages
+/// resolve cleanly — measured on a probe with both, 782 packages, zero errors —
+/// and die at link time, which is the worst place to learn it. check-deps cannot
+/// see this at all: version-conflict compares same-named packages, and gpui vs
+/// gpui-pre are different names by construction. So check-arch owns it, because
+/// the rule is about the RESOLVED graph, which is what cargo metadata gives and
+/// manifest-parsing does not.
+pub const LINEAGE_RULE: &str = "two-gpui-lineages";
+const LINEAGE_CLASSIC: &str = "gpui";
+const LINEAGE_PRE_PREFIX: &str = "gpui-pre";
+/// The package field for a rule that is about the graph rather than one crate.
+const GRAPH_PACKAGE: &str = "the resolved graph";
+
+/// Which toolkit lineages a resolved set of package names contains. Companions
+/// (gpui-base, gpui-component, gpui-kit-assets) are deliberately not counted on
+/// either side: they ride with whichever lineage pulled them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Lineages {
+    pub classic: bool,
+    pub pre: Vec<String>,
+}
+
+pub fn lineages_in(names: &BTreeSet<String>) -> Lineages {
+    Lineages {
+        classic: names.contains(LINEAGE_CLASSIC),
+        pre: names
+            .iter()
+            .filter(|n| n.starts_with(LINEAGE_PRE_PREFIX))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Both lineages present is a violation, and the message names the pullers,
+/// because "who brought the second toolkit" is the only useful next question.
+pub fn lineage_findings(graph: &Graph) -> Vec<Violation> {
+    let found = lineages_in(&graph.universe());
+    if !found.classic || found.pre.is_empty() {
+        return Vec::new();
+    }
+    let pullers = |name: &str| -> String {
+        let who: Vec<String> = graph
+            .direct
+            .iter()
+            .filter(|(_, deps)| deps.iter().any(|d| d == name))
+            .map(|(from, _)| from.clone())
+            .take(4)
+            .collect();
+        if who.is_empty() {
+            "no direct edge".to_string()
+        } else {
+            who.join(", ")
+        }
+    };
+    let pre = &found.pre[0];
+    vec![Violation {
+        rule: LINEAGE_RULE,
+        package: GRAPH_PACKAGE,
+        dep: format!(
+            "{LINEAGE_CLASSIC} (pulled by {}) + {pre} (pulled by {}); two toolkits in one graph means \
+             two Window types, and cargo resolves that happily until the link",
+            pullers(LINEAGE_CLASSIC),
+            pullers(pre)
+        ),
+        via: Via::Direct,
+        wrapper: None,
+    }]
 }
 
 /// Which entries of [DEV_TRANSITIVE_EXEMPTIONS] this graph actually exercises.
@@ -831,11 +955,17 @@ mod tests {
         graph(
             &workspace(),
             &[
-                ("notes-core", &["serde", "gpui", "notes-platform"]),
+                // Poisoned with a SIBLING name, not the root: this fixture is what
+                // proves the family rule fires. Under literal matching it is green
+                // while a real gpui-pre leak sits in core.
+                (
+                    "notes-core",
+                    &["serde", "gpui-pre-platform", "notes-platform"],
+                ),
                 ("notes-api", &["notes-core", "notes-platform", "gpui"]),
                 ("notes-platform", &["windows", "raw-window-handle"]),
                 ("notes-bridge-gpui", &["notes-api", "gpui", "notes-core"]),
-                ("xtask", &["serde_json", "gpui"]),
+                ("xtask", &["serde_json", "gpui-kit"]),
             ],
             &[
                 ("notes-core", &["serde", "windows-sys"]),
@@ -880,17 +1010,22 @@ mod tests {
                 "core-orthogonal-to-platform",
                 "no-transitive-through-external",
                 "port-is-ui-agnostic",
+                // The poison now carries a second toolkit lineage as well: core
+                // was poisoned with gpui-pre-platform while the bridge still
+                // pulls bare gpui, so this fixture also proves the one-gpui rule
+                // fires on a graph, not only in its own test below.
+                "two-gpui-lineages",
             ]
         );
         assert_eq!(
             violations.len(),
-            7,
-            "one finding per poison plus the reach-around it enables: {violations:?}"
+            8,
+            "one finding per poison, the reach-around it enables, and the second lineage: {violations:?}"
         );
         let direct = violations.iter().filter(|v| v.via == Via::Direct).count();
         assert_eq!(
-            direct, 5,
-            "core-no-os is poisoned transitively: {violations:?}"
+            direct, 6,
+            "core-no-os is poisoned transitively, the lineage finding is direct: {violations:?}"
         );
     }
 
@@ -1271,6 +1406,174 @@ mod tests {
             DEV_TRANSITIVE_EXEMPTIONS,
             &["tempfile"],
             "adding a name here is a decision; say so in the commit message"
+        );
+    }
+
+    /// THE fixture the rename would have silently disarmed: core depends on a
+    /// gpui companion crate that is NOT named gpui. With literal name matching
+    /// this is 0 violations - a gate that stopped firing and kept printing good
+    /// news. It is also why the rule is a family, not a list.
+    #[test]
+    fn a_gpui_pre_leak_into_core_is_caught_by_the_family_rule() {
+        let g = graph(
+            &[
+                "notes-core",
+                "notes-api",
+                "notes-platform",
+                "notes-bridge-gpui",
+            ],
+            &[
+                ("notes-core", &["serde", "gpui-pre-platform"]),
+                ("notes-api", &["notes-core"]),
+                ("notes-platform", &["windows-sys"]),
+                ("notes-bridge-gpui", &["notes-api", "gpui-pre"]),
+            ],
+            &[("notes-core", &["serde", "gpui-pre-platform"])],
+        );
+        let v = evaluate(&g);
+        assert!(
+            !v.is_empty(),
+            "gpui-pre-platform in core must be caught by the family rule"
+        );
+        assert!(
+            v.iter()
+                .any(|x| x.package == "notes-core" && x.dep == "gpui-pre-platform"),
+            "{v:?}"
+        );
+        // An underscore sibling and a root-only name both match too.
+        let g2 = graph(
+            &[
+                "notes-core",
+                "notes-api",
+                "notes-platform",
+                "notes-bridge-gpui",
+            ],
+            &[
+                ("notes-core", &["gpui_component"]),
+                ("notes-api", &["notes-core"]),
+                ("notes-platform", &["windows-sys"]),
+                ("notes-bridge-gpui", &["notes-api"]),
+            ],
+            &[("notes-core", &["gpui_component"])],
+        );
+        assert!(
+            evaluate(&g2).iter().any(|x| x.dep == "gpui_component"),
+            "root_underscore form must match the family too"
+        );
+        // And a crate that merely contains the word is NOT the family.
+        let g3 = graph(
+            &[
+                "notes-core",
+                "notes-api",
+                "notes-platform",
+                "notes-bridge-gpui",
+            ],
+            &[
+                ("notes-core", &["not-gpui", "notes-bridge-gpui"]),
+                ("notes-api", &["notes-core"]),
+                ("notes-platform", &["windows-sys"]),
+                ("notes-bridge-gpui", &["notes-api"]),
+            ],
+            &[("notes-core", &["not-gpui", "notes-bridge-gpui"])],
+        );
+        // The same reach applies through the also-list of the structural rules:
+        // xtask's independence rule names bare "gpui", and gpui-kit must trip it.
+        let g4 = graph(
+            &[
+                "notes-core",
+                "notes-api",
+                "notes-platform",
+                "notes-bridge-gpui",
+                "xtask",
+            ],
+            &[
+                ("notes-core", &["serde"]),
+                ("notes-api", &["notes-core"]),
+                ("notes-platform", &["windows-sys"]),
+                ("notes-bridge-gpui", &["notes-api", "gpui"]),
+                ("xtask", &["serde", "gpui-kit"]),
+            ],
+            &[("xtask", &["serde", "gpui", "gpui-kit"])],
+        );
+        let v4 = evaluate(&g4);
+        assert!(
+            v4.iter()
+                .any(|x| x.package == "xtask" && x.dep == "gpui-kit"),
+            "gpui-kit must reach the xtask rule through the family: {v4:?}"
+        );
+
+        let v3 = evaluate(&g3);
+        assert!(
+            !v3.iter().any(|x| x.dep == "not-gpui"),
+            "a name that merely contains gpui is not the family: {v3:?}"
+        );
+        assert!(
+            v3.iter().any(|x| x.dep == "notes-bridge-gpui"),
+            "but a core -> bridge edge is still the structural violation it is: {v3:?}"
+        );
+    }
+
+    /// One lineage is tonight's tree and must be green; the second one appearing
+    /// anywhere in the resolved graph is the violation, named with its pullers.
+    #[test]
+    fn one_toolkit_is_clean_and_two_is_named_with_who_pulled_them() {
+        let one = graph(
+            &[
+                "notes-core",
+                "notes-api",
+                "notes-platform",
+                "notes-bridge-gpui",
+            ],
+            &[
+                ("notes-core", &["serde"]),
+                ("notes-api", &["notes-core"]),
+                ("notes-platform", &["windows-sys"]),
+                (
+                    "notes-bridge-gpui",
+                    &["notes-api", "gpui", "gpui-component"],
+                ),
+            ],
+            &[],
+        );
+        assert!(
+            lineage_findings(&one).is_empty(),
+            "gpui + its own companions is ONE lineage: {:?}",
+            lineage_findings(&one)
+        );
+        let two = graph(
+            &[
+                "notes-core",
+                "notes-api",
+                "notes-platform",
+                "notes-bridge-gpui",
+            ],
+            &[
+                ("notes-core", &["serde"]),
+                ("notes-api", &["notes-core"]),
+                ("notes-platform", &["windows-sys"]),
+                (
+                    "notes-bridge-gpui",
+                    &["notes-api", "gpui", "gpui-kit", "gpui-pre-platform"],
+                ),
+            ],
+            &[],
+        );
+        let v = lineage_findings(&two);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].rule, LINEAGE_RULE);
+        let msg = v[0].message();
+        println!("TWO-LINEAGE MESSAGE: {msg}");
+        assert!(
+            msg.contains("gpui-kit") || msg.contains("gpui-pre-platform"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("notes-bridge-gpui"),
+            "must name the puller: {msg}"
+        );
+        assert!(
+            evaluate(&two).iter().any(|x| x.rule == LINEAGE_RULE),
+            "the rule must reach the report, not just the helper"
         );
     }
 }
