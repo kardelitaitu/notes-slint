@@ -360,72 +360,165 @@ fn a_deleted_note_that_is_not_the_scratch_still_reports_load_failed() {
 
 // ------------------------------------------------------------------ test 4 --
 
-/// What the scratch does to the RECENTS list, checked rather than assumed.
-/// D69 pinned the answer at the write: the scratch joins the recents like any
-/// other file. What this pins is the restart half of it: one entry, no stacked
-/// rows, and no second entry appearing every launch.
+/// THE SPLIT, proven the way it matters: type into an untitled note, quit,
+/// relaunch, and the text is back WHILE the recents list stays empty. Identity
+/// for restore, absence from the list - session.path names the scratch (that is
+/// what makes the restart work) and settings.toml holds no row for it (that is
+/// what keeps a real note from being pushed out of a ten-slot menu).
+///
+/// This replaces the assertion this file used to carry - "the scratch joins the
+/// recents once" - which pinned D69 as first decided. The reversal is named in
+/// Engine::remember, in tests/session.rs and in first_run.rs case 9, so a future
+/// reader sees a decision that moved rather than a test that was annoying.
 #[test]
-fn relaunching_the_scratch_leaves_exactly_one_recent_entry() {
+fn the_scratch_is_a_restore_target_and_never_a_recent_file() {
     let dir = tempfile::tempdir().expect("tempdir");
     let scratch = scratch_of(dir.path());
     let (first, rx) = headless(dir.path());
     open_window(&first);
     first
         .send(Command::Flush {
-            text: "one entry\n".to_string(),
+            text: "a draft, not a choice\n".to_string(),
             revision: 1,
             epoch: 0,
         })
         .expect("queued");
-    let mut entries = Vec::new();
     let deadline = Instant::now() + ANSWER;
-    while entries.is_empty() {
-        assert!(
-            Instant::now() < deadline,
-            "no recents after the scratch write"
-        );
-        if let Event::RecentsUpdated(list) = rx.recv_timeout(ANSWER).expect("an event") {
-            entries = list;
+    loop {
+        assert!(Instant::now() < deadline, "the scratch write never landed");
+        match rx.recv_timeout(ANSWER).expect("an event") {
+            Event::Saved { path, .. } if path == scratch => break,
+            Event::RecentsUpdated(list) => panic!("the menu blinked for the scratch: {list:?}"),
+            _ => {}
         }
     }
-    assert_eq!(
-        entries.iter().filter(|e| e.path == scratch).count(),
-        1,
-        "D69: the scratch joins the recents once"
-    );
     first.close().expect("quit joins");
+    // The session DID bind the scratch: that half of the split must survive.
     wait_for_session_path(dir.path(), &scratch);
 
-    // Relaunch: the restore opens the scratch again.
     let (second, rx) = headless(dir.path());
-    assert!(matches!(
-        restore(&rx, &second, &scratch),
-        Event::Loaded { .. }
-    ));
-    let mut after = Vec::new();
-    let until = Instant::now() + TICK + Duration::from_millis(300);
+    match restore(&rx, &second, &scratch) {
+        Event::Loaded { path, text, .. } => {
+            assert_eq!(path, scratch, "restored INTO the scratch");
+            assert_eq!(text, "a draft, not a choice\n", "and the text is back");
+        }
+        other => panic!("the restore must answer Loaded, got {other:?}"),
+    }
+    // Two ticks of the engine, and the list stays as empty as the user left it.
+    let until = Instant::now() + TICK * 2 + Duration::from_millis(200);
     while Instant::now() < until {
         if let Ok(Event::RecentsUpdated(list)) = rx.recv_timeout(Duration::from_millis(50)) {
-            after = list;
+            assert!(
+                list.is_empty(),
+                "a relaunch that opened the scratch wrote {list:?} into the menu"
+            );
         } else {
-            // give the tick a chance to be over
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    let list = if after.is_empty() {
-        entries.clone()
-    } else {
-        after
-    };
-    assert_eq!(
-        list.iter()
-            .filter(|e| identity_key(&e.path) == identity_key(&scratch))
-            .count(),
-        1,
-        "a relaunch must not stack a second scratch row in the menu"
+    let stored = notes_core::settings::read_settings(&StateDir(dir.path().to_path_buf()))
+        .expect("settings readable")
+        .unwrap_or_default();
+    assert!(
+        stored.recents.iter().all(|e| e.path != scratch),
+        "settings.toml must hold no scratch row: {:?}",
+        stored.recents
     );
-    assert_eq!(list.len(), 1, "and must not add anything else either");
     second.close().expect("second quit joins");
+}
+
+/// The mixed case, which is where the old behaviour cost something: a scratch
+/// draft plus TWO files the user actually opened. The list is exactly the two,
+/// in most-recent-first order, and the scratch is nowhere in it - so the draft
+/// cannot take the slot a real note earned.
+#[test]
+fn a_scratch_draft_plus_two_opened_files_leaves_exactly_two_recents() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let scratch = scratch_of(dir.path());
+    let one = dir.path().join("first-real.notes");
+    let two = dir.path().join("second-real.notes");
+    fs::write(&one, b"the first real note\n").expect("seed one");
+    fs::write(&two, b"the second real note\n").expect("seed two");
+
+    let (gateway, rx) = headless(dir.path());
+    open_window(&gateway);
+    gateway
+        .send(Command::Flush {
+            text: "typed with no title\n".to_string(),
+            revision: 1,
+            epoch: 0,
+        })
+        .expect("queued");
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        assert!(Instant::now() < deadline, "the scratch write never landed");
+        if let Event::Saved { path, .. } = rx.recv_timeout(ANSWER).expect("an event") {
+            assert_eq!(path, scratch);
+            break;
+        }
+    }
+
+    // Each Open bumps the engine's generation, and the flush that follows carries
+    // the stamp the bridge would be echoing at that moment.
+    let mut list: Vec<notes_api::RecentEntry> = Vec::new();
+    for (path, revision, epoch) in [(&one, 2u64, 1u64), (&two, 3u64, 2u64)] {
+        gateway
+            .send(Command::Open { path: path.clone() })
+            .expect("queued");
+        let deadline = Instant::now() + ANSWER;
+        loop {
+            assert!(Instant::now() < deadline, "open of {path:?} never answered");
+            if let Event::Loaded { path: loaded, .. } = rx.recv_timeout(ANSWER).expect("an event") {
+                assert_eq!(&loaded, path);
+                break;
+            }
+        }
+        // A real file, opened by the user, then edited: it earns the top slot.
+        gateway
+            .send(Command::Flush {
+                text: "edited in place\n".to_string(),
+                revision,
+                epoch,
+            })
+            .expect("queued");
+        let deadline = Instant::now() + ANSWER;
+        loop {
+            assert!(Instant::now() < deadline, "the edit never saved");
+            match rx.recv_timeout(ANSWER).expect("an event") {
+                Event::Saved { path: saved, .. } if &saved == path => break,
+                // The list the Open of this file pushed, still in the channel:
+                // caught here rather than waited for after the fact.
+                Event::RecentsUpdated(entries) => list = entries,
+                _ => {}
+            }
+        }
+    }
+
+    let paths: Vec<PathBuf> = list.iter().map(|e| e.path.clone()).collect();
+    assert_eq!(
+        paths,
+        vec![two.clone(), one.clone()],
+        "exactly the two files the user chose, most recent first"
+    );
+    assert!(
+        list.iter()
+            .all(|e| identity_key(&e.path) != identity_key(&scratch)),
+        "the scratch took no slot: {list:?}"
+    );
+    gateway.close().expect("quit joins");
+
+    // And the restart promise is untouched by the exclusion: the session named
+    // the LAST file the user opened, not the scratch.
+    wait_for_session_path(dir.path(), &two);
+    let (relaunch, rx) = headless(dir.path());
+    match restore(&rx, &relaunch, &two) {
+        Event::Loaded { path, text, .. } => {
+            assert_eq!(path, two);
+            assert_eq!(text, "edited in place\n");
+        }
+        other => panic!("the relaunch must load the real note, got {other:?}"),
+    }
+    relaunch.close().expect("second quit joins");
 }
 
 // ------------------------------------------------------------------ test 6 --

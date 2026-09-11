@@ -540,6 +540,14 @@ fn a_write_denied_scratch_still_skips_and_leaves_the_stale_bytes() {
 /// underneath and the app relaunches: features.md:89 says grey out, do not
 /// silently delete - the entry must survive as stale and the app must not
 /// crash or lose the other nine.
+///
+/// THE RECENTS SPLIT, and why this file still plants a scratch entry: the engine
+/// stopped adding the scratch to the MRU at all (identity for restore, absence
+/// from the list), so a scratch row can only be here because a pre-reversal
+/// launch put it there. That is exactly the state this case is about: a stale
+/// row must grey out, never be silently deleted, and never cost the other nine.
+/// The engine writes nothing to the list here - the point is what a RELAUNCH does
+/// with bytes it did not choose to write.
 #[test]
 fn ten_entries_plus_a_deleted_scratch_survive_the_relaunch_as_stale() {
     let dir = tempfile::tempdir().expect("tempdir");

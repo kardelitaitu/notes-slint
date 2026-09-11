@@ -663,12 +663,12 @@ impl Engine {
     /// is NOT a refusal.
     ///
     /// What this deliberately does not do is call [`Engine::remember`]: a file
-    /// that does not exist was not opened, so it must not re-age the MRU. The
-    /// scratch earns its recents entry the way it earns everything else - when
-    /// text is actually written into it (D69's `Saved`/`Rebound`/`remember` at
-    /// the flush). The session's own `path` is restated because it is the fact
-    /// that has to survive this launch: it is already the scratch (that is why
-    /// the bridge asked), and restating + queueing repairs the case where the
+    /// that does not exist was not opened. The scratch is in no case a recents
+    /// entry any more (see [`Engine::remember`]'s split) - identity for restore,
+    /// absence from the list - and this path keeps that true by binding the
+    /// session directly. The session's own `path` is restated because it is the
+    /// fact that has to survive this launch: it is already the scratch (that is
+    /// why the bridge asked), and restating + queueing repairs the case where the
     /// session file was missing or corrupt and the bridge is opening the scratch
     /// for another reason entirely.
     fn restore_missing_scratch(&mut self, scratch: &Path) {
@@ -848,8 +848,11 @@ impl Engine {
             // judge and probe every other state path uses); the port owns the
             // write, through the SAME machinery Save As uses (sibling temp,
             // fsync, rename - no second writer). Then the document is rebound:
-            // Saved announces the bytes, Rebound announces the new identity,
-            // and the scratch joins the recents like any other file.
+            // Saved announces the bytes, Rebound announces the new identity, and
+            // the session is pointed at the scratch so the next launch restores
+            // it. The scratch does NOT join the recents (see
+            // [`Engine::remember`]'s split): it is a restore target, not a file
+            // the user chose.
             //
             // This mirrors save_as's body minus its load_refused guard: the
             // refused-load state protects a FOREIGN file from a blind overwrite,
@@ -921,6 +924,8 @@ impl Engine {
                         },
                         revision,
                     });
+                    // Binds session.path to the scratch and stops there:
+                    // `remember` keeps the scratch out of the MRU.
                     self.remember(&scratch);
                 }
                 Err(_) => {
@@ -1441,9 +1446,26 @@ impl Engine {
     /// Records a file as opened: into the session (so the next launch restores it,
     /// which is a stored path and not an automatic Open), into the MRU, and into
     /// the menu via an event.
+    ///
+    /// THE SPLIT (this reverses D69's "the scratch joins the recents like any
+    /// other file", and the reason is the price of that behaviour, not taste):
+    /// the SCRATCH is bound into the session and kept OUT of the MRU. Reopening
+    /// the scratch is not a user intent - it is the state you are in when nothing
+    /// else is open - so its row is noise, and the write-side push re-aged that
+    /// noise to the TOP of the list on every launch where the user typed
+    /// anything, permanently displacing a real file from a ten-slot menu.
+    /// Identity for restore, absence from the list. An entry a scratch put in the
+    /// list BEFORE this reversal is not evicted (features.md 4.4: grey out, never
+    /// silently delete); it simply stops being re-aged.
     fn remember(&mut self, path: &Path) {
         self.session.path = Some(path.to_path_buf());
         self.queue(Target::Session);
+        if self.is_scratch(path) {
+            // Bound, not remembered: no push, no settings.toml write armed, and
+            // no RecentsUpdated either - the menu must not blink for a file the
+            // user never chose.
+            return;
+        }
         // What goes INTO the file is the bare, case-preserved name: a FACT about
         // this path, stored per entry. The menu label is not that - a label is a
         // RENDERING of the whole list (two "readme.txt" entries disambiguate each

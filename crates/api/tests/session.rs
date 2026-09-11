@@ -837,8 +837,9 @@ fn an_oversize_file_is_refused_from_the_stat_and_cannot_be_overwritten() {
 /// instead of being dropped with a skip - the first-run user types, autosave
 /// fires, and the text must land on disk. The path is core's
 /// (scratch_note_path), the write is the Save As machinery, the events are
-/// Saved THEN Rebound, the document is rebound to the scratch, and the scratch
-/// joins the recents like any other file.
+/// Saved THEN Rebound, the document is rebound to the scratch, and the SESSION
+/// names it. The scratch is deliberately NOT a recents entry (the split decided
+/// later - see the comment inside the test).
 #[test]
 fn an_untitled_note_is_written_to_a_scratch_file_instead_of_dropped() {
     let app = Harness::new();
@@ -853,15 +854,23 @@ fn an_untitled_note_is_written_to_a_scratch_file_instead_of_dropped() {
     });
 
     // Event order: Saved THEN Rebound, both naming the scratch.
+    //
+    // THE RECENTS SPLIT (the reversal of D69's "the scratch joins the recents
+    // like any other file", decided because the write-side push re-aged the
+    // scratch to the top of the MRU on every launch where the user typed, which
+    // permanently displaced a real file from a ten-slot list): this test used to
+    // wait for a RecentsUpdated naming the scratch and assert
+    // `entries[0].path == scratch`. It now asserts the OPPOSITE - identity for
+    // restore, absence from the list - and the session assertion below it is
+    // unchanged, because the restart promise is what the scratch is FOR.
     let mut saved_at = None;
     let mut rebound_at = None;
-    let mut recents_after = None;
     let mut index = 0usize;
     let deadline = Instant::now() + ANSWER;
-    while saved_at.is_none() || rebound_at.is_none() || recents_after.is_none() {
+    while saved_at.is_none() || rebound_at.is_none() {
         assert!(
             Instant::now() < deadline,
-            "Saved/Rebound/recents never all arrived (saved={saved_at:?} rebound={rebound_at:?})"
+            "Saved/Rebound never both arrived (saved={saved_at:?} rebound={rebound_at:?})"
         );
         let event = app
             .rx
@@ -870,9 +879,11 @@ fn an_untitled_note_is_written_to_a_scratch_file_instead_of_dropped() {
         match event {
             Event::Saved { path, .. } if path == scratch => saved_at = Some(index),
             Event::Rebound { path, .. } if path == scratch => rebound_at = Some(index),
-            Event::RecentsUpdated(entries) if entries.len() == 1 => {
-                assert_eq!(entries[0].path, scratch, "the scratch joins the recents");
-                recents_after = Some(index);
+            Event::RecentsUpdated(entries) => {
+                assert!(
+                    entries.iter().all(|e| e.path != scratch),
+                    "the scratch is not a recent file: {entries:?}"
+                );
             }
             _ => {}
         }
