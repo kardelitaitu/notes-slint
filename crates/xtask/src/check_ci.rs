@@ -511,9 +511,114 @@ pub fn decide(rows: &[Row], steps: &[Step]) -> Vec<String> {
     v
 }
 
+/// The bracketed rule ids in the run of `#` comment lines that starts at the
+/// line containing `marker`. Found by its SENTENCE, never by a line number: a
+/// rewrap moves lines and does not move words, and a pin that breaks because
+/// somebody reflowed a comment is a pin that gets deleted instead of fixed.
+///
+/// This is the mechanism for the class of drift that is otherwise invisible: a
+/// human-readable list of things a checker prints. The list is prose, check-ci
+/// does not parse comments, and so a rule can be added to the checker and the
+/// comment keeps claiming the old set forever - which is what happened to the
+/// unsafe rule list at 4e when [raw-ffi-imbalance] landed.
+pub fn bracketed_ids_in_prose(text: &str, marker: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let Some(at) = lines.iter().position(|l| l.contains(marker)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut i = at;
+    let limit = (at + 16).min(lines.len());
+    while i < limit {
+        let t = lines[i].trim_start();
+        if !t.starts_with('#') {
+            break;
+        }
+        let body = t.trim_start_matches('#');
+        let mut rest = body;
+        while let Some(open) = rest.find('[') {
+            let after = &rest[open + 1..];
+            match after.find(']') {
+                Some(close) => {
+                    let id = &after[..close];
+                    if !id.is_empty()
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_')
+                    {
+                        out.push(id.to_string());
+                    }
+                    rest = &after[close + 1..];
+                }
+                None => {
+                    rest = "";
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Steps that actually carried a command - the number in the success line.
 pub fn checked_count(steps: &[Step]) -> usize {
     steps.iter().filter(|s| !s.commands.is_empty()).count()
+}
+
+/// Rule id for a prose list of rule ids that has stopped matching the code.
+pub const PROSE_RULES: &str = "prose-rule-list";
+
+/// A human-readable list of rule ids in a comment is a CLAIM, and the claims this
+/// file can check are only about commands - so the claim went unchecked, and
+/// drifted, exactly once per rule added. This compares what the comment says
+/// against what the checker can actually print, and it runs on every check-ci,
+/// not only in a test: a unit test that nobody gates with is a second opinion
+/// nobody asks for.
+pub fn prose_list_findings(text: &str, marker: &str, want: &[&str]) -> Vec<String> {
+    let found = bracketed_ids_in_prose(text, marker);
+    if found.is_empty() {
+        return vec![format!(
+            "CI VIOLATION: [{PROSE_RULES}] no comment containing \"{marker}\" carries a bracketed rule \
+             list - the prose was rewritten, deleted, or moved, and the pin cannot see what it was \
+             replaced by. Put the marker sentence back or point the pin at the new one.",
+        )];
+    }
+    let mut sorted = found.clone();
+    sorted.sort();
+    sorted.dedup();
+    let mut expect: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+    expect.sort();
+    expect.dedup();
+    if sorted == expect {
+        return Vec::new();
+    }
+    let missing: Vec<&str> = expect
+        .iter()
+        .filter(|e| !sorted.iter().any(|f| f == *e))
+        .map(|s| s.as_str())
+        .collect();
+    let extra: Vec<&str> = sorted
+        .iter()
+        .filter(|f| !expect.iter().any(|e| e == *f))
+        .map(|s| s.as_str())
+        .collect();
+    vec![format!(
+        "CI VIOLATION: [{PROSE_RULES}] the list in the comment about \"{marker}\" says {} rule(s) and \
+         the checker prints {}: missing {}, stale {}. A rule added to the code without the sentence \
+         being updated is a claim about a tool that no longer describes it.",
+        sorted.len(),
+        expect.len(),
+        if missing.is_empty() {
+            "none".to_string()
+        } else {
+            missing.join(", ")
+        },
+        if extra.is_empty() {
+            "none".to_string()
+        } else {
+            extra.join(", ")
+        }
+    )]
 }
 
 /// Entry point. The optional argument is a workflow path, so the rules can be
@@ -587,6 +692,16 @@ pub fn run(args: &[String]) -> i32 {
         }
         ContractOutcome::Judged(found) => violations.extend(found),
     }
+    // The prose surface, folded in the same way the exit-code surface is. A comment
+    // that enumerates a checker's rule ids is a claim about that checker, and
+    // decide() only ever compares COMMANDS, so the claim sat here unchecked and said
+    // "six" on the day the code grew a seventh rule - check-ci reported 0 violations
+    // truthfully and uselessly. Same class, third surface this judge owns.
+    violations.extend(prose_list_findings(
+        &text,
+        "enforces the",
+        crate::check_unsafe::RULE_IDS,
+    ));
     for line in &violations {
         println!("{line}");
     }
@@ -724,6 +839,29 @@ mod tests {
             "the advisory job leaked into the gate: {steps:?}"
         );
         assert!(decide(&roster(), &steps).is_empty());
+    }
+
+    /// The two bridge steps LEAD with `cargo --config <value>`, and signature()
+    /// drops --config together with its value. So "put --locked immediately after
+    /// the subcommand" is a different string depending on which token you call
+    /// the subcommand, and check-ci compares strings. Pinned as behaviour rather
+    /// than as a comment about ordering: a comment about a string comparison is
+    /// the first thing to stop being true when someone rewraps a step.
+    #[test]
+    fn the_lock_sits_after_the_subcommand_because_the_config_token_is_dropped() {
+        let ci_step =
+            "cargo --config 'any=value' build --locked -p notes-bridge-gpui --bin notes-gpui";
+        let row = "cargo build --locked -p notes-bridge-gpui --bin notes-gpui";
+        assert_eq!(
+            signature_of(ci_step),
+            signature_of(row),
+            "the bridge pair only matches with the flag AFTER the subcommand"
+        );
+        assert_ne!(
+            signature_of("cargo --locked build -p notes-bridge-gpui --bin notes-gpui"),
+            signature_of(row),
+            "a --locked BEFORE the subcommand is a different signature: that is the trap"
+        );
     }
 
     #[test]
@@ -989,6 +1127,74 @@ mod tests {
         assert!(
             v[0].contains("binary older than sources"),
             "and what it means: {v:?}"
+        );
+    }
+
+    /// A prose list of rule ids in ci.yml is a claim with no instrument behind it,
+    /// and it drifted the moment check_unsafe grew [raw-ffi-imbalance]: the comment
+    /// said six, the code printed seven, check-ci said 0 violations because it only
+    /// parses commands. This pins the sentence against the const the checker
+    /// actually prints from, and pins the absence of a hand-typed count word - a
+    /// checked list with a number in front of it just moves the lie one word left.
+    #[test]
+    fn the_unsafe_rule_list_in_ci_yml_is_the_real_one() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml");
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+        let found = bracketed_ids_in_prose(&text, "enforces the");
+        let mut want: Vec<String> = crate::check_unsafe::RULE_IDS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        want.sort();
+        let mut sorted = found.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted, want,
+            "the ci.yml rule list and check_unsafe::RULE_IDS must be the same set; found {found:?}"
+        );
+        assert_eq!(
+            found.len(),
+            crate::check_unsafe::RULE_IDS.len(),
+            "and listed once each, not repeated"
+        );
+        let line = text
+            .lines()
+            .find(|l| l.contains("enforces the"))
+            .expect("the marker sentence must stay findable");
+        for typed in [
+            "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        ] {
+            assert!(
+                !line.contains(&format!("{typed} rule")),
+                "a hand-typed count next to a checked list is the drift that just happened: {line}"
+            );
+        }
+    }
+
+    /// The other direction, on a synthetic string rather than on the repo file: the
+    /// helper has to be able to see a rule added to the checker and not to the
+    /// comment, and a rule in the comment that the checker does not print.
+    #[test]
+    fn the_prose_list_helper_sees_both_directions_of_the_drift() {
+        let with_extra = "# enforces the rules\n# [alpha], [beta], [gamma-not-a-rule]\n# plain\n";
+        assert_eq!(
+            bracketed_ids_in_prose(with_extra, "enforces the"),
+            ["alpha", "beta", "gamma-not-a-rule"]
+                .map(String::from)
+                .to_vec(),
+            "an id in the comment that no checker prints must be visible to the pin"
+        );
+        let stopped = "# [before]\n# enforces the rules\n# [alpha]\nnot a comment\n# [zulu]\n";
+        assert_eq!(
+            bracketed_ids_in_prose(stopped, "enforces the"),
+            [String::from("alpha")].to_vec(),
+            "the run ends at the first non-comment line, so it cannot swallow the file"
+        );
+        assert!(
+            bracketed_ids_in_prose("# nothing here\n", "enforces the").is_empty(),
+            "no marker is not a pass: the pin asserts the set, and an empty set is a failure"
         );
     }
 

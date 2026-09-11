@@ -627,10 +627,16 @@ jobs:
           exit $status
       # --- 4e. the unsafe ledger, now a rule instead of a claim ----------------
       # "cargo run --locked -p xtask -- check-unsafe" (crates/xtask/src/check_unsafe.rs) scans the
-      # platform sources and enforces the seven rules AGENTS.md states as an invariant that
-      # nothing used to prove: [unsafe-outside-platform], [unsafe-without-safety],
-      # [local-allowance], [ledger-imbalance], [raw-ffi-imbalance], [lint-missing],
-      # [lint-escape]. It BLOCKS:
+      # platform sources and enforces the rules AGENTS.md states as an invariant that
+      # nothing used to prove. This list is CHECKED, not proofread: the test
+      # the_unsafe_rule_list_in_ci_yml_is_the_real_one compares it against
+      # check_unsafe::RULE_IDS and fails if a rule is added to the checker without
+      # being named here, or vice versa. No count word is typed above it on purpose -
+      # a hand-written number in front of a machine-checked list only relocates the
+      # lie. The list: [unsafe-outside-platform], [unsafe-without-safety],
+      # [local-allowance], [allowance-outside-platform], [ledger-imbalance],
+      # [raw-ffi-imbalance], [lint-missing], [lint-escape]. It BLOCKS:
+      # unsafe is the one place where a polite mistake is a memory-safety bug, and until
       # this row existed the only enforcement was the honesty of whoever wrote the block.
       # The roster makes it non-quick-skippable, so the drift lock at 4c runs it too - the
       # named cell here exists to say WHICH rule escaped, in its own red.

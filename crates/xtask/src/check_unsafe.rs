@@ -110,6 +110,26 @@ pub const RAW_FFI_IMBALANCE: &str = "raw-ffi-imbalance";
 pub const LINT_MISSING: &str = "lint-missing";
 pub const LINT_ESCAPE: &str = "lint-escape";
 
+/// EVERY rule id this module can print, in one place, so a list of them
+/// somewhere else can be CHECKED instead of being re-typed. ci.yml's 4e comment
+/// used to enumerate the rules in prose and said "six" while shipping seven
+/// ids worth of rules after [raw-ffi-imbalance] landed - nothing machine-read
+/// that sentence, so nothing noticed. The pin is
+/// [crate::check_ci::the_unsafe_rule_list_in_ci_yml_is_the_real_one]; the rule
+/// for anyone editing this file is that a new rule id joins this list in the
+/// same commit it starts being printed, and the ci.yml comment then has to name
+/// it or THAT commit goes red for a reason the message states.
+pub const RULE_IDS: &[&str] = &[
+    UNSAFE_OUTSIDE,
+    NO_SAFETY,
+    LOCAL_ALLOWANCE,
+    ALLOWANCE_OUTSIDE,
+    LEDGER_IMBALANCE,
+    RAW_FFI_IMBALANCE,
+    LINT_MISSING,
+    LINT_ESCAPE,
+];
+
 /// How far above an unsafe block a SAFETY comment may sit.
 pub const SAFETY_LOOKBACK: usize = 12;
 
