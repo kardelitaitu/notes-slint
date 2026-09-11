@@ -824,21 +824,23 @@ fn a_fresh_install_persists_on_the_first_geometry_changed() {
 /// unregister arm must measure-and-flush while the handle is still valid.
 #[test]
 fn the_last_state_write_happens_before_the_window_is_gone() {
+    // The file says the window is at the OLD rect; the host says it is at the
+    // NEW one (the user dragged it). No tick fires between the drag and the
+    // quit, so the ONLY chance to persist is the unregister arm - while the
+    // handle is still live. A dirty pin rides the same write.
     let dir = tempfile::tempdir().expect("tempdir");
     write_session(
         dir.path(),
         &Session {
-            rect: Rect::new(50, 50, 700, 500),
+            rect: Rect::new(10, 10, 640, 480),
             ..Session::default()
         },
     )
     .expect("seed the session");
-    // The host answers with the seeded rect, so measured and previous agree
-    // and the assertion tests SURVIVAL, not the mock.
     let (gateway, _rx, _host) = start_with(
         dir.path(),
         Answers {
-            restore: Some(FrameRect::new(50, 50, 700, 500)),
+            restore: Some(FrameRect::new(900, 40, 800, 600)),
             ..Answers::default()
         },
     );
@@ -848,20 +850,19 @@ fn the_last_state_write_happens_before_the_window_is_gone() {
             handle: WindowHandle(0x100),
         })
         .expect("queued");
-    // The user pins and quits inside one tick: no tick flush can run first.
     gateway.send(Command::SetPinned(true)).expect("queued");
     gateway.send(Command::UnregisterWindow).expect("queued");
     gateway.close().expect("the quit joins");
 
-    let persisted =
-        read_session(dir.path()).expect("the session existed before; it must exist after");
+    let persisted = read_session(dir.path())
+        .expect("the session existed before; it must exist after");
     assert!(
         persisted.pinned,
         "the pin change must survive a quit that never gave a tick"
     );
     assert_eq!(
         persisted.rect,
-        Rect::new(50, 50, 700, 500),
-        "and the geometry is not lost with it"
+        Rect::new(900, 40, 800, 600),
+        "the measured rect is the truth, and the truth must outlive the window"
     );
 }

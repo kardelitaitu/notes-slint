@@ -187,6 +187,7 @@ fn shutdown_drains_commands_queued_behind_it() {
         let _ = gateway.send(Command::Flush {
             text: String::new(),
             revision,
+            epoch: 0,
         });
     }
     let _ = gateway.send(Command::Shutdown);
@@ -227,6 +228,7 @@ fn drop_without_shutdown_aborts_but_buffered_events_survive() {
         let _ = gateway.send(Command::Flush {
             text: String::new(),
             revision,
+            epoch: 0,
         });
     }
     let _ = gateway.send(Command::SetAutosave(false));
@@ -261,6 +263,7 @@ fn dropped_receiver_does_not_kill_the_engine() {
     let _ = gateway.send(Command::Flush {
         text: "x".into(),
         revision: 1,
+        epoch: 0,
     });
     // Wait for that answer, then take the listener away.
     rx.recv_timeout(WAIT).expect("the first answer");
@@ -272,6 +275,7 @@ fn dropped_receiver_does_not_kill_the_engine() {
         let _ = gateway.send(Command::Flush {
             text: String::new(),
             revision,
+            epoch: 0,
         });
         let _ = gateway.send(Command::Open {
             path: PathBuf::from("C:/notes/who.notes"),
@@ -402,6 +406,7 @@ fn a_slow_consumer_never_blocks_the_producer() {
         let _ = gateway.send(Command::Flush {
             text: String::new(),
             revision,
+            epoch: 0,
         });
     }
     let produced = started.elapsed();
