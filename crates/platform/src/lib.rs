@@ -110,6 +110,26 @@ pub enum PlatformError {
     NoMonitor,
 }
 
+/// What a topmost request actually did, read back from the window itself.
+///
+/// The FFI answer alone is not the truth: a `SetWindowPos` can succeed and
+/// still change nothing (the documented hidden-window case - an async reband
+/// on a window that is not yet visible never lands), so every success is
+/// verified by reading `WS_EX_TOPMOST` back out of the window's style.
+#[derive(Debug)]
+pub enum PinOutcome {
+    /// The call succeeded and the window's style read back as requested.
+    Applied,
+    /// The request was refused before it could touch the window - a bad
+    /// handle, or the OS refusing the call. The error is the typed one the
+    /// crate always returns.
+    Failed(PlatformError),
+    /// The call succeeded but the window did not end up in the requested
+    /// band: `expected` is what was asked for, `actual` what the style
+    /// read back. This is the outcome a `bool` cannot express.
+    NotApplied { expected: bool, actual: bool },
+}
+
 /// The window-handle seams that `api` consumes.
 ///
 /// Object-safe and `Send`: a bridge registers one implementation (`windows::Backend`
@@ -120,10 +140,15 @@ pub trait WindowBackend: Send {
     /// Raises the window above every other window (`on`) or puts it back.
     /// Moves nothing and resizes nothing.
     ///
-    /// Issued with `SWP_ASYNCWINDOWPOS`: this returns before the reband has
-    /// landed - see [`WindowBackend::set_frame_rect`] for the caller obligation
-    /// that follows from that.
-    fn set_topmost(&mut self, handle: isize, on: bool) -> PlatformResult<()>;
+    /// Returns a verdict read back from the window's own style, not the FFI
+    /// answer: [`PinOutcome::Applied`] means `WS_EX_TOPMOST` was observed,
+    /// [`PinOutcome::NotApplied`] means the call succeeded and changed
+    /// nothing (the documented hidden-window case), [`PinOutcome::Failed`]
+    /// carries the typed refusal. Issued with `SWP_ASYNCWINDOWPOS`, so the
+    /// reband lands after the call returns - see
+    /// [`WindowBackend::set_frame_rect`] for the caller obligation that
+    /// follows from that.
+    fn set_topmost(&mut self, handle: isize, on: bool) -> PinOutcome;
 
     /// The window frame rectangle, in the unit `FrameRect` documents.
     fn frame_rect(&self, handle: isize) -> PlatformResult<FrameRect>;
@@ -235,7 +260,7 @@ pub trait HostFacts: Send {
 }
 #[cfg(test)]
 mod tests {
-    use super::{FrameRect, HostFacts, PlatformError, PlatformResult, WindowBackend};
+    use super::{FrameRect, HostFacts, PinOutcome, PlatformError, PlatformResult, WindowBackend};
 
     /// A stand-in for `api`: it implements the seam with no window, no desktop and
     /// no `windows` dependency, which is the point of the shape - bare `isize`
@@ -246,9 +271,9 @@ mod tests {
     }
 
     impl WindowBackend for Mock {
-        fn set_topmost(&mut self, handle: isize, on: bool) -> PlatformResult<()> {
+        fn set_topmost(&mut self, handle: isize, on: bool) -> PinOutcome {
             self.calls.push(format!("topmost {handle:#x} {on}"));
-            Ok(())
+            PinOutcome::Applied
         }
 
         fn frame_rect(&self, _handle: isize) -> PlatformResult<FrameRect> {
@@ -302,7 +327,10 @@ mod tests {
     #[test]
     fn a_consumer_can_hold_the_seam_as_a_boxed_trait_object() {
         let mut backend: Box<dyn WindowBackend> = Box::new(Mock::default());
-        assert!(backend.set_topmost(0x1234, true).is_ok());
+        assert!(matches!(
+            backend.set_topmost(0x1234, true),
+            PinOutcome::Applied
+        ));
         assert!(matches!(
             backend.frame_rect(0x1234),
             Ok(rect) if rect == FrameRect::new(1, 2, 3, 4)

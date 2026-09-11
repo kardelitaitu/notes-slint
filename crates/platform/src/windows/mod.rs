@@ -17,7 +17,7 @@ pub mod topmost;
 use ::windows::Win32::Foundation::HWND;
 use ::windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
-use crate::{FrameRect, HostFacts, PlatformError, PlatformResult, WindowBackend};
+use crate::{FrameRect, HostFacts, PinOutcome, PlatformError, PlatformResult, WindowBackend};
 
 /// The Win32 implementation of [`WindowBackend`].
 ///
@@ -28,7 +28,7 @@ use crate::{FrameRect, HostFacts, PlatformError, PlatformResult, WindowBackend};
 pub struct Backend;
 
 impl WindowBackend for Backend {
-    fn set_topmost(&mut self, handle: isize, on: bool) -> PlatformResult<()> {
+    fn set_topmost(&mut self, handle: isize, on: bool) -> PinOutcome {
         topmost::set_topmost(handle, on)
     }
 
@@ -130,7 +130,7 @@ pub(crate) fn win32_error(api: &'static str, error: ::windows::core::Error) -> P
 #[cfg(test)]
 mod tests {
     use super::Backend;
-    use crate::{FrameRect, HostFacts, PlatformError, PlatformResult, WindowBackend};
+    use crate::{FrameRect, HostFacts, PinOutcome, PlatformError, PlatformResult, WindowBackend};
 
     /// Runs the three handle-taking seams and returns their verdicts. None of the
     /// handles used here can name a live window: a USER handle value is 4-byte
@@ -139,8 +139,14 @@ mod tests {
     /// value is a window. The assertions are therefore exact and cannot be flaked by
     /// another process creating or destroying a window mid-run.
     fn all_handle_seams(backend: &mut Backend, handle: isize) -> Vec<PlatformResult<()>> {
+        // The topmost seam reports a verdict, not a Result: a refusal maps to
+        // the same typed error the other seams return directly.
+        let topmost = match backend.set_topmost(handle, true) {
+            PinOutcome::Failed(err) => Err(err),
+            PinOutcome::Applied | PinOutcome::NotApplied { .. } => Ok(()),
+        };
         vec![
-            backend.set_topmost(handle, true),
+            topmost,
             backend.frame_rect(handle).map(|_| ()),
             backend.restore_frame_rect(handle).map(|_| ()),
             backend.set_frame_rect(handle, FrameRect::new(0, 0, 10, 10), 1.0),

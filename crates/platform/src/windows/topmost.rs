@@ -2,11 +2,13 @@
 
 use ::windows::Win32::UI::WindowsAndMessaging::{
     HWND_NOTOPMOST, HWND_TOPMOST, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, WS_EX_TOPMOST,
 };
 
+use ::windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GetWindowLongPtrW};
+
 use super::{to_hwnd, win32_error};
-use crate::PlatformResult;
+use crate::PinOutcome;
 
 /// `SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS`, spelled as one
 /// const so a reviewer can see the bits that confine this call to a z-order change
@@ -28,8 +30,11 @@ const TOPMOST_FLAGS: SET_WINDOW_POS_FLAGS =
 /// Issued with `SWP_ASYNCWINDOWPOS` (see [`TOPMOST_FLAGS`]): this returns before
 /// the band has actually switched, so a placement read straight back may still
 /// show the old band.
-pub fn set_topmost(handle: isize, on: bool) -> PlatformResult<()> {
-    let hwnd = to_hwnd(handle)?;
+pub fn set_topmost(handle: isize, on: bool) -> PinOutcome {
+    let hwnd = match to_hwnd(handle) {
+        Ok(hwnd) => hwnd,
+        Err(err) => return PinOutcome::Failed(err),
+    };
     let insert_after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
     // SAFETY: SetWindowPos receives the HWND that `to_hwnd` accepted from IsWindow
     // at check time. The window may have been destroyed since; SetWindowPos
@@ -40,16 +45,41 @@ pub fn set_topmost(handle: isize, on: bool) -> PlatformResult<()> {
     // side dereferences; no pointer crosses at all, and TOPMOST_FLAGS carries
     // SWP_NOMOVE and SWP_NOSIZE, which make the four zero coordinates ignored.
     // SWP_ASYNCWINDOWPOS changes only liveness - the call posts the reband instead
-    // of blocking on the owner's pump - never what is written.
-    // The returned Result is mapped, never unwrapped.
-    unsafe { SetWindowPos(hwnd, Some(insert_after), 0, 0, 0, 0, TOPMOST_FLAGS) }
-        .map_err(|error| win32_error("SetWindowPos", error))
+    // of blocking on the owner's pump - never what is written. The returned
+    // Result is mapped into the verdict, never unwrapped.
+    let call = unsafe { SetWindowPos(hwnd, Some(insert_after), 0, 0, 0, 0, TOPMOST_FLAGS) };
+    if let Err(error) = call {
+        return PinOutcome::Failed(win32_error("SetWindowPos", error));
+    }
+    // The FFI answer is not the verdict: a call can succeed and change nothing -
+    // the documented hidden-window case, where an async reband never lands - so
+    // the window's own style is read back and a mismatch is its own outcome.
+    // SAFETY: GetWindowLongPtrW is a pure style query on the HWND `to_hwnd`
+    // accepted at check time and that SetWindowPos just answered for; it reads
+    // one integer out of the window's USER handle record, writes nothing on
+    // this side, and the index is the documented GWL_EXSTYLE.
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    let actual = style_is_topmost(style);
+    if actual == on {
+        PinOutcome::Applied
+    } else {
+        PinOutcome::NotApplied {
+            expected: on,
+            actual,
+        }
+    }
+}
+
+/// The style-word half of the verdict, so the bit comparison is testable
+/// without a window: `WS_EX_TOPMOST` (0x8) set in the extended style word.
+fn style_is_topmost(style: isize) -> bool {
+    style & WS_EX_TOPMOST.0 as isize != 0
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TOPMOST_FLAGS, set_topmost};
-    use crate::{PlatformError, PlatformResult};
+    use super::{TOPMOST_FLAGS, set_topmost, style_is_topmost};
+    use crate::{PinOutcome, PlatformError};
     use ::windows::Win32::UI::WindowsAndMessaging::{
         SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
         SWP_NOSIZE, SWP_SHOWWINDOW,
@@ -60,16 +90,33 @@ mod tests {
         // A USER handle value is 4-byte aligned, and the meaningful bits of an HWND
         // are 32-bit; every value below is misaligned or has the 64-bit sign bit set,
         // so none can name a live window and no other process can flake this. No
-        // window is created, focused or waited on here.
+        // window is created, focused or waited on here. The refusal arrives as the
+        // verdict's Failed arm carrying the same typed error as before.
         for on in [true, false] {
             for handle in [0, 0x1234_5679, 0x0000_000f, isize::MIN + 1] {
-                let result: PlatformResult<()> = set_topmost(handle, on);
+                let verdict = set_topmost(handle, on);
                 assert!(
-                    matches!(result, Err(PlatformError::InvalidHandle)),
-                    "handle {handle:#x} on={on}: {result:?}",
+                    matches!(&verdict, PinOutcome::Failed(PlatformError::InvalidHandle)),
+                    "handle {handle:#x} on={on}: {verdict:?}",
                 );
             }
         }
+    }
+
+    /// The style-word comparison is the whole of the read-back, so it is
+    /// pinned without a window: the bit, its absence, and words that carry
+    /// other bits beside it.
+    #[test]
+    fn the_style_word_answers_only_its_own_bit() {
+        assert!(!style_is_topmost(0), "no style, no pin");
+        assert!(style_is_topmost(0x8), "WS_EX_TOPMOST alone");
+        assert!(
+            style_is_topmost(0x8 | 0x10 | 0x80),
+            "topmost among other bits"
+        );
+        assert!(!style_is_topmost(0x10 | 0x80), "other bits, no pin");
+        assert!(!style_is_topmost(isize::MIN), "sign bit is not the pin");
+        assert!(style_is_topmost(-1), "all-ones carries every bit");
     }
 
     #[test]

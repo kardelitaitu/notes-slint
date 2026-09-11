@@ -52,7 +52,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
 use ::windows::core::{PCWSTR, w};
 
 use notes_platform::windows::Backend;
-use notes_platform::{FrameRect, PlatformError, WindowBackend};
+use notes_platform::{FrameRect, PinOutcome, PlatformError, WindowBackend};
 
 // kernel32's GetModuleHandleW and user32's raw DefWindowProcW, declared
 // locally: GetModuleHandleW is gated behind the Win32_System_LibraryLoader
@@ -213,7 +213,10 @@ fn spawn_owner() -> (
                     Command::SelfTopmost => {
                         // The control: the SAME seam, the owner's OWN thread.
                         let mut backend = Backend;
-                        let applied = backend.set_topmost(hwnd.0 as isize, true).is_ok();
+                        let applied = matches!(
+                            backend.set_topmost(hwnd.0 as isize, true),
+                            PinOutcome::Applied
+                        );
                         let _ = ack_tx.send(applied);
                     }
                     Command::PumpContinuously => {
@@ -344,7 +347,10 @@ fn an_async_move_and_reband_land_when_the_owner_pumps() {
         Duration::from_secs(2),
     )
     .expect("set_topmost must not block while the owner is parked");
-    rebanded.expect("the reband is accepted");
+    assert!(
+        matches!(rebanded, PinOutcome::Applied),
+        "the visible-window reband must read back as applied: {rebanded:?}"
+    );
     let parked_elapsed = started.elapsed();
     eprintln!("[phase C] set_topmost with owner PARKED returned in {parked_elapsed:?}");
     assert!(
@@ -395,7 +401,7 @@ fn an_async_move_and_reband_land_when_the_owner_pumps() {
         }
         None => panic!(
             "FINDING (reproduced on this machine): the cross-thread async reband NEVER \
-             landed. set_topmost returned Ok in {parked_elapsed:?} with the owner parked, \
+             landed. set_topmost returned Applied-quickly in {parked_elapsed:?} with the \n             owner parked, \
              and WS_EX_TOPMOST was still unset after 2s of the owner pumping faithfully \
              via GetMessageW - while the SAME reband applied by the owner thread lands \
              immediately (phase C2). An async SetWindowPos reliably lands a MOVE but \
@@ -426,10 +432,10 @@ fn a_garbage_handle_still_maps_to_the_typed_error_on_the_real_backend() {
             matches!(result, Err(PlatformError::InvalidHandle)),
             "handle {handle:#x}: {result:?}"
         );
-        let result = backend.set_topmost(handle, true);
+        let verdict = backend.set_topmost(handle, true);
         assert!(
-            matches!(result, Err(PlatformError::InvalidHandle)),
-            "handle {handle:#x}: {result:?}"
+            matches!(verdict, PinOutcome::Failed(PlatformError::InvalidHandle)),
+            "handle {handle:#x}: {verdict:?}"
         );
         let result = backend.restore_frame_rect(handle);
         assert!(
