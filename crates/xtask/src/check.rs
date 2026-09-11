@@ -318,7 +318,14 @@ fn joined(names: &[&str]) -> String {
 /// gate is supposed to have over Cargo.lock passes through here or not at all,
 /// and `every_row_that_resolves_a_graph_carries_the_lock` is what keeps that
 /// sentence true instead of aspirational. A row without the flag is not a slower
-/// step, it is a step that will quietly refresh a lock nobody committed.
+/// step, it is a step that will quietly refresh a lock nobody committed - measured,
+/// not asserted: in a copy of this commit with one unplanted dependency added to
+/// `crates/core`, the verbatim step `cargo run --locked -p xtask -- check-deps`
+/// exits 101 with "cannot update the lock file ... because --locked was passed" and
+/// Cargo.lock's md5 is IDENTICAL before and after (18ac197e), while the same step
+/// with the flag removed exits 0, prints "5 member crates, 0 violations", and
+/// rewrites Cargo.lock to a new md5 (6382fdcc). Green, and the drift is gone: not
+/// fixed, just un-recorded. That is the failure this flag exists to refuse.
 pub fn roster() -> Vec<crate::check_ci::Row> {
     step_specs()
         .into_iter()
