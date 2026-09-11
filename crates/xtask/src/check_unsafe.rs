@@ -567,6 +567,49 @@ pub fn bare_by_count(ffi: &BTreeMap<String, FfiCensus>) -> usize {
     ffi.values().map(FfiCensus::bare_by_count).sum()
 }
 
+/// The tripwire summary, as a function rather than an inline format string, so
+/// both branches can be TESTED - the sentence is what a reader trusts, and the
+/// first version of it named "the worst single crate" unconditionally, which on a
+/// clean tree is a tie at zero resolved by map iteration order and so printed
+/// `xtask`, a crate holding no FFI at all, as if it were the suspect. A printout
+/// that invents a worst offender is worse than one that says nothing: it points
+/// the next reader at the wrong crate. So the green case names where the FFI
+/// actually is, and only a positive bare total names a worst crate.
+pub fn tripwire_line(ffi: &BTreeMap<String, FfiCensus>) -> String {
+    let extern_total: usize = ffi.values().map(|c| c.extern_blocks).sum();
+    let declared_total: usize = ffi.values().map(|c| c.unsafe_declarations).sum();
+    let bare_total = bare_by_count(ffi);
+    let where_ffi = if extern_total == 0 {
+        "no extern block anywhere in the workspace".to_string()
+    } else if bare_total == 0 {
+        let (home, census) = ffi
+            .iter()
+            .filter(|(_, c)| c.extern_blocks > 0)
+            .max_by_key(|(_, c)| c.extern_blocks)
+            .map(|(n, c)| (n.clone(), c.clone()))
+            .unwrap();
+        format!(
+            "the FFI is concentrated in {home} at {} blocks against {} unsafe-qualified \
+             declarations, which is the only crate where a bare block could hide today",
+            census.extern_blocks, census.unsafe_declarations
+        )
+    } else {
+        let (worst_crate, worst) = ffi
+            .iter()
+            .map(|(n, c)| (n.clone(), c.bare_by_count()))
+            .max_by_key(|(_, b)| *b)
+            .unwrap_or_else(|| ("unknown".to_string(), 0));
+        format!("the worst single crate is {worst_crate} at {worst} bare")
+    };
+    format!(
+        "unsafe: tripwire {extern_total} extern blocks - {declared_total} unsafe-qualified \
+         declarations = {bare_total} bare across the tree; {where_ffi}. A positive number is a \
+         [raw-ffi-imbalance] finding above. Zero is arithmetic, not a survey: a bare block still \
+         matches no pattern here, a block a macro emits is counted on neither side, and a build \
+         script passing -lkernel32 leaves no count anywhere to subtract."
+    )
+}
+
 fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -744,15 +787,7 @@ pub fn run(args: &[String]) -> i32 {
          unsafe declarations)",
         ledger.blocks, ledger.safety_comments, ledger.files, ledger.declarations
     );
-    let extern_total: usize = ledger.ffi.values().map(|c| c.extern_blocks).sum();
-    let declared_total: usize = ledger.ffi.values().map(|c| c.unsafe_declarations).sum();
-    let bare_total = bare_by_count(&ledger.ffi);
-    let (worst_crate, worst) = ledger
-        .ffi
-        .iter()
-        .map(|(n, c)| (n.clone(), c.bare_by_count()))
-        .max_by_key(|(_, b)| *b)
-        .unwrap_or_else(|| ("no crate".to_string(), 0));
+    let tripwire = tripwire_line(&ledger.ffi);
     let rows: Vec<String> = ledger
         .ffi
         .iter()
@@ -771,14 +806,7 @@ pub fn run(args: &[String]) -> i32 {
          {PLATFORM_DIR}, so every row but that one must read 0 - 0 = 0: {}",
         rows.join(", ")
     );
-    println!(
-        "unsafe: tripwire {extern_total} extern blocks - {declared_total} unsafe-qualified \
-         declarations = {bare_total} bare across the tree; the worst single crate is \
-         {worst_crate} at {worst}. A positive number is a [raw-ffi-imbalance] finding above. \
-         Zero is arithmetic, not a survey: a bare block still matches no pattern here, a block \
-         a macro emits is counted on neither side, and a build script passing -lkernel32 leaves \
-         no count anywhere to subtract."
-    );
+    println!("{tripwire}");
     if ledger.allowances.is_empty() {
         println!("unsafe: no module-root #![allow(unsafe_code)] anywhere");
     } else {
@@ -1105,6 +1133,59 @@ mod tests {
                 .contains("legal Rust the SAFETY ledger cannot see"),
             "but it is told a different thing: {}",
             in_home[0].message()
+        );
+    }
+
+    /// All three shapes of the summary sentence, because the sentence is what a
+    /// reader acts on and the green branch is the one that lied last time.
+    #[test]
+    fn the_tripwire_summary_names_a_suspect_only_when_there_is_one() {
+        let empty: BTreeMap<String, FfiCensus> = BTreeMap::new();
+        let line = tripwire_line(&empty);
+        assert!(
+            line.contains("no extern block anywhere"),
+            "nothing to count must say so: {line}"
+        );
+
+        let mut clean: BTreeMap<String, FfiCensus> = BTreeMap::new();
+        clean.insert(
+            "notes-platform".to_string(),
+            FfiCensus {
+                extern_blocks: 2,
+                unsafe_declarations: 2,
+            },
+        );
+        clean.insert(
+            "xtask".to_string(),
+            FfiCensus {
+                extern_blocks: 0,
+                unsafe_declarations: 4,
+            },
+        );
+        let line = tripwire_line(&clean);
+        assert!(line.contains("0 bare across the tree"), "{line}");
+        assert!(
+            !line.contains("worst"),
+            "a tie at zero has no worst crate, and naming one points the next reader at a \
+             crate with no FFI at all: {line}"
+        );
+        assert!(
+            line.contains("concentrated in notes-platform at 2 blocks"),
+            "the green case must say where the FFI is: {line}"
+        );
+
+        let mut dirty: BTreeMap<String, FfiCensus> = BTreeMap::new();
+        dirty.insert(
+            "notes-core".to_string(),
+            FfiCensus {
+                extern_blocks: 3,
+                unsafe_declarations: 1,
+            },
+        );
+        let line = tripwire_line(&dirty);
+        assert!(
+            line.contains("the worst single crate is notes-core at 2 bare"),
+            "a positive total must name the crate AND the number: {line}"
         );
     }
 
