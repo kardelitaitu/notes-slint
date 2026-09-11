@@ -157,6 +157,26 @@ struct Wire {
     recents: Vec<RecentEntry>,
     /// The global toggle, as last stated by the ENGINE (see `new`).
     autosave: bool,
+    /// THE BRIDGE'S OPEN GENERATION, mirroring the engine's own `self.epoch`
+    /// (crates/api/src/engine.rs:537 in `open`, :646 in `save_as` - the only two
+    /// sites that bump it). Bumped by [`Wire::rebind`] exactly when WE start a
+    /// new buffer: every send of `Command::Open` or `Command::SaveAs`, the only
+    /// commands whose engine handlers rebind the document. The two counters
+    /// must move in LOCKSTEP, because the flush guard compares them for
+    /// EQUALITY: a bump on one side without the other would discard every later
+    /// Flush. This is why the pathless startup - a fresh scratch, where the
+    /// bridge sends no rebind command at all - bumps nothing: the engine never
+    /// sees a rebind for it either, and an unmirrored bump would silence the
+    /// untitled note's autosave forever.
+    epoch: u64,
+    /// The generation the edits now sitting in the debounce belonged to when
+    /// they ENTERED it (see [`Wire::note_edit`]). The whole guard lives on this
+    /// being captured AT ENTRY, never at fire time: read at fire time it would
+    /// always equal `epoch` (both sides moved together at the rebind), and the
+    /// stale buffer of A's text would land in B atomically and report Saved.
+    /// Set ONLY beside `seen_edits`, so a buffered revision can never name a
+    /// different document than its epoch.
+    edit_epoch: u64,
 }
 
 impl Wire {
@@ -175,6 +195,12 @@ impl Wire {
             // the only visible proof that the settings reload path works. Same one-way door
             // the pin was: a check that follows what the UI asked for proves nothing.
             autosave,
+            // The engine's epoch starts at 0 (engine.rs:339) and so does ours: the
+            // counters are equal before the first rebind, which is the only state
+            // in which the first Flush can be honest about whose buffer it carries.
+            epoch: 0,
+            // Nothing has entered the debounce yet; the first edit stamps it.
+            edit_epoch: 0,
         }
     }
 
@@ -186,6 +212,30 @@ impl Wire {
     /// compares against the one it sent.
     fn dirty(&self) -> bool {
         self.seen_edits != self.flushed_edits
+    }
+
+    /// AN EDIT ENTERS THE DEBOUNCE. The one place `seen_edits` moves, and
+    /// therefore the one place the epoch stamp is taken: the revision and its
+    /// generation are captured as one unit, so the buffered revision can never
+    /// name a different document than its epoch. (The text itself stays in the
+    /// editor and is read at fire time; what is recorded here is the fact that
+    /// everything the editor holds at revision `edits` belongs to generation
+    /// `self.epoch`.)
+    fn note_edit(&mut self, edits: u64, now: Instant) {
+        self.seen_edits = edits;
+        self.changed_at = now;
+        self.edit_epoch = self.epoch;
+    }
+
+    /// WE STARTED A NEW BUFFER. Called at every send of `Command::Open` or
+    /// `Command::SaveAs` - the startup load, the menu's Ctrl+O, an open from
+    /// the recents menu, and a Save As rebind - because those are exactly the
+    /// commands whose engine handlers do `self.epoch += 1` (engine.rs:537,
+    /// :646). The engine bumps even when the load or save then FAILS, so the
+    /// bump happens at SEND, not on the answer: the counters must be equal at
+    /// every instant the engine might be judging a Flush.
+    fn rebind(&mut self) {
+        self.epoch += 1;
     }
 }
 
@@ -780,8 +830,10 @@ impl Surface {
         {
             let mut wire = self.wire.borrow_mut();
             if edits != wire.seen_edits {
-                wire.seen_edits = edits;
-                wire.changed_at = now;
+                // THE STAMP: the edit enters the debounce HERE, while the
+                // generation is still the one the user typed it under - not at
+                // the fire below, which can run long after a rebind moved it.
+                wire.note_edit(edits, now);
             }
         }
         let composing = self.editor.read(cx).is_composing();
@@ -790,23 +842,14 @@ impl Surface {
             return;
         }
         let text = self.editor.read(cx).text().to_string();
+        report(&format!("flush: revision {edits}, {} bytes", text.len()));
+        let command = flush_command(&self.wire.borrow(), text, edits);
         {
             let mut wire = self.wire.borrow_mut();
             wire.flushed_edits = edits;
             wire.in_flight = Some(edits);
         }
-        report(&format!("flush: revision {edits}, {} bytes", text.len()));
-        send(
-            &self.gateway,
-            Command::Flush {
-                text,
-                revision: edits,
-                // The vocabulary now carries the buffer's OPEN GENERATION; held at
-                // 0 here until the flush carries the generation its buffer
-                // actually belongs to (the very next commit).
-                epoch: 0,
-            },
-        );
+        send(&self.gateway, command);
     }
 
     /// The second line: the pump's own cost, live, because "it is cheap" is not
@@ -1284,6 +1327,13 @@ fn main() {
             // launch and an untitled note that was never written come back the way they
             // should, empty.
             if let Some(path) = initial.session.path.clone() {
+                // THE STARTUP LOAD IS A REBIND: the buffer is about to become this
+                // document's, and the engine's `open` bumps its epoch
+                // (engine.rs:537) the moment this command is processed - ours
+                // moves with it, at the send. A startup with NO path sends
+                // nothing and bumps nothing: the fresh scratch is generation 0 on
+                // both sides.
+                wire.borrow_mut().rebind();
                 report(&format!("startup: asking the port for {}", path.display()));
                 send(&gateway, Command::Open { path });
             }
@@ -1476,6 +1526,21 @@ fn flush_due(wire: &Wire, composing: bool, quiet_for: Duration) -> bool {
     quiet_for >= AUTOSAVE_IDLE
 }
 
+/// THE FLUSH AS DATA: `flush_tick`'s send, extracted so the debounce can be
+/// tested without a window, the way `Watch` is - the decision (`flush_due`)
+/// and the command are pure, and the clock is passed in. The epoch is the wire's
+/// STAMP, taken when the edit entered the debounce (`Wire::note_edit`), never
+/// the live generation: at fire time the live generation always matches the
+/// engine's, because both sides moved together at the rebind, and that equality
+/// is exactly the bug.
+fn flush_command(wire: &Wire, text: String, edits: u64) -> Command {
+    Command::Flush {
+        text,
+        revision: edits,
+        epoch: wire.edit_epoch,
+    }
+}
+
 /// THE LAST FLUSH, issued before `Shutdown` so the engine's own exit drain does the
 /// write while we are still waiting for it. Every branch says what it did in the exit
 /// trace, because the one outcome that must never be silent is text that is about to
@@ -1517,6 +1582,11 @@ fn final_flush(
         report("final flush: HELD, a composition was open - that text is LOST");
         return;
     }
+    // A FINAL FLUSH IS NOT EXEMPT from the epoch guard: the outstanding edits
+    // entered the debounce under a generation, and if a rebind has happened
+    // since, the engine MUST discard this - "last chance to write" is not
+    // "belongs to the document now on screen".
+    let epoch = state.edit_epoch;
     drop(state);
     let text = editor.read(cx).text().to_string();
     wire.borrow_mut().flushed_edits = edits;
@@ -1529,9 +1599,7 @@ fn final_flush(
         Command::Flush {
             text,
             revision: edits,
-            // Same placeholder as the debounced flush: the field must compile;
-            // its real value comes with the generation.
-            epoch: 0,
+            epoch,
         },
     );
 }
@@ -1549,9 +1617,10 @@ fn register_menu_commands(
 ) {
     cx.on_action({
         let gateway = Rc::clone(&gateway);
+        let wire = Rc::clone(&wire);
         let view_slot = Rc::clone(&view_slot);
         move |_: &menu::OpenFile, cx: &mut App| {
-            prompt_open(&gateway, &view_slot, cx);
+            prompt_open(&gateway, &wire, &view_slot, cx);
         }
     });
     cx.on_action({
@@ -1641,6 +1710,7 @@ fn note_to(view_slot: &Rc<RefCell<Option<GpuiWindowHandle<Surface>>>>, cx: &mut 
 /// never reads the file itself, which is the seam holding.
 fn prompt_open(
     gateway: &Rc<RefCell<Option<Gateway>>>,
+    wire: &Rc<RefCell<Wire>>,
     view_slot: &Rc<RefCell<Option<GpuiWindowHandle<Surface>>>>,
     cx: &mut App,
 ) {
@@ -1651,6 +1721,7 @@ fn prompt_open(
         prompt: None,
     });
     let gateway = Rc::clone(gateway);
+    let wire = Rc::clone(wire);
     let view_slot = Rc::clone(view_slot);
     // Detached on purpose: the task IS the dialog's continuation, and there is nothing to
     // await it for - its whole effect is the command it sends and the sentence it writes.
@@ -1675,6 +1746,9 @@ fn prompt_open(
         let name = path
             .file_name()
             .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        // Ctrl+O IS a rebind: the buffer is about to become another document,
+        // and the engine's `open` bumps its epoch the moment this command lands.
+        wire.borrow_mut().rebind();
         send(&gateway, Command::Open { path });
         with_view(&view_slot, cx, move |view, cx| {
             view.note(&format!("asking the engine to open {name}"), cx)
@@ -1725,6 +1799,7 @@ fn prompt_save_as(
     }
     let receiver = cx.prompt_for_new_path(&directory, suggested.as_deref());
     let gateway = Rc::clone(gateway);
+    let wire = Rc::clone(wire);
     let view_slot = Rc::clone(view_slot);
     // Detached: the task is the dialog's continuation, and its whole effect is the command
     // it sends and the sentence it writes. There is nothing to await it for.
@@ -1745,6 +1820,10 @@ fn prompt_save_as(
         let name = path
             .file_name()
             .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        // A Save As rebinds the document even if the write then fails: the
+        // engine bumps its epoch at the top of `save_as` (engine.rs:646), so
+        // ours moves at the send, not on the `Rebound` answer.
+        wire.borrow_mut().rebind();
         send(
             &gateway,
             Command::SaveAs {
@@ -1778,6 +1857,9 @@ fn open_recent(
     let entry = menu::entry_for(&wire.borrow().recents, index).cloned();
     match entry {
         Some(entry) if entry.exists => {
+            // Opening from the recents menu is Ctrl+O by another door: a rebind,
+            // for the same reason and at the same moment.
+            wire.borrow_mut().rebind();
             send(
                 gateway,
                 Command::Open {
@@ -2517,5 +2599,75 @@ mod tests {
             !flush_due(&wire, false, Duration::from_millis(100)),
             "and not before the idle has run out"
         );
+    }
+
+    /// THE EPOCH GUARD, at the seam the brief names: an edit enters the debounce
+    /// while document A is current, the user then opens B, the rebind moves the
+    /// generation on BOTH sides, and only then does the quiet period elapse. The
+    /// Flush that reaches the port must carry the generation the edit BELONGED
+    /// to - stamped at fire time it would carry the live one, always match the
+    /// engine, and A's whole buffer would land in B atomically and report Saved.
+    /// (The engine-side discard was proven producible in 0c314c17/afe83082; this
+    /// is our side of the same seam.)
+    #[test]
+    fn a_flush_fires_with_the_generation_its_edit_entered_the_debounce_with() {
+        let t0 = Instant::now();
+        let mut wire = Wire::new(true);
+        wire.loaded = true;
+        wire.armed = true;
+        // The user types in A: revision 5 enters the debounce at generation 0.
+        wire.note_edit(5, t0);
+        // The user opens B: the bridge rebinds, exactly as every Open send does.
+        wire.rebind();
+        // The debounce fires: dirty, armed, quiet, nothing in the air - and the
+        // buffer still holds A's text because `Loaded` for B has not been applied.
+        assert!(
+            flush_due(&wire, false, AUTOSAVE_IDLE),
+            "the scene is set: the stale buffer is due to flush"
+        );
+        let command = flush_command(&wire, "A's whole buffer".to_string(), 5);
+        match command {
+            Command::Flush {
+                text,
+                revision,
+                epoch,
+            } => {
+                assert_eq!(revision, 5);
+                assert_eq!(text, "A's whole buffer");
+                assert_eq!(
+                    epoch, 0,
+                    "the Flush must carry the generation the edit entered the                      debounce with, not the live one: the engine is at 1 and must                      DISCARD this instead of writing A's text into B"
+                );
+            }
+            other => panic!("a due flush builds a Flush, got {other:?}"),
+        }
+    }
+
+    /// And the guard is a guard, not a wall: an edit that enters the debounce
+    /// AFTER the rebind belongs to the new document, and its Flush must carry
+    /// the NEW generation so the engine accepts it.
+    #[test]
+    fn an_edit_after_the_rebind_flushes_under_the_new_generation() {
+        let t0 = Instant::now();
+        let mut wire = Wire::new(true);
+        wire.loaded = true;
+        wire.armed = true;
+        wire.note_edit(5, t0);
+        wire.rebind();
+        // Typing continues in the new document: the next edit re-stamps.
+        wire.note_edit(6, t0 + AUTOSAVE_IDLE);
+        let command = flush_command(&wire, "B's text".to_string(), 6);
+        match command {
+            Command::Flush {
+                epoch, revision, ..
+            } => {
+                assert_eq!(revision, 6);
+                assert_eq!(
+                    epoch, 1,
+                    "the new buffer must not be discarded with the old one"
+                );
+            }
+            other => panic!("a due flush builds a Flush, got {other:?}"),
+        }
     }
 }
