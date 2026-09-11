@@ -54,6 +54,73 @@ jobs:
       # v2 derives its key from Cargo.lock + toolchain + OS/arch itself. No bespoke key invented.
       - uses: Swatinem/rust-cache@v2
 
+      # --- 0. lockfile authority: what --locked means, and why it is not a flag on
+      # the steps below yet. Cargo.lock moved underneath us tonight (the kit migration
+      # added hundreds of packages), so the claim the runner resolved the graph that was
+      # reviewed now needs proving. --locked proves it: cargo ERRORS at resolution time,
+      # before compiling anything, when Cargo.lock does not match the manifests, instead
+      # of quietly rewriting the file mid-pipeline (step 2 builds one graph, step 7
+      # tests another, check-deps reports on neither).
+      #
+      # Measured on a scratch copy of HEAD (git archive extract, private target dir,
+      # cargo 1.98.0) with
+      # one dependency line planted in crates/core/Cargo.toml and the lock left alone:
+      #   cargo metadata            -> exit 0 AND Cargo.lock modified: tonight behaves
+      #                               this way, a silent mid-run graph swap
+      #   cargo metadata --locked   -> exit 101, and this is the text a reader will see:
+      #     error: cannot update the lock file <path>/Cargo.lock because --locked was
+      #       passed to prevent this
+      #     help: to generate the lock file without accessing the network, remove the
+      #       --locked flag and use --offline instead.
+      #   CARGO_LOCKED=1            -> exit 0, lock rewritten: there is no env substitute
+      #   --config resolve.locked=1 -> exit 0, lock rewritten: no such config key exists
+      #
+      # Why the twelve gate cargo steps are still unflagged (2, 3, 3b, 3c, 3d, 3e, 4,
+      # 4a, 4b, 4c, 4d, 4e): check-ci matches a step to its roster row by TOKEN
+      # SIGNATURE, and signature() drops only --quiet, the bare --, pwsh -NoProfile /
+      # -File / -NonInteractive, and --config plus its value. --locked is KEPT, so
+      # flagging those twelve leaves eleven roster rows unknown (clippy, test,
+      # bridge-build, bridge-clippy, manifest, smoke, check-arch, check-deps, fixtures,
+      # check-ci, check-unsafe) plus the drift step 4c, which the checker knows through
+      # the AGGREGATE constant in check_ci.rs rather than a row. Measured tonight on a
+      # flagged scratch copy of this file: check-ci exits 1 with 11x [step-missing] plus
+      # 12x [step-extra] - and check-ci is itself a gate, so the tree would be left red.
+      # Both halves must move in one commit and the other half lives in crates/xtask
+      # (the rows in check.rs AND the AGGREGATE constant in check_ci.rs), outside this
+      # fence. The rows the follow-up needs, token-for-token as signature() sees them
+      # (--locked directly after the subcommand, in each row's args array too - the
+      # comparison is over args, the display string is cosmetic):
+      #   cargo clippy --locked --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings
+      #   cargo test --locked --workspace --exclude notes-bridge-gpui
+      #   cargo --config 'future-incompat-report.frequency="never"' --locked build -p notes-bridge-gpui --bin notes-gpui
+      #   cargo --config 'future-incompat-report.frequency="never"' --locked clippy -p notes-bridge-gpui --all-targets -- -D warnings
+      #   cargo run --locked -p xtask -- manifest
+      #   cargo run --locked -p xtask -- smoke
+      #   cargo run --locked -p xtask -- check-arch
+      #   cargo run --locked -p xtask -- check-deps
+      #   cargo run --locked -p xtask -- fixtures verify
+      #   cargo run --locked -p xtask -- check      (plus AGGREGATE: "cargo run --locked -p xtask check")
+      #   cargo run --locked -p xtask -- check-ci
+      #   cargo run --locked -p xtask -- check-unsafe
+      # So --locked is live today on the two jobs check-ci does not parse
+      # (bridge-gpui-advisory and core-portable; the latter also proves the lock
+      # resolves on Linux), and the gate steps get their flags in the follow-up carrying
+      # the matching rows. Partial and green beats complete and red, and this paragraph
+      # is the receipt for what is still missing.
+      #
+      # If a step ever fails with the error above, its meaning is exact: a manifest
+      # changed in that commit and the lock did not come with it. The fix is not to
+      # re-run it. Run cargo check (or cargo update -p <crate>) locally and commit the
+      # resulting Cargo.lock IN THE SAME COMMIT as the manifest: the lock is folded, not
+      # incidental, which is the convention the cargo help text does not state.
+      #
+      # Deliberately not added anywhere: --offline (the local cache resolves this whole
+      # graph offline today, which says nothing about a fresh runner cache after a
+      # migration that pulled the kit over the network, and an uncached-crate refusal has
+      # nothing to do with the change under review). And not on fmt: cargo fmt resolves
+      # no graph - measured: with the stale lock planted, fmt --all -- --check ran to its
+      # own formatting verdict and left the lock byte-identical.
+      #
       # --- 1. formatting (rustfmt defaults, AGENTS.md "Code conventions") ----
       # "--all" means every workspace member, notes-bridge-gpui included: the bridge is
       # ALREADY format-gated here, so it needs no duplicate fmt step further down.
@@ -435,7 +502,7 @@ jobs:
       # red with exit 2 as "fix the manifests, then find out whether the drift was real".
       - name: deps — cargo run -p xtask -- check-deps (member manifests match the workspace template)
         id: deps
-        if: ${ !cancelled() }}
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
@@ -662,6 +729,9 @@ jobs:
 
       # Its OWN step: "cargo test" also compiles, so merging it with the summary below
       # would hide which of the two - a build break or a test/window failure - happened.
+      # --locked here (and in core-portable) because check-ci parses the GATE job only,
+      # so this half of the lock authority can land today without desynchronising the
+      # roster; the gate steps get the flag in the commit that carries the matching rows.
       # --no-fail-fast: with no test suite yet, the value here is the full list of
       # whatever does exist, not the first failure.
       - name: test — cargo test -p notes-bridge-gpui (advisory - may need a desktop session)
@@ -671,7 +741,7 @@ jobs:
         run: |
           set -o pipefail
           status=0
-          cargo test -p notes-bridge-gpui --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/gpui-test.log" || status=$?
+          cargo test --locked -p notes-bridge-gpui --no-fail-fast 2>&1 | tee "$RUNNER_TEMP/gpui-test.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           exit $status
 
@@ -691,10 +761,10 @@ jobs:
           errs=$(grep -c '^error' "$log" || true)
           passed=$(grep -cE '^test [^ ]+ \.\.\. ok$' "$log" || true)
           if [ "$status" = "0" ]; then
-            echo "gpui-bridge: GREEN — cargo test -p notes-bridge-gpui exit 0, ${passed:-0} tests passed, ${errs:-0} error lines. Advisory job; the gate does not depend on it."
+            echo "gpui-bridge: GREEN — cargo test --locked -p notes-bridge-gpui exit 0, ${passed:-0} tests passed, ${errs:-0} error lines. Advisory job; the gate does not depend on it."
           else
             first=$(grep -m1 -E '^(error|panic)' "$log" || true)
-            echo "::warning::gpui-bridge: RED — cargo test -p notes-bridge-gpui exit ${status}, ${errs:-?} error lines; first: ${first:-none captured}. Ambiguous by design (broken code vs. no window on a headless runner), which is why it is advisory. The gate's bridge steps (fmt/build/clippy) carry the real verdict."
+            echo "::warning::gpui-bridge: RED — cargo test --locked -p notes-bridge-gpui exit ${status}, ${errs:-?} error lines; first: ${first:-none captured}. Ambiguous by design (broken code vs. no window on a headless runner), which is why it is advisory. The gate's bridge steps (fmt/build/clippy) carry the real verdict."
           fi
 
   # ===========================================================================
@@ -720,11 +790,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
 
-      - name: clippy — cargo clippy -p notes-core -p xtask --all-targets -- -D warnings
-        run: cargo clippy -p notes-core -p xtask --all-targets -- -D warnings
+      - name: clippy — cargo clippy --locked -p notes-core -p xtask --all-targets -- -D warnings
+        run: cargo clippy --locked -p notes-core -p xtask --all-targets -- -D warnings
 
-      - name: test — cargo test -p notes-core -p xtask
-        run: cargo test -p notes-core -p xtask
+      - name: test — cargo test --locked -p notes-core -p xtask
+        run: cargo test --locked -p notes-core -p xtask
 
       # Same verifier, on Linux, on purpose - not decoration. Manifest keys are flat
       # filenames (a test asserts none contains a backslash), joined with Path::join, and
@@ -733,6 +803,6 @@ jobs:
       # Windows gate means either a path-separator assumption leaked into the verifier or
       # a Linux checkout normalised fixture bytes (the "binary" rule in .gitattributes
       # stopped holding). check-arch and check-docs.ps1 stay Windows-only; see above.
-      - name: fixtures — cargo run -p xtask -- fixtures verify (encoding fixtures are byte-exact vs manifest)
+      - name: fixtures — cargo run --locked -p xtask -- fixtures verify (encoding fixtures are byte-exact vs manifest)
         if: ${{ !cancelled() }}
-        run: cargo run -p xtask -- fixtures verify
+        run: cargo run --locked -p xtask -- fixtures verify
