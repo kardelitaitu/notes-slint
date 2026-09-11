@@ -1,4 +1,3 @@
-//! The recent-files MRU list (features.md 4.5).
 //!
 //! Filesystem honesty: identity_key (via canonicalise) is the ONLY function
 //! in this module that touches the filesystem — and even it never writes.
@@ -291,29 +290,14 @@ fn identity_of(path: &Path) -> (String, bool) {
 /// spellings of one file still meet (both canonicalise to the same on-disk
 /// casing) while two distinct files stay distinct.
 ///
-/// OPEN BOUNDARY (probed by tests/recents_identity.rs): case variants and
-/// junctions unify today; a mapped-drive vs UNC spelling of the SAME share
-/// can still yield two keys, and core cannot see the volume identity behind
-/// a path. If that case ever matters, the platform fact to request is
-/// `final_identity_path(path) -> Option<String>` — GetFinalPathNameByHandleW
-/// with FILE_NAME_NORMALIZED | VOLUME_NAME_GUID — and core would key on that
-/// string verbatim (platform decides nothing; core keeps the policy).
-///
-/// THE INTEGRATION CONTRACT, once that fact exists:
-/// * the GUID form is the KEY and NEVER the display or the stored path — a
-///   volume GUID in a recents menu is unreadable, and Command::Open needs an
-///   openable path, so RecentEntry keeps the user spelling / DOS-canonical
-///   form exactly as today;
-/// * a GUID key survives a drive REASSIGNMENT (its purpose) but not a
-///   reformat (a fresh volume mints a fresh GUID — a fresh install is the
-///   one place nobody expects recents to survive) and not a clone-to-
-///   another-volume (self-healing: the stale entry greys out via
-///   mark_missing and ages out);
-/// * on None, identity_of falls back to the EXISTING chain (canonicalise,
-///   then the lexical fallback already pinned by
-///   the_lexical_identity_key_pins_the_folding_rule) — the two-spelling
-///   defect resurfaces only for the duration of that fallback, which is
-///   honest and better than refusing to dedupe at all.
+/// VOLUME-IDENTITY QUESTION: CLOSED. Case variants, junctions and subst
+/// already collapse (canonicalise resolves through them; probed by
+/// tests/recents_identity.rs). The one residual case is a mapped network
+/// drive versus its UNC spelling; the platform-side fact for it
+/// (final_identity_path, GetFinalPathNameByHandleW with VOLUME_NAME_GUID)
+/// landed and is called by nobody. Reopen only if that duplication is
+/// reported in the wild — the identity question does not authorize any
+/// change here on its own.
 fn key_from_canonical(raw: &str) -> String {
     strip_verbatim(raw)
 }

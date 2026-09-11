@@ -509,6 +509,15 @@ mod tests {
             (concat!(r"\\?\C:\x.notes", r"\"), PathVerdict::Allowed), // trailing backslash
             (r"\??\C:\x.notes", PathVerdict::ReservedDevice),
             (r"\\.\PhysicalDrive0", PathVerdict::ReservedDevice),
+            // VOLUME-IDENTITY GATE: a volume-GUID name can never be
+            // authorised for a write. If anyone widens the extended-prefix
+            // carve-out so an identity string re-enters as an openable path,
+            // this row fails - the guarantee expressed as a gate, not a
+            // comment.
+            (
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\note.notes",
+                PathVerdict::ReservedDevice,
+            ),
         ];
         for (p, expected) in cases {
             assert_eq!(v(Path::new(p)), *expected, "{p}");
