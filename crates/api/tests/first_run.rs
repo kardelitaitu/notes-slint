@@ -24,6 +24,7 @@ use notes_api::{Command, Event, Gateway, Settings as ApiSettings, StateDir, Wind
 
 // thiserror is a dependency of notes-api, not of this target; naming it keeps
 // the unused-crate-dependencies lint honest.
+use notes_platform as _;
 use thiserror as _;
 
 /// The one setup step every scenario shares: the window exists before anything
@@ -358,9 +359,8 @@ fn a_directory_on_session_json_is_reported_and_the_scratch_still_lands() {
     );
     let deadline = Instant::now() + ANSWER;
     loop {
-        match expect_event(&rx, deadline) {
-            Event::SessionWriteFailed { .. } => break,
-            _ => {}
+        if let Event::SessionWriteFailed { .. } = expect_event(&rx, deadline) {
+            break;
         }
     }
     std::thread::sleep(TICK + Duration::from_millis(200));
@@ -406,12 +406,9 @@ fn a_file_where_the_notes_dir_belongs_still_skips_and_writes_nothing() {
         .expect("queued");
     let deadline = Instant::now() + ANSWER;
     loop {
-        match expect_event(&rx, deadline) {
-            Event::AutosaveSkipped { reason } => {
-                assert_eq!(format!("{reason:?}"), "NeedsPath");
-                break;
-            }
-            _ => {}
+        if let Event::AutosaveSkipped { reason } = expect_event(&rx, deadline) {
+            assert_eq!(format!("{reason:?}"), "NeedsPath");
+            break;
         }
     }
     assert!(!scratch_of(dir.path()).exists(), "no scratch was written");
@@ -458,12 +455,9 @@ fn a_dangling_junction_on_the_notes_dir_is_refused_fast_with_needs_path() {
         .expect("queued");
     let deadline = Instant::now() + ANSWER;
     loop {
-        match expect_event(&rx, deadline) {
-            Event::AutosaveSkipped { reason } => {
-                assert_eq!(format!("{reason:?}"), "NeedsPath");
-                break;
-            }
-            _ => {}
+        if let Event::AutosaveSkipped { reason } = expect_event(&rx, deadline) {
+            assert_eq!(format!("{reason:?}"), "NeedsPath");
+            break;
         }
     }
     assert!(
@@ -516,12 +510,9 @@ fn a_write_denied_scratch_still_skips_and_leaves_the_stale_bytes() {
         .expect("queued");
     let deadline = Instant::now() + ANSWER;
     loop {
-        match expect_event(&rx, deadline) {
-            Event::AutosaveSkipped { reason } => {
-                assert_eq!(format!("{reason:?}"), "NeedsPath");
-                break;
-            }
-            _ => {}
+        if let Event::AutosaveSkipped { reason } = expect_event(&rx, deadline) {
+            assert_eq!(format!("{reason:?}"), "NeedsPath");
+            break;
         }
     }
     assert_eq!(
@@ -582,12 +573,9 @@ fn ten_entries_plus_a_deleted_scratch_survive_the_relaunch_as_stale() {
     );
     let deadline = Instant::now() + ANSWER;
     loop {
-        match expect_event(&rx, deadline) {
-            Event::RecentsUpdated(entries) => {
-                assert_eq!(entries.len(), 10, "the seeded list, at the ten cap");
-                break;
-            }
-            _ => {}
+        if let Event::RecentsUpdated(entries) = expect_event(&rx, deadline) {
+            assert_eq!(entries.len(), 10, "the seeded list, at the ten cap");
+            break;
         }
     }
     gateway.close().expect("quit joins");
@@ -601,22 +589,18 @@ fn ten_entries_plus_a_deleted_scratch_survive_the_relaunch_as_stale() {
     );
     let deadline = Instant::now() + ANSWER;
     loop {
-        match expect_event(&rx, deadline) {
-            Event::RecentsUpdated(entries) => {
-                let stale = entries.iter().find(|e| e.path == scratch);
-                assert!(
-                    stale.is_some(),
-                    "features.md:89: the deleted scratch must survive as stale, not vanish"
-                );
-                assert_eq!(
-                    stale.expect("the stale entry").exists,
-                    false,
-                    "stale means exists == false"
-                );
-                assert_eq!(entries.len(), 10, "and the other nine are still there");
-                break;
-            }
-            _ => {}
+        if let Event::RecentsUpdated(entries) = expect_event(&rx, deadline) {
+            let stale = entries.iter().find(|e| e.path == scratch);
+            assert!(
+                stale.is_some(),
+                "features.md:89: the deleted scratch must survive as stale, not vanish"
+            );
+            assert!(
+                !stale.expect("the stale entry").exists,
+                "stale means exists == false"
+            );
+            assert_eq!(entries.len(), 10, "and the other nine are still there");
+            break;
         }
     }
     second.close().expect("second quit joins");
