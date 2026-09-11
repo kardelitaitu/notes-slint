@@ -1146,6 +1146,18 @@ fn main() {
             // `Event::GeometryNotRestored` and the status line says so, in
             // notes-platform's own words.
 
+            // STEP 5 - ASK FOR THE DOCUMENT THAT WAS OPEN. The session carries the path
+            // and nothing in the app asked for it, which is why a relaunch came back to an
+            // EMPTY editor while the bytes sat on disk (named in b343543). This is one
+            // command of EXISTING vocabulary, and its answer is the `Loaded` the wire
+            // already applies - so it is a send, not a subsystem. No path, no ask: a first
+            // launch and an untitled note that was never written come back the way they
+            // should, empty.
+            if let Some(path) = initial.session.path.clone() {
+                report(&format!("startup: asking the port for {}", path.display()));
+                send(&gateway, Command::Open { path });
+            }
+
             // The old startup drain is gone: the pump drains on its first wake,
             // 8 ms from now, and renders what the startup produced instead of
             // discarding it.
