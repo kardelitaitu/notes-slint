@@ -290,6 +290,14 @@ fn identity_of(path: &Path) -> (String, bool) {
 /// folding — the spelling is the OS's own answer for a real file, so two
 /// spellings of one file still meet (both canonicalise to the same on-disk
 /// casing) while two distinct files stay distinct.
+///
+/// OPEN BOUNDARY (probed by tests/recents_identity.rs): case variants and
+/// junctions unify today; a mapped-drive vs UNC spelling of the SAME share
+/// can still yield two keys, and core cannot see the volume identity behind
+/// a path. If that case ever matters, the platform fact to request is
+/// `final_identity_path(path) -> Option<String>` — GetFinalPathNameByHandleW
+/// with FILE_NAME_NORMALIZED | VOLUME_NAME_GUID — and core would key on that
+/// string verbatim (platform decides nothing; core keeps the policy).
 fn key_from_canonical(raw: &str) -> String {
     strip_verbatim(raw)
 }
