@@ -28,6 +28,14 @@
 //!   change this rule exists to catch, and two adjacent blocks can borrow one
 //!   comment's lookback window, so the arithmetic catches what a per-site scan
 //!   cannot.
+//! * [raw-ffi-imbalance] - THE TRIPWIRE, and the reason this rule counts extern
+//!   blocks at all. A crate holding MORE extern blocks than unsafe-qualified
+//!   declarations has by construction at least one BARE `extern "..." { }`, which
+//!   is the shape every other rule here is blind to. It is arithmetic rather than
+//!   a pattern list on purpose: it fires on a spelling this file has never seen,
+//!   and its message names the subtraction, mirroring [crate::arch]'s
+//!   lineage-unrecognised rule, which says out loud that it keys on names it may
+//!   not know.
 //! * [lint-missing] / [lint-escape] - the workspace must set unsafe_code =
 //!   "forbid" under [workspace.lints.rust], and notes-platform is the only
 //!   manifest allowed to relax it, and never all the way to "allow".
@@ -54,19 +62,35 @@
 //!   in the tree", never as "exactly this much compiles".
 //! * an allowance reached through a derive, or written across several lines, is
 //!   not matched.
-//! * a BARE extern "system" { fn ... } declaration is invisible: every rule here keys
-//!   on the unsafe token, and the 2024 edition does not require unsafe to DECLARE a
-//!   foreign function. Measured and pinned by
-//!   [the_scanner_sees_the_2024_form_and_is_blind_to_the_bare_one]: the form this repo
-//!   actually uses (crates/platform/src/windows/paths.rs writes unsafe extern
-//!   "system") IS caught, and so is every call, because calling a foreign function
-//!   needs an unsafe block in every edition. What slips through is a bare declaration
-//!   that is never called - dead code that reaches nothing. The shape to fund if that
-//!   ever matters is a per-crate count of extern blocks beside the block/SAFETY/
-//!   declaration counts already in the ledger, with the allowed home named in the
-//!   printout rather than assumed.
+//! * a BARE extern "system" { fn ... } declaration is still INVISIBLE to every PATTERN
+//!   rule here: the rules key on the unsafe token, and the 2024 edition does not
+//!   require unsafe to DECLARE a foreign function. Measured and pinned by
+//!   [the_scanner_sees_the_2024_form_and_is_blind_to_the_bare_one], which this slice
+//!   deliberately leaves true - [scan_foreign] does not match a bare block, and if a
+//!   future edit makes it match, that test is the thing that has to be rewritten on
+//!   purpose rather than a number quietly re-aimed. What closed is the OTHER half: the
+//!   ledger now counts extern BLOCKS per crate ([count_ffi]) and subtracts the
+//!   unsafe-qualified declarations from them ([ffi_findings]), so a crate that carries a
+//!   bare one is caught by arithmetic without anyone having to think of the spelling.
+//!   Funded shape, now built: per-crate count, allowed home printed, tripwire firing on
+//!   the count rather than on the pattern.
+//! * what the tripwire still cannot see, stated so a green row is not read as a proof:
+//!   an extern block whose `{` sits on the next line (rustfmt keeps it on the header
+//!   line and the fmt row gates first, but alone this would miss it, exactly as the
+//!   "unsafe" newline "{" limit above); an extern block emitted by a macro, which the
+//!   text reader never sees at all; and the MASKING case - one bare block plus one
+//!   unrelated `unsafe fn` in the same crate is 1 block against 1 declaration, so the
+//!   subtraction says nothing. The mask only exists where unsafe declarations are
+//!   already legal: outside notes-platform an unsafe declaration is itself a
+//!   [unsafe-outside-platform] finding, so in every crate that is not the sanctioned
+//!   home the denominator is zero by construction and a single bare block fires. That is
+//!   why the rule is trusted where it matters and soft where it is allowed to be.
+//! * a build script adding `-lkernel32` with no call anywhere is invisible to every
+//!   instrument in this repo, not just to this one: check-arch reads metadata edges and
+//!   a link flag is not an edge, and no self-check can notice an ABSENCE of a call. That
+//!   hole is documented on purpose and stays open.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -80,6 +104,9 @@ pub const NO_SAFETY: &str = "unsafe-without-safety";
 pub const LOCAL_ALLOWANCE: &str = "local-allowance";
 pub const ALLOWANCE_OUTSIDE: &str = "allowance-outside-platform";
 pub const LEDGER_IMBALANCE: &str = "ledger-imbalance";
+/// The tripwire: a crate holding MORE extern blocks than unsafe-qualified
+/// declarations is holding a bare one, counted rather than pattern-matched.
+pub const RAW_FFI_IMBALANCE: &str = "raw-ffi-imbalance";
 pub const LINT_MISSING: &str = "lint-missing";
 pub const LINT_ESCAPE: &str = "lint-escape";
 
@@ -102,6 +129,34 @@ impl Finding {
     }
 }
 
+/// One crate's share of the raw-FFI row of the ledger, counted over EVERY file the
+/// package owns - sources, tests, benches, examples and build.rs. `extern_blocks`
+/// counts block HEADERS whether or not they carry the unsafe keyword; that is the
+/// half this file could not previously see. `unsafe_declarations` is the same
+/// measurement as [Ledger::declarations], kept per crate because the tripwire
+/// compares the two INSIDE a crate: across the workspace the numbers are not
+/// comparable at all.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FfiCensus {
+    pub extern_blocks: usize,
+    pub unsafe_declarations: usize,
+}
+
+impl FfiCensus {
+    /// Fold one file into its crate row. Sum, never max: two files holding one
+    /// bare block each must not read as one.
+    pub fn add(&mut self, other: &FfiCensus) {
+        self.extern_blocks += other.extern_blocks;
+        self.unsafe_declarations += other.unsafe_declarations;
+    }
+
+    /// What the subtraction proves about this crate. Positive means a bare block
+    /// exists; zero is NOT a proof that none does - one unrelated unsafe
+    /// declaration in the same crate balances it there.
+    pub fn bare_by_count(&self) -> usize {
+        self.extern_blocks.saturating_sub(self.unsafe_declarations)
+    }
+}
 /// The printed ledger. Every field is a measurement of the current tree.
 #[derive(Debug, Default, Clone)]
 pub struct Ledger {
@@ -110,6 +165,9 @@ pub struct Ledger {
     pub declarations: usize,
     pub allowances: Vec<String>,
     pub files: usize,
+    /// Raw FFI by crate. A BTreeMap so the printout is in name order and a diff
+    /// of two runs is a diff of the tree, not of a hash map's iteration.
+    pub ffi: BTreeMap<String, FfiCensus>,
 }
 fn is_comment(line: &str) -> bool {
     let t = line.trim_start();
@@ -251,6 +309,64 @@ pub fn scan_platform(file: &str, text: &str) -> (Ledger, Vec<Finding>) {
     (ledger, findings)
 }
 
+/// True when the line OPENS an extern block: `extern` (optionally preceded by
+/// `unsafe`, optionally followed by an ABI string) with the `{` on the same line.
+/// Deliberately does NOT require the unsafe keyword - that is the whole point, the
+/// 2024 edition makes the keyword optional at declaration time. Requires an ABI
+/// string or a brace so it does not read `extern crate`, nor a one-line
+/// `extern "system" fn f() {}`, as a block.
+fn is_extern_block(line: &str) -> bool {
+    let words: Vec<&str> = code_part(line).split_whitespace().collect();
+    let Some(at) = words.iter().position(|w| *w == "extern") else {
+        return false;
+    };
+    // The header is `extern`, then at most one ABI string, then `{`. An ABI is
+    // matched by SHAPE, not from a list of spellings - a new calling convention
+    // is still an extern block, and a name list here would be the thing
+    // [crate::arch]'s lineage rule refuses to be.
+    let rest = match words.get(at + 1) {
+        Some(w) => *w,
+        None => return false,
+    };
+    // `extern {` - no ABI, C by default, and it opens a block right here.
+    if rest.starts_with('{') {
+        return true;
+    }
+    // An ABI literal must OPEN with a real quote in the source text. A backslash
+    // does not: `extern \"system\"` is a string in somebody's fixture, not a block.
+    if !rest.starts_with('"') {
+        return false; // `extern crate`, `extern "C" fn ...`: not this line's block
+    }
+    let after_quote = &rest[1..];
+    match after_quote.find('"') {
+        // `"system"{` or `"system"` - the brace is either glued on or the next word.
+        Some(i) => {
+            let tail = &after_quote[i + 1..];
+            tail.contains('{') || words.get(at + 2).is_some_and(|w| w.starts_with('{'))
+        }
+        None => false,
+    }
+}
+
+/// The raw-FFI census for one file, over EVERY line the ledger ignores nothing:
+/// doc and comment prose is skipped like everywhere else here, so a paragraph
+/// about extern blocks does not arm the tripwire.
+pub fn count_ffi(text: &str) -> FfiCensus {
+    let mut census = FfiCensus::default();
+    for line in text.split('\n') {
+        if is_doc(line) || is_comment(line) {
+            continue;
+        }
+        if is_extern_block(line) {
+            census.extern_blocks += 1;
+        }
+        if is_declaration(line) {
+            census.unsafe_declarations += 1;
+        }
+    }
+    census
+}
+
 /// Scan a file in a crate that may not contain unsafe at all. A SAFETY comment
 /// buys nothing here: the location is the violation.
 pub fn scan_foreign(file: &str, text: &str) -> Vec<Finding> {
@@ -372,6 +488,63 @@ pub fn ledger_findings(ledger: &Ledger) -> Option<Finding> {
             ledger.blocks, ledger.safety_comments
         ),
     })
+}
+
+/// THE TRIPWIRE, and the reason the extern count is in the ledger at all. Inside
+/// one crate, `extern_blocks > unsafe_declarations` can only mean the crate holds
+/// at least `blocks - declarations` BARE extern blocks - the spelling every other
+/// rule here keys on `unsafe` for, and therefore cannot see. No pattern list is
+/// involved, so an ABI or a formatting trick nobody thought of still fires it.
+///
+/// It also says where its own eyes are wrong, the way [crate::arch]'s
+/// lineage-unrecognised rule does: an unrelated `unsafe fn` in the same crate
+/// balances the subtraction and a bare block then reads green, and a block emitted
+/// by a macro is counted on neither side. A clean row here is arithmetic, not a
+/// proof - which is exactly what the message of a red row is worth.
+pub fn ffi_findings(ffi: &BTreeMap<String, FfiCensus>) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for (name, census) in ffi {
+        if census.extern_blocks <= census.unsafe_declarations {
+            continue;
+        }
+        let bare = census.extern_blocks - census.unsafe_declarations;
+        out.push(Finding {
+            rule: RAW_FFI_IMBALANCE,
+            location: name.clone(),
+            detail: format!(
+                "{} extern blocks against {} unsafe-qualified declarations: {} - {} = {} BARE \
+                 extern block(s). A bare block carries no unsafe token, so every rule above is blind to it by \
+                 construction; this finding is the SUBTRACTION, so it never needed to recognise the spelling that \
+                 hid it. It is also admitting where its own eyes are: a block a macro emits is counted on neither \
+                 side, one more unsafe declaration in this crate would have balanced the subtraction to green, and \
+                 a build script passing -lkernel32 leaves no count for anything to compare. {} is the only crate \
+                 allowed to declare foreign functions{}",
+                census.extern_blocks,
+                census.unsafe_declarations,
+                census.extern_blocks,
+                census.unsafe_declarations,
+                bare,
+                PLATFORM_CRATE,
+                if name == PLATFORM_CRATE {
+                    "- so here it is legal Rust the SAFETY ledger cannot see at all: write the API \
+                     and the invariant into a comment above the block, or qualify the block as unsafe \
+                     extern so the ledger counts it"
+                        .to_string()
+                } else {
+                    format!(" - and this is not it; raw FFI belongs in {PLATFORM_DIR}")
+                }
+            ),
+        });
+    }
+    out
+}
+
+/// The tripwire's own arithmetic, spelled out for the green case too: the largest
+/// bare-by-count total the ledger can prove. Zero means no crate has more blocks
+/// than declarations, which is a claim about subtraction, not about the scanner
+/// having seen every shape.
+pub fn bare_by_count(ffi: &BTreeMap<String, FfiCensus>) -> usize {
+    ffi.values().map(FfiCensus::bare_by_count).sum()
 }
 
 fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -516,6 +689,11 @@ pub fn run(args: &[String]) -> i32 {
                 });
                 continue;
             };
+            // The raw-FFI census is taken over EVERY crate, platform included: the
+            // tripwire is per-crate arithmetic, so the sanctioned home needs its own
+            // row as much as the crate that might be smuggling one does.
+            let census = count_ffi(&source);
+            ledger.ffi.entry(name.clone()).or_default().add(&census);
             if is_platform {
                 let (one, mut f) = scan_platform(&rel, &source);
                 ledger.blocks += one.blocks;
@@ -536,6 +714,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     findings.extend(check_lints(&workspace_manifest, &manifests));
     findings.extend(ledger_findings(&ledger));
+    findings.extend(ffi_findings(&ledger.ffi));
 
     for line in &findings {
         println!("{}", line.message());
@@ -544,6 +723,32 @@ pub fn run(args: &[String]) -> i32 {
         "unsafe: {} blocks, {} SAFETY comments in {PLATFORM_CRATE} ({} source files scanned, {} \
          unsafe declarations)",
         ledger.blocks, ledger.safety_comments, ledger.files, ledger.declarations
+    );
+    let extern_total: usize = ledger.ffi.values().map(|c| c.extern_blocks).sum();
+    let declared_total: usize = ledger.ffi.values().map(|c| c.unsafe_declarations).sum();
+    let bare = bare_by_count(&ledger.ffi);
+    let rows: Vec<String> = ledger
+        .ffi
+        .iter()
+        .map(|(n, c)| {
+            format!(
+                "{n}: {} blocks / {} unsafe declarations",
+                c.extern_blocks, c.unsafe_declarations
+            )
+        })
+        .collect();
+    println!(
+        "unsafe: raw FFI per crate (extern blocks counted BARE AND unsafe-qualified / unsafe-qualified \
+         declarations). The only home allowed to declare foreign functions is {PLATFORM_CRATE} at \
+         {PLATFORM_DIR}, so every other row must read 0: {}",
+        rows.join(", ")
+    );
+    println!(
+        "unsafe: tripwire {extern_total} extern blocks - {declared_total} unsafe-qualified \
+         declarations = {bare} BARE by count, and no crate shows more blocks than its own \
+         declarations. That is arithmetic, not a survey: a bare block still matches no pattern \
+         above, a block a macro emits is counted on neither side, and a build script passing \
+         -lkernel32 leaves no count anywhere to subtract.",
     );
     if ledger.allowances.is_empty() {
         println!("unsafe: no module-root #![allow(unsafe_code)] anywhere");
@@ -567,10 +772,14 @@ mod tests {
     /// The fixtures spell the keyword ~U~ on purpose: this module's own scanner
     /// reads a string literal containing the real thing as code (its documented
     /// text-parse limit, and the strict direction), so a test written normally
-    /// would flag the test file as containing unsafe. The normaliser only
-    /// substitutes the keyword back; it cannot hide a violation.
+    /// would flag the test file as containing unsafe. ~E~ is the same trap for the
+    /// raw-FFI census, which keys on the word `extern` and not on `unsafe`: a
+    /// fixture that opened an extern block in ordinary text would arm the tripwire
+    /// against crates/xtask itself. The normaliser only substitutes the keywords
+    /// back; it cannot hide a violation.
     fn fix(text: &str) -> String {
         text.replace("~U~", &["un", "safe"].concat())
+            .replace("~E~", &["ex", "tern"].concat())
     }
 
     /// The shape the crate already uses: a SAFETY line, some argument building,
@@ -742,7 +951,7 @@ mod tests {
 
     #[test]
     fn a_declaration_is_counted_separately_from_a_block() {
-        let src = "pub ~U~ extern \"system\" {\n    fn SetWindowPos() -> i32;\n}\n";
+        let src = "pub ~U~ ~E~ \"system\" {\n    fn SetWindowPos() -> i32;\n}\n";
         let (ledger, findings) = plat(src);
         assert_eq!(ledger.declarations, 1);
         assert_eq!(
@@ -773,7 +982,7 @@ mod tests {
         // own convention: the scanner reads a literal containing the keyword as
         // code, so a test written normally would flag its own file.
         let ffi_2024 =
-            "~U~ extern \"system\" {\n    fn GetFinalPathNameByHandleW(a: u32) -> i32;\n}\n";
+            "~U~ ~E~ \"system\" {\n    fn GetFinalPathNameByHandleW(a: u32) -> i32;\n}\n";
         let found: Vec<String> = scan_foreign("crates/core/src/x.rs", &fix(ffi_2024))
             .iter()
             .map(|f| f.rule.to_string())
@@ -784,11 +993,181 @@ mod tests {
             !scan_foreign("crates/core/src/x.rs", &fix(call)).is_empty(),
             "the USE of any FFI needs an unsafe block in every edition, and that is caught"
         );
-        let bare = "extern \"system\" {\n    fn GetFinalPathNameByHandleW(a: u32) -> i32;\n}\n";
+        let bare = "~E~ \"system\" {\n    fn GetFinalPathNameByHandleW(a: u32) -> i32;\n}\n";
         assert!(
-            scan_foreign("crates/core/src/x.rs", bare).is_empty(),
+            scan_foreign("crates/core/src/x.rs", &fix(bare)).is_empty(),
             "documented blind spot: a bare extern DECLARATION is invisible to a reader that
              keys on the unsafe keyword - and on its own it is also dead code"
+        );
+    }
+
+    /// THE OTHER HALF of the gap pinned above, and the funded reason for this
+    /// slice: the scanner still cannot match the bare block - the census counts it,
+    /// and the subtraction is what fires.
+    #[test]
+    fn the_census_counts_the_bare_block_the_scanner_cannot_see() {
+        let bare = "~E~ \"system\" {\n    fn GetFinalPathNameByHandleW(a: u32) -> i32;\n}\n";
+        let c = count_ffi(&fix(bare));
+        assert_eq!(
+            (c.extern_blocks, c.unsafe_declarations),
+            (1, 0),
+            "a bare block is counted as a block and as nothing else",
+        );
+        let qualified = "~U~ ~E~ \"system\" {\n    fn SetWindowPos() -> i32;\n}\n";
+        let q = count_ffi(&fix(qualified));
+        assert_eq!(
+            (q.extern_blocks, q.unsafe_declarations),
+            (1, 1),
+            "the 2024 form is one block AND one unsafe declaration",
+        );
+        assert_eq!(q.bare_by_count(), 0, "1 - 1 proves nothing was hidden");
+        assert_eq!(c.bare_by_count(), 1, "1 - 0 is the finding");
+    }
+
+    #[test]
+    fn the_tripwire_message_names_the_arithmetic_and_the_allowed_home() {
+        let mut ffi = BTreeMap::new();
+        ffi.insert(
+            "notes-core".to_string(),
+            FfiCensus {
+                extern_blocks: 3,
+                unsafe_declarations: 1,
+            },
+        );
+        let f = ffi_findings(&ffi);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule, RAW_FFI_IMBALANCE);
+        assert_eq!(f[0].location, "notes-core");
+        let m = f[0].message();
+        for needed in [
+            "3 extern blocks against 1 unsafe-qualified declarations",
+            "3 - 1 = 2 BARE",
+            PLATFORM_CRATE,
+            PLATFORM_DIR,
+            "SUBTRACTION",
+            "macro",
+            "-lkernel32",
+        ] {
+            assert!(m.contains(needed), "the message must say {needed}: {m}");
+        }
+        assert!(
+            m.contains("and this is not it"),
+            "a crate that is not the home is told so: {m}"
+        );
+        let in_home = {
+            let mut one = BTreeMap::new();
+            one.insert(
+                PLATFORM_CRATE.to_string(),
+                FfiCensus {
+                    extern_blocks: 2,
+                    unsafe_declarations: 0,
+                },
+            );
+            ffi_findings(&one)
+        };
+        assert_eq!(
+            in_home.len(),
+            1,
+            "the sanctioned home is not exempt from arithmetic"
+        );
+        assert!(
+            in_home[0]
+                .message()
+                .contains("legal Rust the SAFETY ledger cannot see"),
+            "but it is told a different thing: {}",
+            in_home[0].message()
+        );
+    }
+
+    /// The two mechanisms must be shown COMPLEMENTARY: the qualified form is
+    /// balanced arithmetic (silent tripwire) and is carried by the keyword rule,
+    /// while the bare form is the reverse.
+    #[test]
+    fn the_qualified_form_is_the_other_rules_job_and_the_bare_form_is_this_one() {
+        let qualified = "~U~ ~E~ \"C\" {\n    fn W() -> i32;\n}\n";
+        let keyword = scan_foreign("crates/core/src/ffi.rs", &fix(qualified));
+        assert_eq!(
+            keyword[0].rule, UNSAFE_OUTSIDE,
+            "caught by the pattern rule"
+        );
+        let mut ffi = BTreeMap::new();
+        ffi.insert("notes-core".to_string(), count_ffi(&fix(qualified)));
+        assert!(
+            ffi_findings(&ffi).is_empty(),
+            "1 - 1 is no evidence of a bare block, so the tripwire stays quiet"
+        );
+        let bare = "~E~ \"C\" {\n    fn W() -> i32;\n}\n";
+        assert!(
+            scan_foreign("crates/core/src/ffi.rs", &fix(bare)).is_empty(),
+            "the pattern rule is still blind - the gap test above must stay true"
+        );
+        let mut ffi2 = BTreeMap::new();
+        ffi2.insert("notes-core".to_string(), count_ffi(&fix(bare)));
+        assert_eq!(
+            ffi_findings(&ffi2).len(),
+            1,
+            "the arithmetic is what catches it"
+        );
+    }
+
+    /// The limit stated in the header, pinned so it cannot be forgotten: an
+    /// unrelated unsafe declaration in the same crate balances the subtraction.
+    #[test]
+    fn an_unrelated_unsafe_declaration_masks_a_bare_block_and_says_so() {
+        let masked = "~U~ fn helper() {}\n~E~ \"system\" {\n    fn W();\n}\n";
+        let c = count_ffi(&fix(masked));
+        assert_eq!((c.extern_blocks, c.unsafe_declarations), (1, 1));
+        assert_eq!(
+            c.bare_by_count(),
+            0,
+            "documented blind spot of the arithmetic"
+        );
+    }
+
+    #[test]
+    fn a_pointer_a_crate_and_prose_are_not_extern_blocks() {
+        for src in [
+            "type WndProc = ~U~ ~E~ \"system\" fn(HWND, u32) -> LRESULT;\n",
+            "~E~ crate nothing;\n",
+            "~U~ ~E~ \"system\" fn wndproc(h: HWND) -> i32 { 0 }\n",
+            "// ~E~ \"system\" {\n",
+            "/// opens an ~E~ \"C\" { block in prose\n",
+            "let s = \"~E~ \\\"system\\\" { is only text\";\n",
+        ] {
+            assert_eq!(count_ffi(&fix(src)).extern_blocks, 0, "not a block: {src}");
+        }
+        assert_eq!(
+            count_ffi(&fix("~E~ {\n    fn f();\n}\n")).extern_blocks,
+            1,
+            "extern with no ABI is still a block"
+        );
+    }
+
+    /// THE FIXTURE HAZARD, pinned: this module is a workspace member, so its own
+    /// source is scanned by the rule it tests. A fixture that read as an extern
+    /// block would arm the tripwire against crates/xtask and ship the repo red.
+    #[test]
+    fn the_census_counts_nothing_in_its_own_source() {
+        let own = count_ffi(include_str!("check_unsafe.rs"));
+        assert_eq!(
+            own.extern_blocks, 0,
+            "a fixture that reads as an extern block arms the tripwire against this very crate: spell the word ~E~ and let fix() put it back"
+        );
+    }
+
+    #[test]
+    fn the_census_and_the_declaration_count_agree_on_platform_shapes() {
+        let src = "~U~ ~E~ \"system\" {\n    fn W() -> i32;\n}\n~U~ { C() };\n";
+        let (ledger, _) = plat(src);
+        let census = count_ffi(&fix(src));
+        assert_eq!(
+            ledger.declarations, census.unsafe_declarations,
+            "one predicate, two folds: they must not drift"
+        );
+        assert_eq!(census.extern_blocks, 1);
+        assert_eq!(
+            ledger.blocks, 1,
+            "the block is still counted as a block elsewhere"
         );
     }
 }
