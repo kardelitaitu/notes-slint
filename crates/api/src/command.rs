@@ -73,7 +73,17 @@ pub enum Command {
     /// whose revision is at or below the last saved revision means *clean*: core
     /// may report [`SkipReason::Clean`](crate::SkipReason::Clean), but on a path
     /// the user triggered by hand it must not go silent.
-    Flush { text: String, revision: u64 },
+    /// `epoch` is the bridge's own OPEN GENERATION: it increments every time
+    /// the bridge rebinds the document (Open, Save As) and is captured when an
+    /// edit is buffered, not when the debounced Flush fires. A Flush whose
+    /// epoch names a generation the engine has already replaced is DISCARDED
+    /// (with its own skip reason) - otherwise an in-flight edit for A lands
+    /// in the file named B, atomically, and reports Saved.
+    Flush {
+        text: String,
+        revision: u64,
+        epoch: u64,
+    },
 
     /// The menu's global auto-save toggle. Per-document arming is a different
     /// thing and lives in [`FileMeta::armed`](crate::FileMeta::armed); do not
@@ -135,9 +145,14 @@ mod tests {
                 text: text.clone(),
                 revision: *revision,
             },
-            Command::Flush { text, revision } => Command::Flush {
+            Command::Flush {
+                text,
+                revision,
+                epoch,
+            } => Command::Flush {
                 text: text.clone(),
                 revision: *revision,
+                epoch: *epoch,
             },
             Command::SetAutosave(on) => Command::SetAutosave(*on),
             Command::SetPinned(on) => Command::SetPinned(*on),
@@ -179,6 +194,7 @@ mod tests {
             Command::Flush {
                 text: "hello".to_string(),
                 revision: 7,
+                epoch: 0,
             },
             Command::SetAutosave(true),
             Command::SetPinned(false),
@@ -246,11 +262,13 @@ mod tests {
         assert_ne!(
             Command::Flush {
                 text: "x".into(),
-                revision: 1
+                revision: 1,
+                epoch: 0,
             },
             Command::Flush {
                 text: "x".into(),
-                revision: 2
+                revision: 2,
+                epoch: 0,
             }
         );
         assert_ne!(Command::SetAutosave(true), Command::SetAutosave(false));

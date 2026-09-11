@@ -102,6 +102,12 @@ pub enum SkipReason {
     /// The buffer matches what is on disk (D11: the `Flush` revision is at or
     /// below the last saved revision), so there is nothing to write.
     Clean,
+    /// The edit belonged to a document that has since been replaced (the open
+    /// generation moved on): the stale Flush was DISCARDED, and this says so -
+    /// silently dropping a user edit is the other failure mode. The bytes now
+    /// on disk are the CURRENT document's; the discarded text lived in a
+    /// buffer that no longer exists.
+    Superseded,
     /// We could not make a file for the note (D69): the scratch location or
     /// the write was refused. NOT "the note has no path" — the untitled note
     /// owns a scratch home (<StateDir>/notes/untitled.notes) that the engine
@@ -260,6 +266,26 @@ pub enum LoadError {
 /// Delivered on the UI thread. `RecentsUpdated` carries the whole list rather
 /// than a delta so the menu never has to reconstruct state it may have missed
 /// while the window did not exist.
+/// WHICH state file a failure names. A status line can say "settings could
+/// not be saved" only if the event carries the subject; [`Display`] renders
+/// the user-visible file name, lowercase, no path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateFile {
+    /// session.json - geometry, monitor, scale, pin, the open document.
+    Session,
+    /// settings.toml - the autosave toggle, the code page, the recents.
+    Settings,
+}
+
+impl std::fmt::Display for StateFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StateFile::Session => write!(f, "session"),
+            StateFile::Settings => write!(f, "settings"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// A file finished loading: the buffer text plus the facts needed to
@@ -326,8 +352,7 @@ pub enum Event {
     /// neither, and riding them here forced a `revision: 0` the UI could
     /// render and the user could believe; they now report through their own
     /// family
-    /// ([`Event::SessionWriteFailed`], [`Event::SettingsWriteFailed`],
-    /// [`Event::StateDirUnusable`]). The port builds this variant at exactly
+    /// ([`Event::StateWriteFailed`], [`Event::StateDirUnusable`]). The port builds this variant at exactly
     /// one site - `Engine::document_save_failed` - whose assert is the
     /// tripwire for the empty-path case core already refuses as InvalidPath
     /// (save.rs:141) before any save outcome exists.
@@ -366,8 +391,21 @@ pub enum Event {
     /// one error toast per tick, for a problem the user cannot act on from
     /// inside the app. [`reason`] is core's own sentence (its SessionError
     /// Display), passed through untranslated.
-    SessionWriteFailed {
-        /// What core said when the session write was refused, verbatim.
+    /// A STATE file refused to be written: the session, or the settings -
+    /// [`file`] names WHICH, so a status line can say "settings could not be
+    /// saved" without the UI knowing which call it just made. One variant for
+    /// both state files (D62 fold: two one-shot events with no subject became
+    /// one named one; the count stays 13 because [`Event::PinFailed`] arrives
+    /// in the same wave). Same latch discipline as before - one report per
+    /// failure, retried every tick, cleared on the next success - and the
+    /// same no-revision honesty: a state file HAS no revision, and the old
+    /// shape claimed `revision: 0` through [`Event::SaveFailed`], which is a
+    /// document event. [`reason`] is core's own sentence (the error's
+    /// Display), passed through untranslated.
+    StateWriteFailed {
+        /// Which state file refused.
+        file: StateFile,
+        /// What core said when the write was refused, verbatim.
         reason: String,
     },
     /// The state directory could not be created, or cannot be used as a
@@ -384,15 +422,14 @@ pub enum Event {
         /// What the OS said, or which path is not a directory.
         reason: String,
     },
-    /// settings.toml could not be written. The settings.toml twin of
-    /// [`Event::SessionWriteFailed`] - same latch discipline (one report per
-    /// failure episode, retried every tick, cleared on success), same no-
-    /// revision honesty: a settings file HAS no revision, and the old shape
-    /// claimed `revision: 0` through [`Event::SaveFailed`], which is a
-    /// document event. [`reason`] is core's own sentence (SettingsError's
-    /// Display), passed through untranslated.
-    SettingsWriteFailed {
-        /// What core said when the settings write was refused, verbatim.
+    /// The pin request could not be honoured with what the port knows: the
+    /// topmost call refused (the reason is platform's own sentence, and the
+    /// day platform grows a verdict richer than an error string, it flows
+    /// through [`reason`] without a second vocabulary change). Rendered by
+    /// the bridge INSTEAD OF the state it asked for - a pin that failed and
+    /// is rendered as a success is a lie in the title bar.
+    PinFailed {
+        /// The platform's own words for the refusal.
         reason: String,
     },
 }
@@ -459,13 +496,14 @@ mod tests {
             Event::SettingsCorrupt { reason } => Event::SettingsCorrupt {
                 reason: reason.clone(),
             },
-            Event::SessionWriteFailed { reason } => Event::SessionWriteFailed {
+            Event::StateWriteFailed { file, reason } => Event::StateWriteFailed {
+                file: file.clone(),
                 reason: reason.clone(),
             },
             Event::StateDirUnusable { reason } => Event::StateDirUnusable {
                 reason: reason.clone(),
             },
-            Event::SettingsWriteFailed { reason } => Event::SettingsWriteFailed {
+            Event::PinFailed { reason } => Event::PinFailed {
                 reason: reason.clone(),
             },
         }
@@ -482,9 +520,12 @@ mod tests {
             Event::AutosaveSkipped { .. } => "AutosaveSkipped",
             Event::GeometryNotRestored { .. } => "GeometryNotRestored",
             Event::SettingsCorrupt { .. } => "SettingsCorrupt",
-            Event::SessionWriteFailed { .. } => "SessionWriteFailed",
+            Event::StateWriteFailed { file, .. } => match file {
+                StateFile::Session => "StateWriteFailed(Session)",
+                StateFile::Settings => "StateWriteFailed(Settings)",
+            },
             Event::StateDirUnusable { .. } => "StateDirUnusable",
-            Event::SettingsWriteFailed { .. } => "SettingsWriteFailed",
+            Event::PinFailed { .. } => "PinFailed",
 
             Event::RecentsUpdated(_) => "RecentsUpdated",
         }
@@ -540,14 +581,15 @@ mod tests {
             Event::SettingsCorrupt {
                 reason: "settings file corrupt: expected a value at line 2".to_string(),
             },
-            Event::SessionWriteFailed {
+            Event::StateWriteFailed {
+                file: StateFile::Session,
                 reason: "no space left on device".to_string(),
             },
             Event::StateDirUnusable {
                 reason: "Access is denied. (os error 5)".to_string(),
             },
-            Event::SettingsWriteFailed {
-                reason: "settings could not be serialised: unsupported type".to_string(),
+            Event::PinFailed {
+                reason: "SetWindowPos refused: access denied".to_string(),
             },
         ]
     }
@@ -568,12 +610,12 @@ mod tests {
         );
         // Loaded, LoadFailed, Saved, GeometryNotRestored, SaveFailed,
         // ExternalChange, AutosaveSkipped, RecentsUpdated, SettingsCorrupt,
-        // SessionWriteFailed, StateDirUnusable, SettingsWriteFailed.
-        // (GeometryNotRestored still carries BOTH the placement and the pin
-        // causes; the split is one vocabulary wave with the state-failure
-        // consolidation, after this slice. A bounded-join timeout is reported
-        // through close()'s typed Err, not through an Event: a Gateway-held
-        // Event sender would delay the Disconnected contract.)
+        // StateWriteFailed (the Settings twin is the same variant),
+        // StateDirUnusable, PinFailed. The wave that added PinFailed folded
+        // SessionWriteFailed+SettingsWriteFailed into StateWriteFailed{file}:
+        // +1 -1 = 13, the same deliberate count (D62). A bounded-join timeout
+        // is reported through close()'s typed Err, not through an Event: a
+        // Gateway-held Event sender would delay the Disconnected contract.)
         assert_eq!(all.len(), 13, "Event gained or lost a variant");
 
         for event in &all {

@@ -86,6 +86,7 @@ fn type_idle_quit_relaunch_and_the_text_comes_back() {
         .send(Command::Flush {
             text: "the morning thought\n".to_string(),
             revision: 1,
+            epoch: 0,
         })
         .expect("queued");
     let mut saved_at = None;
@@ -171,6 +172,7 @@ fn dropping_without_close_flushed_text_survives_but_unflushed_text_since_the_las
         .send(Command::Flush {
             text: "kept\n".to_string(),
             revision: 1,
+            epoch: 0,
         })
         .expect("queued");
     poll_until(
@@ -227,6 +229,7 @@ fn autosave_disabled_means_no_scratch_file_ever() {
         .send(Command::Flush {
             text: "do not save me\n".to_string(),
             revision: 1,
+            epoch: 0,
         })
         .expect("queued");
     let deadline = Instant::now() + ANSWER;
@@ -343,6 +346,7 @@ fn a_directory_on_session_json_is_reported_and_the_scratch_still_lands() {
         .send(Command::Flush {
             text: "typed anyway\n".to_string(),
             revision: 1,
+            epoch: 0,
         })
         .expect("queued");
     let scratch = scratch_of(dir.path());
@@ -359,7 +363,7 @@ fn a_directory_on_session_json_is_reported_and_the_scratch_still_lands() {
     );
     let deadline = Instant::now() + ANSWER;
     loop {
-        if let Event::SessionWriteFailed { .. } = expect_event(&rx, deadline) {
+        if let Event::StateWriteFailed { .. } = expect_event(&rx, deadline) {
             break;
         }
     }
@@ -368,7 +372,7 @@ fn a_directory_on_session_json_is_reported_and_the_scratch_still_lands() {
     let until = Instant::now() + TICK + Duration::from_millis(200);
     while Instant::now() < until {
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(Event::SessionWriteFailed { .. }) => {
+            Ok(Event::StateWriteFailed { .. }) => {
                 second_report = true;
                 break;
             }
@@ -402,6 +406,7 @@ fn a_file_where_the_notes_dir_belongs_still_skips_and_writes_nothing() {
         .send(Command::Flush {
             text: "no place\n".to_string(),
             revision: 1,
+            epoch: 0,
         })
         .expect("queued");
     let deadline = Instant::now() + ANSWER;
@@ -451,6 +456,7 @@ fn a_dangling_junction_on_the_notes_dir_is_refused_fast_with_needs_path() {
         .send(Command::Flush {
             text: "behind a broken link\n".to_string(),
             revision: 1,
+            epoch: 0,
         })
         .expect("queued");
     let deadline = Instant::now() + ANSWER;
@@ -506,6 +512,7 @@ fn a_write_denied_scratch_still_skips_and_leaves_the_stale_bytes() {
         .send(Command::Flush {
             text: "will not land\n".to_string(),
             revision: 1,
+            epoch: 0,
         })
         .expect("queued");
     let deadline = Instant::now() + ANSWER;
@@ -625,6 +632,7 @@ fn two_launches_reuse_one_scratch_file() {
         .send(Command::Flush {
             text: "launch one\n".to_string(),
             revision: 1,
+            epoch: 0,
         })
         .expect("queued");
     poll_until(
@@ -647,6 +655,7 @@ fn two_launches_reuse_one_scratch_file() {
         .send(Command::Flush {
             text: "launch two\n".to_string(),
             revision: 1,
+            epoch: 0,
         })
         .expect("queued");
     poll_until(

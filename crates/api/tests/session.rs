@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use notes_api::{
     Command, Encoding, Event, FileMeta, Gateway, LineEnding, Rect, SaveError, Session, Settings,
-    SkipReason, StateDir, WindowHandle,
+    SkipReason, StateDir, StateFile, WindowHandle,
 };
 // The session file is read back with core's own parser: what is being asserted is
 // that the engine wrote a file CORE can read, not one whose bytes we guessed.
@@ -67,11 +67,20 @@ fn a_failing_session_write_is_reported_once_until_it_succeeds() {
     let mut app = Harness::at(root, Settings::default());
 
     let assert_one_failure = |app: &mut Harness, want: &str| {
-        match app.until(want, |ev| matches!(ev, Event::SessionWriteFailed { .. })) {
-            Event::SessionWriteFailed { reason } => {
+        match app.until(want, |ev| {
+            matches!(
+                ev,
+                Event::StateWriteFailed {
+                    file: StateFile::Session,
+                    ..
+                }
+            )
+        }) {
+            Event::StateWriteFailed { file, reason } => {
+                assert_eq!(file, StateFile::Session, "the SUBJECT must be nameable");
                 assert!(!reason.trim().is_empty(), "renderable: core's own sentence");
             }
-            other => panic!("expected SessionWriteFailed ({want}), got {other:?}"),
+            other => panic!("expected StateWriteFailed ({want}), got {other:?}"),
         }
         // EXACTLY ONE: wait out two tick periods. Any second event here is
         // the flood this test exists to fail on.
@@ -81,7 +90,7 @@ fn a_failing_session_write_is_reported_once_until_it_succeeds() {
             .recv_timeout(quiet.saturating_duration_since(Instant::now()))
         {
             assert!(
-                !matches!(event, Event::SessionWriteFailed { .. }),
+                !matches!(event, Event::StateWriteFailed { .. }),
                 "the failure was reported more than once: {event:?}"
             );
         }
@@ -159,7 +168,7 @@ fn startup_creates_a_state_directory_that_does_not_exist_yet() {
         !strays.iter().any(|event| {
             matches!(
                 event,
-                Event::SessionWriteFailed { .. } | Event::StateDirUnusable { .. }
+                Event::StateWriteFailed { .. } | Event::StateDirUnusable { .. }
             )
         }),
         "a fresh install must not report a failure: {strays:?}"
@@ -179,6 +188,7 @@ struct Harness {
     root: PathBuf,
     /// Held so the directory outlives every assertion; None when the harness is
     /// resuming a directory that some other owner already keeps alive.
+    epoch: u64,
     _dir: Option<tempfile::TempDir>,
 }
 
@@ -218,6 +228,7 @@ impl Harness {
             rx,
             root,
             _dir: dir,
+            epoch: 0,
         }
     }
 
@@ -272,10 +283,23 @@ impl Harness {
         while self.rx.recv_timeout(ANSWER).is_ok() {}
     }
 
+    /// An Open that does not need the Loaded payload still moves the OPEN
+    /// GENERATION - the harness mirrors the engine, or its buffered Flushes
+    /// would be discarded as stale.
+    fn open_generation(&mut self, path: &Path) {
+        self.gateway
+            .send(Command::Open {
+                path: path.to_path_buf(),
+            })
+            .expect("queued");
+        self.epoch += 1;
+    }
+
     fn open(&mut self, path: &Path) -> (String, FileMeta) {
         self.send(Command::Open {
             path: path.to_path_buf(),
         });
+        self.epoch += 1;
         match self.until(
             "Loaded",
             |ev| matches!(ev, Event::Loaded { path: p, .. } if p == path),
@@ -290,6 +314,7 @@ impl Harness {
         self.send(Command::Flush {
             text: text.to_string(),
             revision,
+            epoch: self.epoch,
         });
         match self.until(
             "Saved",
@@ -306,6 +331,7 @@ impl Harness {
         self.send(Command::Flush {
             text: text.to_string(),
             revision,
+            epoch: self.epoch,
         });
         match self.until("a skip", |ev| {
             matches!(ev, Event::AutosaveSkipped { .. } | Event::Saved { .. })
@@ -324,6 +350,8 @@ impl Harness {
             text: text.to_string(),
             revision,
         });
+        // A rebind is a new OPEN GENERATION; the harness mirrors the engine.
+        self.epoch += 1;
         match self.until("Saved", |ev| match ev {
             Event::Saved { path: p, .. } => p == path,
             Event::SaveFailed { path: p, .. } => p == path,
@@ -479,6 +507,8 @@ fn a_failed_save_arrives_as_an_event_and_the_engine_keeps_working() {
         text: "content\n".to_string(),
         revision: 0,
     });
+    // A rebind is a new generation (the engine bumped; the harness mirrors).
+    app.epoch += 1;
     let event = app.until(
         "SaveFailed",
         |ev| matches!(ev, Event::SaveFailed { path, .. } if path == &nowhere),
@@ -657,7 +687,7 @@ fn the_recent_list_is_reported_cleared_and_rebuilt() {
 
     // Opening a file that vanished fails with renderable copy: the variant this
     // slice added, because the frozen vocabulary had nowhere honest for it.
-    app.send(Command::Open { path: gone.clone() });
+    app.open_generation(&gone.clone());
     match app.until(
         "LoadFailed",
         |ev| matches!(ev, Event::LoadFailed { path, .. } if path == &gone),
@@ -720,7 +750,7 @@ fn an_ansi_file_is_decoded_at_the_configured_codepage_not_by_assumption() {
         ..Settings::default()
     });
     let same = other.file("fr.notes", &bytes);
-    other.send(Command::Open { path: same.clone() });
+    other.open_generation(&same.clone());
     let event = other.until("a verdict on the ANSI file", |ev| {
         matches!(ev, Event::LoadFailed { path, .. } | Event::Loaded { path, .. } if path == &same)
     });
@@ -751,7 +781,7 @@ fn an_oversize_file_is_refused_from_the_stat_and_cannot_be_overwritten() {
     let size = 8_usize * 1024 * 1024;
     fs::write(&big, vec![b'A'; size]).expect("write the 8 MiB fixture");
 
-    app.send(Command::Open { path: big.clone() });
+    app.open_generation(&big.clone());
     match app.until(
         "LoadFailed(TooLarge)",
         |ev| matches!(ev, Event::LoadFailed { path, .. } if path == &big),
@@ -819,6 +849,7 @@ fn an_untitled_note_is_written_to_a_scratch_file_instead_of_dropped() {
         // (4.5 - it never normalises), so the fixture types it too.
         text: "the first draft\n".to_string(),
         revision: 1,
+        epoch: 0,
     });
 
     // Event order: Saved THEN Rebound, both naming the scratch.
@@ -906,7 +937,7 @@ fn without_a_codepage_an_ansi_file_is_refused_rather_than_guessed() {
         ..Settings::default()
     });
     let path = app.file("fr.notes", &bytes);
-    app.send(Command::Open { path: path.clone() });
+    app.open_generation(&path.clone());
     match app.until(
         "LoadFailed",
         |ev| matches!(ev, Event::LoadFailed { path: got, .. } if got == &path),
@@ -954,9 +985,7 @@ fn the_toggle_and_the_recents_list_survive_a_restart_and_a_vanished_file() {
     // Opened by hand rather than through the `open` helper: that helper waits for
     // `Loaded` and DISCARDS everything else on the way, and the list this test
     // asserts on arrives in the same burst. Every later helper call would eat it.
-    again.send(Command::Open {
-        path: other.clone(),
-    });
+    again.open_generation(&other.clone());
     let list = match again.until(
         "RecentsUpdated with both files",
         |ev| matches!(ev, Event::RecentsUpdated(entries) if entries.len() >= 2),
@@ -1015,12 +1044,13 @@ fn an_unwritable_session_file_is_reported_at_startup_not_at_shutdown() {
 
     app.send(Command::SetPinned(true));
     match app.until("the read-only refusal", |ev| {
-        matches!(ev, Event::SessionWriteFailed { .. })
+        matches!(ev, Event::StateWriteFailed { .. })
     }) {
-        Event::SessionWriteFailed { reason } => {
+        Event::StateWriteFailed { file, reason } => {
+            assert_eq!(file, StateFile::Session);
             assert!(!reason.trim().is_empty(), "renderable: core's sentence");
         }
-        other => panic!("expected SessionWriteFailed, got {other:?}"),
+        other => panic!("expected StateWriteFailed, got {other:?}"),
     }
     // LATCHED: two tick periods of silence, not a flood.
     let quiet = Instant::now() + ticks(2);
@@ -1029,7 +1059,7 @@ fn an_unwritable_session_file_is_reported_at_startup_not_at_shutdown() {
         .recv_timeout(quiet.saturating_duration_since(Instant::now()))
     {
         assert!(
-            !matches!(event, Event::SessionWriteFailed { .. }),
+            !matches!(event, Event::StateWriteFailed { .. }),
             "the read-only refusal was reported more than once: {event:?}"
         );
     }
@@ -1085,9 +1115,9 @@ fn two_recents_with_the_same_basename_do_not_share_a_menu_label() {
     fs::write(&a, b"from a\n").expect("write a");
     fs::write(&b, b"from b\n").expect("write b");
 
-    app.send(Command::Open { path: a });
+    app.open_generation(&a);
     app.until("the first Loaded", |ev| matches!(ev, Event::Loaded { .. }));
-    app.send(Command::Open { path: b.clone() });
+    app.open_generation(&b.clone());
     let entries = match app.until(
         "a two-entry recent list",
         |ev| matches!(ev, Event::RecentsUpdated(list) if list.len() == 2),
@@ -1127,7 +1157,7 @@ fn two_recents_with_the_same_basename_do_not_share_a_menu_label() {
 /// [`Event::SaveFailed`] with a `revision: 0` the file does not have - a
 /// settings file HAS no revision - and would have flooded one event per tick
 /// exactly as the session write did. Now it reports ONE
-/// SettingsWriteFailed per failure episode, latched, cleared by the next
+/// StateWriteFailed(Settings) per failure, latched, cleared by the next
 /// success. The block is the same shape the session test uses: a DIRECTORY
 /// sitting where settings.toml belongs, which the atomic write's rename
 /// refuses with an OS sentence.
@@ -1139,11 +1169,20 @@ fn a_failing_settings_write_is_reported_once_until_it_succeeds() {
     let mut app = Harness::at(root, Settings::default());
 
     let assert_one_failure = |app: &mut Harness, want: &str| {
-        match app.until(want, |ev| matches!(ev, Event::SettingsWriteFailed { .. })) {
-            Event::SettingsWriteFailed { reason } => {
+        match app.until(want, |ev| {
+            matches!(
+                ev,
+                Event::StateWriteFailed {
+                    file: StateFile::Settings,
+                    ..
+                }
+            )
+        }) {
+            Event::StateWriteFailed { file, reason } => {
+                assert_eq!(file, StateFile::Settings, "the SUBJECT must be nameable");
                 assert!(!reason.trim().is_empty(), "renderable: core's sentence");
             }
-            other => panic!("expected SettingsWriteFailed ({want}), got {other:?}"),
+            other => panic!("expected StateWriteFailed(Settings) ({want}), got {other:?}"),
         }
         let quiet = Instant::now() + ticks(2);
         while let Ok(event) = app
@@ -1151,7 +1190,13 @@ fn a_failing_settings_write_is_reported_once_until_it_succeeds() {
             .recv_timeout(quiet.saturating_duration_since(Instant::now()))
         {
             assert!(
-                !matches!(event, Event::SettingsWriteFailed { .. }),
+                !matches!(
+                    event,
+                    Event::StateWriteFailed {
+                        file: StateFile::Settings,
+                        ..
+                    }
+                ),
                 "the settings failure was reported more than once: {event:?}"
             );
         }
@@ -1206,12 +1251,13 @@ fn an_unusable_scratch_location_still_skips_and_writes_nothing() {
 /// to clean up; nothing in the vocabulary says "delete user content".
 #[test]
 fn a_note_saved_away_stops_using_the_scratch_and_the_draft_is_kept() {
-    let app = Harness::new();
+    let mut app = Harness::new();
     let scratch = notes_core::paths::scratch_note_path(&StateDir(app.root.clone()));
 
     app.send(Command::Flush {
         text: "draft one\n".to_string(),
         revision: 1,
+        epoch: 0,
     });
     let deadline = Instant::now() + ANSWER;
     while !scratch.exists() {
@@ -1226,9 +1272,12 @@ fn a_note_saved_away_stops_using_the_scratch_and_the_draft_is_kept() {
         text: "named now\n".to_string(),
         revision: 2,
     });
+    // The Save As rebinds: a new generation. The next edit is stamped with it.
+    app.epoch += 1;
     app.send(Command::Flush {
         text: "named now, edited\n".to_string(),
         revision: 3,
+        epoch: app.epoch,
     });
     let deadline = Instant::now() + ANSWER;
     loop {
@@ -1276,6 +1325,7 @@ fn a_second_untitled_note_reuses_the_same_scratch_path() {
         .send(Command::Flush {
             text: "launch one\n".to_string(),
             revision: 1,
+            epoch: 0,
         })
         .expect("queued");
     let deadline = Instant::now() + ANSWER;
@@ -1297,6 +1347,7 @@ fn a_second_untitled_note_reuses_the_same_scratch_path() {
         .send(Command::Flush {
             text: "launch two\n".to_string(),
             revision: 1,
+            epoch: 0,
         })
         .expect("queued");
     let deadline = Instant::now() + ANSWER;
@@ -1322,4 +1373,55 @@ fn a_second_untitled_note_reuses_the_same_scratch_path() {
         vec!["untitled.notes".to_string()],
         "exactly one deterministic scratch, no invented siblings"
     );
+}
+
+/// FINDING 2: the stale flush. The user types in A (the bridge debounces
+/// 250 ms), hits Ctrl+O for B inside that window, and the ALREADY-QUEUED
+/// Flush{A-text} arrives after the rebind. Without the epoch guard it wrote A's
+/// text into B atomically and reported Saved (RED before). With it, the stale
+/// Flush is DISCARDED and says so, B stays byte-identical, and the CURRENT
+/// document still saves normally afterwards.
+#[test]
+fn a_stale_flush_never_lands_in_the_file_that_replaced_its_document() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a.notes");
+    let b = dir.path().join("b.notes");
+    fs::write(&a, b"doc A\n").expect("seed a");
+    fs::write(&b, b"doc B\n").expect("seed b");
+    let mut app = Harness::at(dir.path().to_path_buf(), Settings::default());
+    app._dir = Some(dir);
+
+    app.open(&a); // generation 1
+    app.flush(&a, "edited A\n", 2); // lands in A
+    app.open_generation(&b); // generation 2: the document is now B
+
+    // The STALE flush: buffered while A was open, delivered after the rebind.
+    app.gateway
+        .send(Command::Flush {
+            text: "edited A\n".to_string(),
+            revision: 3,
+            epoch: 1,
+        })
+        .expect("queued");
+    let reason = loop {
+        match app.rx.recv_timeout(ANSWER) {
+            Ok(Event::AutosaveSkipped { reason }) => break reason,
+            Ok(_) => {}
+            Err(_) => panic!("the discard was silent - a dropped edit must say so"),
+        }
+    };
+    assert_eq!(
+        reason,
+        SkipReason::Superseded,
+        "the discard names itself instead of vanishing"
+    );
+    assert_eq!(
+        fs::read(&b).expect("read b"),
+        b"doc B\n",
+        "B is byte-identical: the stale text never landed"
+    );
+
+    // And the CURRENT document still saves normally afterwards.
+    assert_eq!(app.flush(&b, "edited B\n", 1), 1);
+    assert_eq!(fs::read(&b).expect("read b again"), b"edited B\n");
 }

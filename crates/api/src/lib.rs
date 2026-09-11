@@ -276,7 +276,7 @@ pub use command::{Command, WindowHandle};
 pub use dto::{Rect, Session, Settings, StateDir, resolve_state_dir};
 pub use engine::mark_current_thread_as_engine;
 pub use event::{
-    Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason,
+    Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason, StateFile,
 };
 pub use gateway::{EventRx, Gateway, InitialState};
 
@@ -318,6 +318,7 @@ mod tests {
             .send(Command::Flush {
                 text: "a note".into(),
                 revision: 41,
+                epoch: 0,
             })
             .expect("an unbounded command send never blocks the caller");
         evt_tx
@@ -329,7 +330,7 @@ mod tests {
 
         // Drained the way rule 4 allows: on wake, without blocking.
         match cmd_rx.try_recv() {
-            Ok(Command::Flush { text, revision }) => {
+            Ok(Command::Flush { text, revision, .. }) => {
                 assert_eq!(text, "a note");
                 assert_eq!(revision, 41, "D11: a monotonic u64, not a hash");
             }

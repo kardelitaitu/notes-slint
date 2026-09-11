@@ -93,6 +93,7 @@ fn a_burst_of_flushes_saves_once_at_the_last_revision_and_the_deadline_re_arms()
             .send(Command::Flush {
                 text: format!("revision {revision}\n"),
                 revision,
+                epoch: 0,
             })
             .expect("queued");
     }
@@ -140,6 +141,7 @@ fn a_burst_of_flushes_saves_once_at_the_last_revision_and_the_deadline_re_arms()
         .send(Command::Flush {
             text: "revision 4\n".to_string(),
             revision: 4,
+            epoch: 0,
         })
         .expect("queued");
     wait_for(&rx, ANSWER, "the re-armed save", |ev| {

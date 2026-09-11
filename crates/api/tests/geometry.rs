@@ -817,3 +817,51 @@ fn a_fresh_install_persists_on_the_first_geometry_changed() {
         "and it carries a real frame-space rect"
     );
 }
+
+/// THE QUIT-WITHIN-A-SECOND CASE (finding 1): the bridge unregisters the
+/// window BEFORE close(), so the drain has no handle - and for an EXISTING
+/// session.json a defer there would keep the OLD rect and pin forever. The
+/// unregister arm must measure-and-flush while the handle is still valid.
+#[test]
+fn the_last_state_write_happens_before_the_window_is_gone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_session(
+        dir.path(),
+        &Session {
+            rect: Rect::new(50, 50, 700, 500),
+            ..Session::default()
+        },
+    )
+    .expect("seed the session");
+    // The host answers with the seeded rect, so measured and previous agree
+    // and the assertion tests SURVIVAL, not the mock.
+    let (gateway, _rx, _host) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(FrameRect::new(50, 50, 700, 500)),
+            ..Answers::default()
+        },
+    );
+
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    // The user pins and quits inside one tick: no tick flush can run first.
+    gateway.send(Command::SetPinned(true)).expect("queued");
+    gateway.send(Command::UnregisterWindow).expect("queued");
+    gateway.close().expect("the quit joins");
+
+    let persisted =
+        read_session(dir.path()).expect("the session existed before; it must exist after");
+    assert!(
+        persisted.pinned,
+        "the pin change must survive a quit that never gave a tick"
+    );
+    assert_eq!(
+        persisted.rect,
+        Rect::new(50, 50, 700, 500),
+        "and the geometry is not lost with it"
+    );
+}

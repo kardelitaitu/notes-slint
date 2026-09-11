@@ -47,9 +47,9 @@ use notes_core::{
 
 use crate::command::{Command, WindowHandle};
 use crate::event::{
-    Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason,
+    Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason, StateFile,
 };
-use notes_platform::{FrameRect, HostFacts, WindowBackend};
+use notes_platform::{FrameRect, HostFacts, PinOutcome, WindowBackend};
 
 use crate::gateway::EventTx;
 
@@ -219,6 +219,11 @@ pub(crate) struct Engine {
     /// could write stale text to a new path while the editor showed something
     /// else. That is data loss with a nicer name, so the command vocabulary grew
     /// the missing fields (D30) and the fields below disappeared with them.
+    /// The OPEN GENERATION: bumped on every rebind (Open, Save As). A Flush
+    /// stamped with an older generation is a buffered edit for a document that
+    /// no longer exists - it is discarded, not written into the file that
+    /// replaced it (the stale-flush-overwrites-B bug).
+    epoch: u64,
     /// True when the last [`Command::Open`] was refused. One reason to exist: a
     /// refused load leaves the bridge holding a buffer that is NOT this file, so an
     /// explicit Save As would overwrite a document the app never read with stale or
@@ -331,6 +336,7 @@ impl Engine {
             settings_failure_latched: false,
             draining: false,
             measure_failure_latched: false,
+            epoch: 0,
             last_move_issued: None,
             backend,
             facts,
@@ -444,6 +450,21 @@ impl Engine {
             // then MOVE. Unregister is the bridge's "this window is gone";
             // after it, nothing touches the stored value again.
             Command::UnregisterWindow => {
+                // THE HANDLE IS STILL VALID ON THIS LINE - and it is the last
+                // chance to measure honestly. The bridge closes the window
+                // BEFORE close(), so the drain's flush would otherwise run
+                // handle-less forever: measure fails, an existing session.json
+                // is deferred into staleness, and a move-then-quick-quit loses
+                // the move (the README's opening promise). Measure and flush
+                // NOW, once, then let the handle go.
+                if self.window.is_some() {
+                    // The guard lifts here for the same reason it lifts at
+                    // final_flush: this read-back is the last honest one there
+                    // will ever be for this window.
+                    self.last_move_issued = None;
+                    self.measure_rect();
+                    self.flush_state();
+                }
                 self.window = None;
             }
             Command::GeometryChanged => {
@@ -487,7 +508,11 @@ impl Engine {
                 text,
                 revision,
             } => self.save_as(&path, &text, revision),
-            Command::Flush { text, revision } => self.flush(text, revision),
+            Command::Flush {
+                text,
+                revision,
+                epoch,
+            } => self.flush(text, revision, epoch),
             Command::Shutdown => {
                 self.drain();
                 return Flow::Exit;
@@ -507,6 +532,9 @@ impl Engine {
     /// [`LoadError::TooLarge`] is for on the paths that cannot present an empty
     /// read-only buffer at all.
     fn open(&mut self, path: &Path) {
+        // Any successful rebind is a new generation: edits buffered for the
+        // previous document are stale the moment this one loads.
+        self.epoch += 1;
         let on_disk = match fs::metadata(path) {
             Ok(meta) => meta,
             Err(err) => {
@@ -615,6 +643,7 @@ impl Engine {
     /// arming, and the TARGET's encoding rather than the source's. A failed Save
     /// As emits only [`Event::SaveFailed`]: nothing was rebound.
     fn save_as(&mut self, path: &Path, text: &str, revision: u64) {
+        self.epoch += 1;
         if self.load_refused {
             // The measured 0-byte overwrite. A refused open means the buffer on
             // screen is not this file, so writing it would destroy a document the
@@ -699,7 +728,20 @@ impl Engine {
     /// carries the counter it was handed (`last_saved_revision`) and asks
     /// core the questions core can answer. When core owns the buffer, this line
     /// becomes [`Document::should_flush`] and the field disappears.
-    fn flush(&mut self, text: String, revision: u64) {
+    fn flush(&mut self, text: String, revision: u64, epoch: u64) {
+        // THE EPOCH GUARD: a Flush buffered under an OPEN GENERATION the engine
+        // has already replaced must not land in the file that replaced it - the
+        // stale text would overwrite the current document atomically and report
+        // Saved. Discard, and say so.
+        if std::env::var("N2_DEBUG").is_ok() {
+            eprintln!("FLUSH epoch={} engine_epoch={}", epoch, self.epoch);
+        }
+        if epoch != self.epoch {
+            self.emit(Event::AutosaveSkipped {
+                reason: SkipReason::Superseded,
+            });
+            return;
+        }
         if revision > self.doc.revision() {
             self.doc.apply_edit();
         }
@@ -959,6 +1001,16 @@ impl Engine {
                             // The clamp moved it: store where it actually is, so the
                             // next launch does not have to clamp it again.
                             self.session.rect = clamped;
+                            // AND SAY SO: the restore the session asked for did not
+                            // happen as asked. Once per registration - a real,
+                            // countable fallback, not a silent one (D42's
+                            // unanswered question: how many users hit this?).
+                            self.emit(Event::GeometryNotRestored {
+                                rect,
+                                reason: String::from(
+                                    "the saved position does not fully fit any monitor; it was clamped back on screen",
+                                ),
+                            });
                             self.queue(Target::Session);
                         }
                     }
@@ -992,16 +1044,23 @@ impl Engine {
         let Some(backend) = self.backend.as_mut() else {
             return;
         };
-        if let Err(err) = backend.set_topmost(handle.0 as isize, on) {
-            // The pin failure rides GeometryNotRestored FOR NOW: the split into
-            // its own variant is one event-vocabulary wave, together with the
-            // state-failure consolidation, so the bridge's exhaustive match
-            // recompiles once. Until then one name carries two causes, and the
-            // reason string is the only discriminator.
-            self.emit(Event::GeometryNotRestored {
-                rect: self.session.rect,
-                reason: err.to_string(),
-            });
+        // Platform's verdict, mapped straight onto the event: the reason
+        // strings are platform's own sentences, so a richer verdict flows
+        // through without a second vocabulary change.
+        match backend.set_topmost(handle.0 as isize, on) {
+            PinOutcome::Applied => {}
+            PinOutcome::Failed(err) => {
+                self.emit(Event::PinFailed {
+                    reason: err.to_string(),
+                });
+            }
+            PinOutcome::NotApplied { expected, actual } => {
+                self.emit(Event::PinFailed {
+                    reason: format!(
+                        "the pin did not stick: asked for topmost={expected}, the window read back {actual}"
+                    ),
+                });
+            }
         }
     }
 
@@ -1207,7 +1266,8 @@ impl Engine {
                         // untranslated, like every other platform/core refusal.
                         if !self.session_failure_latched {
                             self.session_failure_latched = true;
-                            self.emit(Event::SessionWriteFailed {
+                            self.emit(Event::StateWriteFailed {
+                                file: StateFile::Session,
                                 reason: err.to_string(),
                             });
                         }
@@ -1234,7 +1294,8 @@ impl Engine {
                     // (SettingsError's Display) as the reason.
                     if !self.settings_failure_latched {
                         self.settings_failure_latched = true;
-                        self.emit(Event::SettingsWriteFailed {
+                        self.emit(Event::StateWriteFailed {
+                            file: StateFile::Settings,
                             reason: err.to_string(),
                         });
                     }
@@ -1304,6 +1365,10 @@ impl Engine {
             path.to_path_buf(),
             &display,
         );
+        // The recents live in settings.toml: without arming THAT write, a
+        // restart loses every entry the session remembered (invisible until a
+        // menu existed to show it).
+        self.queue(Target::Settings);
         self.emit_recent();
     }
 
@@ -1587,6 +1652,7 @@ mod tests {
         Command::Flush {
             text: String::new(),
             revision,
+            epoch: 0,
         }
     }
 

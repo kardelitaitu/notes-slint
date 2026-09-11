@@ -14,7 +14,9 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use notes_platform::{FrameRect, HostFacts, PlatformError, PlatformResult, WindowBackend};
+use notes_platform::{
+    FrameRect, HostFacts, PinOutcome, PlatformError, PlatformResult, WindowBackend,
+};
 
 /// One recorded call, in the order it happened.
 #[derive(Debug, Clone, PartialEq)]
@@ -173,14 +175,14 @@ fn lock<T>(cell: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl WindowBackend for Host {
-    fn set_topmost(&mut self, handle: isize, on: bool) -> PlatformResult<()> {
+    fn set_topmost(&mut self, handle: isize, on: bool) -> PinOutcome {
         self.record(Call::Topmost { handle, on });
         match self.answers().fail_topmost.clone() {
-            Some(why) => Err(PlatformError::Win32 {
+            Some(why) => PinOutcome::Failed(PlatformError::Win32 {
                 api: "SetWindowPos",
                 message: why,
             }),
-            None => Ok(()),
+            None => PinOutcome::Applied,
         }
     }
 
