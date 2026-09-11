@@ -23,6 +23,7 @@ mod editor;
 use editor::{LineGeometry, PaintStats, ShapeCache, line_ranges, rebuild_shapes, retained_window};
 use gpui_kit::{ShapedLine, px};
 use std::hint::black_box;
+use std::ops::Range;
 use std::time::Instant;
 
 /// A stand-in for `ShapedLine` with the SAME byte size, which is the only property that
@@ -328,6 +329,15 @@ fn a_selection_straddling_the_window_edge_keeps_both_ends_answerable() {
 
 /// THE NUMBER THAT MUST NOT MOVE. Worst-case anchors: caret at the top, a mark at the
 /// top, and a selection over the WHOLE note - select-all, then scroll to the bottom.
+///
+/// DO NOT SIMPLIFY THIS FIXTURE BACK. The version of the flatness test that shipped with
+/// 8404b566 built its own `0..29` window and handed it straight to `rebuild_shapes`, so it
+/// measured the LOOP while claiming to measure the design - it passed at 200 and 2,000
+/// because a window the test supplied is flat by construction, whatever the rule that would
+/// have produced one. This one drives the production predicate, `retained_window`, which is
+/// the only thing in the file that decides what a frame looks at. `foil_the_rule_as_shipped
+/// at_8404b566` below is the proof the assertion bites: same fixture, old rule, 20,000
+/// lines examined at 20,000 lines.
 #[test]
 fn retention_stays_flat_with_the_worst_case_anchors_at_every_size() {
     let mut seen = Vec::new();
@@ -458,11 +468,21 @@ fn measure_the_caret_path_that_still_scans_bytes() {
         println!(
             "MEASURE lines={lines:>5} line_index_at={scan:>5}us/call line_range_at={range:>6}us/call",
         );
-        // The bound is on the path a keystroke takes: `line_range_at` (word selection,
-        // backspace-to-line-start, the caret's own line) is now O(line). The prefix count
-        // above is NOT fixed here and the number is printed precisely so that stays an
-        // open, measured item rather than a forgotten one: 7,182 us per call at 20,000
-        // lines, reached once per Up/Down via `vertical_target`.
+        // TWO bounds, two different amounts of ownership.
+        //
+        // `line_range_at` (word selection, backspace-to-line-start, the caret's own line) is
+        // pinned tight because this file owns it. It used to count the whole prefix AND build
+        // the full line index to `nth` it - measured at 138 / 1,415 / 17,456 us per call at
+        // 200 / 2,000 / 20,000 lines, i.e. one keystroke eating a whole 60 Hz frame. It now
+        // scans out to the two newlines that bound the byte and measures 0 us at every size.
+        //
+        // `line_index_at` is printed rather than pinned, because the fix is NOT this file's:
+        // another lane is giving `TextState` its own line-start cache as this is written, so
+        // the ceiling below is a tripwire against "seconds per arrow key", not a claim about
+        // a constant. Measured the day it was written: 69 / 706 / 7,228 us per call at the
+        // three sizes, reached once per Up/Down through `vertical_target`. If this starts
+        // printing 0, that cache has landed and this paragraph is stale - keep the tripwire,
+        // delete the number.
         assert!(
             range < 200,
             "line_range_at must be O(line), not O(note): {range}us"
@@ -470,3 +490,75 @@ fn measure_the_caret_path_that_still_scans_bytes() {
         assert!(scan < 20_000, "a keystroke must not take seconds: {scan}us");
     }
 }
+
+/// THE FOIL: 8404b566's retention rule, transcribed. Widen ONE contiguous range to reach
+/// the caret line and the line the mark STARTS on, and take nothing at all from the
+/// selection. It is kept here, and run here, for one reason: an instrument that passes on
+/// the broken version is decoration, and until this function exists the flatness test
+/// cannot be shown to bite. It is a transcription, not the shipped code - the shipped code
+/// is `git show 8404b566:crates/bridge-gpui/src/editor.rs`, and the numbers below are the
+/// numbers that rule produces at every size the new rule is quoted at.
+fn foil_the_rule_as_shipped_at_8404b566<Line>(
+    cache: &ShapeCache<Line>,
+    visible: &Range<usize>,
+    caret_line: usize,
+    marked: &Option<Range<usize>>,
+    selection: &Range<usize>,
+) -> Range<usize> {
+    let mut first = visible.start;
+    let mut last = visible.end;
+    for edge in [
+        Some(caret_line),
+        marked
+            .as_ref()
+            .and_then(|m| cache.line_index_at(m.start)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        first = first.min(edge);
+        last = last.max(edge + 1);
+    }
+    let _ = selection;
+    first..last
+}
+
+/// THE ASSERTION, BITING. Feed the foil the same worst-case anchors the real test uses and
+/// count what it would have walked. It is not close at any size, and it is not a constant:
+/// it is the whole note, which is the exact claim `lines_examined` was put in the file to
+/// watch. The new rule walks 31 at all three sizes (see the test above); the old one walks
+/// 200 / 2,000 / 20,000.
+#[test]
+fn the_widening_rule_fails_the_flatness_assertion_at_every_size() {
+    let mut old = Vec::new();
+    let mut new = Vec::new();
+    for lines in [200usize, 2000, 20000] {
+        let content = buffer(lines);
+        let (cache, geom) = warm(&content, lines - 30);
+        let head = cache.bytes_of(&content, 0).unwrap();
+        let marked = Some(head.start..head.end.max(head.start + 1));
+        let selection = 0..content.len();
+        let visible = geom.visible_lines(cache.lines());
+        let widened =
+            foil_the_rule_as_shipped_at_8404b566(&cache, &visible, 0, &marked, &selection);
+        let pinned =
+            retained_window(&cache, &visible, content.len(), 0, &marked, &selection);
+        old.push(widened.len());
+        new.push(pinned.rows(cache.lines()).len());
+        // The far end of the selection is not in the old set at all, which is the OTHER
+        // failure: fewer lines walked than the new rule only when the caret happens to be
+        // nearby, and no answer at all when it is not.
+        assert!(
+            !widened.contains(&(lines - 1)) || widened.len() == lines,
+            "{lines}: the foil covered the far end by widening to the whole note"
+        );
+    }
+    println!("FOIL old-rule walked={old:?} new-rule walked={new:?} (cap {})", VIEWPORT_ROWS + 4);
+    assert_eq!(new, vec![31; 3], "the new rule is flat at 31");
+    assert_eq!(old, vec![200, 2000, 20000], "the old rule IS the buffer");
+    assert!(
+        old.iter().enumerate().all(|(i, n)| *n > new[i] * 6),
+        "the assertion must bite at every size: {old:?} vs {new:?}"
+    );
+}
+
