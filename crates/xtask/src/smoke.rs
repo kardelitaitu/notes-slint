@@ -885,6 +885,49 @@ const SOURCE_FILES: &[&str] = &["Cargo.toml", "Cargo.lock"];
 pub const BUILD_FAILED_EXIT: i32 = 4;
 /// The exe is older than the sources that produce it.
 pub const STALE_BINARY_EXIT: i32 = 5;
+/// Everything passed.
+pub const PASS_EXIT: i32 = 0;
+/// An app step failed: the app itself, not the harness.
+pub const STEP_FAILED_EXIT: i32 = 1;
+/// The harness could not run at all (also the answer to a bad argument).
+pub const HARNESS_EXIT: i32 = 2;
+/// Declined: this machine cannot judge the GUI, which is not the app's fault.
+pub const DECLINED_EXIT: i32 = 3;
+
+/// THE CONTRACT. One table, spelled from the constants the code actually returns,
+/// so a new verdict has to be a new row here rather than a bare return that
+/// nobody documented. check-ci asserts ci.yml branches on exactly these codes.
+pub const CONTRACT: &[Contract] = &[
+    Contract(PASS_EXIT, "pass"),
+    Contract(STEP_FAILED_EXIT, "step failed"),
+    Contract(HARNESS_EXIT, "harness could not run"),
+    Contract(DECLINED_EXIT, "declined"),
+    Contract(BUILD_FAILED_EXIT, "target did not compile"),
+    Contract(STALE_BINARY_EXIT, "binary older than sources"),
+    Contract(GEOMETRY_FAILED_EXIT, "window-memory broke"),
+    Contract(PIN_FAILED_EXIT, "the pin lied"),
+];
+
+/// One row of the contract. A struct rather than a tuple so the number and the
+/// sentence cannot be transposed by a reader in a hurry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Contract(pub i32, pub &'static str);
+
+/// The codes, in order, for the startup line and for check-ci's message text.
+pub fn contract_codes() -> Vec<i32> {
+    CONTRACT.iter().map(|c| c.0).collect()
+}
+
+/// The startup line, built from the same codes check-ci compares against, so the
+/// line a run prints cannot disagree with the table that run is judged by.
+pub fn contract_line() -> String {
+    let mut out = String::from("smoke: contract");
+    for code in contract_codes() {
+        out.push(' ');
+        out.push_str(&code.to_string());
+    }
+    out
+}
 
 fn mtime_of(path: &Path) -> Option<std::time::SystemTime> {
     crate::identity::mtime_of(path)
@@ -1768,6 +1811,9 @@ fn restore_session(path: &Path, bytes: Option<&[u8]>) {
 
 /// Entry point for "cargo xtask smoke [--reuse-state] [--no-build]".
 pub fn run(args: &[String]) -> i32 {
+    // The contract first, before anything can fail: a log that shows a verdict
+    // also shows the code table that verdict came out of.
+    println!("{}", contract_line());
     let unknown: Vec<&str> = args
         .iter()
         .map(String::as_str)
@@ -1776,7 +1822,7 @@ pub fn run(args: &[String]) -> i32 {
     if !unknown.is_empty() {
         eprintln!("smoke: unknown argument(s): {}", unknown.join(" "));
         eprintln!("smoke: usage: cargo xtask smoke [--reuse-state] [--no-build]");
-        return 2;
+        return HARNESS_EXIT;
     }
     let reuse = args.iter().any(|a| a == "--reuse-state");
 
@@ -1784,14 +1830,14 @@ pub fn run(args: &[String]) -> i32 {
         Ok(dir) => dir,
         Err(e) => {
             eprintln!("smoke: cannot read the current directory: {e}");
-            return 2;
+            return HARNESS_EXIT;
         }
     };
     let root = match crate::metadata::find_workspace_root(&cwd) {
         Ok(dir) => dir,
         Err(e) => {
             eprintln!("smoke: {e}");
-            return 2;
+            return HARNESS_EXIT;
         }
     };
     let exe = root.join(BIN_REL);
@@ -1826,7 +1872,7 @@ pub fn run(args: &[String]) -> i32 {
             exe.display()
         );
         println!("smoke: window=MISSING close=NOBIN session=NOBIN 0.0s");
-        return 1;
+        return STEP_FAILED_EXIT;
     }
     match staleness(mtime_of(&exe), newest_source(&root)) {
         Stale::OlderThan {
@@ -1845,7 +1891,7 @@ pub fn run(args: &[String]) -> i32 {
         }
         Stale::Unknown(why) => {
             println!("SMOKE FAIL: freshness cannot be proven - {why}");
-            return 2;
+            return HARNESS_EXIT;
         }
         Stale::Fresh => {}
     }
@@ -1880,7 +1926,7 @@ pub fn run(args: &[String]) -> i32 {
                 &relocation
             )
         );
-        return 3;
+        return DECLINED_EXIT;
     }
 
     let script = temp_path("probe", "ps1");
@@ -2032,7 +2078,7 @@ pub fn run(args: &[String]) -> i32 {
         println!("smoke: user state outcome: {}", guard.outcome_note());
         if guard.failed && code == 0 {
             println!("smoke: DECLINED TO PASS - user state did not come back byte-identical");
-            return 1;
+            return STEP_FAILED_EXIT;
         }
     }
     for junk in [&script, &geom_script, &out_file, &err_file] {

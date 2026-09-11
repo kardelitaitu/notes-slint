@@ -540,6 +540,16 @@ pub fn evaluate(graph: &Graph) -> Vec<Violation> {
 pub const LINEAGE_RULE: &str = "two-gpui-lineages";
 const LINEAGE_CLASSIC: &str = "gpui";
 const LINEAGE_PRE_PREFIX: &str = "gpui-pre";
+/// The tripwire: a family package that no known lineage recognises. Named
+/// separately because it is a claim about THIS checker being stale, not about
+/// the graph being wrong, and those two need different fixes.
+pub const LINEAGE_UNKNOWN_RULE: &str = "lineage-unrecognised";
+/// Companions that ride with whichever lineage pulled them, so their presence is
+/// not evidence of a third toolkit. The list is short on purpose and the tripwire
+/// below fires on anything gpui-prefixed that is not in it: an unknown name is
+/// reported rather than ignored, so this stays a list of the KNOWN rather than a
+/// list of everything that must be remembered.
+const KNOWN_COMPANIONS: &[&str] = &["gpui-kit", "gpui-base", "gpui-component", "gpui-kit-assets"];
 /// The package field for a rule that is about the graph rather than one crate.
 const GRAPH_PACKAGE: &str = "the resolved graph";
 
@@ -566,7 +576,34 @@ pub fn lineages_in(names: &BTreeSet<String>) -> Lineages {
 /// Both lineages present is a violation, and the message names the pullers,
 /// because "who brought the second toolkit" is the only useful next question.
 pub fn lineage_findings(graph: &Graph) -> Vec<Violation> {
-    let found = lineages_in(&graph.universe());
+    let universe = graph.universe();
+    let found = lineages_in(&universe);
+    // Failing-loud default. If the graph carries toolkit-family packages that
+    // NEITHER lineage recognises, this rule's own name list is stale - and the
+    // honest answer is a finding, not a quiet empty vector. A rule that can only
+    // catch a leak when somebody remembers to add a name is the instrument this
+    // file just spent a slice replacing.
+    let unknown: Vec<String> = universe
+        .iter()
+        .filter(|n| in_family(&["gpui"], n))
+        .filter(|n| *n != LINEAGE_CLASSIC && !n.starts_with(LINEAGE_PRE_PREFIX))
+        .filter(|n| !KNOWN_COMPANIONS.contains(&n.as_str()))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() && !found.classic && found.pre.is_empty() {
+        return vec![Violation {
+            rule: LINEAGE_UNKNOWN_RULE,
+            package: GRAPH_PACKAGE,
+            dep: format!(
+                "{} are in the gpui family but match no known lineage; this rule keys on {LINEAGE_CLASSIC} \
+                 and {LINEAGE_PRE_PREFIX}, so a rename of both turns it off unless the name list is updated \
+                 (check-arch is the judge, and it is saying its own eyes are wrong)",
+                unknown.join(", ")
+            ),
+            via: Via::Direct,
+            wrapper: None,
+        }];
+    }
     if !found.classic || found.pre.is_empty() {
         return Vec::new();
     }
@@ -995,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn poisoned_graph_reports_exactly_the_six_rule_ids() {
+    fn poisoned_graph_reports_every_rule_id_it_can_reach() {
         let violations = evaluate(&poisoned_graph());
         let mut ids: Vec<&str> = violations.iter().map(|v| v.rule).collect();
         ids.sort_unstable();
@@ -1574,6 +1611,88 @@ mod tests {
         assert!(
             evaluate(&two).iter().any(|x| x.rule == LINEAGE_RULE),
             "the rule must reach the report, not just the helper"
+        );
+    }
+
+    /// Item 4's answer, as a test: a name that is neither of the two lineage
+    /// names must NOT be able to hide. The structural rules catch the leak (any
+    /// gpui-prefixed crate is in the family), and if the whole graph renames
+    /// itself, the lineage rule reports its own staleness instead of going quiet.
+    #[test]
+    fn a_name_nobody_predicted_still_cannot_slip_past_either_rule() {
+        // In core: caught by core-is-pure through the family root, no list needed.
+        let leaked = graph(
+            &[
+                "notes-core",
+                "notes-api",
+                "notes-platform",
+                "notes-bridge-gpui",
+            ],
+            &[
+                ("notes-core", &["serde", "gpui-somewhen-2030"]),
+                ("notes-api", &["notes-core"]),
+                ("notes-platform", &["windows-sys"]),
+                ("notes-bridge-gpui", &["notes-api"]),
+            ],
+            &[("notes-core", &["serde", "gpui-somewhen-2030"])],
+        );
+        assert!(
+            evaluate(&leaked)
+                .iter()
+                .any(|x| x.rule == "core-is-pure" && x.dep == "gpui-somewhen-2030"),
+            "the family root must catch an unforeseen sibling: {:?}",
+            evaluate(&leaked)
+        );
+        // Graph-wide: a bridge whose toolkit has renamed ITSELF, both lineage
+        // names gone. Silence here would be the silent-green failure again.
+        let renamed = graph(
+            &[
+                "notes-core",
+                "notes-api",
+                "notes-platform",
+                "notes-bridge-gpui",
+            ],
+            &[
+                ("notes-core", &["serde"]),
+                ("notes-api", &["notes-core"]),
+                ("notes-platform", &["windows-sys"]),
+                ("notes-bridge-gpui", &["notes-api", "gpui-continuation"]),
+            ],
+            &[],
+        );
+        let v = lineage_findings(&renamed);
+        assert_eq!(v.len(), 1, "the tripwire must speak: {v:?}");
+        assert_eq!(v[0].rule, LINEAGE_UNKNOWN_RULE);
+        assert!(
+            v[0].message().contains("gpui-continuation"),
+            "and name the package: {:?}",
+            v[0].message()
+        );
+        // Companions do NOT trip it: they ride with a real lineage.
+        let one = graph(
+            &[
+                "notes-core",
+                "notes-api",
+                "notes-platform",
+                "notes-bridge-gpui",
+            ],
+            &[
+                ("notes-core", &["serde"]),
+                ("notes-api", &["notes-core"]),
+                ("notes-platform", &["windows-sys"]),
+                (
+                    "notes-bridge-gpui",
+                    &["notes-api", "gpui", "gpui-kit", "gpui-component"],
+                ),
+            ],
+            &[],
+        );
+        assert!(
+            !lineage_findings(&one)
+                .iter()
+                .any(|x| x.rule == LINEAGE_UNKNOWN_RULE),
+            "gpui-kit is a known companion, not a third lineage: {:?}",
+            lineage_findings(&one)
         );
     }
 }

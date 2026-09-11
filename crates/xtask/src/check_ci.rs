@@ -21,6 +21,16 @@
 //!   shell: bash on Windows as bash -e WITHOUT pipefail, so a failing cargo
 //!   behind | tee reports tee's success: a red step once looked green here. A
 //!   rule now, not a comment;
+//! * [arm-missing] / [arm-extra] - the exit-code contract smoke publishes (see
+//!   smoke::CONTRACT) and the case arms of the smoke step must name the same set
+//!   of codes. This exists because the roster models COMMANDS, and exit codes
+//!   live on a different surface: 9b84bb7b added a documented return value with
+//!   no arm and check-ci said 0 violations truthfully. [no-shell-bash] was
+//!   written for the same class of silent mislabel and nobody thought to look
+//!   here. LIMIT, and it is the limit of every checker in this file: a branch can
+//!   be proven to EXIST and to RUN, never that its wording is HONEST. Whether
+//!   "exit 5 means the app was never launched" is a fair sentence stays a human
+//!   read of the arm body. Four times tonight a green meant less than it sounded.
 //! * [no-shell-bash] - a step using bash-only syntax (case/esac, set -o, <())
 //!   that does not declare shell: bash, or a continue-on-error step that
 //!   declares NO shell at all. The default shell on windows-latest is pwsh,
@@ -74,6 +84,22 @@ pub struct Step {
     pub has_pipe: bool,
     pub has_bashism: bool,
     pub has_pipefail: bool,
+    /// Every numeric case arm the step's body carries, in file order. Kept
+    /// because the exit-code contract is a second surface the roster cannot
+    /// describe: the roster models COMMANDS, and exit codes live on this one.
+    pub arms: Vec<i32>,
+    /// True when the body contains a 'case' statement at all, so an empty arms
+    /// list can be told apart from an unparsed one.
+    pub has_case: bool,
+}
+impl Step {
+    /// The step that runs the GUI smoke, identified by its command rather than
+    /// by its display name, because names are prose and get rewritten.
+    pub fn is_smoke(&self) -> bool {
+        self.commands
+            .iter()
+            .any(|c| c.split_whitespace().last() == Some("smoke"))
+    }
 }
 
 impl Step {
@@ -241,6 +267,8 @@ pub fn parse(text: &str) -> Parsed {
             has_pipe: false,
             has_bashism: false,
             has_pipefail: false,
+            arms: Vec::new(),
+            has_case: false,
         };
         if let Some(rest) = body.strip_prefix("name:") {
             step.name = rest.trim().to_string();
@@ -296,6 +324,12 @@ pub fn parse(text: &str) -> Parsed {
                 if t.starts_with("set -o pipefail") {
                     step.has_pipefail = true;
                 }
+                if let Some(code) = case_arm(t) {
+                    step.arms.push(code);
+                }
+                if t.starts_with("case ") || t.starts_with("case\t") {
+                    step.has_case = true;
+                }
             }
             i += 1;
         }
@@ -314,6 +348,88 @@ fn status_word(advisory: bool) -> &'static str {
     } else {
         "a GATE"
     }
+}
+
+/// A numeric bash case arm: a line whose first token is digits followed by ')'.
+/// The catch-all '*' is DELIBERATELY not collected: an undocumented code being
+/// absorbed by '*' is the drift this rule exists to catch, not a branch on it.
+pub fn case_arm(trimmed: &str) -> Option<i32> {
+    let head = trimmed.split_whitespace().next()?;
+    let digits = head.strip_suffix(')')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The verdict of the contract rule. A refusal is a VALUE here, not an early
+/// return someone can forget, because "the reader could not see the arms" and
+/// "the arms are all present" otherwise look identical from the outside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContractOutcome {
+    Judged(Vec<String>),
+    Refused(String),
+}
+
+/// What this rule can and cannot prove. It proves a branch EXISTS and can RUN.
+/// It cannot prove the branch's WORDING is honest: whether "exit 5 means the app
+/// was never launched" or "exit 1 separates three unrelated readings" is a fair
+/// sentence about the world is a human read of the arm body, and a green here
+/// must not be over-trusted. Tonight a green meant less than it sounded four
+/// separate times; this rule is where a fifth would be most comfortable hiding.
+pub fn decide_contract(steps: &[Step], contract: &[crate::smoke::Contract]) -> ContractOutcome {
+    let Some(step) = steps.iter().find(|s| s.is_smoke()) else {
+        return ContractOutcome::Refused(
+            "CI VIOLATION: [contract-unreadable] no gate step runs smoke, so its exit codes cannot be \
+             checked against the published contract - this checker refuses to judge rather than report \
+             a green it did not earn"
+                .to_string(),
+        );
+    };
+    if contract.is_empty() {
+        return ContractOutcome::Refused(
+            "CI VIOLATION: [contract-unreadable] smoke published an empty CONTRACT table, so there is \
+             no side to compare against - refusing to judge".to_string(),
+        );
+    }
+    if step.has_case && step.arms.is_empty() {
+        return ContractOutcome::Refused(format!(
+            "CI VIOLATION: [contract-unreadable] the smoke step (line {}) has a case statement with no \
+             numeric arm this reader could parse, so a missing branch would look like a parse gap - \
+             refusing to judge",
+            step.line
+        ));
+    }
+    if !step.has_case {
+        return ContractOutcome::Refused(format!(
+            "CI VIOLATION: [contract-unreadable] the smoke step '{}' (line {}) has no case statement at \
+             all, so every smoke verdict falls through to a bare exit - refusing to judge",
+            step.name, step.line
+        ));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for c in contract {
+        if !step.arms.contains(&c.0) {
+            out.push(format!(
+                "CI VIOLATION: [arm-missing] smoke publishes exit {} ({}) and the smoke step '{}' (line \
+                 {}) has no case arm for it - add the arm, or retire the code from CONTRACT in \
+                 smoke.rs; the two surfaces may not disagree (and note that a catch-all '*' is not \
+                 counted as branching on it)",
+                c.0, c.1, step.name, step.line
+            ));
+        }
+    }
+    for a in &step.arms {
+        if !contract.iter().any(|c| c.0 == *a) {
+            out.push(format!(
+                "CI VIOLATION: [arm-extra] the smoke step '{}' (line {}) branches on exit {a}, which \
+                 smoke's CONTRACT does not publish - either smoke can return it and the table is \
+                 incomplete, or the arm is dead wording that should go",
+                step.name, step.line
+            ));
+        }
+    }
+    ContractOutcome::Judged(out)
 }
 
 /// The comparison. Pure over the two lists, so every rule has a test.
@@ -452,7 +568,20 @@ pub fn run(args: &[String]) -> i32 {
         return 2;
     }
     let rows = crate::check::roster();
-    let violations = decide(&rows, &parsed.steps);
+    let mut violations = decide(&rows, &parsed.steps);
+    // The exit-code surface, in the same verdict rather than a second report
+    // someone can skip reading.
+    match decide_contract(&parsed.steps, crate::smoke::CONTRACT) {
+        ContractOutcome::Refused(why) => {
+            println!("{why}");
+            for line in &violations {
+                println!("{line}");
+            }
+            println!("check-ci: refused to judge {}", path.display());
+            return 2;
+        }
+        ContractOutcome::Judged(found) => violations.extend(found),
+    }
     for line in &violations {
         println!("{line}");
     }
@@ -775,5 +904,102 @@ mod tests {
                 .iter()
                 .all(|v| v.contains("[step-missing]"))
         );
+    }
+
+    /// A step body that branches on exactly the given codes, so each direction of
+    fn smoke_step(arms: &[i32]) -> String {
+        let mut body = String::from(
+            "      - name: smoke - smoke\n        shell: bash\n        continue-on-error: true\n        \
+             run: |\n          set -o pipefail\n          cargo run -p xtask --quiet -- smoke 2>&1 | tee \
+             log || status=$?\n          case \"$status\" in\n",
+        );
+        for a in arms {
+            body.push_str(&format!("            {a}) echo code {a} ;;\n"));
+        }
+        body.push_str("            *) echo other ;;\n          esac\n          exit $status\n");
+        body
+    }
+    fn full_arms() -> Vec<i32> {
+        crate::smoke::contract_codes()
+    }
+
+    /// The whole table, branched on: clean. Without this the other two tests prove
+    /// nothing, because a rule that always fires would also "catch" a good file.
+    #[test]
+    fn a_step_that_branches_on_every_contracted_code_is_clean() {
+        let steps = parse_ok(&gate_text(&format!("{ARCH}{}", smoke_step(&full_arms()))));
+
+        let out = decide_contract(&steps, crate::smoke::CONTRACT);
+        assert_eq!(
+            out,
+            ContractOutcome::Judged(Vec::new()),
+            "every code has an arm, so nothing may be claimed: {out:?}"
+        );
+    }
+
+    /// Direction one: smoke returns a code the workflow never branches on. This
+    /// is the shape 9b84bb7b left behind - a documented verdict with no arm, and
+    /// a checker that said 0 violations truthfully because it modelled commands
+    /// and not codes.
+    #[test]
+    fn a_code_with_no_case_arm_is_reported() {
+        let mut arms = full_arms();
+        arms.retain(|a| *a != 5);
+        let steps = parse_ok(&gate_text(&format!("{ARCH}{}", smoke_step(&arms))));
+        let out = decide_contract(&steps, crate::smoke::CONTRACT);
+        let ContractOutcome::Judged(v) = out else {
+            panic!("both sides were readable, so this is judged: {out:?}");
+        };
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("[arm-missing]"), "{v:?}");
+        assert!(v[0].contains("exit 5"), "must name the code: {v:?}");
+        assert!(
+            v[0].contains("binary older than sources"),
+            "and what it means: {v:?}"
+        );
+    }
+
+    /// Direction two: an arm for a code smoke does not publish. Dead wording, or
+    /// an undocumented return value - either way the two surfaces disagree.
+    #[test]
+    fn an_arm_for_an_unpublished_code_is_reported() {
+        let mut arms = full_arms();
+        arms.push(9);
+        let steps = parse_ok(&gate_text(&format!("{ARCH}{}", smoke_step(&arms))));
+        let out = decide_contract(&steps, crate::smoke::CONTRACT);
+        let ContractOutcome::Judged(v) = out else {
+            panic!("judged: {out:?}");
+        };
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("[arm-extra]"), "{v:?}");
+        assert!(v[0].contains("exit 9"), "{v:?}");
+    }
+
+    /// The refusal posture, both ways it can arise. A parse gap must never be
+    /// reported as compliance.
+    #[test]
+    fn an_unreadable_side_refuses_to_judge() {
+        let steps = parse_ok(&gate_text(ARCH));
+        let out = decide_contract(&steps, crate::smoke::CONTRACT);
+        assert!(matches!(out, ContractOutcome::Refused(_)), "{out:?}");
+        assert!(format!("{out:?}").contains("[contract-unreadable]"));
+        let empty: Vec<crate::smoke::Contract> = Vec::new();
+        let steps = parse_ok(&gate_text(&format!("{ARCH}{}", smoke_step(&full_arms()))));
+        assert!(matches!(
+            decide_contract(&steps, &empty),
+            ContractOutcome::Refused(_)
+        ));
+    }
+
+    /// The catch-all is not an arm on a code: absorbing 8 into '*' is how an
+    /// undocumented verdict becomes invisible, so a '*' does not close a hole.
+    #[test]
+    fn a_catch_all_does_not_count_as_branching() {
+        let steps = parse_ok(&gate_text(&format!("{ARCH}{}", smoke_step(&[0]))));
+        let out = decide_contract(&steps, crate::smoke::CONTRACT);
+        let ContractOutcome::Judged(v) = out else {
+            panic!("arms were parsed, so this is judged: {out:?}");
+        };
+        assert_eq!(v.len(), crate::smoke::CONTRACT.len() - 1, "{v:?}");
     }
 }
