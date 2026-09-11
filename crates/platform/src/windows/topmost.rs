@@ -14,10 +14,16 @@ use super::{to_hwnd, win32_error};
 use crate::PinOutcome;
 
 /// How long the style read-back waits for an async reband to land before it
-/// declares NotApplied. A pumping owner lands the band in ~1-2 ms (measured
-/// by the geometry_live probe); a parked owner never lands it, which is
-/// exactly the failure the verdict exists to report. The wait must be long
-/// enough for the first truth and short enough not to stall the caller.
+/// declares NotApplied. The geometry_live probe measures three different
+/// quantities, which the old prose blurred into one: an owner-thread reband
+/// is visible on the first read (~300 ns, phase C2); a cross-queue async
+/// MOVE lands in ~1-2 ms (phase B) - the number this text used to quote;
+/// but a cross-queue async Z-ORDER reband, the event this read-back waits
+/// for, waits on the owner's scheduler and pump and landed at 11-13 ms in
+/// the probe's runs - load-dependent, and past this 10 ms window at the top
+/// of the range. A parked owner never lands it at all, which is exactly the
+/// failure the verdict exists to report. The wait must be long enough for
+/// the first truth and short enough not to stall the caller.
 const BAND_LAND_WINDOW: Duration = Duration::from_millis(10);
 
 /// `SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS`, spelled as one
@@ -65,8 +71,9 @@ pub fn set_topmost(handle: isize, on: bool) -> PinOutcome {
     // the documented hidden-window case, where an async reband never lands - so
     // the window's own style is read back, and because the reband is ASYNC it is
     // read back until it lands or until BAND_LAND_WINDOW expires. A single
-    // immediate read would misreport every cross-queue reband (measured: the bit
-    // becomes visible ~1.4 ms after the call returns, on the owner's pump).
+    // immediate read would misreport every cross-queue reband (measured: the
+    // bit lands on the owner's pump ~11-13 ms after the call returns by
+    // load, printed by the geometry_live probe).
     let deadline = Instant::now() + BAND_LAND_WINDOW;
     loop {
         // SAFETY: GetWindowLongPtrW is a pure style query on the HWND `to_hwnd`
@@ -83,9 +90,9 @@ pub fn set_topmost(handle: isize, on: bool) -> PinOutcome {
                 actual,
             };
         }
-        // Yield-spin rather than sleep: the landing is a ~1 ms event and the
-        // wait is bounded, so a spin gives microsecond resolution without a
-        // timer-granularity overshoot.
+        // Yield-spin rather than sleep: the landing is a millisecond-scale
+        // event (observed ~1-13 ms by load) and the wait is bounded, so a spin
+        // gives microsecond resolution without a timer-granularity overshoot.
         thread::yield_now();
     }
 }

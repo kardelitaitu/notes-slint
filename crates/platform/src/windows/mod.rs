@@ -133,7 +133,7 @@ mod tests {
     use super::Backend;
     use crate::{FrameRect, HostFacts, PinOutcome, PlatformError, PlatformResult, WindowBackend};
 
-    /// Runs the three handle-taking seams and returns their verdicts. None of the
+    /// Runs every handle-taking seam and returns its verdict. None of the
     /// handles used here can name a live window: a USER handle value is 4-byte
     /// aligned, and each value the tests pass is either misaligned or has the 64-bit
     /// sign bit set - and the meaningful bits of an `HWND` are 32-bit, so no such
