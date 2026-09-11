@@ -511,3 +511,32 @@ fn a_temp_sibling_that_would_not_fit_must_not_claim_the_folder_is_gone()
     );
     Ok(())
 }
+
+/// THE REVIEWER'S EXPERIMENT: an ILLEGAL CHARACTER at a DEEP path must yield
+/// depth AND CAUSE, not depth alone. The first cut of the reclassification
+/// fired on the candidate length alone and discarded the OS error — "too
+/// deep (345 characters)" for a name holding a `|` is a lie with a number
+/// in it: the user shortens the path and still fails, with our authority.
+#[test]
+fn an_illegal_character_at_a_deep_path_names_the_os_error_not_depth_alone()
+-> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let mut deep = dir.path().to_path_buf();
+    for _ in 0..5 {
+        deep.push("deep-folder-name-that-is-long-on-purpose-0123456789");
+    }
+    fs::create_dir_all(&deep)?;
+    let target = deep.join("bad|name.notes");
+    match save_document(&target, "x", utf8_det()) {
+        Err(SaveError::InvalidPath(msg)) => {
+            assert!(
+                msg.contains("the OS said:"),
+                "a deep-path refusal must carry the OS error it actually got — an illegal character at depth is NOT depth alone: {msg}"
+            );
+        }
+        other => panic!(
+            "an illegal character at a deep path must be refused with the deep+cause diagnosis, got {other:?}"
+        ),
+    }
+    Ok(())
+}

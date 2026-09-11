@@ -361,10 +361,27 @@ fn create_sibling_temp(target: &Path) -> Result<(PathBuf, std::fs::File), SaveEr
                 // temp-then-rename makes true (measured: the temp's final
                 // component crosses the 255-char name ceiling while the
                 // target is still creatable, os error 123 on this box).
-                if candidate.as_os_str().len() > 260 {
+                //
+                // The MEASURE is UTF-16 code units, not bytes: Windows path
+                // limits count units, and UTF-8 bytes over-count every
+                // non-ASCII character (2x Cyrillic, 3x BMP CJK, 2x astral),
+                // so a byte-length sentence would misfire on exactly the
+                // users whose names are long. Counted purely (no platform
+                // import): astral characters are the only 2-unit case.
+                //
+                // The OS error is APPENDED, never discarded: depth can be
+                // the cause, but so can an illegal character or an ACL on
+                // the same long path — number and cause together are what
+                // make the sentence both true and actionable.
+                let units: usize = candidate
+                    .as_os_str()
+                    .to_string_lossy()
+                    .chars()
+                    .map(|c| 1 + usize::from(c as u32 > 0xFFFF))
+                    .sum();
+                if units > 260 {
                     return Err(SaveError::InvalidPath(format!(
-                        "the path is too deep for us to write safely — our own scratch name for this save ({} characters) would not fit; your file was not modified",
-                        candidate.as_os_str().len()
+                        "the path is too deep for us to write safely — our own scratch name for this save ({units} characters) would not fit; the OS said: {e}. Your file was not modified.",
                     )));
                 }
                 return Err(classify_io_error(&e, IoStep::Create));
