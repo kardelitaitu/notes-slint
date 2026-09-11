@@ -17,21 +17,21 @@ serde_json = "1"
 thiserror = "2"
 toml = "0.9"
 tempfile = "3"
-# Pinned: 0.1.x is yanked and the API moved (docs/roadmap.md watch items).
-# default-features = false is REQUIRED, not tidiness: gpui supplies its own application manifest through
-# windows-manifest, and linking a second one into the executable is a hard linker error
-# ("duplicate resource: type MANIFEST (ID 24) / name ID 1 / language 1033"). An app that declares
-# longPathAware — a notes app is handed paths of arbitrary length — must therefore own the manifest and
-# turn that feature off. "font-kit" is the one default feature the bridge still needs. Measured by C4 at
-# 3fe7722: with default-features on, notes-gpui.exe does not link.
-gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
-# THE KIT GENERATION, this migration: applications depend on gpui-kit alone
-# (.agents/skills/gpui-kit). 0.6.1 pulls gpui-pre 0.3.4 and names it `gpui`, then flat-re-exports it
-# (`pub use ::gpui::*` at gpui-kit-0.6.1/src/lib.rs:94), so no name this bridge imports disappeared.
-# The manifest paragraph above still describes the hazard, but NOT the arrangement: gpui-pre-platform
-# force-enables windows-manifest in its own declaration, features are additive, and no line in this
-# file can switch it off - so the toolkit's manifest now ships in the exe and ours does not. See
-# crates/bridge-gpui/build.rs.
+# NO `gpui` ENTRY ANYMORE, AND THE REASON IS A LINKER FACT WORTH KEEPING IN MIND BEFORE YOU "HELP".
+# gpui ships its own application manifest via the windows-manifest feature, and embedding a second one is a
+# hard linker error ("duplicate resource: type MANIFEST (ID 24) / name ID 1 / language 1033"). For the 0.2.2
+# generation we escaped that by depending on gpui with default-features = false, which turned the feature off
+# and let OUR app.manifest own the exe. That control no longer exists: gpui-pre-platform force-enables
+# windows-manifest in its OWN dependency declaration, features are additive, and every shape that can open a
+# window pulls it in - verified by linking three variants that all died the same way (see
+# crates/bridge-gpui/build.rs). So the toolkit manifest is the one the linker sees, and ours goes in AFTER
+# the link: cargo xtask manifest replaces the embedded resource with app.manifest, then reads it back to
+# prove our markers are present. Run it; a manifest nobody verifies is how you ship someone elses DPI
+# awareness. longPathAware is the one declaration we would actually miss (a notes app is handed paths of
+# arbitrary length), which is why we keep ours rather than accepting theirs.
+# Applications depend on the kit facade alone (.agents/skills/gpui-kit): 0.6.1 pulls gpui-pre 0.3.4, renames
+# it `gpui`, and flat-re-exports it (`pub use ::gpui::*`, gpui-kit-0.6.1/src/lib.rs:94), so no
+# name the bridge imported disappeared.
 gpui-kit = "=0.6.1"
 raw-window-handle = "0.6"
 # Granted by FCR at S1 (bridge editor). Needed for grapheme-cluster boundaries in the caret-to-point mapping
