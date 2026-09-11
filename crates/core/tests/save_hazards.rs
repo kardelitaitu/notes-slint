@@ -34,7 +34,7 @@ use serde_json as _;
 use thiserror as _;
 use toml as _;
 
-use notes_core::{Detected, LineEnding, TextEncoding, is_notes_path, save_document};
+use notes_core::{Detected, LineEnding, SaveError, TextEncoding, is_notes_path, save_document};
 
 /// The bytes the app wants to write - distinct from every sentinel, so
 /// "where did it land" is never ambiguous.
@@ -461,5 +461,53 @@ fn bom_in_the_name() -> Result<(), Box<dyn Error>> {
 fn reserved_device_name() -> Result<(), Box<dyn Error>> {
     let p = probe("CON.notes", &[])?;
     assert_no_silent_elsewhere(&p, "CON.notes");
+    Ok(())
+}
+
+/// THE DEEP-SAVE DIAGNOSIS (the audit's user-facing bug): our temp sibling
+/// is named "<name>.tmp-<pid>-<nanos>-<attempt>.part" — 38-42 chars on top
+/// of the target (save.rs, the join format). A target that is perfectly
+/// creatable can therefore have a SIBLING ALONE that crosses the path limit,
+/// and the same Win32 code (ERROR_PATH_NOT_FOUND) then answers both "the
+/// folder is gone" and "we could not create our own scratch name". The
+/// contract under test: whenever the save fails and the failure is depth,
+/// the diagnosis must say so and promise the bytes are intact (true,
+/// temp-then-rename) — never "the file or its folder no longer exists".
+///
+/// HONEST REPRO NOTE: the sweep spans the whole window where the target is
+/// creatable (single component <=255) while the sibling may not fit. On
+/// THIS box a >260-char plain path already round-trips (see the long-path
+/// probe in path_hazards.rs, no manifest), so whether the failure appears
+/// at all is box-dependent; if every length saves Ok here, the test still
+/// pins the diagnosis contract for the box that does fail.
+#[test]
+fn a_temp_sibling_that_would_not_fit_must_not_claim_the_folder_is_gone()
+-> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let mut honest_refusals = 0usize;
+    let mut oks = 0usize;
+    // Name lengths 200..=255 (the NTFS single-component ceiling) with a
+    // ~50-char root: targets from ~250 to ~305 chars, siblings from ~288 to
+    // ~347 — the theorised window is fully covered in 2-char steps.
+    for name_len in (200..=255).step_by(2) {
+        let name = format!("{}.notes", "n".repeat(name_len));
+        let target = dir.path().join(&name);
+        match save_document(&target, "deep", utf8_det()) {
+            Ok(_) => oks += 1,
+            Err(SaveError::InvalidPath(msg)) if msg.contains("too deep") => {
+                honest_refusals += 1;
+                assert!(
+                    msg.contains("not modified"),
+                    "the deep-path diagnosis must promise the bytes are intact: {msg}"
+                );
+            }
+            Err(e) => panic!(
+                "at name length {name_len} the diagnosis is {e:?} — a deep save must be Ok or 'too deep for us to write safely', never a false 'folder is gone'"
+            ),
+        }
+    }
+    println!(
+        "deep-path sweep on this box: {oks} saves Ok, {honest_refusals} honest deep-path refusals"
+    );
     Ok(())
 }

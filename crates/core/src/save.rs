@@ -348,7 +348,27 @@ fn create_sibling_temp(target: &Path) -> Result<(PathBuf, std::fs::File), SaveEr
         {
             Ok(file) => return Ok((candidate, file)),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(classify_io_error(&e, IoStep::Create)),
+            Err(e) => {
+                // THE DEEP-SAVE DIAGNOSIS: the same Win32 failure answers
+                // both "the folder is gone" and "our OWN scratch name alone
+                // does not fit" — the difference is which name we were
+                // opening. The candidate length is computed from the real
+                // name (the format string in the join above), never from a
+                // constant, and this is NOT a length rule in the policy:
+                // nothing that would have succeeded is refused, only a save
+                // that already failed gets a sentence the user can act on
+                // and the promise the bytes are intact — which
+                // temp-then-rename makes true (measured: the temp's final
+                // component crosses the 255-char name ceiling while the
+                // target is still creatable, os error 123 on this box).
+                if candidate.as_os_str().len() > 260 {
+                    return Err(SaveError::InvalidPath(format!(
+                        "the path is too deep for us to write safely — our own scratch name for this save ({} characters) would not fit; your file was not modified",
+                        candidate.as_os_str().len()
+                    )));
+                }
+                return Err(classify_io_error(&e, IoStep::Create));
+            }
         }
     }
     Err(SaveError::Other(
