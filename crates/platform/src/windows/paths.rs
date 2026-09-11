@@ -25,15 +25,21 @@
 //! already chose; this is the collapse key that makes a substituted drive, a
 //! UNC spelling and a junction path the SAME file.
 //!
-//! THE FINDING CORE ASKED FOR: the identity can only be minted while the
-//! file exists and is open - GetFinalPathNameByHandleW is a handle query,
-//! and there is no handle for a nonexistent path. A recent-files entry whose
-//! file has aged out cannot have its identity derived on demand; the caller
-//! must mint and STORE the identity at open time, beside the display path,
-//! and key on it from then on.
+//! A FACT ABOUT REACHABILITY: the identity is obtainable only while a live
+//! handle to the file exists - GetFinalPathNameByHandleW is a handle query,
+//! and there is no handle for a nonexistent path. What a caller does with
+//! that, including whether the string is kept at all, is policy and belongs
+//! above this seam. One consequence is worth stating because it bounds every
+//! design above the seam: an identity minted on a live handle can be
+//! re-derived or checked only through another live handle to the same file;
+//! when the volume is offline, neither is possible - while a DOS path can
+//! always at least be re-stated. That is a property of the fact, not an
+//! instruction to prefer one design over another.
 
 use ::windows::Win32::Foundation::HANDLE;
 use ::windows::core::PWSTR;
+
+use crate::{PlatformError, PlatformResult};
 
 // kernel32's GetFinalPathNameByHandleW, declared locally: the windows crate
 // gates this symbol behind the Win32_Storage_FileSystem feature, which the
@@ -68,41 +74,53 @@ const FIRST_BUFFER_CCH: usize = 1024;
 /// The volume identity of the file an OS handle refers to: normalized, with
 /// the volume spelled as its GUID - \\?\Volume{guid}\real\path\note.notes.
 ///
-/// `Some` is the OS answer VERBATIM, prefix and all: the prefix is part of
+/// `Ok(Some)` is the OS answer VERBATIM, prefix and all: the prefix is part of
 /// the identity, not noise this crate trims away. Two different spellings of
 /// one file - a drive letter and a junction, a subst and the real letter -
 /// answer the SAME string, which is the whole defect this closes.
 ///
 /// The friction, and what each case returns:
 /// * **A reparse point the OS refuses to normalize** (some junction and
-///   symlink shapes): the call fails with ERROR_NOT_SUPPORTED -> `None`.
+///   symlink shapes): the call fails with ERROR_NOT_SUPPORTED -> `Ok(None)`.
 /// * **A network file**: the volume is the redirector, and a GUID may not
 ///   exist for it - the call may answer a UNC-spelled device form or fail;
-///   either way the answer is whatever the OS said (Some) or `None`. This
+///   either way the answer is whatever the OS said (Ok(Some)) or `Ok(None)`. This
 ///   crate does not translate one into the other.
 /// * **A drive mapping that is gone** (substituted drive removed, share
 ///   disconnected): the volume GUID SURVIVES the letter, so the identity
 ///   still comes back - `Some(\\?\Volume{guid}\...)` naming a path no
 ///   user can open. That is correct: it is an identity, not an openable
-///   path, and `None` must stay reserved for "the OS could not answer".
+///   path, and `Ok(None)` must stay reserved for "the OS could not answer".
 ///
-/// `None` means the query failed - bad handle, refused reparse shape, OS
-/// refusal - and carries no further meaning: the caller owns the policy,
-/// including whether a DOS key beats no key. No DOS fallback happens here.
+/// The three verdicts are separated so the caller never has to guess:
+/// `Err` means the ARGUMENT was structurally wrong before any OS contact
+/// (a null handle - nothing was open, a caller bug worth naming);
+/// `Ok(None)` means the OS was asked and could not answer (bad or closed
+/// handle at query time, a reparse shape it refuses to normalize) - the
+/// caller owns what None means, including whether a DOS key beats no key,
+/// and no DOS fallback happens here; `Ok(Some)` is the identity.
+///
+/// What Some does NOT promise: that the path is openable by a human. A
+/// volume GUID survives the removal of its drive letter, and a still-open
+/// handle to a disconnected share may or may not resolve - the OS answer is
+/// handed over either way. The string's own prefix is the only free signal
+/// about its shape; telling "the volume is not here now" from "the OS would
+/// not answer" any further would cost a second syscall and a policy this
+/// crate does not hold.
 ///
 /// Cost: one syscall on the happy path, ~19 microseconds measured on this
 /// host (the test prints it) - a first-open and rename fact, never a
 /// per-save tax.
-pub fn volume_identity_of(handle: isize) -> Option<String> {
+pub fn volume_identity_of(handle: isize) -> PlatformResult<Option<String>> {
     if handle == 0 {
-        return None;
+        return Err(PlatformError::InvalidHandle);
     }
     let file = HANDLE(handle as *mut core::ffi::c_void);
     let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_GUID;
     let mut buffer = vec![0u16; FIRST_BUFFER_CCH];
     // SAFETY: GetFinalPathNameByHandleW receives the handle value we were
     // given (the API validates it internally and fails closed on a handle
-    // that is not a file, which becomes None below), plus `buffer`, a live
+    // that is not a file, which becomes Ok(None) below), plus `buffer`, a live
     // Vec<u16> whose length is passed as the capacity and whose storage the
     // call may write and nothing else. No pointer is retained past the call.
     // The returned count is inspected, never unwrapped.
@@ -110,8 +128,8 @@ pub fn volume_identity_of(handle: isize) -> Option<String> {
         GetFinalPathNameByHandleW(file, PWSTR(buffer.as_mut_ptr()), buffer.len() as u32, flags)
     };
     if needed == 0 {
-        // Any query failure is None; the caller owns what None means.
-        return None;
+        // Any query failure is Ok(None); the caller owns what None means.
+        return Ok(None);
     }
     if needed as usize > buffer.len() {
         // The too-small answer counts the null terminator; grow and retry once.
@@ -122,20 +140,21 @@ pub fn volume_identity_of(handle: isize) -> Option<String> {
             GetFinalPathNameByHandleW(file, PWSTR(buffer.as_mut_ptr()), buffer.len() as u32, flags)
         };
         if needed == 0 {
-            return None;
+            return Ok(None);
         }
     }
     let len = (needed as usize).min(buffer.len());
-    Some(
+    Ok(Some(
         String::from_utf16_lossy(&buffer[..len])
             .trim_end_matches('\0')
             .to_string(),
-    )
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::volume_identity_of;
+    use crate::PlatformError;
     use std::os::windows::io::AsRawHandle;
     use std::path::PathBuf;
     use std::{fs, process};
@@ -196,9 +215,12 @@ mod tests {
         let direct = fs::File::open(scratch.target.join("note.txt")).expect("opens");
         let through_link =
             fs::File::open(scratch.link.join("note.txt")).expect("opens through the junction");
-        let a = volume_identity_of(direct.as_raw_handle() as isize).expect("direct resolves");
-        let b =
-            volume_identity_of(through_link.as_raw_handle() as isize).expect("junction resolves");
+        let a = volume_identity_of(direct.as_raw_handle() as isize)
+            .expect("direct resolves")
+            .expect("direct identity");
+        let b = volume_identity_of(through_link.as_raw_handle() as isize)
+            .expect("junction resolves")
+            .expect("junction identity");
         assert_eq!(a, b, "one file, one identity: {a} vs {b}");
         assert!(a.starts_with(r"\\?\Volume{"), "the GUID form: {a}");
         assert!(a.contains("target_dir"), "the real path is named: {a}");
@@ -222,7 +244,9 @@ mod tests {
         let scratch = Scratch::new("hostile");
         let file =
             fs::File::open(scratch.link.join("note.txt")).expect("opens through the junction");
-        let identity = volume_identity_of(file.as_raw_handle() as isize).expect("resolves");
+        let identity = volume_identity_of(file.as_raw_handle() as isize)
+            .expect("resolves")
+            .expect("identity present");
         assert!(
             identity.starts_with(r"\\?\Volume{") && identity.contains("target_dir\\note.txt"),
             "the real crossing is visible inside the GUID identity: {identity}"
@@ -242,20 +266,29 @@ mod tests {
             scratch.target.join("renamed.txt"),
         )
         .expect("std opens with FILE_SHARE_DELETE, so the rename succeeds");
-        let identity = volume_identity_of(file.as_raw_handle() as isize).expect("resolves");
+        let identity = volume_identity_of(file.as_raw_handle() as isize)
+            .expect("resolves")
+            .expect("identity present");
         assert!(
             identity.contains("renamed.txt") && !identity.contains("note.txt"),
             "the CURRENT name comes back: {identity}"
         );
     }
 
-    /// Refusals are None, per the pinned contract: the caller owns the policy
-    /// for None, including whether a DOS key beats no key. No DOS fallback,
-    /// no guess, no distinction this crate is not allowed to make.
+    /// Refusals are typed, not guesses: a null handle never reached the OS,
+    /// so it is the caller-bug error; a handle the OS is asked anyway comes
+    /// back `Ok(None)` when it declines. The caller owns what None means,
+    /// including whether a DOS key beats no key. No DOS fallback, no guess,
+    /// no distinction this crate is not allowed to make.
     #[test]
-    fn a_refused_handle_is_none_not_a_guess() {
-        assert_eq!(volume_identity_of(0), None);
-        assert_eq!(volume_identity_of(isize::MIN), None);
+    fn a_refusal_is_typed_not_a_guess() {
+        // The three-verdict split: a null handle is the caller's bug, typed;
+        // a garbage value is asked to the OS, which declines -> Ok(None).
+        assert!(matches!(
+            volume_identity_of(0),
+            Err(PlatformError::InvalidHandle)
+        ));
+        assert!(matches!(volume_identity_of(isize::MIN), Ok(None)));
     }
 
     /// The cost, measured on a real open handle and printed for the record:
@@ -268,7 +301,9 @@ mod tests {
         let rounds = 200u32;
         let started = std::time::Instant::now();
         for _ in 0..rounds {
-            volume_identity_of(raw).expect("resolves");
+            volume_identity_of(raw)
+                .expect("resolves")
+                .expect("identity present");
         }
         let per_call = started.elapsed() / rounds;
         eprintln!("volume_identity_of measured cost: {per_call:?} per call");
