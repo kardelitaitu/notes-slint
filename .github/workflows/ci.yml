@@ -219,7 +219,57 @@ jobs:
           fi
           exit $status
 
-      # --- 3d. the GUI smoke, which stays advisory ---------------------------
+      # --- 3d. the manifest inside the exe is OURS, and it is a gate ----------
+      # "cargo run -p xtask -- manifest" (crates/xtask/src/manifest.rs) replaces the
+      # embedded assembly identity / longPathAware / dpiAware declaration in the BUILT
+      # exe and then READS THE FILE BACK to prove the replacement landed - mt.exe saying
+      # ok is not the verdict, the produced resource is.
+      # Bare invocation, deliberately: the roster row is "cargo run -p xtask manifest" and
+      # check-ci matches a step by TOKEN SIGNATURE, so spelling out the default path
+      # (target/debug/notes-gpui.exe, which the tool already assumes) would make this step
+      # unknown to the very contract check that demands it exist.
+      # GATE, not advisory, and not --quick-skippable: a wrong DPI declaration is not a
+      # desktop dependency, it is a shipped binary contradicting D40/D42, and the state
+      # this step exists to detect is exactly the one a skip would hide.
+      # POSITION: after 3b (it mutates the exe 3b just linked) and before smoke (3e), so
+      # the runtime probe launches the artifact as shipped, not the pre-mutation one.
+      #
+      # Exit codes, exactly as the lane published them:
+      #   0  verified - replaced AND read back out of the file
+      #   20 NO SDK - mt.exe not found, and the tool says nothing was written
+      #   21 REFUSED TO JUDGE - mt.exe claimed success and the read-back disagrees
+      #   22 CANNOT RUN - no exe at the path, source manifest unreadable, mt.exe nonzero
+      #
+      # 20 GATES RED HERE ON PURPOSE, a deliberate disagreement with how smoke handles its
+      # own decline: windows-latest ships the Windows SDK, so a NO-SDK verdict on a runner
+      # means OUR discovery broke (the newest-first search under Program Files found no
+      # bin/*/x64/mt.exe), not that the machine is unkind. A decline that reads as a pass
+      # is how a check becomes permanently inert with nobody noticing, and the tool already
+      # separates "not installed" from "not found" - so the workflow must not blur them.
+      # On a developer laptop 20 is honest; run from a Developer Prompt or read the search
+      # path it prints. Never re-purpose this arm to make a red row go away.
+      #
+      # mt.exe prints a Microsoft banner on stdout, and this step captures it (tee, no
+      # filtering): if 21 ever fires, the banner and mt.exe's own claim are the evidence,
+      # and a grep -v that removes the banner could just as easily remove a real line.
+      - name: manifest — cargo run -p xtask -- manifest (the shipped exe declares identity and DPI as ours)
+        id: manifest
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          status=0
+          cargo run -p xtask -- manifest 2>&1 | tee "$RUNNER_TEMP/manifest.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          case "$status" in
+            0) echo "manifest: verified - replaced and read back from the file. The PASS line above names the exe, which mt.exe was used, the size before and after, and whether the resource was already ours." ;;
+            20) echo "::error::MANIFEST CHECK NEVER RAN - NO mt.exe FOUND (exit 20). windows-latest ships the Windows SDK, so this is OUR discovery breaking, not a missing prerequisite: nothing was written and the produced exe is still the toolkits declaration. Red by design (a decline that passes is an inert check); fix the mt.exe search or the SDK on the runner, and do not soften this arm to green." ;;
+            21) echo "::error::MANIFEST REFUSED TO JUDGE (exit 21) - mt.exe reported success and the read-back disagrees: the declaration we asked for is NOT in the produced resource. This is the decorative-instrument failure the step exists to catch: the exe would ship with the wrong identity/DPI while a check-only CI stayed green. The file on disk is the authority, not mt.exe's exit code; the log above carries both claims side by side." ;;
+            22) echo "::error::MANIFEST CHECK CANNOT RUN (exit 22) - no exe at the path step 3b should have linked, the source manifest is unreadable, or mt.exe exited nonzero. No verdict exists about the shipped binary. If 3b is green and this still says no exe, that is a step-order or path problem and not a product bug." ;;
+            *) echo "::error::MANIFEST COULD NOT JUDGE (exit $status) - the tool returned something outside its published contract, so nothing about the shipped manifest is known. This arm deliberately names NO numbers, because an arm that enumerates codes goes stale the day one is added; read it as no information, never as a pass." ;;
+          esac
+          exit $status
+      # --- 3e. the GUI smoke, which stays advisory ---------------------------
       # "cargo run -p xtask -- smoke" (crates/xtask/src/smoke.rs) launches the real
       # notes-gpui.exe that step 3b just linked, waits a bounded time for a window handle
       # and a title, closes it with a REAL WM_CLOSE, asserts the process exited BY ITSELF
@@ -278,10 +328,13 @@ jobs:
       # codes 4/5, then 6, then 7 each landed with no arm waiting, because check-ci
       # compares the ROSTER of commands and says nothing about exit codes. The fix is
       # queued with the xtask lane, not invented in this file: smoke.rs publishes a
-      # CONTRACT table derived from its own constants and check-ci asserts
-      # [arm-missing] / [arm-extra] against this very step. Until that lands, arming the
-      # case is part of the commit that changes the contract - not part of a CI commit
-      # that happens to notice.
+      # CONTRACT table derived from its own constants, and check-ci asserts [arm-missing] /
+      # [arm-extra] against this very step - so an undocumented or unhandled verdict is now
+      # a red run, not a hopeful review comment. Proof it is not decorative: the rule
+      # caught this file missing an arm for exit 2 (a code the catch-all covered in
+      # practice) and refused anyway, because a verdict absorbed by "*" is precisely the
+      # drift the check exists to catch. Standing rule that leaves: changing the contract
+      # means arming it, in the same commit.
       # Every arm is attributable because the step prints its own identity line: "smoke:
       # tested binary <path> | <age> | built_by_this_run=YES|NO | git HEAD at that moment
       # <sha>" - so a green cell names the exact artifact and commit it proved.
@@ -326,6 +379,7 @@ jobs:
           case "$status" in
             0) echo "smoke: PASS - a window appeared, WM_CLOSE shut the app down by itself, that run wrote session.json, and the user state the harness relocated is accounted for - byte-identical by the harness's own contract, which is what makes exit 1 below possible. Citable as written: graceful shutdown, real persistence, no profile left damaged. The outcome_note on the line above says WHICH pass it was - kept-app-artefact (this run wrote it, the user bytes parked aside) or restored-user-state (the user file came back unchanged) - so quote that token, not just the green." ;;
             1) echo "::error::SMOKE EXIT 1 - three unrelated readings share this code; separate them before citing it. Look at the smoke: window=.../close=.../session=... line and the SMOKE FAIL line above it. close=FORCED means the app had to be killed to stop it (shutdown bug). session=FAILED, with every path searched printed, means nothing was persisted (product bug). window=MISSING close=NOBIN means the exe disappeared between its build and the launch (an artifact that vanished, not a shutdown bug) - a TARGET THAT DOES NOT COMPILE IS EXIT 4, not this one. But if the log says the relocated user state did not come back byte-identical, or could not restore it and names a temp path, then THE HARNESS DAMAGED A USER PROFILE - an infrastructure emergency: put that file back by hand and fix the harness before this row is read as the app failing to persist." ;;
+            2) echo "::error::SMOKE HARNESS COULD NOT RUN (exit 2) - the instrument failed before it could judge anything: no PowerShell to post WM_CLOSE with, the probe script could not be written or run, the source mtimes could not be read (deliberately NOT reported as 5/stale - that would accuse a binary of being old when nobody checked), or a bad invocation of cargo xtask smoke. Nothing was launched, so no verdict about the app exists in either direction; this is the one code that is always the harness own fault. Read the eprintln lines above for which precondition failed." ;;
             3) echo "::notice::smoke DECLINED - the summary line above says which of the two it was: (no desktop) means no interactive session to open a window in; (BLOCKED BY FOREIGN STATE) means something that is not a session file occupies the state path, which is machine pollution and not the app - the DECLINED line prints what is sitting there, with ACLs, and says clear the occupant. Neither is a failure; the check was simply not possible on this machine." ;;
             4) echo "::error::SMOKE EXIT 4 - THE TARGET DID NOT COMPILE. THE APP WAS NEVER LAUNCHED and no cached exe was substituted to keep the row green, so this says nothing about shutdown, persistence or geometry: it is a build failure, reported as an annotation only because a GUI step must not gate a headless runner. The line above (smoke: build | error[E...]) is the first real cargo error, and the step BEFORE this one (3b/3c) usually carries the same verdict with a name - fix the code, then re-read 1 and 3; do not treat a green 3b as proof this 4 is wrong, smoke builds the test profile itself." ;;
             5) echo "::error::SMOKE EXIT 5 - STALE BINARY: the notes-gpui.exe on disk is older than the sources that build it, so smoke refused to judge the running app against a build nobody compiled from this commit (window=STALE close=STALE session=STALE, and the identity line prints the age plus built_by_this_run=NO). Read it as the instrumentation refusing to lie about WHICH binary it tested: the app was never launched at all, so this is neither a product bug nor a pass - a verdict on a stale exe would be a claim about code that no longer exists. The --no-build diagnostic path asked for this; rebuild, do not force a run." ;;
@@ -435,7 +489,7 @@ jobs:
       # fixtures verify as GATE rows, plus the bridge compile check, the GUI smoke row and
       # the docs validator as ADVISORY rows that are reported and never gate. (Two of those
       # deserve a word: the bridge row is a "cargo check" - compile only, so the LINK is
-      # gated by 3b and not by xtask - and smoke is the row 3d names separately because a
+      # gated by 3b and not by xtask - and smoke is the row 3e names separately because a
       # window bug is worth its own cell.) The
       # explicit named steps above stay for that reason: a named cell points at one gate in
       # the Actions UI, and xtask's table is the developer's list, not CI's shape. What this
