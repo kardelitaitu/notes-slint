@@ -43,6 +43,14 @@
 //!   under-report - the right direction for a gate, since a precise reading
 //!   would have to evaluate every cfg expression, and a checker that quietly
 //!   drops edges is worse than one that keeps too many.
+//! * LIMIT OF THIS SURFACE, stated before the string below is trusted: the checker reads
+//!   cargo metadata, so it sees EDGES and RESOLVED NAMES and nothing else. A crate that
+//!   reaches the operating system with no edge at all - a hand-declared extern block, a
+//!   build script adding -lkernel32 - is invisible here BY CONSTRUCTION, and "0
+//!   violations" makes no claim about it. The backstop is the source-level reader
+//!   [crate::check_unsafe], which does see the unsafe-qualified form this repository
+//!   actually uses for FFI; its own residual gap is documented there. Neither tool
+//!   parses an AST, and neither one is total.
 //! * Name lists are FAMILIES: [in_family] matches gpui, gpui-pre, gpui-pre-platform,
 //!   gpui-base, gpui-kit-assets and friends against the single root gpui, because an
 //!   upstream rename must not be able to turn a structural rule off by renaming

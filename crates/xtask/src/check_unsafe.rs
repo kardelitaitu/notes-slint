@@ -54,6 +54,17 @@
 //!   in the tree", never as "exactly this much compiles".
 //! * an allowance reached through a derive, or written across several lines, is
 //!   not matched.
+//! * a BARE extern "system" { fn ... } declaration is invisible: every rule here keys
+//!   on the unsafe token, and the 2024 edition does not require unsafe to DECLARE a
+//!   foreign function. Measured and pinned by
+//!   [the_scanner_sees_the_2024_form_and_is_blind_to_the_bare_one]: the form this repo
+//!   actually uses (crates/platform/src/windows/paths.rs writes unsafe extern
+//!   "system") IS caught, and so is every call, because calling a foreign function
+//!   needs an unsafe block in every edition. What slips through is a bare declaration
+//!   that is never called - dead code that reaches nothing. The shape to fund if that
+//!   ever matters is a per-crate count of extern blocks beside the block/SAFETY/
+//!   declaration counts already in the ledger, with the allowed home named in the
+//!   printout rather than assumed.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -745,5 +756,39 @@ mod tests {
     fn it_takes_no_flags_and_says_so() {
         // The check-ci trap, pre-empted: a flag is never read as a path.
         assert_eq!(run(&["--offline".to_string()]), 2);
+    }
+
+    /// WHERE THE TEXT READER ENDS. Measured, not assumed: the real declaration in
+    /// crates/platform/src/windows/paths.rs is the 2024 form 'unsafe extern
+    /// "system"', which this scanner DOES see, so a hand-spelled kernel binding in
+    /// core, api or xtask is a finding today. What the scanner cannot see is a
+    /// BARE 'extern "system"' block, which the 2024 edition allows for declaring.
+    /// That residual gap is stated rather than papered over, and it is narrow: the
+    /// edition still requires an unsafe block to CALL such a function, so a bare
+    /// declaration that is actually used is caught at the call site, and one that
+    /// is not used reaches nothing at all.
+    #[test]
+    fn the_scanner_sees_the_2024_form_and_is_blind_to_the_bare_one() {
+        // Spelled with the ~U~ sentinel and normalised by fix(), per this module's
+        // own convention: the scanner reads a literal containing the keyword as
+        // code, so a test written normally would flag its own file.
+        let ffi_2024 =
+            "~U~ extern \"system\" {\n    fn GetFinalPathNameByHandleW(a: u32) -> i32;\n}\n";
+        let found: Vec<String> = scan_foreign("crates/core/src/x.rs", &fix(ffi_2024))
+            .iter()
+            .map(|f| f.rule.to_string())
+            .collect();
+        assert_eq!(found, vec![UNSAFE_OUTSIDE.to_string()], "{found:?}");
+        let call = "    let code = ~U~ { GetFinalPathNameByHandleW(h) };\n";
+        assert!(
+            !scan_foreign("crates/core/src/x.rs", &fix(call)).is_empty(),
+            "the USE of any FFI needs an unsafe block in every edition, and that is caught"
+        );
+        let bare = "extern \"system\" {\n    fn GetFinalPathNameByHandleW(a: u32) -> i32;\n}\n";
+        assert!(
+            scan_foreign("crates/core/src/x.rs", bare).is_empty(),
+            "documented blind spot: a bare extern DECLARATION is invisible to a reader that
+             keys on the unsafe keyword - and on its own it is also dead code"
+        );
     }
 }
