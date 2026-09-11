@@ -7,6 +7,7 @@ mod check_unsafe;
 mod deps;
 mod fixtures;
 mod identity;
+mod manifest;
 mod metadata;
 mod smoke;
 
@@ -27,6 +28,13 @@ fn usage() {
     );
     eprintln!(
         "       SAFETY comment, no per-item allowances, and the workspace lint still forbids"
+    );
+    eprintln!("usage: cargo xtask manifest [path-to-exe]");
+    eprintln!(
+        "       ensure the built exe carries OUR win32 manifest (mt.exe after the link), then verify"
+    );
+    eprintln!(
+        "       it by reading the resource back: exit 0 verified, 20 no SDK, 21 read-back refused"
     );
     eprintln!("usage: cargo xtask smoke [--reuse-state] [--no-build]");
     eprintln!(
@@ -80,6 +88,7 @@ fn main() {
         Some("check-deps") => std::process::exit(deps::run()),
         Some("check-ci") => std::process::exit(check_ci::run(&args[1..])),
         Some("check-unsafe") => std::process::exit(check_unsafe::run(&args[1..])),
+        Some("manifest") => std::process::exit(manifest::run(&args[1..])),
         Some("smoke") => std::process::exit(smoke::run(&args[1..])),
         Some("fixtures") => match args.get(1).map(String::as_str) {
             Some("generate") => std::process::exit(fixtures::run_generate()),

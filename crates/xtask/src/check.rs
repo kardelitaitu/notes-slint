@@ -159,6 +159,21 @@ fn step_specs() -> Vec<StepSpec> {
             budget_secs: 60,
         },
         StepSpec {
+            name: "manifest",
+            display: "cargo run -p xtask -- manifest",
+            program: "cargo",
+            args: &["run", "-p", "xtask", "--quiet", "--", "manifest"],
+            // Blocking, not advisory, and this is the one row whose reason is NOT
+            // "cheap so why skip": a wrong DPI declaration is not a desktop
+            // dependency, it is a shipped binary that disagrees with the
+            // assumptions under D40/D42. It mutates the exe it verifies, so it is
+            // deliberately NOT quick-skippable - skipping it is the exact state
+            // the step exists to detect.
+            advisory: false,
+            quick_skippable: false,
+            budget_secs: 120,
+        },
+        StepSpec {
             name: "check-unsafe",
             display: "cargo run -p xtask -- check-unsafe",
             program: "cargo",
@@ -437,6 +452,7 @@ mod tests {
             "check-deps",
             "check-ci",
             "check-unsafe",
+            "manifest",
             "fixtures",
         ] {
             assert!(
