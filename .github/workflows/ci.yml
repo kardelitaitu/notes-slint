@@ -140,8 +140,8 @@ jobs:
       # compile would convert a slow-but-green run into a false red. The 45-minute job
       # timeout is the backstop. Revisit with one measured CI duration - and if you do
       # bound it, bound the bridge clippy at 3c too so the two cannot disagree.
-      - name: clippy — cargo clippy --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings
-        run: cargo clippy --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings
+      - name: clippy — cargo clippy --locked --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings
 
       # --- 3. tests (== the `cargo gate` alias) ------------------------------
       # BOUNDED, and bounded from measured numbers rather than a guess, because a hang in
@@ -166,9 +166,9 @@ jobs:
       # dependency graph - so 15 min is ~7x that and ~300x the warm worst case (3 s):
       # slack enough that no legitimately slow runner gets cut off, short enough to name
       # a hang. Raise it only with a measured CI duration, never to silence a red.
-      - name: test — cargo test --workspace --exclude notes-bridge-gpui
+      - name: test — cargo test --locked --workspace --exclude notes-bridge-gpui
         timeout-minutes: 15
-        run: cargo test --workspace --exclude notes-bridge-gpui
+        run: cargo test --locked --workspace --exclude notes-bridge-gpui
 
       # --- 3b/3c. THE BRIDGE: which checks gate, and which deliberately do not -
       # One place, so nobody re-decides this per-file. notes-bridge-gpui is no longer a
@@ -238,7 +238,7 @@ jobs:
       # the exact downgrade this file was written to prevent. (Both also dodge the stale-
       # exe trap by going through cargo run; no step in this file invokes an exe path.)
       # --- 3b. the bridge LINKS ------------------------------------------------
-      - name: bridge — cargo build -p notes-bridge-gpui --bin notes-gpui (the exe must link)
+      - name: bridge — cargo build --locked -p notes-bridge-gpui --bin notes-gpui (the exe must link)
         id: bridge
         shell: bash
         run: |
@@ -247,7 +247,7 @@ jobs:
           # check prints green. Every piped bash step below carries it for that reason.
           set -o pipefail
           status=0
-          cargo --config 'future-incompat-report.frequency="never"' build -p notes-bridge-gpui --bin notes-gpui 2>&1 | tee "$RUNNER_TEMP/bridge-build.log" || status=$?
+          cargo --config 'future-incompat-report.frequency="never"' build --locked -p notes-bridge-gpui --bin notes-gpui 2>&1 | tee "$RUNNER_TEMP/bridge-build.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           # Annotate the first errors so the cause is visible without scrolling a long log.
           while IFS= read -r line; do
@@ -266,13 +266,13 @@ jobs:
       # PURPOSE like step 2 (measured here this session: 1m26s cold in a private target dir,
       # 10.44s warm; the job timeout is the backstop) - the reason and the numbers are
       # written down so this is a decision, not an oversight. See step 2 for the rule.
-      - name: clippy (bridge) — cargo clippy -p notes-bridge-gpui --all-targets -- -D warnings
+      - name: clippy (bridge) — cargo clippy --locked -p notes-bridge-gpui --all-targets -- -D warnings
         id: bridge_clippy
         shell: bash
         run: |
           set -o pipefail
           status=0
-          cargo --config 'future-incompat-report.frequency="never"' clippy -p notes-bridge-gpui --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/bridge-clippy.log" || status=$?
+          cargo --config 'future-incompat-report.frequency="never"' clippy --locked -p notes-bridge-gpui --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/bridge-clippy.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           # rustc/clippy diagnostics start at column 0; the leading anchor keeps source
           # snippets quoted inside a diagnostic from being annotated as if they were one.
@@ -319,14 +319,14 @@ jobs:
       # mt.exe prints a Microsoft banner on stdout, and this step captures it (tee, no
       # filtering): if 21 ever fires, the banner and mt.exe's own claim are the evidence,
       # and a grep -v that removes the banner could just as easily remove a real line.
-      - name: manifest — cargo run -p xtask -- manifest (the shipped exe declares identity and DPI as ours)
+      - name: manifest — cargo run --locked -p xtask -- manifest (the shipped exe declares identity and DPI as ours)
         id: manifest
         shell: bash
         timeout-minutes: 5
         run: |
           set -o pipefail
           status=0
-          cargo run -p xtask -- manifest 2>&1 | tee "$RUNNER_TEMP/manifest.log" || status=$?
+          cargo run --locked -p xtask -- manifest 2>&1 | tee "$RUNNER_TEMP/manifest.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           case "$status" in
             0) echo "manifest: verified - replaced and read back from the file. The PASS line above names the exe, which mt.exe was used, the size before and after, and whether the resource was already ours." ;;
@@ -433,7 +433,7 @@ jobs:
       # kills its pwsh child at 40 s, the row budget is 120 s). 15 min is ~7x that worst
       # measured compile and a third of the 45-minute job timeout - a hung GUI or a stuck
       # link now dies with THIS step named, instead of eating the whole job in silence.
-      - name: smoke — cargo run -p xtask -- smoke (advisory - needs a desktop session)
+      - name: smoke — cargo run --locked -p xtask -- smoke (advisory - needs a desktop session)
         id: xtask_smoke
         continue-on-error: true
         shell: bash
@@ -441,7 +441,7 @@ jobs:
         run: |
           set -o pipefail
           status=0
-          cargo run -p xtask --quiet -- smoke 2>&1 | tee "$RUNNER_TEMP/xtask-smoke.log" || status=$?
+          cargo run --locked -p xtask --quiet -- smoke 2>&1 | tee "$RUNNER_TEMP/xtask-smoke.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           case "$status" in
             0) echo "smoke: PASS - a window appeared, WM_CLOSE shut the app down by itself, that run wrote session.json, and the user state the harness relocated is accounted for - byte-identical by the harness's own contract, which is what makes exit 1 below possible. Citable as written: graceful shutdown, real persistence, no profile left damaged. The outcome_note on the line above says WHICH pass it was - kept-app-artefact (this run wrote it, the user bytes parked aside) or restored-user-state (the user file came back unchanged) - so quote that token, not just the green." ;;
@@ -462,7 +462,7 @@ jobs:
       #   0 clean | 1 a layering rule was violated | 2 the check itself could not run.
       # Each violation prints "ARCH VIOLATION: <pkg> ... [rule: <rule-id>]" and is
       # re-emitted below as an annotation, so a failure names the rule id.
-      - name: arch — cargo run -p xtask -- check-arch
+      - name: arch — cargo run --locked -p xtask -- check-arch
         id: arch
         shell: bash
         run: |
@@ -470,7 +470,7 @@ jobs:
           # failing cargo behind "| tee" would otherwise read as tee success.
           set -o pipefail
           status=0
-          cargo run -p xtask -- check-arch 2>&1 | tee "$RUNNER_TEMP/check-arch.log" || status=$?
+          cargo run --locked -p xtask -- check-arch 2>&1 | tee "$RUNNER_TEMP/check-arch.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           # One annotation per violated rule id, taken straight from check-arch's output.
           while IFS= read -r line; do
@@ -500,14 +500,14 @@ jobs:
       # step, and it reddens it because of the set -o pipefail line below - a gate that
       # goes green because its checker could not start is a gate nobody can trust. Read a
       # red with exit 2 as "fix the manifests, then find out whether the drift was real".
-      - name: deps — cargo run -p xtask -- check-deps (member manifests match the workspace template)
+      - name: deps — cargo run --locked -p xtask -- check-deps (member manifests match the workspace template)
         id: deps
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
           status=0
-          cargo run -p xtask -- check-deps 2>&1 | tee "$RUNNER_TEMP/check-deps.log" || status=$?
+          cargo run --locked -p xtask -- check-deps 2>&1 | tee "$RUNNER_TEMP/check-deps.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           # One annotation per violation, straight from the checker's own line format.
           while IFS= read -r line; do
@@ -530,14 +530,14 @@ jobs:
       # judges the fixtures; there is deliberately no "fixtures generate" step here.
       # Exit codes: 0 clean | 1 a fixture no longer matches its manifest sha256 | 2 the
       # verifier could not run (manifest missing/unreadable), which is not a violation.
-      - name: fixtures — cargo run -p xtask -- fixtures verify (encoding fixtures are byte-exact vs manifest)
+      - name: fixtures — cargo run --locked -p xtask -- fixtures verify (encoding fixtures are byte-exact vs manifest)
         id: fixtures
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
           status=0
-          cargo run -p xtask -- fixtures verify 2>&1 | tee "$RUNNER_TEMP/fixtures-verify.log" || status=$?
+          cargo run --locked -p xtask -- fixtures verify 2>&1 | tee "$RUNNER_TEMP/fixtures-verify.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           # Annotate each offending fixture by name, straight from the verifier output.
           while IFS= read -r line; do
@@ -607,14 +607,14 @@ jobs:
       # reader REFUSED to parse ci.yml rather than guess, and a workflow nothing can read
       # is a workflow nothing gates - so 2 must be fixed, never waved through.
       # Violations are re-emitted as annotations, so the Actions UI names the rule id.
-      - name: roster — cargo run -p xtask -- check-ci (CI steps match the xtask gate roster)
+      - name: roster — cargo run --locked -p xtask -- check-ci (CI steps match the xtask gate roster)
         id: check_ci
         shell: bash
         timeout-minutes: 5
         run: |
           set -o pipefail
           status=0
-          cargo run -p xtask -- check-ci 2>&1 | tee "$RUNNER_TEMP/check-ci.log" || status=$?
+          cargo run --locked -p xtask -- check-ci 2>&1 | tee "$RUNNER_TEMP/check-ci.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           while IFS= read -r line; do
             echo "::error::$line"
@@ -626,12 +626,11 @@ jobs:
           esac
           exit $status
       # --- 4e. the unsafe ledger, now a rule instead of a claim ----------------
-      # "cargo run -p xtask -- check-unsafe" (crates/xtask/src/check_unsafe.rs) scans the
+      # "cargo run --locked -p xtask -- check-unsafe" (crates/xtask/src/check_unsafe.rs) scans the
       # platform sources and enforces the seven rules AGENTS.md states as an invariant that
       # nothing used to prove: [unsafe-outside-platform], [unsafe-without-safety],
       # [local-allowance], [ledger-imbalance], [raw-ffi-imbalance], [lint-missing],
       # [lint-escape]. It BLOCKS:
-      # unsafe is the one place where a polite mistake is a memory-safety bug, and until
       # this row existed the only enforcement was the honesty of whoever wrote the block.
       # The roster makes it non-quick-skippable, so the drift lock at 4c runs it too - the
       # named cell here exists to say WHICH rule escaped, in its own red.
@@ -650,14 +649,14 @@ jobs:
       # Exit codes: 0 clean | 1 a rule was violated | 2 the checker REFUSED to judge
       # (metadata unreadable, no platform member, no readable sources). 2 is red on
       # purpose: a ledger nobody counted is not a balanced ledger.
-      - name: unsafe — cargo run -p xtask -- check-unsafe (the unsafe ledger balances and stays in platform)
+      - name: unsafe — cargo run --locked -p xtask -- check-unsafe (the unsafe ledger balances and stays in platform)
         id: check_unsafe
         shell: bash
         timeout-minutes: 5
         run: |
           set -o pipefail
           status=0
-          cargo run -p xtask -- check-unsafe 2>&1 | tee "$RUNNER_TEMP/check-unsafe.log" || status=$?
+          cargo run --locked -p xtask -- check-unsafe 2>&1 | tee "$RUNNER_TEMP/check-unsafe.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           # One annotation per violation, each carrying its bracketed rule id.
           while IFS= read -r line; do

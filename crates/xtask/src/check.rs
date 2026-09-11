@@ -103,10 +103,11 @@ fn step_specs() -> Vec<StepSpec> {
         },
         StepSpec {
             name: "clippy",
-            display: "cargo clippy --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings",
+            display: "cargo clippy --locked --workspace --exclude notes-bridge-gpui --all-targets -- -D warnings",
             program: "cargo",
             args: &[
                 "clippy",
+                "--locked",
                 "--workspace",
                 "--exclude",
                 "notes-bridge-gpui",
@@ -121,36 +122,60 @@ fn step_specs() -> Vec<StepSpec> {
         },
         StepSpec {
             name: "test",
-            display: "cargo test --workspace --exclude notes-bridge-gpui",
+            display: "cargo test --locked --workspace --exclude notes-bridge-gpui",
             program: "cargo",
-            args: &["test", "--workspace", "--exclude", "notes-bridge-gpui"],
+            args: &[
+                "test",
+                "--locked",
+                "--workspace",
+                "--exclude",
+                "notes-bridge-gpui",
+            ],
             advisory: false,
             quick_skippable: true,
             budget_secs: 900,
         },
         StepSpec {
             name: "check-arch",
-            display: "cargo run -p xtask -- check-arch",
+            display: "cargo run --locked -p xtask -- check-arch",
             program: "cargo",
-            args: &["run", "-p", "xtask", "--quiet", "--", "check-arch"],
+            args: &[
+                "run",
+                "--locked",
+                "-p",
+                "xtask",
+                "--quiet",
+                "--",
+                "check-arch",
+            ],
             advisory: false,
             quick_skippable: false,
             budget_secs: 180,
         },
         StepSpec {
             name: "check-deps",
-            display: "cargo run -p xtask -- check-deps",
+            display: "cargo run --locked -p xtask -- check-deps",
             program: "cargo",
-            args: &["run", "-p", "xtask", "--quiet", "--", "check-deps"],
+            args: &[
+                "run",
+                "--locked",
+                "-p",
+                "xtask",
+                "--quiet",
+                "--",
+                "check-deps",
+            ],
             advisory: false,
             quick_skippable: false,
             budget_secs: 180,
         },
         StepSpec {
             name: "check-ci",
-            display: "cargo run -p xtask -- check-ci",
+            display: "cargo run --locked -p xtask -- check-ci",
             program: "cargo",
-            args: &["run", "-p", "xtask", "--quiet", "--", "check-ci"],
+            args: &[
+                "run", "--locked", "-p", "xtask", "--quiet", "--", "check-ci",
+            ],
             // Blocking, and never --quick-skipped: it is cheap, it reads two
             // text files, and it is the row that protects every other row from
             // drifting away from ci.yml.
@@ -160,9 +185,11 @@ fn step_specs() -> Vec<StepSpec> {
         },
         StepSpec {
             name: "manifest",
-            display: "cargo run -p xtask -- manifest",
+            display: "cargo run --locked -p xtask -- manifest",
             program: "cargo",
-            args: &["run", "-p", "xtask", "--quiet", "--", "manifest"],
+            args: &[
+                "run", "--locked", "-p", "xtask", "--quiet", "--", "manifest",
+            ],
             // Blocking, not advisory, and this is the one row whose reason is NOT
             // "cheap so why skip": a wrong DPI declaration is not a desktop
             // dependency, it is a shipped binary that disagrees with the
@@ -175,9 +202,17 @@ fn step_specs() -> Vec<StepSpec> {
         },
         StepSpec {
             name: "check-unsafe",
-            display: "cargo run -p xtask -- check-unsafe",
+            display: "cargo run --locked -p xtask -- check-unsafe",
             program: "cargo",
-            args: &["run", "-p", "xtask", "--quiet", "--", "check-unsafe"],
+            args: &[
+                "run",
+                "--locked",
+                "-p",
+                "xtask",
+                "--quiet",
+                "--",
+                "check-unsafe",
+            ],
             // Blocking and never --quick-skipped: AGENTS.md calls unsafe a hard
             // invariant, and until this row existed the only thing enforcing it
             // was the honesty of whoever wrote the block. Cheap to run, so there
@@ -188,18 +223,20 @@ fn step_specs() -> Vec<StepSpec> {
         },
         StepSpec {
             name: "fixtures",
-            display: "cargo run -p xtask -- fixtures verify",
+            display: "cargo run --locked -p xtask -- fixtures verify",
             program: "cargo",
-            args: &["run", "-p", "xtask", "--quiet", "--", "fixtures", "verify"],
+            args: &[
+                "run", "--locked", "-p", "xtask", "--quiet", "--", "fixtures", "verify",
+            ],
             advisory: false,
             quick_skippable: false,
             budget_secs: 180,
         },
         StepSpec {
             name: "smoke",
-            display: "cargo run -p xtask -- smoke (advisory: opens a real window on this desktop)",
+            display: "cargo run --locked -p xtask -- smoke (advisory: opens a real window on this desktop)",
             program: "cargo",
-            args: &["run", "-p", "xtask", "--quiet", "--", "smoke"],
+            args: &["run", "--locked", "-p", "xtask", "--quiet", "--", "smoke"],
             // Advisory, never a gate: a runner with no desktop is not a broken
             // repo, and a GUI row that goes red for an environmental reason
             // trains people to ignore the row. --quick skips it too.
@@ -214,19 +251,27 @@ fn step_specs() -> Vec<StepSpec> {
         // both of these.
         StepSpec {
             name: "bridge-build",
-            display: "cargo build -p notes-bridge-gpui --bin notes-gpui",
+            display: "cargo build --locked -p notes-bridge-gpui --bin notes-gpui",
             program: "cargo",
-            args: &["build", "-p", "notes-bridge-gpui", "--bin", "notes-gpui"],
+            args: &[
+                "build",
+                "--locked",
+                "-p",
+                "notes-bridge-gpui",
+                "--bin",
+                "notes-gpui",
+            ],
             advisory: false,
             quick_skippable: true,
             budget_secs: 900,
         },
         StepSpec {
             name: "bridge-clippy",
-            display: "cargo clippy -p notes-bridge-gpui --all-targets -- -D warnings",
+            display: "cargo clippy --locked -p notes-bridge-gpui --all-targets -- -D warnings",
             program: "cargo",
             args: &[
                 "clippy",
+                "--locked",
                 "-p",
                 "notes-bridge-gpui",
                 "--all-targets",
@@ -265,6 +310,15 @@ fn joined(names: &[&str]) -> String {
 /// The gate's own roster, in the shape check-ci compares against ci.yml. One
 /// source of truth on this side: it is derived from step_specs(), so the list
 /// CI is checked against cannot drift from the list check() actually runs.
+///
+/// THIS IS ALSO THE INNER COMMAND LINE. The aggregate step in ci.yml runs
+/// `cargo run --locked -p xtask -- check`, and that outer --locked governs only
+/// the resolve that BUILDS xtask; the twelve steps this roster spawns each
+/// resolve AGAIN, in `run_child` below, from `spec.args`. So the authority the
+/// gate is supposed to have over Cargo.lock passes through here or not at all,
+/// and `every_row_that_resolves_a_graph_carries_the_lock` is what keeps that
+/// sentence true instead of aspirational. A row without the flag is not a slower
+/// step, it is a step that will quietly refresh a lock nobody committed.
 pub fn roster() -> Vec<crate::check_ci::Row> {
     step_specs()
         .into_iter()
@@ -641,6 +695,39 @@ mod tests {
         assert_eq!(Outcome::Timeout.label(false), "TIMEOUT");
     }
 
+    /// The roster IS the inner command line: run_child spawns spec.args, and
+    /// check-ci compares the same list against ci.yml. So a row that does not
+    /// carry --locked is an unlockable resolve no matter what the workflow says,
+    /// and this is the half of the coupling the workflow judge cannot see.
+    /// fmt never resolves a graph and docs is pwsh: they are the two exemptions,
+    /// and the count is asserted so a row added tomorrow without the flag trips
+    /// BOTH the per-row message and the roster size.
+    #[test]
+    fn every_row_that_resolves_a_graph_carries_the_lock() {
+        let exempt = ["fmt", "docs"];
+        let mut locked = 0;
+        for spec in step_specs() {
+            if exempt.contains(&spec.name) {
+                continue;
+            }
+            assert!(
+                spec.args.contains(&"--locked"),
+                "{} resolves the dependency graph and carries no --locked: {}. Lock the row or exempt it by name with a reason.",
+                spec.name,
+                spec.args.join(" "),
+            );
+            locked += 1;
+        }
+        assert_eq!(
+            locked, 11,
+            "eleven rows resolve a graph here; another number means the roster changed shape and this statement is now about a different list",
+        );
+        assert_eq!(
+            step_specs().len(),
+            13,
+            "fmt and docs are the two exempt rows"
+        );
+    }
     /// The demotion of a gating row to advisory is exactly the silent weakening
     /// this checker exists to catch. An indirect guard - the roster length
     /// assertion, or check-ci going red - would not name WHICH decision broke,
@@ -672,11 +759,11 @@ mod tests {
         // name-only assertion and is strictly weaker than both.
         assert_eq!(
             build.args.join(" "),
-            "build -p notes-bridge-gpui --bin notes-gpui"
+            "build --locked -p notes-bridge-gpui --bin notes-gpui"
         );
         assert_eq!(
             lint.args.join(" "),
-            "clippy -p notes-bridge-gpui --all-targets -- -D warnings"
+            "clippy --locked -p notes-bridge-gpui --all-targets -- -D warnings"
         );
         // Still quick-skippable: a desktop-less runner must be able to run
         // check --quick. Skipping is not the same as not gating.
