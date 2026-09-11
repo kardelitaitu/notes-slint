@@ -5,10 +5,20 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, WS_EX_TOPMOST,
 };
 
+use std::thread;
+use std::time::{Duration, Instant};
+
 use ::windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GetWindowLongPtrW};
 
 use super::{to_hwnd, win32_error};
 use crate::PinOutcome;
+
+/// How long the style read-back waits for an async reband to land before it
+/// declares NotApplied. A pumping owner lands the band in ~1-2 ms (measured
+/// by the geometry_live probe); a parked owner never lands it, which is
+/// exactly the failure the verdict exists to report. The wait must be long
+/// enough for the first truth and short enough not to stall the caller.
+const BAND_LAND_WINDOW: Duration = Duration::from_millis(10);
 
 /// `SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS`, spelled as one
 /// const so a reviewer can see the bits that confine this call to a z-order change
@@ -53,20 +63,30 @@ pub fn set_topmost(handle: isize, on: bool) -> PinOutcome {
     }
     // The FFI answer is not the verdict: a call can succeed and change nothing -
     // the documented hidden-window case, where an async reband never lands - so
-    // the window's own style is read back and a mismatch is its own outcome.
-    // SAFETY: GetWindowLongPtrW is a pure style query on the HWND `to_hwnd`
-    // accepted at check time and that SetWindowPos just answered for; it reads
-    // one integer out of the window's USER handle record, writes nothing on
-    // this side, and the index is the documented GWL_EXSTYLE.
-    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
-    let actual = style_is_topmost(style);
-    if actual == on {
-        PinOutcome::Applied
-    } else {
-        PinOutcome::NotApplied {
-            expected: on,
-            actual,
+    // the window's own style is read back, and because the reband is ASYNC it is
+    // read back until it lands or until BAND_LAND_WINDOW expires. A single
+    // immediate read would misreport every cross-queue reband (measured: the bit
+    // becomes visible ~1.4 ms after the call returns, on the owner's pump).
+    let deadline = Instant::now() + BAND_LAND_WINDOW;
+    loop {
+        // SAFETY: GetWindowLongPtrW is a pure style query on the HWND `to_hwnd`
+        // accepted at check time and that SetWindowPos just answered for; it
+        // reads one integer out of the window's USER handle record, writes
+        // nothing on this side, and the index is the documented GWL_EXSTYLE.
+        let actual = style_is_topmost(unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) });
+        if actual == on {
+            return PinOutcome::Applied;
         }
+        if Instant::now() >= deadline {
+            return PinOutcome::NotApplied {
+                expected: on,
+                actual,
+            };
+        }
+        // Yield-spin rather than sleep: the landing is a ~1 ms event and the
+        // wait is bounded, so a spin gives microsecond resolution without a
+        // timer-granularity overshoot.
+        thread::yield_now();
     }
 }
 

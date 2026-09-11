@@ -347,10 +347,21 @@ fn an_async_move_and_reband_land_when_the_owner_pumps() {
         Duration::from_secs(2),
     )
     .expect("set_topmost must not block while the owner is parked");
+    // The verdict at call time is the parked-owner truth: the FFI succeeded and
+    // the state did not change, because the band lands only on the owner's pump.
+    // That is precisely the hole a bool could not express - the call succeeded
+    // and nothing happened - now visible in the return value.
     assert!(
-        matches!(rebanded, PinOutcome::Applied),
-        "the visible-window reband must read back as applied: {rebanded:?}"
+        matches!(
+            rebanded,
+            PinOutcome::NotApplied {
+                expected: true,
+                actual: false
+            }
+        ),
+        "the parked-owner verdict must be NotApplied {{expected:true, actual:false}}: {rebanded:?}"
     );
+    eprintln!("[phase C] verdict while parked: {rebanded:?} (the read-back caught it)");
     let parked_elapsed = started.elapsed();
     eprintln!("[phase C] set_topmost with owner PARKED returned in {parked_elapsed:?}");
     assert!(
