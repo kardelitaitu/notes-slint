@@ -41,8 +41,8 @@ use notes_core::settings::write_settings;
 use notes_core::{
     DecodeError, Detected, Document, FileKind, LineEnding as CoreLineEnding, NoteParts,
     SaveError as CoreSaveError, Session, Settings, Skip, StateDir, TextEncoding, classify_io_error,
-    clear as clear_recents, decode, detect, is_notes_path, is_oversize, mark_missing,
-    push as push_recent, rebuild, save_document_revision, split,
+    clear as clear_recents, decode, detect, ensure_scratch_dir, identity_key, is_notes_path,
+    is_oversize, mark_missing, push as push_recent, rebuild, save_document_revision, split,
 };
 
 use crate::command::{Command, WindowHandle};
@@ -538,6 +538,21 @@ impl Engine {
         let on_disk = match fs::metadata(path) {
             Ok(meta) => meta,
             Err(err) => {
+                // D69's RESTART half. Because the engine records the scratch in
+                // the session (see [`Engine::flush`]'s `remember`), a relaunch
+                // OPENS it - and the scratch is scratch: a file THIS port made,
+                // which the user is free to delete (or to sweep along with the
+                // whole notes/ directory) between runs. A missing scratch is not
+                // a lost document, it is a scratch that has not been written
+                // yet, so the ask is answered with a fresh EMPTY one rather than
+                // an error banner over an empty editor. Every OTHER missing path
+                // keeps [`Engine::fail_load`]'s honest refusal: that is a real
+                // loss, and the refused-load guard that follows it is what stops
+                // Save As overwriting a document the app never read.
+                if err.kind() == ErrorKind::NotFound && self.is_scratch(path) {
+                    self.restore_missing_scratch(path);
+                    return;
+                }
                 self.fail_load(path, &err);
                 return;
             }
@@ -622,6 +637,70 @@ impl Engine {
             path: path.to_path_buf(),
             reason: load_error_from_io(err),
         });
+    }
+
+    /// True when `path` IS this state dir's scratch note.
+    ///
+    /// Identity, not bytes: Windows paths are case-insensitive but not
+    /// case-preserving, so the comparison is core's [`identity_key`] - the one
+    /// answer this repo has for "the same file" (canonicalise when the file
+    /// exists, a pure lexical key when it does not, and never a canonicalise on
+    /// a verdict that says the attempt can stall, which is what a UNC state dir
+    /// would be). This branch is reached only after the stat said NotFound, so
+    /// both sides take the lexical key and nothing blocks. Where the scratch
+    /// lives is core's rule (`scratch_note_path`), asked and never re-derived -
+    /// and the whole point of D69 is that this is the ONLY place the mapping
+    /// "the session names this path" -> "that path is the scratch" exists. It
+    /// does not live in the bridge, and `path: null` never means "the scratch"
+    /// anywhere: a secret two crates have to keep is how an untitled note comes
+    /// back empty.
+    fn is_scratch(&self, path: &Path) -> bool {
+        identity_key(path) == identity_key(&notes_core::paths::scratch_note_path(&self.state_dir))
+    }
+
+    /// The scratch's own answer to "the file is gone": the IDENTITY comes back
+    /// (path + armed + the new-file format), the buffer is empty, and the load
+    /// is NOT a refusal.
+    ///
+    /// What this deliberately does not do is call [`Engine::remember`]: a file
+    /// that does not exist was not opened, so it must not re-age the MRU. The
+    /// scratch earns its recents entry the way it earns everything else - when
+    /// text is actually written into it (D69's `Saved`/`Rebound`/`remember` at
+    /// the flush). The session's own `path` is restated because it is the fact
+    /// that has to survive this launch: it is already the scratch (that is why
+    /// the bridge asked), and restating + queueing repairs the case where the
+    /// session file was missing or corrupt and the bridge is opening the scratch
+    /// for another reason entirely.
+    fn restore_missing_scratch(&mut self, scratch: &Path) {
+        let detected = new_file_detected();
+        self.doc = Document::open(scratch, file_kind(scratch), false, false);
+        self.detected = detected;
+        self.frontmatter = None;
+        self.load_refused = false;
+        // The DIRECTORY often goes with the file, and the ordinary flush write
+        // path does not create parents (core's atomic write needs a directory to
+        // put its sibling temp in). Best effort and SILENT: if the place cannot
+        // be made, the next write says so through NeedsPath, and the startup
+        // StateDirUnusable event has usually already explained why.
+        let _ = ensure_scratch_dir(&self.state_dir);
+        self.emit(Event::Loaded {
+            path: scratch.to_path_buf(),
+            text: String::new(),
+            meta: FileMeta {
+                encoding: api_encoding(detected.encoding),
+                line_ending: api_line_ending(detected.line_ending),
+                trailing_newline: detected.trailing_newline,
+                read_only: false,
+                oversize: false,
+                // CHECKED, not assumed: the scratch is named untitled.notes, so
+                // core's `is_notes_path` classifies it as ours and ADR-0001 arms
+                // autosave on open. A foreign file the app did not create stays
+                // disarmed; ours never does, and no bridge workaround is needed.
+                armed: self.doc.is_armed(),
+            },
+        });
+        self.session.path = Some(scratch.to_path_buf());
+        self.queue(Target::Session);
     }
 
     /// Save As: write the snapshot at the chosen path, then rebind AND arm.
@@ -736,6 +815,12 @@ impl Engine {
         if std::env::var("N2_DEBUG").is_ok() {
             eprintln!("FLUSH epoch={} engine_epoch={}", epoch, self.epoch);
         }
+        // EQUALITY against the engine's own open generation. Two independent
+        // counters, compared for equality, across a seam: the only thing that
+        // makes that sound is that BOTH start at 0 and only ever move at a
+        // send the other side can see — see the lockstep note in
+        // [`Engine::restore_missing_scratch`]'s caller and the non-action in
+        // [`Engine::flush`]'s scratch branch.
         if epoch != self.epoch {
             self.emit(Event::AutosaveSkipped {
                 reason: SkipReason::Superseded,
@@ -796,6 +881,19 @@ impl Engine {
             let disk_text = self.text_for_disk(&text);
             match self.write(&scratch, &disk_text, detected, revision) {
                 Ok(()) => {
+                    // NO EPOCH BUMP HERE, and that is a load-bearing
+                    // non-action, not an oversight: the bridge mirrors the
+                    // engine's generation at the SEND of an Open or a Save As
+                    // (Wire::rebind), and it sent neither to get here — an
+                    // untitled note is bound to its scratch from the engine's
+                    // own side of the seam. The guard above compares the two
+                    // counters for EQUALITY, so a bump here would put the engine
+                    // one generation ahead of every flush the bridge has in the
+                    // debounce and silently discard the autosave of the one
+                    // document this product always has. Pinned by
+                    // `the_scratch_bind_does_not_bump_the_epoch` in
+                    // tests/scratch_restart.rs; the two bump sites are
+                    // [`Engine::open`] and [`Engine::save_as`] and nothing else.
                     self.doc.save_as(&scratch);
                     self.detected = detected;
                     let read_only =
