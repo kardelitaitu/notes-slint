@@ -20,7 +20,7 @@
 //! Cleanup is explicit: the window is destroyed by its own thread and the
 //! thread is joined; nothing leaks. Every unsafe block below carries its own
 //! SAFETY comment (AGENTS.md); src/ is untouched by this file, so the src
-//! SAFETY ledger stands at 14 unsafe blocks / 16 SAFETY comments.
+//! SAFETY ledger gains nothing here - `check-unsafe` prints the live counts.
 //!
 //! One caveat this probe established the hard way, recorded here because the
 //! port depends on it: with the window HIDDEN, the async reband never lands -
