@@ -58,6 +58,7 @@
 // no Flush, no Loaded text - until S6, so it is a working surface with nothing
 // behind it, not a finished M2.
 mod editor;
+mod menu;
 
 use editor::Editor;
 
@@ -70,8 +71,9 @@ use std::time::{Duration, Instant};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     AnyWindowHandle, App, AsyncApp, Bounds, Context, Entity, Focusable, IntoElement, KeyBinding,
-    Pixels, Point, Render, SharedString, Subscription, Task, TitlebarOptions, WeakEntity, Window,
-    WindowBounds, WindowId, WindowOptions, div, px, rgb, size,
+    PathPromptOptions, Pixels, Point, Render, SharedString, Subscription, Task, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowHandle as GpuiWindowHandle, WindowId, WindowOptions,
+    div, px, rgb, size,
 };
 use notes_api::{
     Command, Encoding, Event, EventRx, FileMeta, Gateway, InitialState, LineEnding, RecentEntry,
@@ -144,13 +146,21 @@ struct Wire {
     /// a save by an arming rule the port never had a chance to state, and the text is lost
     /// on exit - which is exactly what the first live round trip did.
     loaded: bool,
-    /// The global toggle. There is no menu yet, so it is the engine's own default and
-    /// nothing changes it; it lives here so the UI has one place to act on later.
+    /// The document the port last told us about, from `Loaded::path` or `Rebound::path` -
+    /// NEVER from what the bridge asked for. Save As picks a path in a dialog, but the path
+    /// stored here is the one the ENGINE reported back: a bridge that remembers its own
+    /// request can name a file the save never landed on. It is used for exactly one thing,
+    /// the suggested directory of the next dialog.
+    path: Option<std::path::PathBuf>,
+    /// The list the port last delivered (`RecentsUpdated`), kept as given so the menu is
+    /// rebuilt from the engine's words, not from a bridge-side copy of the truth.
+    recents: Vec<RecentEntry>,
+    /// The global toggle, as last stated by the ENGINE (see `new`).
     autosave: bool,
 }
 
 impl Wire {
-    fn new() -> Self {
+    fn new(autosave: bool) -> Self {
         Self {
             seen_edits: 0,
             changed_at: Instant::now(),
@@ -158,7 +168,13 @@ impl Wire {
             in_flight: None,
             armed: false,
             loaded: false,
-            autosave: true,
+            path: None,
+            recents: Vec::new(),
+            // SEEDED FROM THE PORT, not from a literal: `InitialState::autosave_enabled` is
+            // read out of session.json by the engine, so the check mark on the first frame is
+            // the only visible proof that the settings reload path works. Same one-way door
+            // the pin was: a check that follows what the UI asked for proves nothing.
+            autosave,
         }
     }
 
@@ -444,7 +460,7 @@ impl Surface {
             events,
             stats,
             _pump: None,
-            status: SharedString::from("no event from the port yet"),
+            status: SharedString::from(format!("{} · no event from the port yet", menu::legend())),
             window,
             gateway,
             watch: Watch::default(),
@@ -643,7 +659,7 @@ impl Surface {
     /// lie on screen. Everything the wire needs to remember is decided here, once.
     fn apply(&mut self, event: &Event, cx: &mut Context<Self>) {
         match event {
-            Event::Loaded { text, meta, .. } => {
+            Event::Loaded { text, meta, path } => {
                 // LOAD RESETS THE VIEW, not just the text - see `Editor::load`. The
                 // arming comes from the port's own `FileMeta::armed` (ADR-0001): a
                 // foreign file nobody has saved once is not armed, and the bridge does
@@ -652,19 +668,29 @@ impl Surface {
                     .update(cx, |editor, cx| editor.load(text.clone(), cx));
                 let mut wire = self.wire.borrow_mut();
                 wire.armed = meta.armed;
+                // The path the ENGINE says this buffer now is. Not the one we asked for.
+                wire.path = Some(path.clone());
                 wire.in_flight = None;
                 wire.changed_at = Instant::now();
                 let edits = self.editor.read(cx).edits();
                 wire.seen_edits = edits;
                 wire.flushed_edits = edits;
             }
-            Event::Rebound { meta, revision, .. } => {
+            Event::Rebound {
+                meta,
+                revision,
+                path,
+            } => {
                 // The SAME buffer, a new path: Save As. No text crosses back - the
                 // bridge owns it - but the write that just happened was this text, so it
                 // is clean now, and the arming follows the new path (a file chosen by
                 // hand is armed, ADR-0001).
                 let mut wire = self.wire.borrow_mut();
                 wire.armed = meta.armed;
+                // ADOPTED FROM THE PORT: this is the rebind the menu's Save As depends on.
+                // Every later Flush goes to the document the engine rebound to, and the
+                // bridge learned that from an Event, not from its own request.
+                wire.path = Some(path.clone());
                 wire.flushed_edits = wire.seen_edits;
                 if wire.in_flight.is_some_and(|sent| sent <= *revision) {
                     wire.in_flight = None;
@@ -684,17 +710,66 @@ impl Surface {
                 if wire.in_flight.is_some_and(|sent| sent <= *revision) {
                     wire.in_flight = None;
                 }
+                // THE ONLY ENGINE ANSWER THAT PROVES THE TOGGLE IS ON: `Saved` reaches the
+                // bridge solely from the autosave path (there is no manual Save command), so
+                // a save the engine performed says the global toggle was not off. `Event` has
+                // no "autosave setting changed" variant, which is why the check mark is driven
+                // by outcomes and never by what the menu asked for.
+                if matches!(event, Event::Saved { .. }) && !wire.autosave {
+                    wire.autosave = true;
+                    drop(wire);
+                    self.refresh_menus(cx);
+                }
             }
-            Event::AutosaveSkipped { .. } => {
+            Event::AutosaveSkipped { reason } => {
+                // THE ENGINE'S OWN WORDS THAT THE TOGGLE IS OFF. This is the readback the
+                // check mark waits for: `SkipReason::AutosaveDisabled` is the port telling us
+                // the global switch is off, as opposed to the per-document arming or a clean
+                // buffer. Any other reason leaves the setting alone.
                 // ANSWERED, even though it was refused. `SkipReason` says why but the
                 // variant carries NO revision (crates/api/src/event.rs:344), so this is
                 // the second place - after the abandon path - where the bridge has to
                 // guess whether the skip was about its own flush. See the request in the
                 // commit notes: the port has no way to tie an answer to a revision.
-                self.wire.borrow_mut().in_flight = None;
+                let mut wire = self.wire.borrow_mut();
+                wire.in_flight = None;
+                if *reason == SkipReason::AutosaveDisabled && wire.autosave {
+                    wire.autosave = false;
+                    drop(wire);
+                    self.refresh_menus(cx);
+                }
+            }
+            Event::RecentsUpdated(entries) => {
+                // The list, as the engine delivered it - capped, labelled and existence-
+                // marked by core. The menu is rebuilt FROM THIS and nothing else, so the
+                // recent list can never show a file the port did not report.
+                self.wire.borrow_mut().recents = entries.clone();
+                self.refresh_menus(cx);
             }
             _ => {}
         }
+    }
+
+    /// Rebuild the native menu bar from the state the PORT supplied. Cheap and rare: it
+    /// happens when a recent list, a save outcome, or a skip arrives - not per frame, and
+    /// never from a frame callback. `App::set_menus` takes `&self` and the Windows platform
+    /// implementation only stores the vector, so this cannot touch the window, the overlay
+    /// stack, or the editor's selection - which is the whole reason the menu was allowed in
+    /// without `Root`.
+    fn refresh_menus(&mut self, cx: &mut Context<Self>) {
+        let wire = self.wire.borrow();
+        let menus = menu::build_menus(wire.autosave, &wire.recents);
+        drop(wire);
+        cx.set_menus(menus);
+    }
+
+    /// A sentence the bridge itself wants on the status line - "save as cancelled" is not
+    /// something the port can know. The next event from the engine replaces it, because the
+    /// engine's words outrank ours; `SHUTDOWN_NOTE` still outranks both.
+    fn note(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.status = SharedString::from(one_line(text.to_string()));
+        report(&format!("menu: {text}"));
+        cx.notify();
     }
 
     /// THE DEBOUNCE, and the one-in-the-air rule. Called from the pump, never from a
@@ -1040,14 +1115,27 @@ fn main() {
                 KeyBinding::new("shift-pageup", editor::SelectPageUp, None),
                 KeyBinding::new("shift-pagedown", editor::SelectPageDown, None),
             ]);
-
+            // THE MENU'S CHORDS, from the same table the legend and the menu labels
+            // are generated from (menu::SHORTCUTS). On Windows `set_menus` stores the bar and
+            // never draws it, so these bindings ARE the reachable form of Open, Save As, the
+            // autosave toggle and the ten recents - and they dispatch the SAME actions the
+            // menu items carry, so there is one handler per command rather than one for the
+            // key and one for the click.
+            cx.bind_keys(menu::key_bindings());
             // THE WIRE'S STATE and the editor's address, both out here rather than in
             // the build closure below, because the close path needs them and it is not the
             // view that runs it. The editor crosses as a slot for the same reason the
             // window handle does: it is built inside `open_window`, and a `RefCell<Option<
             // _>>` filled there is readable from here afterwards.
-            let wire: Rc<RefCell<Wire>> = Rc::new(RefCell::new(Wire::new()));
+            // Seeded from the port's own setting, so the menu's check mark on the first
+            // frame is a readback of session.json and not a bridge-side opinion.
+            let wire: Rc<RefCell<Wire>> =
+                Rc::new(RefCell::new(Wire::new(initial.autosave_enabled)));
             let editor_slot: Rc<RefCell<Option<Entity<Editor>>>> = Rc::new(RefCell::new(None));
+            // The root view's handle, filled below, so a menu handler can put a sentence on
+            // the status line - the only place this app can say "save as cancelled".
+            let view_slot: Rc<RefCell<Option<GpuiWindowHandle<Surface>>>> =
+                Rc::new(RefCell::new(None));
 
             // STEP 2 - create the window AT the saved rect, before anything is
             // drawn. Only the bridge can: the port has no window type at all. The
@@ -1097,6 +1185,25 @@ fn main() {
                 cx.quit();
                 return;
             };
+            // THE MENU'S HANDS LIVE ON THE APP, not on a view: `App::on_action` is an
+            // app-global listener, `impl Fn(&A, &mut App)` (gpui-pre-0.3.4 src/app.rs:2261).
+            // That is the third fact behind doing this slice without `Root`: a menu item and a
+            // key chord both land in a function holding the App and nothing else, so no
+            // overlay stack and no second owner of the window's text selection appears next to
+            // the editor's marked range.
+            *view_slot.borrow_mut() = Some(handle);
+            register_menu_commands(
+                cx,
+                Rc::clone(&gateway),
+                Rc::clone(&wire),
+                Rc::clone(&editor_slot),
+                Rc::clone(&view_slot),
+            );
+            let (autosave_on, recents) = {
+                let state = wire.borrow();
+                (state.autosave, state.recents.clone())
+            };
+            cx.set_menus(menu::build_menus(autosave_on, &recents));
             // STEP 3 - register the window handle with the port. The HWND crosses
             // as an i64 because the port must not know a platform type exists.
             //
@@ -1409,6 +1516,289 @@ fn final_flush(
             revision: edits,
         },
     );
+}
+
+/// THE FOUR MENU COMMANDS, attached to the App. Each one answers through the native
+/// platform prompt (gpui-pre-0.3.4 src/app.rs:1582 and :1595, both `&self` on the App,
+/// both returning an awaitable receiver) - no kit dialog, no overlay, no `Root`, and no
+/// view to hold a subscription.
+fn register_menu_commands(
+    cx: &mut App,
+    gateway: Rc<RefCell<Option<Gateway>>>,
+    wire: Rc<RefCell<Wire>>,
+    editor_slot: Rc<RefCell<Option<Entity<Editor>>>>,
+    view_slot: Rc<RefCell<Option<GpuiWindowHandle<Surface>>>>,
+) {
+    cx.on_action({
+        let gateway = Rc::clone(&gateway);
+        let view_slot = Rc::clone(&view_slot);
+        move |_: &menu::OpenFile, cx: &mut App| {
+            prompt_open(&gateway, &view_slot, cx);
+        }
+    });
+    cx.on_action({
+        let gateway = Rc::clone(&gateway);
+        let wire = Rc::clone(&wire);
+        let editor_slot = Rc::clone(&editor_slot);
+        let view_slot = Rc::clone(&view_slot);
+        move |_: &menu::SaveAsFile, cx: &mut App| {
+            prompt_save_as(&gateway, &wire, &editor_slot, &view_slot, cx);
+        }
+    });
+    cx.on_action({
+        let gateway = Rc::clone(&gateway);
+        let wire = Rc::clone(&wire);
+        let view_slot = Rc::clone(&view_slot);
+        move |_: &menu::ToggleAutosave, cx: &mut App| {
+            let asking_for = !wire.borrow().autosave;
+            // THE TOGGLE CHANGES NOTHING LOCALLY. Not the check mark, not the flush gate.
+            // `Event` has no "the setting is now X" variant, so the only honest sources are
+            // the engine's own answers: `AutosaveSkipped { AutosaveDisabled }` proves off and
+            // a `Saved` proves on. Both are handled in `apply`. A check mark that flipped when
+            // we asked would be the pin bug again - the UI believing its own request.
+            send(&gateway, Command::SetAutosave(asking_for));
+            note_to(
+                &view_slot,
+                cx,
+                &format!(
+                    "autosave toggle sent: asking the engine for {}. the check mark waits for the engine's answer",
+                    asking_for
+                ),
+            );
+        }
+    });
+    cx.on_action({
+        let gateway = Rc::clone(&gateway);
+        let view_slot = Rc::clone(&view_slot);
+        move |_: &menu::ClearRecents, cx: &mut App| {
+            send(&gateway, Command::ClearRecents);
+            note_to(
+                &view_slot,
+                cx,
+                "clear recent files sent; the list is the engine's to answer with",
+            );
+        }
+    });
+    // One handler per slot, because a gpui action's identity is its TYPE (app_menu.rs:92
+    // boxes `dyn Action`), so ten entries are ten types and the index is compile-time.
+    macro_rules! recent {
+        ($($type:ty => $index:expr),* $(,)?) => {
+            $(
+                cx.on_action({
+                    let gateway = Rc::clone(&gateway);
+                    let wire = Rc::clone(&wire);
+                    let view_slot = Rc::clone(&view_slot);
+                    move |_: &$type, cx: &mut App| {
+                        open_recent($index, &gateway, &wire, &view_slot, cx);
+                    }
+                });
+            )*
+        };
+    }
+    recent!(
+        menu::Recent0 => 0,
+        menu::Recent1 => 1,
+        menu::Recent2 => 2,
+        menu::Recent3 => 3,
+        menu::Recent4 => 4,
+        menu::Recent5 => 5,
+        menu::Recent6 => 6,
+        menu::Recent7 => 7,
+        menu::Recent8 => 8,
+        menu::Recent9 => 9,
+    );
+}
+
+/// A sentence on the status line from outside the view. The handle is the one the run
+/// closure filled; before a window exists there is nowhere to say anything, so this is
+/// silent rather than wrong.
+fn note_to(view_slot: &Rc<RefCell<Option<GpuiWindowHandle<Surface>>>>, cx: &mut App, text: &str) {
+    if let Some(handle) = *view_slot.borrow() {
+        let _ = handle.update(cx, |view, _window, cx| view.note(text, cx));
+    }
+}
+
+/// THE FILE MENU'S ONLY ASK: a path from the real `IFileOpenDialog`, then `Open`. The
+/// answer comes back as `Loaded` (or `LoadFailed`) and the pump does the rest - the bridge
+/// never reads the file itself, which is the seam holding.
+fn prompt_open(
+    gateway: &Rc<RefCell<Option<Gateway>>>,
+    view_slot: &Rc<RefCell<Option<GpuiWindowHandle<Surface>>>>,
+    cx: &mut App,
+) {
+    let receiver = cx.prompt_for_paths(PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+        prompt: None,
+    });
+    let gateway = Rc::clone(gateway);
+    let view_slot = Rc::clone(view_slot);
+    // Detached on purpose: the task IS the dialog's continuation, and there is nothing to
+    // await it for - its whole effect is the command it sends and the sentence it writes.
+    // Detached: the task is the dialog's continuation, and its whole effect is the command
+    // it sends and the sentence it writes. There is nothing to await it for.
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let picked = match receiver.await {
+            Ok(Ok(Some(mut paths))) => paths.pop(),
+            _ => None,
+        };
+        let Some(path) = picked else {
+            // Cancelled: the buffer and its path stay exactly as they were. The status line
+            // says so because silence after a key press reads as a hang.
+            with_view(&view_slot, cx, |view, cx| {
+                view.note(
+                    "open cancelled - nothing was loaded and nothing was flushed",
+                    cx,
+                )
+            });
+            return;
+        };
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        send(&gateway, Command::Open { path });
+        with_view(&view_slot, cx, move |view, cx| {
+            view.note(&format!("asking the engine to open {name}"), cx)
+        });
+    })
+    .detach();
+}
+
+/// SAVE AS, and the ordering rule inside it: the text and the revision are read from the
+/// buffer BEFORE the dialog, so what lands at the new path is what was on screen when the
+/// user asked - and the rebind we then adopt comes from the engine's `Rebound`, never from
+/// the path we typed into the chooser.
+fn prompt_save_as(
+    gateway: &Rc<RefCell<Option<Gateway>>>,
+    wire: &Rc<RefCell<Wire>>,
+    editor_slot: &Rc<RefCell<Option<Entity<Editor>>>>,
+    view_slot: &Rc<RefCell<Option<GpuiWindowHandle<Surface>>>>,
+    cx: &mut App,
+) {
+    let Some(editor) = editor_slot.borrow().clone() else {
+        return;
+    };
+    let text = editor.read(cx).text().to_string();
+    let revision = editor.read(cx).edits();
+    let (directory, suggested) = {
+        let state = wire.borrow();
+        match state.path.as_ref().and_then(|path| {
+            path.parent().map(|dir| {
+                (
+                    dir.to_path_buf(),
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned()),
+                )
+            })
+        }) {
+            Some((dir, name)) => (dir, name),
+            None => (std::env::current_dir().unwrap_or_default(), None),
+        }
+    };
+    if text.is_empty() && revision == 0 {
+        // Nothing to save is not nothing to say. An empty fresh buffer asked to be renamed:
+        // send it anyway - the user may want the file to exist - but say what it holds.
+        note_to(
+            &view_slot.clone(),
+            cx,
+            "save as: the buffer is empty, the new file will be too",
+        );
+    }
+    let receiver = cx.prompt_for_new_path(&directory, suggested.as_deref());
+    let gateway = Rc::clone(gateway);
+    let view_slot = Rc::clone(view_slot);
+    // Detached: the task is the dialog's continuation, and its whole effect is the command
+    // it sends and the sentence it writes. There is nothing to await it for.
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let picked = match receiver.await {
+            Ok(Ok(Some(path))) => Some(path),
+            _ => None,
+        };
+        let Some(path) = picked else {
+            with_view(&view_slot, cx, |view, cx| {
+                view.note(
+                    "save as cancelled - the document keeps its current path",
+                    cx,
+                )
+            });
+            return;
+        };
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        send(
+            &gateway,
+            Command::SaveAs {
+                path: path.clone(),
+                text,
+                revision,
+            },
+        );
+        with_view(&view_slot, cx, move |view, cx| {
+            // NOT "saved as": the engine has only been ASKED. `Rebound` is the word that
+            // changes what the bridge believes about this buffer's path.
+            view.note(
+                &format!("save as sent: {name}, awaiting the engine's rebind"),
+                cx,
+            )
+        });
+    })
+    .detach();
+}
+
+/// A numbered recent entry. The entry is looked up in the list THE PORT LAST SENT, at the
+/// same index the menu item was built from, so a stale menu can only miss - never open a
+/// different file than the one it named.
+fn open_recent(
+    index: usize,
+    gateway: &Rc<RefCell<Option<Gateway>>>,
+    wire: &Rc<RefCell<Wire>>,
+    view_slot: &Rc<RefCell<Option<GpuiWindowHandle<Surface>>>>,
+    cx: &mut App,
+) {
+    let entry = menu::entry_for(&wire.borrow().recents, index).cloned();
+    match entry {
+        Some(entry) if entry.exists => {
+            send(
+                gateway,
+                Command::Open {
+                    path: entry.path.clone(),
+                },
+            );
+            note_to(
+                view_slot,
+                cx,
+                &format!("asking the engine to open {}", entry.display),
+            );
+        }
+        // The menu disables these, and the click still should not lie about what happened.
+        Some(entry) => note_to(
+            view_slot,
+            cx,
+            &format!("{} no longer exists - nothing was opened", entry.display),
+        ),
+        None => note_to(
+            view_slot,
+            cx,
+            &format!(
+                "recent slot {} is empty - the list changed under the menu",
+                index + 1
+            ),
+        ),
+    }
+}
+
+/// Update the root view from a spawned task, if the window is still up.
+fn with_view(
+    view_slot: &Rc<RefCell<Option<GpuiWindowHandle<Surface>>>>,
+    cx: &mut AsyncApp,
+    f: impl FnOnce(&mut Surface, &mut gpui_kit::Context<Surface>),
+) {
+    let Some(handle) = *view_slot.borrow() else {
+        return;
+    };
+    let _ = handle.update(cx, |view, _window, cx| f(view, cx));
 }
 
 fn close(gateway: &Rc<RefCell<Option<Gateway>>>, events: &Rc<RefCell<EventRx>>) {
@@ -2052,7 +2442,7 @@ mod tests {
     #[test]
     fn a_flush_needs_change_quiet_and_an_answered_predecessor() {
         let quiet = Duration::from_millis(800);
-        let mut wire = Wire::new();
+        let mut wire = Wire::new(true);
         wire.armed = true;
         wire.loaded = true;
         assert!(!flush_due(&wire, false, quiet), "clean: nothing to send");
