@@ -26,12 +26,12 @@
 
 use std::ops::Range;
 
-use gpui::prelude::*;
-use gpui::{
+use gpui_kit::prelude::*;
+use gpui_kit::{
     App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextRun,
+    Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextAlign, TextRun,
     UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, px, relative, rgb, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -1708,9 +1708,22 @@ impl Element for EditorElement {
             }
             visible += 1;
             // A failed line is a blank row for one frame, not an aborted editor.
-            let _ = frame
-                .line
-                .paint(frame.bounds.origin, frame.bounds.size.height, window, cx);
+            //
+            // THE NEW TWO ARGUMENTS, passed as the geometry IS and not as whatever
+            // silences the compiler (gpui-pre-0.3.4/src/text_system/line.rs:83 - align:
+            // TextAlign, align_width: Option<Pixels>): this editor does not word-wrap, every
+            // line lays out left-aligned, and the box it was shaped into is `frame.bounds`.
+            // So align is Left and align_width is that box's width - the width the line was
+            // measured against. Left alignment adds no offset, which is also why this cannot
+            // move a glyph by a pixel: it states the box, it does not re-flow it.
+            let _ = frame.line.paint(
+                frame.bounds.origin,
+                frame.bounds.size.height,
+                TextAlign::Left,
+                Some(frame.bounds.size.width),
+                window,
+                cx,
+            );
         }
         if focus_handle.is_focused(window) {
             if let Some(cursor) = prepaint.cursor.take() {

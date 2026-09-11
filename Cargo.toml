@@ -25,6 +25,14 @@ tempfile = "3"
 # turn that feature off. "font-kit" is the one default feature the bridge still needs. Measured by C4 at
 # 3fe7722: with default-features on, notes-gpui.exe does not link.
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
+# THE KIT GENERATION, this migration: applications depend on gpui-kit alone
+# (.agents/skills/gpui-kit). 0.6.1 pulls gpui-pre 0.3.4 and names it `gpui`, then flat-re-exports it
+# (`pub use ::gpui::*` at gpui-kit-0.6.1/src/lib.rs:94), so no name this bridge imports disappeared.
+# The manifest paragraph above still describes the hazard, but NOT the arrangement: gpui-pre-platform
+# force-enables windows-manifest in its own declaration, features are additive, and no line in this
+# file can switch it off - so the toolkit's manifest now ships in the exe and ours does not. See
+# crates/bridge-gpui/build.rs.
+gpui-kit = "=0.6.1"
 raw-window-handle = "0.6"
 # Granted by FCR at S1 (bridge editor). Needed for grapheme-cluster boundaries in the caret-to-point mapping
 # (slice S4) and for a caret that does not split a combining sequence. Verified present in the offline

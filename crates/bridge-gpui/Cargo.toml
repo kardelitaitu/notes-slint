@@ -16,13 +16,15 @@ path = "src/main.rs"
 
 [dependencies]
 notes-api = { workspace = true }
-# Inherited, and it has to stay inherited: the workspace line turns off gpui's
-# `windows-manifest` default feature, because that feature embeds a second
-# RT_MANIFEST id=1 and rust-lld refuses an app manifest next to it (see build.rs).
-# Repeating the version here would double-pin it; inheriting means that if the
-# feature is ever re-enabled, this binary fails to LINK, loudly, and the reason is
-# in the workspace comment next to the feature.
-gpui = { workspace = true }
+# Inherited, and it has to stay inherited. THE KIT GENERATION: one toolkit dependency for the app,
+# per .agents/skills/gpui-kit. gpui-kit 0.6.1 flat-re-exports gpui-pre 0.3.4 as `gpui_kit::*`, so
+# every name this crate imported still exists - the diff is the generation, not the API.
+# windows-manifest is now forced ON by gpui-pre-platform's own declaration (features are additive,
+# nothing here can turn it off), so the toolkit's RT_MANIFEST ships in this executable and ours does
+# not: two of them is the duplicate-resource link error the workspace comment above describes. That is
+# why build.rs no longer embeds - it says so, and app.manifest stays in the tree for the post-link
+# step another lane is building as `cargo xtask manifest`.
+gpui-kit = { workspace = true }
 # Only to read the HWND out of the window gpui created: HasWindowHandle is
 # implemented by gpui itself (src/window.rs), so this is the toolkit handle
 # Granted as the S1 FCR (root Cargo.toml line 32). Grapheme cluster boundaries for the

@@ -67,11 +67,11 @@ use std::rc::Rc;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
-use gpui::prelude::*;
-use gpui::{
-    AnyWindowHandle, App, Application, AsyncApp, Bounds, Context, Entity, Focusable, IntoElement,
-    KeyBinding, Pixels, Point, Render, SharedString, Subscription, Task, TitlebarOptions,
-    WeakEntity, Window, WindowBounds, WindowOptions, div, px, rgb, size,
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    AnyWindowHandle, App, AsyncApp, Bounds, Context, Entity, Focusable, IntoElement, KeyBinding,
+    Pixels, Point, Render, SharedString, Subscription, Task, TitlebarOptions, WeakEntity, Window,
+    WindowBounds, WindowId, WindowOptions, div, px, rgb, size,
 };
 use notes_api::{
     Command, Encoding, Event, EventRx, FileMeta, Gateway, InitialState, LineEnding, RecentEntry,
@@ -593,7 +593,7 @@ impl Render for Surface {
         if !self.focus_requested {
             self.focus_requested = true;
             let handle = Focusable::focus_handle(self.editor.read(cx), cx);
-            window.focus(&handle);
+            window.focus(&handle, cx);
         }
         // Nothing invented here: GPUI 0.2.2 has no `Label` widget (its own text
         // elements are in src/elements/text.rs - `impl Element for &'static str` at
@@ -993,13 +993,21 @@ fn main() {
     // `None` until it is filled, and `None` means "nothing to compare yet".
     let window_slot: Rc<RefCell<Option<AnyWindowHandle>>> = Rc::new(RefCell::new(None));
 
-    Application::new().run({
+    // THE KIT GENERATION: `Application::new` is gone from the surface this crate is given;
+    // gpui_kit::platform::application() is the constructor that picks the platform backend
+    // (gpui-pre-platform-0.3.4/src/gpui_platform.rs:13).
+    gpui_kit::platform::application().run({
         let gateway = Rc::clone(&gateway);
         let events = Rc::clone(&events);
         let stats = Rc::clone(&stats);
         let subscriptions = Rc::clone(&subscriptions);
         let window_slot = Rc::clone(&window_slot);
         move |cx: &mut App| {
+            // REQUIRED, not decoration: without this the app panics at first render with
+            // "no state of type gpui_component::theme::Theme exists" (learned by the probe,
+            // named in the migration brief). It initializes the kit's app state - it does
+            // NOT put a Theme, Root or any component in this window, and none is used.
+            gpui_kit::init(cx);
             // The key map, in the examples shape (examples/input.rs:677-692), with
             // the Windows modifiers rather than the mac ones the example carries, and
             // the actions named through the module so `Copy` cannot shadow the trait
@@ -1182,7 +1190,14 @@ fn main() {
                 let events = Rc::clone(&events);
                 let editor_slot = Rc::clone(&editor_slot);
                 let wire = Rc::clone(&wire);
-                move |cx| {
+                // THE KIT GENERATION: the callback now also receives the `WindowId` that
+                // closed - `impl FnMut(&mut App, WindowId)` (gpui-pre-0.3.4
+                // src/app.rs:2387), where 0.2.2 passed the app context alone. The id is
+                // not used: this app has exactly one window, and on_window_closed fires
+                // when the LAST one goes, so filtering by id would be a guard against a
+                // case the bridge does not have. If a second window ever exists, THIS is
+                // the line that must start comparing ids before it closes the engine.
+                move |cx: &mut App, _window: WindowId| {
                     // LAST WORDS FIRST: the final Flush goes out before `Shutdown` is
                     // queued by `close`, so the engine's own bounded exit does the write
                     // and the join we already wait on waits for it. Not inside a frame -
