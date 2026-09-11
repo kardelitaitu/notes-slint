@@ -726,29 +726,38 @@ pub fn run(args: &[String]) -> i32 {
     );
     let extern_total: usize = ledger.ffi.values().map(|c| c.extern_blocks).sum();
     let declared_total: usize = ledger.ffi.values().map(|c| c.unsafe_declarations).sum();
-    let bare = bare_by_count(&ledger.ffi);
+    let bare_total = bare_by_count(&ledger.ffi);
+    let (worst_crate, worst) = ledger
+        .ffi
+        .iter()
+        .map(|(n, c)| (n.clone(), c.bare_by_count()))
+        .max_by_key(|(_, b)| *b)
+        .unwrap_or_else(|| ("no crate".to_string(), 0));
     let rows: Vec<String> = ledger
         .ffi
         .iter()
         .map(|(n, c)| {
             format!(
-                "{n}: {} blocks / {} unsafe declarations",
-                c.extern_blocks, c.unsafe_declarations
+                "{n}: {} - {} = {}",
+                c.extern_blocks,
+                c.unsafe_declarations,
+                c.bare_by_count()
             )
         })
         .collect();
     println!(
-        "unsafe: raw FFI per crate (extern blocks counted BARE AND unsafe-qualified / unsafe-qualified \
-         declarations). The only home allowed to declare foreign functions is {PLATFORM_CRATE} at \
-         {PLATFORM_DIR}, so every other row must read 0: {}",
+        "unsafe: raw FFI per crate, extern blocks - unsafe-qualified declarations = bare by \
+         count. The only home allowed to declare foreign functions is {PLATFORM_CRATE} at \
+         {PLATFORM_DIR}, so every row but that one must read 0 - 0 = 0: {}",
         rows.join(", ")
     );
     println!(
         "unsafe: tripwire {extern_total} extern blocks - {declared_total} unsafe-qualified \
-         declarations = {bare} BARE by count, and no crate shows more blocks than its own \
-         declarations. That is arithmetic, not a survey: a bare block still matches no pattern \
-         above, a block a macro emits is counted on neither side, and a build script passing \
-         -lkernel32 leaves no count anywhere to subtract.",
+         declarations = {bare_total} bare across the tree; the worst single crate is \
+         {worst_crate} at {worst}. A positive number is a [raw-ffi-imbalance] finding above. \
+         Zero is arithmetic, not a survey: a bare block still matches no pattern here, a block \
+         a macro emits is counted on neither side, and a build script passing -lkernel32 leaves \
+         no count anywhere to subtract."
     );
     if ledger.allowances.is_empty() {
         println!("unsafe: no module-root #![allow(unsafe_code)] anywhere");
