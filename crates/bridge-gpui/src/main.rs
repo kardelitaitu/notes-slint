@@ -288,11 +288,21 @@ const GEOMETRY_FORCE: Duration = Duration::from_millis(1000);
 /// dependency this crate may not have (AGENTS.md: a bridge imports the port and its
 /// own toolkit).
 ///
-/// So the number sent is a HINT in the bridge's own space, which is what the port
-/// says it is: GeometryChanged is "a TRIGGER and a FALLBACK" (api engine.rs, D48) and
-/// measure_rect overwrites it with the measured FRAME rect on the same tick that
-/// writes. What this slice had to supply is the trigger: nothing else in the app ever
-/// marks the session dirty when the user moves the window.
+/// So this number is NOT what gets persisted, and no longer could be. `GeometryChanged`
+/// is now a PAYLOAD-FREE SIGNAL ("geometry state changed, go measure"), the port measures
+/// the FRAME rect itself through `GetWindowPlacement`, and only a successful measure may
+/// write session.json - a failed measure defers the whole write and retries the pending
+/// bit, a move in flight defers the tick too, and the guard lifts only at shutdown,
+/// because there is no later tick to catch it (5ea2f49d).
+///
+/// The old contract said this value was a TRIGGER AND A FALLBACK, and the fallback half
+/// is exactly what broke the app: a client-space number under gpui's own chrome model was
+/// winning every write into a field core documents as FRAME pixels, so each
+/// move-then-relaunch cycle shifted the window by the chrome - 16 px across, 39 px down at
+/// 100%. The role left for `rect_of` is CHANGE DETECTOR: it is diffed by `Watch`, it is
+/// what decides WHEN to send the signal, and it is never sent. A future reader must not
+/// re-attach it to the command, and that is why this paragraph is here instead of a
+/// shorter one.
 fn rect_of(window: &Window) -> Rect {
     let bounds = match window.window_bounds() {
         WindowBounds::Windowed(bounds) | WindowBounds::Maximized(bounds) => bounds,
@@ -415,6 +425,9 @@ struct Surface {
     /// Whether we have asked for the keyboard yet - first frame only, so that
     /// focusing the editor cannot fight something the user clicks into later.
     focus_requested: bool,
+    /// Has the port been told once that a window exists? See the first-reading rule in
+    /// the pump.
+    signalled_once: bool,
 }
 
 impl Surface {
@@ -438,6 +451,7 @@ impl Surface {
             editor,
             wire,
             focus_requested: false,
+            signalled_once: false,
         };
         this.start_pump(cx);
         this
@@ -533,13 +547,34 @@ impl Surface {
         // commands on an unbounded queue. The counters are what prove that claim.
         if let Some(rect) = seen {
             let settled = self.watch.observe(rect, Instant::now());
-            if let Some(rect) = settled {
-                send(&self.gateway, Command::GeometryChanged { rect });
+            // THE FIRST SETTLED READING IS ITSELF A FACT. `Watch` only reports a
+            // CHANGE, which was right under the old contract (the port kept whatever rect
+            // it was last told) and is wrong under the new one: a fresh install has no
+            // rect to restore, the port now writes session.json only after a SUCCESSFUL
+            // measure, and with no signal ever sent there is nothing to measure and
+            // nothing to persist - which is exactly how `xtask smoke` came back with
+            // `session=FAILED, this run wrote no session.json` tonight (measured:
+            // `geometry: 0 rect changes seen, 0 GeometryChanged sent`, and the same
+            // binary DOES persist 333,222,500,350 the moment the window is moved).
+            let first = !self.signalled_once;
+            if first || settled.is_some() {
+                self.signalled_once = true;
+                let fired = settled.unwrap_or(rect);
+                // PAYLOAD-FREE (5ea2f49d): the port measures the FRAME rect itself, and
+                // only a successful measure may write session.json. The rect that fired
+                // the signal is still named in the trace, so the change stays auditable -
+                // it is simply no longer the value that gets persisted, which is the drift
+                // bug this replaces.
+                send(&self.gateway, Command::GeometryChanged);
                 let mut stats = self.stats.borrow_mut();
                 stats.rects_sent += 1;
                 stats.last_rect = Some(format!(
-                    "{} {}x{} at {},{}",
-                    "sent", rect.w, rect.h, rect.x, rect.y
+                    "signal sent{}, change was {}x{} at {},{}",
+                    if first { " (first reading)" } else { "" },
+                    fired.w,
+                    fired.h,
+                    fired.x,
+                    fired.y
                 ));
             }
             let mut stats = self.stats.borrow_mut();
