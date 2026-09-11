@@ -40,9 +40,10 @@ use notes_core::session::write_session;
 use notes_core::settings::write_settings;
 use notes_core::{
     DecodeError, Detected, Document, FileKind, LineEnding as CoreLineEnding, NoteParts,
-    SaveError as CoreSaveError, Session, Settings, Skip, StateDir, TextEncoding, classify_io_error,
-    clear as clear_recents, decode, detect, ensure_scratch_dir, identity_key, is_notes_path,
-    is_oversize, mark_missing, push as push_recent, rebuild, save_document_revision, split,
+    PathVerdict, SaveError as CoreSaveError, Session, Settings, Skip, StateDir, TextEncoding,
+    classify_io_error, clear as clear_recents, decode, detect, ensure_scratch_dir, identity_key,
+    is_notes_path, is_oversize, mark_missing, path_policy, push as push_recent, rebuild,
+    save_document_revision, split,
 };
 
 use crate::command::{Command, WindowHandle};
@@ -320,6 +321,17 @@ impl Engine {
         let mut settings = settings;
         mark_missing(&mut settings.recents);
         for entry in settings.recents.iter_mut() {
+            // A refused name is never statted: this probe runs BEFORE A WINDOW
+            // EXISTS, and a stat is exactly the exposure the read gate in
+            // [`Engine::open`] refuses - a stream answers is_file() == true, a
+            // stripped name answers for the file it was mangled into, and a
+            // drive-relative name resolves against a CWD nobody chose. The
+            // entry stays, greyed: "does not exist on disk" is the honest
+            // rendering of a name the app will not touch, and the menu that
+            // silently eats entries is the worse bug (see above).
+            if read_policy_refusal(&entry.path).is_some() {
+                continue;
+            }
             if entry.path.is_file() {
                 entry.exists = true;
             }
@@ -538,6 +550,26 @@ impl Engine {
     /// [`LoadError::TooLarge`] is for on the paths that cannot present an empty
     /// read-only buffer at all.
     fn open(&mut self, path: &Path) {
+        // THE READ GATE, before the first stat: the write side has refused
+        // these names in core's atomic write since path_policy landed, but a
+        // refusal on write alone left the read path free to LOAD a stream's
+        // second content, a stripped ghost, or a device that answers 0 bytes
+        // as an empty note. Both ways of reaching this arm WITHOUT the user
+        // choosing a name funnel through it - session.json's stored path is
+        // re-issued as Command::Open on every launch, and the recents probe
+        // below runs before a window exists. See [`read_policy_refusal`] for
+        // why exactly these four verdicts, and why UnboundedNetwork is not
+        // one of them. No generation bump and no buffer: nothing was read,
+        // which is the same silence the comment below states for every
+        // other failed load.
+        if let Some(reason) = read_policy_refusal(path) {
+            self.load_refused = true;
+            self.emit(Event::LoadFailed {
+                path: path.to_path_buf(),
+                reason,
+            });
+            return;
+        }
         // NO GENERATION BUMP HERE. The engine ISSUES the generation and the
         // bridge ECHOES it, which only works while every move is ANNOUNCED - and
         // the only announcements are `Loaded` and `Rebound`. A load that fails
@@ -1687,6 +1719,39 @@ fn load_error_from_io(err: &std::io::Error) -> LoadError {
             CoreSaveError::PermissionDenied => LoadError::PermissionDenied,
             other => LoadError::Other(other.to_string()),
         },
+    }
+}
+
+/// The read-side twin of the write gate in core's `atomic_write`: the same
+/// `path_policy` verdicts, judged from the NAME ALONE, refused before the
+/// first stat or read. Two call sites funnel through it - [`Engine::open`]
+/// and the recents probe in [`Engine::with_host`] - because both are
+/// reached without the user choosing the path (session.json's stored
+/// `path` is re-issued as [`Command::Open`] on every launch, and the probe
+/// stats up to ten stored names before a window exists).
+///
+/// Exactly four verdicts refuse, because none of them can name a document
+/// a user legitimately wants edited: a stream is a second content of a
+/// file the app cannot round-trip; a stripped name does not exist as the
+/// OS sees it; a drive-relative path resolves against a per-drive CWD the
+/// user never chose; and a reserved device that answers 0 bytes reads as
+/// an EMPTY NOTE rather than an error. The write side already refuses all
+/// four - this is the same policy applied before the damage instead of
+/// after, not a new one.
+///
+/// [`PathVerdict::UnboundedNetwork`] deliberately gates NOTHING: it matches
+/// every \\server\share name - legitimate notes on network shares
+/// included - and the right answer to the stall it warns about (an
+/// unreachable host blocks the single-threaded engine) is a bounded or
+/// async probe, which is platform work, not a wider refusal.
+fn read_policy_refusal(path: &Path) -> Option<LoadError> {
+    let verdict = path_policy(path);
+    match verdict {
+        PathVerdict::StreamName
+        | PathVerdict::StrippedName
+        | PathVerdict::ReservedDevice
+        | PathVerdict::DriveRelative => Some(LoadError::Policy(verdict)),
+        PathVerdict::Allowed | PathVerdict::UnboundedNetwork => None,
     }
 }
 

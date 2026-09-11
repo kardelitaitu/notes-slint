@@ -10,7 +10,7 @@
 //! This module is **data only**: no serializer, no watcher, no debounce. Those
 //! are engine and core work.
 
-use notes_core::Rect;
+use notes_core::{PathVerdict, Rect};
 use std::path::PathBuf;
 
 /// How a file's bytes are encoded, and therefore how they must be written back.
@@ -255,6 +255,20 @@ pub enum LoadError {
         /// The encoding the file's own header claimed, when it claimed one.
         encoding_hint: Option<Encoding>,
     },
+    /// The path is refused by NAME, before the first stat or read: the read
+    /// side of the refusal the write side has made in core's atomic write
+    /// since path_policy landed. The verdict IS the message - core's
+    /// `path_policy` decided it from the name alone, so this variant carries
+    /// that decision rather than a second sentence about it. Four verdicts
+    /// refuse (an alternate data stream, a name Windows would strip, a
+    /// reserved device, a drive-relative path); `UnboundedNetwork`
+    /// deliberately does not - it matches every \\server\share name,
+    /// legitimate notes included, and the stall it warns about is fixed by a
+    /// bounded probe, not by refusing a whole class of real documents.
+    #[error(
+        "the name-only policy refuses this path ({0:?}) — the app will not read a file it cannot name honestly"
+    )]
+    Policy(PathVerdict),
     /// Anything else, carrying the OS text for the same reason as
     /// [`SaveError::Other`].
     #[error("{0}")]
@@ -857,6 +871,10 @@ mod tests {
         assert_eq!(
             LoadError::Other("os error 1450".to_string()).to_string(),
             "os error 1450"
+        );
+        assert_eq!(
+            LoadError::Policy(PathVerdict::StreamName).to_string(),
+            "the name-only policy refuses this path (StreamName) — the app will not read a file it cannot name honestly"
         );
     }
 
