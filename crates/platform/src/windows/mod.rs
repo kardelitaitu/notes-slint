@@ -12,6 +12,7 @@
 #![allow(unsafe_code)]
 
 pub mod monitors;
+pub mod paths;
 pub mod topmost;
 
 use ::windows::Win32::Foundation::HWND;
