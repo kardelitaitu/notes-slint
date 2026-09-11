@@ -854,8 +854,8 @@ fn the_last_state_write_happens_before_the_window_is_gone() {
     gateway.send(Command::UnregisterWindow).expect("queued");
     gateway.close().expect("the quit joins");
 
-    let persisted = read_session(dir.path())
-        .expect("the session existed before; it must exist after");
+    let persisted =
+        read_session(dir.path()).expect("the session existed before; it must exist after");
     assert!(
         persisted.pinned,
         "the pin change must survive a quit that never gave a tick"
