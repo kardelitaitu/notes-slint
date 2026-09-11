@@ -330,6 +330,24 @@ fn the_flush_refreshes_monitor_facts_when_the_world_changes() {
     };
     assert_eq!(first.monitor_id, 1);
 
+    // The first write was the fresh-install ABSENCE write (provisional: the
+    // move was still in flight, so no honest measure existed yet). The next
+    // tick measures and re-writes - wait for that settled, MEASURED state
+    // before judging idleness.
+    let settled = loop {
+        if let Ok(session) = read_session(dir.path()) {
+            if session.rect == Rect::new(0, 0, 1920, 1032) {
+                break session;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the measured rewrite never landed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(settled.rect, Rect::new(0, 0, 1920, 1032));
+
     // IDLE WORLD, NO DISK WRITE: two tick periods with nothing changed must
     // leave the file byte-identical - a refresh that made every 750 ms tick
     // rewrite the file would be a battery-life bug in a notepad.
@@ -367,11 +385,14 @@ fn the_flush_refreshes_monitor_facts_when_the_world_changes() {
         !second.pinned,
         "and the changed pin bit, from the same flush"
     );
-    // Both flushes MEASURED (the restore rect was read at each one), which is
-    // what feeds the refresh.
+    // The refresh is fed by a MEASURE: the second flush measured (the first
+    // was the fresh-install ABSENCE write - a move was still in flight, so it
+    // deliberately wrote the port-chosen rect without a read-back). One honest
+    // measure is what the refresh needs; the drain had nothing pending to
+    // measure, by design.
     assert!(
-        host.restore_reads() >= 2,
-        "each flush must have measured the restore rect"
+        host.restore_reads() >= 1,
+        "the guard-expired flush must have measured the restore rect"
     );
 }
 
@@ -753,4 +774,46 @@ fn a_deferred_write_leaves_session_json_byte_identical() {
         "an unmeasurable tick must leave the persisted file untouched"
     );
     gateway.close().expect("shutdown joins");
+}
+
+/// A FRESH INSTALL MUST PERSIST, NOT DEFER INTO NOTHINGNESS: with no
+/// session.json there is no previous value to keep, so a defer is a silent
+/// no-persist - the smoke run caught a fresh install that remembered nothing.
+/// The absence rule: session.rect at that moment is a number the port chose
+/// itself in frame space (default-or-restored, clamped at registration), never
+/// a toolkit hint, so writing it is safe; absence is the one unrecoverable
+/// state. Red on the code that introduced defer-without-this-carve-out.
+#[test]
+fn a_fresh_install_persists_on_the_first_geometry_changed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(
+        !dir.path().join("session.json").exists(),
+        "fresh: no file yet"
+    );
+    // A REAL backend whose measure fails (the smoke case: by quit time the
+    // window is gone and GetWindowPlacement refuses) - headless-without-a-host
+    // cannot reproduce it because the no-backend path writes vacuously.
+    let (gateway, _rx, _host) = start_with(
+        dir.path(),
+        Answers {
+            fail_restore: Some("the window is gone by quit".to_string()),
+            ..Answers::default()
+        },
+    );
+
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    gateway.send(Command::GeometryChanged).expect("queued");
+    gateway.close().expect("the quit joins");
+
+    let persisted = read_session(dir.path())
+        .expect("THE FRESH INSTALL WROTE NOTHING - the defer ate the first persist");
+    assert_ne!(
+        persisted.rect,
+        Rect::new(0, 0, 0, 0),
+        "and it carries a real frame-space rect"
+    );
 }

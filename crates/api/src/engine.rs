@@ -1110,7 +1110,41 @@ impl Engine {
             // No backend = headless (the test harness): there is no toolkit to
             // contradict the stored value, so the write proceeds. With a
             // backend, ONLY a successful measure may write.
-            if !move_in_flight && (!has_backend || self.measure_rect()) {
+            //
+            // THE ABSENCE RULE (smoke-caught: a fresh install remembered
+            // NOTHING, because every candidate write was deferred and there was
+            // no previous file to fall back to). Defer protects OVERWRITE -
+            // never replace a good rect with an unmeasured one - and is wrong
+            // about ABSENCE: a missing file is worse than any candidate. With
+            // no session.json yet, session.rect is a number the port chose
+            // itself in frame space (default-or-restored, clamped at
+            // registration) and CANNOT be a toolkit hint, because hints can no
+            // longer reach the field. Absence persists; presence defers. Do not
+            // "restore" this by removing the carve-out.
+            let has_previous = self.state_dir.0.join("session.json").is_file();
+            // The measure runs whenever it honestly can - it feeds the refresh
+            // AND the overwrite guarantee - even on a flush whose write will be
+            // deferred. Only an in-flight move (stale read-back) skips it.
+            let measurable = !move_in_flight;
+            let measured = if has_backend && measurable {
+                self.measure_rect()
+            } else {
+                // Headless (no backend): nothing can contradict the stored
+                // value, so the measure is vacuously good.
+                true
+            };
+            // THE GATE, both halves:
+            // * overwrite - only a successful measure may replace the stored
+            //   value (a failed measure defers: previous stays, bit retries);
+            // * absence - with no session.json there is nothing to protect, and
+            //   a defer would be a silent no-persist (a fresh install that
+            //   remembers nothing), so the port-chosen frame-space rect writes
+            //   even on a tick whose measure failed or could not run. Such a
+            //   write is PROVISIONAL: the pending bit stays set so the next
+            //   tick - guard expired, measure honest - re-writes with the
+            //   measured rect instead of trusting an unmeasured one forever.
+            let write_allowed = (measurable && measured) || !has_previous;
+            if !move_in_flight {
                 // MAJOR 2/5: monitor identity is refreshed HERE, in the one
                 // moment the port's picture of the window updates - together
                 // with the rect, so it cannot half-refresh. A launch-time
@@ -1122,10 +1156,7 @@ impl Engine {
                 // queue call here: flush_state only runs with the session bit
                 // already pending, and the write below clears it - a queue at
                 // this spot cannot change anything.
-                let move_in_flight = self
-                    .last_move_issued
-                    .is_some_and(|at| at.elapsed() < 2 * AUTOSAVE_IDLE);
-                if !move_in_flight {
+                {
                     if let Some(facts) = self.facts.as_ref() {
                         if let Ok((_, monitor)) =
                             facts.work_area_for_rect(to_frame(self.session.rect))
@@ -1154,9 +1185,13 @@ impl Engine {
                         }
                     }
                 }
+            }
+            if write_allowed {
                 match write_session(&self.state_dir.0, &self.session) {
                     Ok(()) => {
-                        self.pending.session = false;
+                        // A measure-backed write is done; an absence write is
+                        // provisional and keeps the bit armed (see above).
+                        self.pending.session = !measured || move_in_flight;
                         // Success re-arms the report: the next distinct failure is
                         // news again (M5).
                         self.session_failure_latched = false;

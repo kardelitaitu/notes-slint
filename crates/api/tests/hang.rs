@@ -100,7 +100,10 @@ fn shutdown_survives_an_engine_blocked_in_a_window_op() {
     while host.topmost().is_empty() || host.restore_reads() == 0 {
         assert!(
             Instant::now() < finish_by,
-            "the abandoned engine never finished its own exit"
+            "the abandoned engine never finished its own exit: topmost={} restore_reads={} moves={}",
+            host.topmost().len(),
+            host.restore_reads(),
+            host.moves().len()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
