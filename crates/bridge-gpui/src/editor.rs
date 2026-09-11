@@ -1572,10 +1572,15 @@ impl EntityInputHandler for Editor {
     /// `update_ime_position` altogether - the toolkit declines to move. So the composition
     /// and candidate windows freeze at the last position they were given, which after a
     /// scroll is over different text, or off-screen. Silent wrongness, and the reason the
-    /// caret line, the marked range and the selection are all in the retention set: every
-    /// line any of those three can name has to answer. Note also that the OS asks with
-    /// `selected_text_range(false)`, `prefer_marked_text = false`, so it is asking for the
-    /// CARET range even while a mark is live elsewhere - the caret needs its own slot.
+    /// selection, the caret line and the marked range are all in the retention set: every
+    /// line any of them can name has to answer. Being exact about which one the OS asks
+    /// about - it calls `selected_text_range(false)`, `prefer_marked_text = false`, so what
+    /// it positions against is the SELECTION range and the marked range is not consulted
+    /// for position at all. The caret is in the set because that is where the selection is
+    /// about to be when a mutation collapses it; the mark is in the set because it is a
+    /// range we are about to commit and underline, not because the candidate window tracks
+    /// it. (An earlier draft of this comment said it does. It does not, and a wrong reason
+    /// here is how the next reader "fixes" a thing that was never broken.)
     fn bounds_for_range(
         &mut self,
         range_utf16: Range<usize>,
