@@ -46,7 +46,9 @@ const SDK_BIN_REL: &str = "Windows Kits/10/bin";
 /// The resource id a PE's manifest lives under. 24 is CREATEPROCESS_MANIFEST_RESOURCE_ID.
 const MANIFEST_RESOURCE_ID: &str = "1";
 /// The manifest we ship, relative to the workspace root.
-const APP_MANIFEST_REL: &str = "crates/bridge-gpui/app.manifest";
+/// Published so smoke can ask the same question of the exe it is about to
+/// launch without duplicating the path or the marker list.
+pub const APP_MANIFEST_REL: &str = "crates/bridge-gpui/app.manifest";
 /// The exe this step protects, relative to the workspace root.
 const EXE_REL: &str = "target/debug/notes-gpui.exe";
 

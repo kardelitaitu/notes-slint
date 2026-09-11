@@ -65,6 +65,10 @@
 //!   move never reached session.json, or the relaunch came back elsewhere. Geometry
 //!   that could not be measured prints "NOT JUDGED (advisory)" and leaves the exit
 //!   code alone - an unverifiable step must not be reported as a pass or a failure.
+//! * 8 - the exe under test carries a manifest that is not ours AND the run asked
+//!   for --require-ours. Without the flag the same state is a WARN line, never a
+//!   red: the ordinary condition on a development machine is that nobody has run
+//!   the post-link step, and smoke must not train people to ignore it.
 //! * 7 - THE PIN LIED: WS_EX_TOPMOST on the live window did not follow what
 //!   session.json claimed (checked in both polarities, pinned:true and
 //!   pinned:false). Kept separate from 6 because the usual cause is the order of
@@ -107,6 +111,8 @@ const CLOSE_SECS: u64 = 10;
 const OUTER_SECS: u64 = WINDOW_SECS + CLOSE_SECS + 20;
 
 const BIN_REL: &str = "target/debug/notes-gpui.exe";
+/// Just the file name, for a CARGO_TARGET_DIR that replaces the whole tree.
+pub const EXE_NAME: &str = "notes-gpui.exe";
 const BUILD_HINT: &str = "cargo build -p notes-bridge-gpui --bin notes-gpui";
 const SESSION_FILE: &str = "session.json";
 
@@ -885,6 +891,13 @@ const SOURCE_FILES: &[&str] = &["Cargo.toml", "Cargo.lock"];
 pub const BUILD_FAILED_EXIT: i32 = 4;
 /// The exe is older than the sources that produce it.
 pub const STALE_BINARY_EXIT: i32 = 5;
+pub const MANIFEST_NOT_OURS_EXIT: i32 = 8;
+/// The exe carries somebody else's manifest and --require-ours was passed. NOT
+/// part of CONTRACT on purpose: the contract table lists what a default
+/// invocation can return, and this code is only reachable behind a flag CI does
+/// not pass. Putting it in the table would force a ci.yml arm for a verdict that
+/// can never occur there, and the rule would then be teaching people to write
+/// arms that do nothing.
 /// Everything passed.
 pub const PASS_EXIT: i32 = 0;
 /// An app step failed: the app itself, not the harness.
@@ -1049,6 +1062,24 @@ fn report_binary(exe: &Path, root: &Path, built: bool) {
         if built { "yes" } else { "NO (--no-build)" },
         head
     );
+    match manifest_of(root, exe) {
+        Ok(m) => {
+            println!(
+                "smoke: manifest in that exe: identity={} longPathAware={} PerMonitorV2={}",
+                m.identity, m.long_path, m.per_monitor
+            );
+            if let crate::manifest::ReadBack::Missing(absent) = crate::manifest::read_back(&m) {
+                println!(
+                    "SMOKE WARN: this exe does NOT carry our manifest - no {:?}. On a development \
+                     machine that is the normal state (nobody ran the post-link step); it is a \
+                     WARNING, not a red, because smoke must not train people to skip it. In CI run \
+                     smoke with --require-ours and this becomes exit 8.",
+                    absent
+                );
+            }
+        }
+        Err(why) => println!("smoke: manifest NOT JUDGED - {why} (no claim either way)"),
+    }
 }
 
 /// The geometry round trip: seed a rect, launch, read where the window really
@@ -1809,7 +1840,48 @@ fn restore_session(path: &Path, bytes: Option<&[u8]>) {
     }
 }
 
-/// Entry point for "cargo xtask smoke [--reuse-state] [--no-build]".
+/// The exe under test, honouring CARGO_TARGET_DIR.
+///
+/// Every lane is now told to build into a private target directory, and smoke
+/// used to resolve <root>/target/debug anyway: it then judged a binary nobody had
+/// built, failed its OWN freshness guard, and left the intended exe sitting
+/// unused. A harness that cannot be pointed at a build is not a harness. The
+/// resolution is pure and returned with the reason it chose, because the path is
+/// the thing a reader needs to trust the verdict.
+pub fn resolve_exe(root: &Path, target_dir: Option<&str>) -> (PathBuf, &'static str) {
+    let trimmed = target_dir.unwrap_or_default().trim();
+    if trimmed.is_empty() {
+        return (
+            root.join(BIN_REL),
+            "no CARGO_TARGET_DIR in the environment, so the workspace default",
+        );
+    }
+    let base = Path::new(trimmed);
+    // Cargo resolves a relative CARGO_TARGET_DIR against the invoking directory.
+    // We are run from the workspace root, so that is what we assume - and say.
+    let base = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        root.join(base)
+    };
+    (
+        base.join("debug").join(EXE_NAME),
+        "CARGO_TARGET_DIR, honoured as asked",
+    )
+}
+
+/// Read the manifest back out of the exe we are about to launch. Same discipline
+/// as the tested-binary line: name the thing, do not assume it. smoke JUDGES and
+/// never repairs - calling mt.exe here would let a smoke run hide the fact that
+/// nobody ran the post-link step.
+pub fn manifest_of(root: &Path, exe: &Path) -> Result<crate::manifest::Markers, String> {
+    let source = fs::read_to_string(root.join(crate::manifest::APP_MANIFEST_REL))
+        .map_err(|e| format!("cannot read the source manifest: {e}"))?;
+    let (identity, wanted) = crate::manifest::source_promise(&source)?;
+    let bytes = fs::read(exe).map_err(|e| format!("cannot read the exe: {e}"))?;
+    Ok(crate::manifest::read_markers(&bytes, &identity, &wanted))
+}
+/// Entry point for "cargo xtask smoke [--reuse-state] [--no-build] [--require-ours]".
 pub fn run(args: &[String]) -> i32 {
     // The contract first, before anything can fail: a log that shows a verdict
     // also shows the code table that verdict came out of.
@@ -1817,11 +1889,11 @@ pub fn run(args: &[String]) -> i32 {
     let unknown: Vec<&str> = args
         .iter()
         .map(String::as_str)
-        .filter(|a| *a != "--reuse-state" && *a != "--no-build")
+        .filter(|a| *a != "--reuse-state" && *a != "--no-build" && *a != "--require-ours")
         .collect();
     if !unknown.is_empty() {
         eprintln!("smoke: unknown argument(s): {}", unknown.join(" "));
-        eprintln!("smoke: usage: cargo xtask smoke [--reuse-state] [--no-build]");
+        eprintln!("smoke: usage: cargo xtask smoke [--reuse-state] [--no-build] [--require-ours]");
         return HARNESS_EXIT;
     }
     let reuse = args.iter().any(|a| a == "--reuse-state");
@@ -1840,7 +1912,12 @@ pub fn run(args: &[String]) -> i32 {
             return HARNESS_EXIT;
         }
     };
-    let exe = root.join(BIN_REL);
+    let (exe, resolved_from) =
+        resolve_exe(&root, std::env::var("CARGO_TARGET_DIR").ok().as_deref());
+    println!(
+        "smoke: exe path {} | resolved from {resolved_from}",
+        exe.display()
+    );
     // BUILD FIRST. A harness that launches whatever exe happens to be lying
     // around proves a cached binary, and a green line on a stale exe is the
     // most dangerous output this repo can produce: it says the app works when
@@ -1866,6 +1943,27 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     report_binary(&exe, &root, built);
+    // The strict shape, opt-in: the line above always names what is in the exe,
+    // and this decides whether a foreign manifest is allowed to pass. Not
+    // default, because the ordinary state on a developer machine is that nobody
+    // ran the post-link step yet, and a rule that makes every local run red is
+    // a rule that gets --no-build-ed past. An UNREADABLE manifest is not judged
+    // here either: absence of evidence is not evidence of a violation.
+    if args.iter().any(|a| a == "--require-ours") {
+        match manifest_of(&root, &exe) {
+            Ok(m) => {
+                if let crate::manifest::ReadBack::Missing(absent) = crate::manifest::read_back(&m) {
+                    println!(
+                        "SMOKE FAIL: --require-ours and the exe we are about to launch is missing {:?}",
+                        absent
+                    );
+                    println!("SMOKE FAIL: run 'cargo xtask manifest' (post-link) on it first");
+                    return MANIFEST_NOT_OURS_EXIT;
+                }
+            }
+            Err(why) => println!("smoke: --require-ours NOT JUDGED - {why}"),
+        }
+    }
     if !exe.is_file() {
         println!(
             "SMOKE FAIL: cargo succeeded but {} is still not there",
@@ -2862,5 +2960,116 @@ mod tests {
                 .contains("\"pinned\": true")
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The bug the bridge lane reported: smoke resolved <root>/target/debug no
+    /// matter what the environment said, so a private build was judged by its
+    /// absent rival and failed the freshness guard on a binary that was sitting
+    /// right there.
+    #[test]
+    fn the_target_dir_we_are_told_is_the_target_dir_we_use() {
+        let root = PathBuf::from(r"C:\dev\notes-gpui");
+        let (path, why) = resolve_exe(&root, None);
+        assert_eq!(
+            path,
+            PathBuf::from(r"C:\dev\notes-gpui\target\debug\notes-gpui.exe")
+        );
+        assert!(why.contains("default"), "{why}");
+        let (path, why) = resolve_exe(&root, Some(""));
+        assert!(
+            path.starts_with(r"C:\dev\notes-gpui\target"),
+            "an empty value is no value: {path:?}"
+        );
+        assert!(why.contains("default"), "{why}");
+        let (path, why) = resolve_exe(&root, Some("   "));
+        assert!(
+            why.contains("default"),
+            "whitespace is not a directory: {why}"
+        );
+        let (private, why) = resolve_exe(&root, Some(r"D:\builds\lane-4"));
+        assert_eq!(
+            private,
+            PathBuf::from(r"D:\builds\lane-4\debug\notes-gpui.exe"),
+            "an absolute CARGO_TARGET_DIR replaces the whole tree"
+        );
+        assert!(private.to_string_lossy().contains("lane-4"), "{private:?}");
+        assert!(why.contains("CARGO_TARGET_DIR"), "{why}");
+        assert!(
+            !path.to_string_lossy().contains("lane-4"),
+            "the default must not be polluted by the other case"
+        );
+        // A relative value is resolved against the root, which is what cargo does
+        // against the invoking directory - and the reason string says so.
+        let (rel, _) = resolve_exe(&root, Some("out/scratch"));
+        assert_eq!(
+            rel,
+            PathBuf::from(r"C:\dev\notes-gpui\out\scratch\debug\notes-gpui.exe"),
+            "{rel:?}"
+        );
+    }
+
+    /// manifest_of must read the promise out of the source file rather than
+    /// hardcoding it: give it a manifest that claims a different identity and the
+    /// verdict follows the claim.
+    #[test]
+    fn the_manifest_verdict_follows_the_source_file_not_a_literal() {
+        // Distinct from the manifest module's own fixture dir, which is keyed on
+        // the same process id: two tests in one binary may not share a scratch path.
+        let dir = std::env::temp_dir().join(format!("xtask-smoke-mf-{}", std::process::id()));
+        let our_dir = dir.join("crates/bridge-gpui");
+        fs::create_dir_all(&our_dir).expect("dir");
+        fs::write(
+            our_dir.join("app.manifest"),
+            "<assemblyIdentity name=\"NotesGpui.App\"/><dpiAwareness>PerMonitorV2</dpiAwareness>\
+             <longPathAware>true</longPathAware>",
+        )
+        .expect("manifest");
+        let exe = dir.join("app.exe");
+        fs::write(
+            &exe,
+            b"prefix <assemblyIdentity name=\"NotesGpui.App\"/> PerMonitorV2 longPathAware",
+        )
+        .expect("exe");
+        let m = manifest_of(&dir, &exe).expect("readable");
+        assert!(m.all_present(), "{m:?}");
+        let foreign = dir.join("foreign.exe");
+        fs::write(
+            &foreign,
+            b"<?xml version=\"1.0\"?><assemblyIdentity name=\"Zed.Other\"/>",
+        )
+        .expect("exe");
+        let m = manifest_of(&dir, &foreign).expect("readable");
+        assert!(
+            !m.all_present(),
+            "a foreign exe must not read as ours: {m:?}"
+        );
+        let crate::manifest::ReadBack::Missing(absent) = crate::manifest::read_back(&m) else {
+            panic!("a foreign exe must name every marker it lacks");
+        };
+        assert_eq!(
+            absent,
+            vec!["assemblyIdentity", "longPathAware", "PerMonitorV2"],
+            "{absent:?}"
+        );
+        // Unreadable input is refused, never reported as a violation.
+        assert!(manifest_of(&dir, &dir.join("nope.exe")).is_err());
+        assert!(manifest_of(&dir.join("nowhere"), &exe).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Exit 8 is deliberately outside the published contract, and a test is the
+    /// only place that claim stays true.
+    #[test]
+    fn the_flag_only_verdict_is_outside_the_contract_on_purpose() {
+        assert_eq!(MANIFEST_NOT_OURS_EXIT, 8);
+        assert!(
+            !CONTRACT.iter().any(|c| c.0 == MANIFEST_NOT_OURS_EXIT),
+            "a code CI can never receive must not demand a ci.yml arm"
+        );
+        assert_eq!(
+            CONTRACT.len(),
+            8,
+            "the default-invocation codes, unchanged by this slice"
+        );
     }
 }
