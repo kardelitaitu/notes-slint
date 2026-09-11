@@ -219,10 +219,16 @@ pub(crate) struct Engine {
     /// could write stale text to a new path while the editor showed something
     /// else. That is data loss with a nicer name, so the command vocabulary grew
     /// the missing fields (D30) and the fields below disappeared with them.
-    /// The OPEN GENERATION: bumped on every rebind (Open, Save As). A Flush
-    /// stamped with an older generation is a buffered edit for a document that
-    /// no longer exists - it is discarded, not written into the file that
-    /// replaced it (the stale-flush-overwrites-B bug).
+    /// THE DOCUMENT GENERATION, and this struct is its only writer. It moves
+    /// exactly once per rebind and ONLY at an emit that announces it - a `Loaded`
+    /// or a `Rebound` - so a caller that stores the number it is handed can never
+    /// be out of step, which is what the bridge's mirrored counter could not
+    /// promise. The scratch bind inside [`Engine::flush`] is the deliberate
+    /// exception: it acquires a FILE for the buffer the window already shows, so
+    /// it moves nothing and carries the unchanged number. A Flush stamped with an
+    /// older generation is a buffered edit for a document that no longer exists -
+    /// it is discarded, not written into the file that replaced it (the
+    /// stale-flush-overwrites-B bug).
     epoch: u64,
     /// True when the last [`Command::Open`] was refused. One reason to exist: a
     /// refused load leaves the bridge holding a buffer that is NOT this file, so an
@@ -532,9 +538,14 @@ impl Engine {
     /// [`LoadError::TooLarge`] is for on the paths that cannot present an empty
     /// read-only buffer at all.
     fn open(&mut self, path: &Path) {
-        // Any successful rebind is a new generation: edits buffered for the
-        // previous document are stale the moment this one loads.
-        self.epoch += 1;
+        // NO GENERATION BUMP HERE. The engine ISSUES the generation and the
+        // bridge ECHOES it, which only works while every move is ANNOUNCED - and
+        // the only announcements are `Loaded` and `Rebound`. A load that fails
+        // (missing, oversize, undecodable) emits neither, so a bump up here would
+        // move the engine's number with nothing to carry it and every later Flush
+        // would come back Superseded: the same silence the mirror used to break
+        // in, wearing the opposite hat. The bump lives at the emit sites below,
+        // beside the event that states the new number.
         let on_disk = match fs::metadata(path) {
             Ok(meta) => meta,
             Err(err) => {
@@ -610,6 +621,10 @@ impl Engine {
         self.detected = detected;
         self.load_refused = false;
         let body = self.body_for_ui(&raw);
+        // THE BUMP, announced: this buffer is a different document than the one
+        // the bridge was echoing, and the number travels in the same event that
+        // replaces the text, so the two can never be observed apart.
+        self.epoch += 1;
         self.emit(Event::Loaded {
             path: path.to_path_buf(),
             text: body,
@@ -624,6 +639,7 @@ impl Engine {
                 // document never inherits the arming of the one before it.
                 armed: self.doc.is_armed(),
             },
+            epoch: self.epoch,
         });
         self.remember(path);
     }
@@ -683,6 +699,10 @@ impl Engine {
         // be made, the next write says so through NeedsPath, and the startup
         // StateDirUnusable event has usually already explained why.
         let _ = ensure_scratch_dir(&self.state_dir);
+        // A move of the number, ANNOUNCED by the Loaded below: the buffer this
+        // window holds becomes a fresh empty scratch, which is a different
+        // document than whatever was in it.
+        self.epoch += 1;
         self.emit(Event::Loaded {
             path: scratch.to_path_buf(),
             text: String::new(),
@@ -698,6 +718,7 @@ impl Engine {
                 // disarmed; ours never does, and no bridge workaround is needed.
                 armed: self.doc.is_armed(),
             },
+            epoch: self.epoch,
         });
         self.session.path = Some(scratch.to_path_buf());
         self.queue(Target::Session);
@@ -722,7 +743,10 @@ impl Engine {
     /// arming, and the TARGET's encoding rather than the source's. A failed Save
     /// As emits only [`Event::SaveFailed`]: nothing was rebound.
     fn save_as(&mut self, path: &Path, text: &str, revision: u64) {
-        self.epoch += 1;
+        // NO BUMP HERE EITHER (see [`Engine::open`]): a Save As that is refused
+        // or fails emits no Rebound, and an unannounced generation move is
+        // exactly the silence this change exists to remove. The buffer did not
+        // change hands, so its stamp does not change.
         if self.load_refused {
             // The measured 0-byte overwrite. A refused open means the buffer on
             // screen is not this file, so writing it would destroy a document the
@@ -750,6 +774,12 @@ impl Engine {
                     path: path.to_path_buf(),
                     revision,
                 });
+                // THE BUMP, announced: the write landed and the Rebound below is
+                // the event that carries the new number, so a bridge that echoes
+                // what it is told can never be caught out by a move it was not
+                // told about - which is why a refused or failed Save As above
+                // bumps nothing.
+                self.epoch += 1;
                 self.emit(Event::Rebound {
                     path: path.to_path_buf(),
                     meta: FileMeta {
@@ -763,6 +793,7 @@ impl Engine {
                         armed: self.doc.is_armed(),
                     },
                     revision,
+                    epoch: self.epoch,
                 });
                 self.remember(path);
             }
@@ -808,19 +839,20 @@ impl Engine {
     /// core the questions core can answer. When core owns the buffer, this line
     /// becomes [`Document::should_flush`] and the field disappears.
     fn flush(&mut self, text: String, revision: u64, epoch: u64) {
-        // THE EPOCH GUARD: a Flush buffered under an OPEN GENERATION the engine
-        // has already replaced must not land in the file that replaced it - the
-        // stale text would overwrite the current document atomically and report
-        // Saved. Discard, and say so.
+        // THE EPOCH GUARD: a Flush carrying an echoed generation the engine has
+        // already replaced must not land in the file that replaced it - the stale
+        // text would overwrite the current document atomically and report Saved.
+        // Discard, and say so.
         if std::env::var("N2_DEBUG").is_ok() {
             eprintln!("FLUSH epoch={} engine_epoch={}", epoch, self.epoch);
         }
-        // EQUALITY against the engine's own open generation. Two independent
-        // counters, compared for equality, across a seam: the only thing that
-        // makes that sound is that BOTH start at 0 and only ever move at a
-        // send the other side can see — see the lockstep note in
-        // [`Engine::restore_missing_scratch`]'s caller and the non-action in
-        // [`Engine::flush`]'s scratch branch.
+        // EQUALITY, now against a number THIS crate issued and the caller only
+        // echoes. That is what makes an equality test the right shape here: the
+        // bridge holds no counter to drift, and a mismatch can only mean the text
+        // was buffered under a document this engine has since replaced. It is
+        // still not a diagnosis - one reason string covers a stamp that is too OLD
+        // (legitimately superseded) and a stamp a buggy caller never re-echoed -
+        // but only one side can now be wrong, and it is not the caller's guess.
         if epoch != self.epoch {
             self.emit(Event::AutosaveSkipped {
                 reason: SkipReason::Superseded,
@@ -923,6 +955,12 @@ impl Engine {
                             armed: self.doc.is_armed(),
                         },
                         revision,
+                        // The UNCHANGED number, stated anyway: the bind is not a
+                        // rebind of the buffer the bridge holds - same text, same
+                        // window, the note just acquired a file - and saying so in
+                        // the event is what lets a bridge echo a number it never
+                        // has to predict. This is the line the mutation test reads.
+                        epoch: self.epoch,
                     });
                     // Binds session.path to the scratch and stops there:
                     // `remember` keeps the scratch out of the MRU.

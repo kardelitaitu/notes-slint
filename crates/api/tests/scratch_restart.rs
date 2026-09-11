@@ -249,9 +249,18 @@ fn a_scratch_deleted_between_launches_comes_back_as_a_fresh_empty_scratch() {
     );
     let event = restore(&rx, &second, &scratch);
     match &event {
-        Event::Loaded { path, text, meta } => {
+        Event::Loaded {
+            path,
+            text,
+            meta,
+            epoch,
+        } => {
             assert_eq!(path, &scratch, "still the scratch: same identity");
             assert_eq!(text, "", "a deleted scratch is a FRESH empty scratch");
+            // The number is ISSUED HERE, not mirrored: this restore took the
+            // buffer off whatever the window held, so it is generation 1, and
+            // the flush below echoes exactly that.
+            assert_eq!(*epoch, 1, "the engine announced its own generation");
             assert!(
                 meta.armed,
                 "the scratch is OURS (.notes), so autosave must be armed without 
@@ -523,16 +532,20 @@ fn a_scratch_draft_plus_two_opened_files_leaves_exactly_two_recents() {
 
 // ------------------------------------------------------------------ test 6 --
 
-/// THE EPOCH LOCKSTEP, seen from the api side, and the reason the untitled
-/// case is the dangerous one. The bridge mirrors the engine open generation at
-/// the SEND of an Open or a Save As and bumps NOTHING on a pathless startup, so
-/// a fresh scratch sits at generation 0 on both sides. The flush guard compares
-/// those counters for EQUALITY, which means the scratch binding inside Flush
-/// must not bump the engine either: no rebind command was sent to get there, so
-/// a bump would put the engine one generation ahead of the edits already in the
-/// debounce and silently discard the autosave of the one document this product
-/// always has. Two flushes, both at generation 0: the first proves the scratch
-/// is reachable at all, the second proves the BIND left the counter alone.
+/// THE GENERATION RULE, from the api side, and the reason the untitled case is
+/// the dangerous one. The engine issues the number and the bridge echoes it, so
+/// the only thing that keeps the echo honest is: the number moves at a rebind of
+/// the BUFFER, and the event that replaces the text carries the new value.
+///
+/// The scratch bind is the case that must NOT move it. The bind acquires a file
+/// for the buffer the window is already showing - the bridge was handed no new
+/// text, so it has nothing newer to echo - and a bump there would put the engine
+/// one generation ahead of every edit already in the debounce, silently
+/// discarding the autosave of the one document this product always has. Two
+/// flushes, both echoing generation 0: the first proves the scratch is reachable
+/// at all, the second proves the BIND left the number alone. The Rebound the
+/// bind emits is also read directly, so the rule is pinned in the DATA and not
+/// only in what the next flush happens to survive.
 #[test]
 fn the_scratch_bind_does_not_bump_the_epoch() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -545,22 +558,53 @@ fn the_scratch_bind_does_not_bump_the_epoch() {
             .send(Command::Flush {
                 text: text.to_string(),
                 revision,
-                // Generation 0: the pathless startup, mirrored by a bridge
-                // counter that never moved either.
+                // Generation 0, echoed: what the bridge holds is the number the
+                // last Loaded/Rebound gave it, and nothing ever gave it another.
                 epoch: 0,
             })
             .expect("queued");
+        // Only the FIRST flush binds anything: after it the document has a path,
+        // so the second is an ordinary write - one Saved and no Rebound, and
+        // waiting for a second Rebound would be asking the engine to lie about a
+        // rebind that did not happen.
+        let binding = revision == 1;
         let deadline = Instant::now() + ANSWER;
+        let mut saved_first = false;
+        let mut rebound_with = None;
         loop {
             assert!(Instant::now() < deadline, "flush {revision} never answered");
             match rx.recv_timeout(ANSWER).expect("an event") {
-                Event::Saved { path, .. } if path == scratch => break,
+                Event::Saved { path, .. } if path == scratch => {
+                    assert!(!saved_first, "one Saved per flush");
+                    saved_first = true;
+                    if !binding {
+                        break;
+                    }
+                }
+                // Rebound is the LAST of the pair (Saved announces the bytes
+                // first), so the binding round ends here and both are checked.
+                Event::Rebound { path, epoch, .. } if path == scratch => {
+                    assert!(binding, "a second bind nobody asked for");
+                    rebound_with = Some(epoch);
+                    break;
+                }
                 Event::AutosaveSkipped { reason } => panic!(
                     "flush {revision} at generation 0 was skipped as {reason:?}: the scratch bind 
-                     moved the engine generation without the bridge"
+                     moved the engine generation out from under the echo"
                 ),
                 _ => {}
             }
+        }
+        assert!(saved_first, "Saved must announce the bytes");
+        if binding {
+            assert_eq!(
+                rebound_with,
+                Some(0),
+                "the bind carries the UNCHANGED generation: the number a bridge echoes is 
+                 still 0, so its next flush cannot be Superseded"
+            );
+        } else {
+            assert_eq!(rebound_with, None, "a plain write announces no rebind");
         }
     }
     assert_eq!(
@@ -642,6 +686,61 @@ fn a_flush_stamped_before_the_restore_open_is_discarded_not_written() {
     second.close().expect("second quit joins");
 }
 
+/// THE POINT OF AN ENGINE-ISSUED NUMBER, stated as a case: a load that FAILS
+/// announces nothing, so it moves nothing, and the buffer on screen is still the
+/// one the bridge is echoing. Under the mirrored counter this was a guess both
+/// sides had to get right - the engine bumped at the top of `open`, before it
+/// knew whether the load would land, and the bridge had to bump at the SEND to
+/// stay level. Now a refused open simply cannot cost the untitled note its next
+/// autosave, because there is no move for it to be out of step with.
+#[test]
+fn a_refused_load_issues_no_generation_and_the_untitled_note_keeps_saving() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let scratch = scratch_of(dir.path());
+    let (gateway, rx) = headless(dir.path());
+    open_window(&gateway);
+    // The user hits Ctrl+O on a file that is gone. Refused, honestly.
+    gateway
+        .send(Command::Open {
+            path: dir.path().join("vanished.notes"),
+        })
+        .expect("queued");
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the refused open answered nothing"
+        );
+        if let Event::LoadFailed { .. } = rx.recv_timeout(ANSWER).expect("an event") {
+            break;
+        }
+    }
+    // The window still shows the untitled note, still at generation 0: it was
+    // never handed a new buffer, so it never received a new number.
+    gateway
+        .send(Command::Flush {
+            text: "typed through the failed open\n".to_string(),
+            revision: 1,
+            epoch: 0,
+        })
+        .expect("queued");
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the untitled note never saved after a refused load"
+        );
+        match rx.recv_timeout(ANSWER).expect("an event") {
+            Event::Saved { path, .. } if path == scratch => break,
+            Event::AutosaveSkipped { reason } => {
+                panic!("a refused load cost the untitled note its autosave: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+    gateway.close().expect("quit joins");
+}
+
 // ------------------------------------------------------------------ test 5 --
 
 /// Save As is the rebind: the session must name the NEW path, the new file must
@@ -700,10 +799,16 @@ fn save_as_rebinds_the_identity_and_the_scratch_ghost_never_returns() {
         "after Save As the session must name the NEW path, not the scratch"
     );
     match restore(&rx, &second, &named) {
-        Event::Loaded { path, text, meta } => {
+        Event::Loaded {
+            path,
+            text,
+            meta,
+            epoch,
+        } => {
             assert_eq!(path, named);
             assert_eq!(text, "draft in the scratch\n");
             assert!(meta.armed, "a .notes the app saved is armed");
+            assert_eq!(epoch, 1, "and the restore issued generation 1 for it");
         }
         other => panic!("the relaunch must load the named file, got {other:?}"),
     }

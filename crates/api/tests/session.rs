@@ -258,6 +258,11 @@ impl Harness {
     /// Skipped events are collected and printed on failure: an unexpected
     /// AutosaveSkipped IS a result, and swallowing one quietly would hide exactly
     /// the ADR-0001 behaviour under test.
+    ///
+    /// THIS IS ALSO THE HARNESS'S WIRE: every event that flows past it updates the
+    /// echoed generation, exactly as a bridge's pump stores the number from a
+    /// `Loaded`/`Rebound` before it does anything else with the event. Nothing
+    /// here guesses at send time; a refused load flows by and changes nothing.
     fn until<F>(&mut self, want: &str, f: F) -> Event
     where
         F: Fn(&Event) -> bool,
@@ -268,6 +273,12 @@ impl Harness {
             let timeout = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(timeout) {
                 Ok(event) => {
+                    match &event {
+                        Event::Loaded { epoch, .. } | Event::Rebound { epoch, .. } => {
+                            self.epoch = *epoch;
+                        }
+                        _ => {}
+                    }
                     if f(&event) {
                         return event;
                     }
@@ -283,28 +294,33 @@ impl Harness {
         while self.rx.recv_timeout(ANSWER).is_ok() {}
     }
 
-    /// An Open that does not need the Loaded payload still moves the OPEN
-    /// GENERATION - the harness mirrors the engine, or its buffered Flushes
-    /// would be discarded as stale.
+    /// An Open whose answer this scenario does not need. No stamp is taken here -
+    /// [`Harness::until`] is the wire, and it updates the echoed generation from
+    /// any `Loaded`/`Rebound` that flows through it - and nothing is mirrored at
+    /// send, which is the whole point of an engine-issued number.
     fn open_generation(&mut self, path: &Path) {
-        self.gateway
-            .send(Command::Open {
-                path: path.to_path_buf(),
-            })
-            .expect("queued");
-        self.epoch += 1;
+        self.send(Command::Open {
+            path: path.to_path_buf(),
+        });
     }
 
+    /// An Open whose `Loaded` payload the scenario does want. Same echo rule as
+    /// [`Harness::open_generation`]: the stamp comes from the event, never from
+    /// a guess at send time.
     fn open(&mut self, path: &Path) -> (String, FileMeta) {
         self.send(Command::Open {
             path: path.to_path_buf(),
         });
-        self.epoch += 1;
         match self.until(
             "Loaded",
             |ev| matches!(ev, Event::Loaded { path: p, .. } if p == path),
         ) {
-            Event::Loaded { text, meta, .. } => (text, meta),
+            Event::Loaded {
+                text, meta, epoch, ..
+            } => {
+                self.epoch = epoch;
+                (text, meta)
+            }
             other => panic!("expected Loaded, got {other:?}"),
         }
     }
@@ -350,8 +366,10 @@ impl Harness {
             text: text.to_string(),
             revision,
         });
-        // A rebind is a new OPEN GENERATION; the harness mirrors the engine.
-        self.epoch += 1;
+        // NO MIRRORING at send: the engine issues the number and the Rebound
+        // below carries it. A Save As that FAILS emits no Rebound and moves
+        // nothing, so a bump here would leave this harness one generation ahead
+        // on its very next flush - the drift the echo exists to remove.
         match self.until("Saved", |ev| match ev {
             Event::Saved { path: p, .. } => p == path,
             Event::SaveFailed { path: p, .. } => p == path,
@@ -365,11 +383,15 @@ impl Harness {
                     |ev| matches!(ev, Event::Rebound { path: p, .. } if p == path),
                 ) {
                     Event::Rebound {
-                        meta, revision: r, ..
+                        meta,
+                        revision: r,
+                        epoch,
+                        ..
                     } => {
                         assert_eq!(r, revision, "Saved and Rebound agree on the revision");
                         assert!(meta.armed, "Save As arms the document (ADR-0001 req 4)");
                         assert!(!meta.oversize);
+                        self.epoch = epoch;
                         revision
                     }
                     other => unreachable!("filtered to Rebound, got {other:?}"),
@@ -507,8 +529,9 @@ fn a_failed_save_arrives_as_an_event_and_the_engine_keeps_working() {
         text: "content\n".to_string(),
         revision: 0,
     });
-    // A rebind is a new generation (the engine bumped; the harness mirrors).
-    app.epoch += 1;
+    // A FAILED Save As is not a rebind: nothing was announced, so the generation
+    // this harness echoes is still the one `open` handed it, and the note keeps
+    // saving on that number.
     let event = app.until(
         "SaveFailed",
         |ev| matches!(ev, Event::SaveFailed { path, .. } if path == &nowhere),
@@ -1386,8 +1409,9 @@ fn a_second_untitled_note_reuses_the_same_scratch_path() {
     );
 }
 
-/// FINDING 2: the stale flush. The user types in A (the bridge debounces
-/// 250 ms), hits Ctrl+O for B inside that window, and the ALREADY-QUEUED
+/// FINDING 2: the stale flush. The user types in A (the bridge debounces 750 ms,
+/// a QUIET PERIOD - every keystroke resets it, so the whole unflushed burst is in
+/// the air), hits Ctrl+O for B inside that window, and the ALREADY-QUEUED
 /// Flush{A-text} arrives after the rebind. Without the epoch guard it wrote A's
 /// text into B atomically and reported Saved (RED before). With it, the stale
 /// Flush is DISCARDED and says so, B stays byte-identical, and the CURRENT
@@ -1414,12 +1438,15 @@ fn a_stale_flush_never_lands_in_the_file_that_replaced_its_document() {
             epoch: 1,
         })
         .expect("queued");
-    let reason = loop {
-        match app.rx.recv_timeout(ANSWER) {
-            Ok(Event::AutosaveSkipped { reason }) => break reason,
-            Ok(_) => {}
-            Err(_) => panic!("the discard was silent - a dropped edit must say so"),
-        }
+    // Routed through the harness wire (until), not a raw recv: the Loaded for B
+    // flows past on the way to the discard, and the wire is what updates the
+    // echoed generation. A raw loop would swallow the announcement and leave
+    // this harness behind the engine - the mistake an echoing caller cannot make.
+    let reason = match app.until("a discard", |ev| {
+        matches!(ev, Event::AutosaveSkipped { .. })
+    }) {
+        Event::AutosaveSkipped { reason } => reason,
+        other => panic!("expected the discard to name itself, got {other:?}"),
     };
     assert_eq!(
         reason,

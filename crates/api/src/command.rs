@@ -73,12 +73,18 @@ pub enum Command {
     /// whose revision is at or below the last saved revision means *clean*: core
     /// may report [`SkipReason::Clean`](crate::SkipReason::Clean), but on a path
     /// the user triggered by hand it must not go silent.
-    /// `epoch` is the bridge's own OPEN GENERATION: it increments every time
-    /// the bridge rebinds the document (Open, Save As) and is captured when an
-    /// edit is buffered, not when the debounced Flush fires. A Flush whose
-    /// epoch names a generation the engine has already replaced is DISCARDED
-    /// (with its own skip reason) - otherwise an in-flight edit for A lands
-    /// in the file named B, atomically, and reports Saved.
+    /// `epoch` is THE DOCUMENT GENERATION THE BRIDGE IS ECHOING - not a counter
+    /// the bridge owns: it is the number the engine stated in the last
+    /// [`Event::Loaded`](crate::Event::Loaded) or
+    /// [`Event::Rebound`](crate::Event::Rebound) whose text this buffer holds,
+    /// captured when the edit entered the debounce rather than when the debounced
+    /// Flush fires. The engine is the only writer of that number, it moves it
+    /// exactly once per rebind, and every move arrives inside the event that
+    /// replaces the text - so a bridge that stores and echoes it can never be one
+    /// bump out of step, which is what the old mirrored counter could not promise.
+    /// A Flush whose echoed epoch names a generation the engine has already
+    /// replaced is DISCARDED (with its own skip reason) - otherwise an in-flight
+    /// edit for A lands in the file named B, atomically, and reports Saved.
     Flush {
         text: String,
         revision: u64,

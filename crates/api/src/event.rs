@@ -294,6 +294,20 @@ pub enum Event {
         path: PathBuf,
         text: String,
         meta: FileMeta,
+        /// THE DOCUMENT GENERATION, and the ONLY place a caller of this port can
+        /// read it: the engine is its single writer, the number moves exactly
+        /// once per rebind, and EVERY move is announced by the event that carries
+        /// it. A `Loaded` or a `Rebound` always states the generation the buffer
+        /// it just described belongs to; a load or a save that FAILED moves
+        /// nothing and says nothing, because the buffer did not change hands.
+        ///
+        /// The bridge does not own a counter and must not keep one: it stores
+        /// this value on `Loaded`/`Rebound` and echoes it back as
+        /// [`Command::Flush::epoch`](crate::Command::Flush::epoch) for the edits
+        /// it buffers. That is what makes the guard an echo check rather than a
+        /// race between two independent counters: a discarded flush can now only
+        /// mean the text belongs to a document this window no longer shows.
+        epoch: u64,
     },
     /// A file could not be opened, and why. Async like every other answer: an
     /// [`Open`](crate::Command::Open) has no reply channel to return an Err to.
@@ -341,6 +355,12 @@ pub enum Event {
         path: PathBuf,
         meta: FileMeta,
         revision: u64,
+        /// THE DOCUMENT GENERATION, issued here: see
+        /// [`Event::Loaded::epoch`](Event::Loaded::epoch). A rebind is the one
+        /// thing that moves the number, so a Rebound is where a bridge re-syncs
+        /// it - including the scratch bind inside a Flush, which announces the
+        /// UNCHANGED number precisely so nothing has to guess.
+        epoch: u64,
     },
     /// A DOCUMENT save failed. The async one: `Flush` has no reply channel,
     /// so this is how the failure reaches the status line (AGENTS.md).
@@ -459,15 +479,23 @@ mod tests {
                 path,
                 meta,
                 revision,
+                epoch,
             } => Event::Rebound {
                 path: path.clone(),
                 meta: *meta,
                 revision: *revision,
+                epoch: *epoch,
             },
-            Event::Loaded { path, text, meta } => Event::Loaded {
+            Event::Loaded {
+                path,
+                text,
+                meta,
+                epoch,
+            } => Event::Loaded {
                 path: path.clone(),
                 text: text.clone(),
                 meta: *meta,
+                epoch: *epoch,
             },
             Event::LoadFailed { path, reason } => Event::LoadFailed {
                 path: path.clone(),
@@ -537,6 +565,7 @@ mod tests {
                 path: PathBuf::from("C:/notes/a.notes"),
                 text: "hi".to_string(),
                 meta: meta(),
+                epoch: 3,
             },
             Event::LoadFailed {
                 path: PathBuf::from("C:/notes/gone.md"),
@@ -553,6 +582,7 @@ mod tests {
                     armed: true,
                 },
                 revision: 4,
+                epoch: 4,
             },
             Event::Saved {
                 path: PathBuf::from("C:/notes/a.notes"),
@@ -662,12 +692,14 @@ mod tests {
             Event::Loaded {
                 path: PathBuf::from("a"),
                 text: String::new(),
-                meta: meta()
+                meta: meta(),
+                epoch: 0
             },
             Event::Loaded {
                 path: PathBuf::from("a"),
                 text: String::new(),
-                meta: armed
+                meta: armed,
+                epoch: 0
             }
         );
         assert_ne!(
