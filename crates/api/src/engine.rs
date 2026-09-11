@@ -446,24 +446,19 @@ impl Engine {
             Command::UnregisterWindow => {
                 self.window = None;
             }
-            Command::GeometryChanged { rect } => {
-                // D48: a TRIGGER and a FALLBACK, no longer the source of truth. The
-                // bridge may import api and its toolkit and nothing else, so the only
-                // rect it can measure is its own space, while what must be persisted is
-                // the RESTORE frame rect - which it has no seam to read. The hint is
-                // kept (it is the best available number if the platform call fails, and
-                // a move the bridge recorded is not a lie); [`measure_rect`] replaces
-                // it with the measured rect on the same tick that writes.
+            Command::GeometryChanged => {
+                // A TRIGGER, nothing more (the payload was removed deliberately:
+                // the only rect a bridge can produce is its own space, and the
+                // live drift bug was exactly such a hint winning the write -
+                // 390,278,1010,698 frame in, 398,297,1002,678 client persisted).
+                // The engine answers by MEASURING once through the platform seam
+                // on the flush tick that the queue arms; the write arm then
+                // carries the measured frame rect or carries nothing.
                 // MAJOR 3: after UnregisterWindow there is no window to
-                // describe. Persisting a rect for a handle the port no longer
-                // holds is how a stranger's placement gets written; a no-op,
-                // deliberately, until the next RegisterWindow.
-                if self.window.is_some() && self.session.rect != rect {
-                    self.session.rect = rect;
-                    self.queue(Target::Session);
-                }
-                // The same rect twice changes nothing, so it queues nothing:
-                // pinned by repeated_geometry_at_one_rect_queues_one_update.
+                // describe, so the measure fails and the write is deferred -
+                // persisting a rect for a handle the port no longer holds is how
+                // a stranger's placement gets written.
+                self.queue(Target::Session);
             }
             Command::SetAutosave(on) => {
                 // The global toggle, answered by the menu's own check mark. The
@@ -864,11 +859,23 @@ impl Engine {
                 }
                 // Nothing left in the queue. This is the normal exit.
                 Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
-                    self.flush_state();
+                    self.final_flush();
                     return;
                 }
             }
         }
+        self.final_flush();
+    }
+
+    /// The shutdown write, and why it is not just flush_state: the move-in-
+    /// flight guard defers TICK writes because a later tick can do better - at
+    /// shutdown there IS no later tick. The guard is lifted, and the host's
+    /// read-back NOW is the window's actual position at quit (or the best
+    /// report the host gives); the hint is still barred from the file, because
+    /// the measure replaces the stored rect before the write. A pre-move
+    /// read-back at quit is honest: that is where the window really is.
+    fn final_flush(&mut self) {
+        self.last_move_issued = None;
         self.flush_state();
     }
 
@@ -1073,9 +1080,13 @@ impl Engine {
             return;
         }
         if pending.session {
-            // One tick, one write, and the rect inside it is the one the host reports
-            // (D48) rather than the one a toolkit guessed. The cost is a single
-            // GetWindowPlacement on the engine thread, where blocking is allowed.
+            // One tick, one write, and the rect inside it is the one the host
+            // REPORTS (D48) rather than the one a toolkit guessed - and that is
+            // now a guarantee, not an aspiration: the write happens ONLY after a
+            // successful measure (a failed measure defers the whole write, keep
+            // the previous persisted value and retry next tick), and NEVER while
+            // a move is in flight. The cost is a single GetWindowPlacement on
+            // the engine thread, where blocking is allowed.
             //
             // MEASURE LATER, NEVER IMMEDIATELY, and this is the ONLY measure site:
             // with the platform's async window ops (SWP_ASYNCWINDOWPOS),
@@ -1084,7 +1095,22 @@ impl Engine {
             // false (probe5). By the flush tick the owner has pumped many times
             // and the measured normal position is the truth. Do not move this
             // call back to restore_and_pin.
-            if self.measure_rect() {
+            // THE WRITE PRIORITY (the drift bug): a move in flight poisons
+            // BOTH candidates - the measured read-back is the pre-move or
+            // mid-drag position, and the stored rect may be the bridge's hint
+            // (its own client-ish space). Persisting either walks the window
+            // across the screen one chrome-height per cycle. So the whole
+            // write is DEFERRED: the previous persisted value stays in the
+            // file, the pending bit stays set, and a later tick - guard
+            // expired, measure honest - does the write with the measured rect.
+            let has_backend = self.backend.is_some();
+            let move_in_flight = self
+                .last_move_issued
+                .is_some_and(|at| at.elapsed() < 2 * AUTOSAVE_IDLE);
+            // No backend = headless (the test harness): there is no toolkit to
+            // contradict the stored value, so the write proceeds. With a
+            // backend, ONLY a successful measure may write.
+            if !move_in_flight && (!has_backend || self.measure_rect()) {
                 // MAJOR 2/5: monitor identity is refreshed HERE, in the one
                 // moment the port's picture of the window updates - together
                 // with the rect, so it cannot half-refresh. A launch-time
@@ -1128,31 +1154,34 @@ impl Engine {
                         }
                     }
                 }
-            }
-            match write_session(&self.state_dir.0, &self.session) {
-                Ok(()) => {
-                    self.pending.session = false;
-                    // Success re-arms the report: the next distinct failure is
-                    // news again (M5).
-                    self.session_failure_latched = false;
-                }
-                Err(err) => {
-                    // M5: a locked session.json or a full disk must not become
-                    // one error per tick forever. Report ONCE, latch, keep the
-                    // pending bit set so the tick keeps retrying, and clear on
-                    // the next success. No revision rides this event - a
-                    // session file HAS none, and SaveFailed's revision-0 claim
-                    // was a lie the UI could render. The reason is core's own
-                    // sentence (SessionError's Display), passed through
-                    // untranslated, like every other platform/core refusal.
-                    if !self.session_failure_latched {
-                        self.session_failure_latched = true;
-                        self.emit(Event::SessionWriteFailed {
-                            reason: err.to_string(),
-                        });
+                match write_session(&self.state_dir.0, &self.session) {
+                    Ok(()) => {
+                        self.pending.session = false;
+                        // Success re-arms the report: the next distinct failure is
+                        // news again (M5).
+                        self.session_failure_latched = false;
+                    }
+                    Err(err) => {
+                        // M5: a locked session.json or a full disk must not become
+                        // one error per tick forever. Report ONCE, latch, keep the
+                        // pending bit set so the tick keeps retrying, and clear on
+                        // the next success. No revision rides this event - a
+                        // session file HAS none, and SaveFailed's revision-0 claim
+                        // was a lie the UI could render. The reason is core's own
+                        // sentence (SessionError's Display), passed through
+                        // untranslated, like every other platform/core refusal.
+                        if !self.session_failure_latched {
+                            self.session_failure_latched = true;
+                            self.emit(Event::SessionWriteFailed {
+                                reason: err.to_string(),
+                            });
+                        }
                     }
                 }
             }
+            // (move in flight, or the measure refused: neither the refresh nor
+            // the write ran - the file keeps the previous persisted value and
+            // the pending bit survives for the next tick.)
         }
         if pending.settings {
             match write_settings(&self.state_dir, &self.settings) {
@@ -1432,7 +1461,6 @@ fn existing_detected(path: &Path, codepage: Option<u16>) -> Detected {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notes_core::Rect;
     use std::path::PathBuf;
 
     /// REVIEWER ITEM 3: the marking call inside [`Engine::run`] is what arms the
@@ -1632,8 +1660,8 @@ mod tests {
         usize::from(engine.pending.session)
     }
 
-    /// D11's spirit, asserted where it is implemented: repeated GeometryChanged
-    /// at the SAME rect queues one update, not N.
+    /// The queue is a TARGET bit, not a counter: repeated GeometryChanged -
+    /// whatever the bridge's debounce hiccup - queues one update, not N.
     #[test]
     fn repeated_geometry_at_one_rect_queues_one_update() {
         let mut engine = engine();
@@ -1649,18 +1677,16 @@ mod tests {
             1,
             "registration marks the session dirty exactly once"
         );
-        let rect = Rect::new(10, 20, 300, 200);
 
-        engine.handle(Command::GeometryChanged { rect });
+        engine.handle(Command::GeometryChanged);
         assert_eq!(pending(&engine), 1);
         for _ in 0..64 {
-            engine.handle(Command::GeometryChanged { rect });
+            engine.handle(Command::GeometryChanged);
         }
-        assert_eq!(engine.session.rect, rect);
         assert_eq!(
             pending(&engine),
             1,
-            "the same rect 65 times must not queue 65 disk updates"
+            "65 triggers must not queue 65 disk updates"
         );
     }
 
@@ -1673,14 +1699,13 @@ mod tests {
         engine.handle(Command::RegisterWindow {
             handle: WindowHandle(1),
         });
-        engine.handle(Command::GeometryChanged {
-            rect: Rect::new(1, 1, 100, 100),
-        });
-        engine.handle(Command::GeometryChanged {
-            rect: Rect::new(2, 2, 200, 200),
-        });
-        assert_eq!(pending(&engine), 1, "one coalesced write");
-        assert_eq!(engine.session.rect, Rect::new(2, 2, 200, 200));
+        engine.handle(Command::GeometryChanged);
+        engine.handle(Command::GeometryChanged);
+        assert_eq!(
+            pending(&engine),
+            1,
+            "one coalesced write: the queue arms a\n         target, it does not stack"
+        );
     }
 
     /// D10: the pin bit has exactly one home. SetPinned writes the session and
@@ -1726,9 +1751,7 @@ mod tests {
     #[test]
     fn the_engine_holds_the_state_dir_it_was_given() {
         let mut engine = engine();
-        engine.handle(Command::GeometryChanged {
-            rect: Rect::new(0, 0, 10, 10),
-        });
+        engine.handle(Command::GeometryChanged);
         assert_eq!(
             engine.state_dir.0,
             PathBuf::from("unused-in-these-tests"),

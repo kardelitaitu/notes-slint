@@ -14,8 +14,6 @@
 
 use std::path::PathBuf;
 
-use crate::dto::Rect;
-
 /// A window handle, crossing the port as a plain integer.
 ///
 /// The bridge owns the window and the toolkit creates it (docs/architecture.md
@@ -99,10 +97,14 @@ pub enum Command {
     /// bridge work, geometry *storage* is core work (AGENTS.md, startup order).
     RegisterWindow { handle: WindowHandle },
 
-    /// Report the window's current frame rect. The engine stores it; it does not
-    /// interpret, clamp or scale it — those are methods on [`Rect`](crate::Rect)
-    /// in `notes-core`, and they belong there.
-    GeometryChanged { rect: Rect },
+    /// Tell the engine the window MOVED (or may have). Deliberately PAYLOAD-FREE:
+    /// the only rect the bridge can produce is its own space, and a hint that can
+    /// reach the frame-space field is a rect that drifts the window one
+    /// chrome-height per cycle (the live bug this removed). The engine answers by
+    /// MEASURING once through the platform seam - GetWindowPlacement yields both
+    /// rcNormalPosition and showCmd, so the persisted value is the frame rect the
+    /// host reports, and maximised costs no second seam.
+    GeometryChanged,
 
     /// The window the bridge registered is GONE (destroyed, recreated). The
     /// stored handle is a VALUE, not a lease: a destroyed HWND fails closed
@@ -142,7 +144,7 @@ mod tests {
             Command::ClearRecents => Command::ClearRecents,
             Command::Shutdown => Command::Shutdown,
             Command::RegisterWindow { handle } => Command::RegisterWindow { handle: *handle },
-            Command::GeometryChanged { rect } => Command::GeometryChanged { rect: *rect },
+            Command::GeometryChanged => Command::GeometryChanged,
             Command::UnregisterWindow => Command::UnregisterWindow,
         }
     }
@@ -159,7 +161,7 @@ mod tests {
             Command::ClearRecents => "ClearRecents",
             Command::Shutdown => "Shutdown",
             Command::RegisterWindow { .. } => "RegisterWindow",
-            Command::GeometryChanged { .. } => "GeometryChanged",
+            Command::GeometryChanged => "GeometryChanged",
             Command::UnregisterWindow => "UnregisterWindow",
         }
     }
@@ -185,9 +187,7 @@ mod tests {
             Command::RegisterWindow {
                 handle: WindowHandle(-1_234_567_890),
             },
-            Command::GeometryChanged {
-                rect: Rect::new(120, 80, 900, 600),
-            },
+            Command::GeometryChanged,
             Command::UnregisterWindow,
         ]
     }

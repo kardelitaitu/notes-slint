@@ -411,11 +411,7 @@ fn after_unregister_nothing_moves_and_no_rect_is_written() {
 
     gateway.send(Command::UnregisterWindow).expect("queued");
     // A geometry update for a window the port no longer holds.
-    gateway
-        .send(Command::GeometryChanged {
-            rect: Rect::new(900, 900, 400, 300),
-        })
-        .expect("queued");
+    gateway.send(Command::GeometryChanged).expect("queued");
     // Re-registering would be a legitimate NEW window; deliberately not sent.
     gateway.close().expect("shutdown joins the engine");
 
@@ -635,4 +631,126 @@ fn the_hosts_ansi_codepage_fills_the_gap_the_settings_left() {
         "CP932 cannot hold an unpaired 0xE9: {event:?}"
     );
     gateway.close().ok();
+}
+
+/// THE HINT MUST NEVER WIN THE WRITE (the drift bug): the bridge's
+/// GeometryChanged carries ITS OWN space (gpui's window_bounds, client-ish),
+/// and the platform dossier showed a move-then-quit persisting exactly that
+/// hint: 390,278,1010,698 frame went in, 398,297,1002,678 client came out -
+/// the chrome applied, walking the window down-right on every cycle. The rule
+/// now: while a move is in flight the flush writes NOTHING (the measured
+/// read-back is stale and the stored rect may be the hint), so the file keeps
+/// the previous persisted value until an honest measure can win; and once the
+/// guard expires, the measure replaces the hint before the write.
+#[test]
+fn the_hint_never_wins_the_write_and_the_measure_replaces_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let previous = Rect::new(50, 50, 700, 500);
+    write_session(
+        dir.path(),
+        &Session {
+            rect: previous,
+            ..Session::default()
+        },
+    )
+    .expect("write the session fixture");
+    // The MEASURED answer differs from the hint by a chrome-sized offset.
+    let measured = Rect::new(200, 150, 800, 600);
+    let hint = Rect::new(120, 110, 800, 600);
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(FrameRect::new(200, 150, 800, 600)),
+            ..Answers::default()
+        },
+    );
+
+    // Register (issues + stamps the async move), then the bridge reports its
+    // hint, then the user quits IMMEDIATELY - the drain flushes inside the
+    // move-in-flight window, exactly the live sequence that drifted.
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    wait_for_calls(&host, 1, "the registration's move");
+    gateway.send(Command::GeometryChanged).expect("queued");
+    gateway.close().expect("the immediate quit joins");
+
+    let persisted = read_session(dir.path()).expect("the session persisted");
+    assert_ne!(
+        persisted.rect, hint,
+        "the bridge's hint must never be persisted into the frame-space field"
+    );
+    assert_eq!(
+        persisted.rect, measured,
+        "even an immediate quit measures: the MEASURED frame rect wins the drain\n         write (the guard lifts at shutdown because there is no later tick)"
+    );
+
+    // A LATER launch (guard long expired): the measure is honest and wins.
+    let (second, _rx, _host2) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(FrameRect::new(200, 150, 800, 600)),
+            ..Answers::default()
+        },
+    );
+    second
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    wait_for_calls(&_host2, 1, "the relaunch's move");
+    std::thread::sleep(Duration::from_millis(750 * 2 + 100));
+    second.send(Command::SetPinned(true)).expect("queued");
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        if let Ok(session) = read_session(dir.path()) {
+            if session.rect == measured {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "the measured rect never won");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    second.close().expect("shutdown joins");
+}
+
+/// THE ACCEPTANCE THE DRIFT BUG BOUGHT: a GeometryChanged whose measure fails
+/// (here: the flush ticks run while a move is in flight, so the only rect the
+/// engine could write is one nobody measured) leaves session.json BYTE-IDENTICAL.
+/// A stale rect is recoverable; a systematically offset one drifts.
+#[test]
+fn a_deferred_write_leaves_session_json_byte_identical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_session(
+        dir.path(),
+        &Session {
+            rect: Rect::new(50, 50, 700, 500),
+            ..Session::default()
+        },
+    )
+    .expect("write the session fixture");
+    let before = std::fs::read(dir.path().join("session.json")).expect("read the seed");
+    let (gateway, _rx, host) = start_with(dir.path(), Answers::default());
+
+    // Register (issues + stamps the async move), then the trigger. Every flush
+    // inside the move-in-flight window must be a full defer.
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    wait_for_calls(&host, 1, "the registration's move");
+    gateway.send(Command::GeometryChanged).expect("queued");
+    gateway.send(Command::SetPinned(true)).expect("queued");
+    std::thread::sleep(Duration::from_millis(750 + 200));
+
+    // Not one byte moved while the measure could not be trusted.
+    let after = std::fs::read(dir.path().join("session.json")).expect("read again");
+    assert_eq!(
+        before, after,
+        "an unmeasurable tick must leave the persisted file untouched"
+    );
+    gateway.close().expect("shutdown joins");
 }

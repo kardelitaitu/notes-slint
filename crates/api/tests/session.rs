@@ -519,10 +519,24 @@ fn a_failed_save_arrives_as_an_event_and_the_engine_keeps_working() {
 /// litter and no second copy of the pin to disagree with the first (D10, D12).
 #[test]
 fn geometry_and_the_pin_bit_survive_a_restart_and_leave_no_temp_litter() {
-    let mut app = Harness::new();
+    let dir = tempfile::tempdir().expect("tempdir");
     let rect = Rect::new(40, 24, 1024, 700);
+    // GeometryChanged is PAYLOAD-FREE now: a rect reaches the session through
+    // a measured frame read (needs a host) or through the persisted file being
+    // restored. Headless, the honest fixture is a session seeded BEFORE the
+    // engine reads it - which is exactly what a restart is.
+    write_session(
+        dir.path(),
+        &Session {
+            rect,
+            ..Session::default()
+        },
+    )
+    .expect("seed the session");
+    let mut app = Harness::at(dir.path().to_path_buf(), Settings::default());
+    app._dir = Some(dir);
     app.send(Command::SetPinned(true));
-    app.send(Command::GeometryChanged { rect });
+    app.send(Command::GeometryChanged);
     // Shutdown drains, and the final session write happens INSIDE the drain -
     // which is what makes the assertions below possible at all.
     app.send(Command::Shutdown);
