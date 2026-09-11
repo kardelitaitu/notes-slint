@@ -157,25 +157,23 @@ struct Wire {
     recents: Vec<RecentEntry>,
     /// The global toggle, as last stated by the ENGINE (see `new`).
     autosave: bool,
-    /// THE BRIDGE'S OPEN GENERATION, mirroring the engine's own `self.epoch`
-    /// (crates/api/src/engine.rs:537 in `open`, :646 in `save_as` - the only two
-    /// sites that bump it). Bumped by [`Wire::rebind`] exactly when WE start a
-    /// new buffer: every send of `Command::Open` or `Command::SaveAs`, the only
-    /// commands whose engine handlers rebind the document. The two counters
-    /// must move in LOCKSTEP, because the flush guard compares them for
-    /// EQUALITY: a bump on one side without the other would discard every later
-    /// Flush. This is why the pathless startup - a fresh scratch, where the
-    /// bridge sends no rebind command at all - bumps nothing: the engine never
-    /// sees a rebind for it either, and an unmirrored bump would silence the
-    /// untitled note's autosave forever.
+    /// THE PORT'S LAST ANNOUNCED OPEN GENERATION (143b1c52). The bridge does
+    /// not count rebinds any more - the prediction (`Wire::rebind`, bumped at
+    /// every Open/SaveAs send) is DELETED - because a bump the bridge predicts
+    /// runs one generation ahead the moment a load or a Save As FAILS: the
+    /// engine moved its bump from the top of `open`/`save_as` to the announced
+    /// emits, so a failed load or save moves NOTHING. Only `Event::Loaded` and
+    /// `Event::Rebound` carry the number; `LoadFailed` carries none, because
+    /// nothing changed hands. Stored verbatim in `apply`, beside `path`.
     epoch: u64,
     /// The generation the edits now sitting in the debounce belonged to when
     /// they ENTERED it (see [`Wire::note_edit`]). The whole guard lives on this
     /// being captured AT ENTRY, never at fire time: read at fire time it would
-    /// always equal `epoch` (both sides moved together at the rebind), and the
-    /// stale buffer of A's text would land in B atomically and report Saved.
-    /// Set ONLY beside `seen_edits`, so a buffered revision can never name a
-    /// different document than its epoch.
+    /// always equal `epoch` (the announcement has long since landed by the
+    /// time a debounce fires), and the stale buffer of A's text would land in B
+    /// atomically and report Saved. Set ONLY beside `seen_edits`, so a buffered
+    /// revision can never name a different document than its epoch. The NUMBER
+    /// is the port's last announcement, never a bridge-side counter.
     edit_epoch: u64,
 }
 
@@ -195,9 +193,9 @@ impl Wire {
             // the only visible proof that the settings reload path works. Same one-way door
             // the pin was: a check that follows what the UI asked for proves nothing.
             autosave,
-            // The engine's epoch starts at 0 (engine.rs:339) and so does ours: the
-            // counters are equal before the first rebind, which is the only state
-            // in which the first Flush can be honest about whose buffer it carries.
+            // The engine's generation starts at 0 and so does the stored echo:
+            // an untitled note has never been announced, and 0 is the honest
+            // value to flush under until `Loaded` or `Rebound` says otherwise.
             epoch: 0,
             // Nothing has entered the debounce yet; the first edit stamps it.
             edit_epoch: 0,
@@ -225,17 +223,6 @@ impl Wire {
         self.seen_edits = edits;
         self.changed_at = now;
         self.edit_epoch = self.epoch;
-    }
-
-    /// WE STARTED A NEW BUFFER. Called at every send of `Command::Open` or
-    /// `Command::SaveAs` - the startup load, the menu's Ctrl+O, an open from
-    /// the recents menu, and a Save As rebind - because those are exactly the
-    /// commands whose engine handlers do `self.epoch += 1` (engine.rs:537,
-    /// :646). The engine bumps even when the load or save then FAILS, so the
-    /// bump happens at SEND, not on the answer: the counters must be equal at
-    /// every instant the engine might be judging a Flush.
-    fn rebind(&mut self) {
-        self.epoch += 1;
     }
 }
 
@@ -709,7 +696,12 @@ impl Surface {
     /// lie on screen. Everything the wire needs to remember is decided here, once.
     fn apply(&mut self, event: &Event, cx: &mut Context<Self>) {
         match event {
-            Event::Loaded { text, meta, path } => {
+            Event::Loaded {
+                text,
+                meta,
+                path,
+                epoch,
+            } => {
                 // LOAD RESETS THE VIEW, not just the text - see `Editor::load`. The
                 // arming comes from the port's own `FileMeta::armed` (ADR-0001): a
                 // foreign file nobody has saved once is not armed, and the bridge does
@@ -718,6 +710,12 @@ impl Surface {
                     .update(cx, |editor, cx| editor.load(text.clone(), cx));
                 let mut wire = self.wire.borrow_mut();
                 wire.armed = meta.armed;
+                // THE ECHO (143b1c52): the generation of the buffer this text is,
+                // as the port ANNOUNCED it. Stored, never counted: what the bridge
+                // used to PREDICT at the Open send is now TOLD about here - and a
+                // load that fails announces nothing (`LoadFailed` carries no epoch),
+                // which is why that arm below touches nothing either.
+                wire.epoch = *epoch;
                 // The path the ENGINE says this buffer now is. Not the one we asked for.
                 wire.path = Some(path.clone());
                 wire.in_flight = None;
@@ -730,6 +728,7 @@ impl Surface {
                 meta,
                 revision,
                 path,
+                epoch,
             } => {
                 // The SAME buffer, a new path: Save As. No text crosses back - the
                 // bridge owns it - but the write that just happened was this text, so it
@@ -741,6 +740,11 @@ impl Surface {
                 // Every later Flush goes to the document the engine rebound to, and the
                 // bridge learned that from an Event, not from its own request.
                 wire.path = Some(path.clone());
+                // THE ECHO (143b1c52): the generation of the document the window now
+                // describes, stored verbatim where the path is stored. A Save As that
+                // FAILS emits no Rebound and moves nothing - the port's promise this
+                // arm now rides on.
+                wire.epoch = *epoch;
                 wire.flushed_edits = wire.seen_edits;
                 if wire.in_flight.is_some_and(|sent| sent <= *revision) {
                     wire.in_flight = None;
@@ -900,7 +904,9 @@ fn describe(event: &Event) -> String {
     match event {
         // `text` is never echoed: the bridge owns the buffer, and the editor is a
         // later slice. Its size is the fact the status line may carry.
-        Event::Loaded { path, text, meta } => format!(
+        Event::Loaded {
+            path, text, meta, ..
+        } => format!(
             "Loaded {} · {} chars · {}",
             path.display(),
             text.chars().count(),
@@ -926,6 +932,7 @@ fn describe(event: &Event) -> String {
             path,
             meta,
             revision,
+            ..
         } => format!(
             "Rebound {} · revision {} · {}",
             path.display(),
@@ -1327,13 +1334,10 @@ fn main() {
             // launch and an untitled note that was never written come back the way they
             // should, empty.
             if let Some(path) = initial.session.path.clone() {
-                // THE STARTUP LOAD IS A REBIND: the buffer is about to become this
-                // document's, and the engine's `open` bumps its epoch
-                // (engine.rs:537) the moment this command is processed - ours
-                // moves with it, at the send. A startup with NO path sends
-                // nothing and bumps nothing: the fresh scratch is generation 0 on
-                // both sides.
-                wire.borrow_mut().rebind();
+                // THE ECHO, not the prediction: the Open goes out and the bridge
+                // touches NO generation here. If the load lands, `Loaded` announces
+                // the new one; if it is refused, `LoadFailed` carries none and the
+                // surviving buffer keeps its generation - and its autosave.
                 report(&format!("startup: asking the port for {}", path.display()));
                 send(&gateway, Command::Open { path });
             }
@@ -1531,8 +1535,9 @@ fn flush_due(wire: &Wire, composing: bool, quiet_for: Duration) -> bool {
 /// and the command are pure, and the clock is passed in. The epoch is the wire's
 /// STAMP, taken when the edit entered the debounce (`Wire::note_edit`), never
 /// the live generation: at fire time the live generation always matches the
-/// engine's, because both sides moved together at the rebind, and that equality
-/// is exactly the bug.
+/// port's, because the announcement has been applied by then, and that equality
+/// is exactly the bug. The number itself is the port's last ANNOUNCED
+/// generation - the bridge counts nothing.
 fn flush_command(wire: &Wire, text: String, edits: u64) -> Command {
     Command::Flush {
         text,
@@ -1617,10 +1622,9 @@ fn register_menu_commands(
 ) {
     cx.on_action({
         let gateway = Rc::clone(&gateway);
-        let wire = Rc::clone(&wire);
         let view_slot = Rc::clone(&view_slot);
         move |_: &menu::OpenFile, cx: &mut App| {
-            prompt_open(&gateway, &wire, &view_slot, cx);
+            prompt_open(&gateway, &view_slot, cx);
         }
     });
     cx.on_action({
@@ -1710,7 +1714,6 @@ fn note_to(view_slot: &Rc<RefCell<Option<GpuiWindowHandle<Surface>>>>, cx: &mut 
 /// never reads the file itself, which is the seam holding.
 fn prompt_open(
     gateway: &Rc<RefCell<Option<Gateway>>>,
-    wire: &Rc<RefCell<Wire>>,
     view_slot: &Rc<RefCell<Option<GpuiWindowHandle<Surface>>>>,
     cx: &mut App,
 ) {
@@ -1721,7 +1724,6 @@ fn prompt_open(
         prompt: None,
     });
     let gateway = Rc::clone(gateway);
-    let wire = Rc::clone(wire);
     let view_slot = Rc::clone(view_slot);
     // Detached on purpose: the task IS the dialog's continuation, and there is nothing to
     // await it for - its whole effect is the command it sends and the sentence it writes.
@@ -1746,9 +1748,9 @@ fn prompt_open(
         let name = path
             .file_name()
             .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-        // Ctrl+O IS a rebind: the buffer is about to become another document,
-        // and the engine's `open` bumps its epoch the moment this command lands.
-        wire.borrow_mut().rebind();
+        // NO GENERATION IS TOUCHED HERE (the echo, not the prediction): if the
+        // load lands, `Loaded` announces it; if the path is refused, the
+        // surviving buffer keeps its generation and its autosave.
         send(&gateway, Command::Open { path });
         with_view(&view_slot, cx, move |view, cx| {
             view.note(&format!("asking the engine to open {name}"), cx)
@@ -1799,7 +1801,6 @@ fn prompt_save_as(
     }
     let receiver = cx.prompt_for_new_path(&directory, suggested.as_deref());
     let gateway = Rc::clone(gateway);
-    let wire = Rc::clone(wire);
     let view_slot = Rc::clone(view_slot);
     // Detached: the task is the dialog's continuation, and its whole effect is the command
     // it sends and the sentence it writes. There is nothing to await it for.
@@ -1820,10 +1821,10 @@ fn prompt_save_as(
         let name = path
             .file_name()
             .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-        // A Save As rebinds the document even if the write then fails: the
-        // engine bumps its epoch at the top of `save_as` (engine.rs:646), so
-        // ours moves at the send, not on the `Rebound` answer.
-        wire.borrow_mut().rebind();
+        // NO GENERATION IS TOUCHED HERE: a Save As that succeeds is announced
+        // by `Rebound`, which carries the epoch now; one that FAILS emits no
+        // Rebound and moves nothing. Predicting the bump would run the bridge a
+        // generation ahead and discard the surviving buffer's autosave.
         send(
             &gateway,
             Command::SaveAs {
@@ -1857,9 +1858,8 @@ fn open_recent(
     let entry = menu::entry_for(&wire.borrow().recents, index).cloned();
     match entry {
         Some(entry) if entry.exists => {
-            // Opening from the recents menu is Ctrl+O by another door: a rebind,
-            // for the same reason and at the same moment.
-            wire.borrow_mut().rebind();
+            // The echo, not the prediction: `Loaded` will announce the generation
+            // if the open lands, and `LoadFailed` carries none if it does not.
             send(
                 gateway,
                 Command::Open {
@@ -2174,6 +2174,7 @@ mod tests {
                     oversize: false,
                     armed: false,
                 },
+                epoch: 3,
             },
             Event::LoadFailed {
                 path: PathBuf::from("C:/notes/gone.md"),
@@ -2199,6 +2200,7 @@ mod tests {
                     armed: true,
                 },
                 revision: 7,
+                epoch: 4,
             },
             Event::ExternalChange {
                 path: PathBuf::from("C:/notes/a.notes"),
@@ -2617,8 +2619,11 @@ mod tests {
         wire.armed = true;
         // The user types in A: revision 5 enters the debounce at generation 0.
         wire.note_edit(5, t0);
-        // The user opens B: the bridge rebinds, exactly as every Open send does.
-        wire.rebind();
+        // The user opens B: the load LANDS, and `apply(Loaded)` stores the
+        // echoed generation - exactly this assignment, nothing more. Under the
+        // pre-echo bridge this line was `wire.rebind()` at the Open send: the
+        // prediction the contract deleted.
+        wire.epoch = 1;
         // The debounce fires: dirty, armed, quiet, nothing in the air - and the
         // buffer still holds A's text because `Loaded` for B has not been applied.
         assert!(
@@ -2653,7 +2658,8 @@ mod tests {
         wire.loaded = true;
         wire.armed = true;
         wire.note_edit(5, t0);
-        wire.rebind();
+        // The open lands: `Loaded` announces generation 1 and the wire stores it.
+        wire.epoch = 1;
         // Typing continues in the new document: the next edit re-stamps.
         wire.note_edit(6, t0 + AUTOSAVE_IDLE);
         let command = flush_command(&wire, "B's text".to_string(), 6);
@@ -2665,6 +2671,46 @@ mod tests {
                 assert_eq!(
                     epoch, 1,
                     "the new buffer must not be discarded with the old one"
+                );
+            }
+            other => panic!("a due flush builds a Flush, got {other:?}"),
+        }
+    }
+
+    /// THE MIRROR of the port's refused-load test, on our side of the seam. The
+    /// untitled note is the buffer the port never LOADED: generation 0, never
+    /// announced. A refused Open must leave it that way - `LoadFailed` carries
+    /// no epoch, because nothing changed hands - so the next edit stamps the
+    /// SAME generation and the flush still lands.
+    #[test]
+    fn a_refused_load_issues_no_generation_and_the_untitled_note_keeps_saving() {
+        let t0 = Instant::now();
+        let mut wire = Wire::new(true);
+        // The user types in the untitled note: revision 5, generation 0.
+        wire.note_edit(5, t0);
+        // The user presses Ctrl+O and picks a path that cannot load. The bridge
+        // sends `Open` and touches NOTHING: `rebind` is gone - this test ran RED
+        // while the send-site bump it models was still in (epoch 1 against the
+        // required 0), which is the deletion made visible. The port answers
+        // `LoadFailed`, which carries NO epoch: `apply` disarms and keeps the
+        // buffer, and nothing else in the wire moves.
+        wire.armed = false;
+        // The user keeps typing in the note that survived; the debounce fires.
+        wire.note_edit(6, t0 + AUTOSAVE_IDLE);
+        assert!(
+            flush_due(&wire, false, AUTOSAVE_IDLE),
+            "an untitled note needs no arming: the flush is still due"
+        );
+        let command = flush_command(&wire, "still the untitled note".to_string(), 6);
+        match command {
+            Command::Flush {
+                epoch, revision, ..
+            } => {
+                assert_eq!(revision, 6);
+                assert_eq!(
+                    epoch, 0,
+                    "a refused load must not move the generation: the surviving \
+                     buffer keeps autosaving"
                 );
             }
             other => panic!("a due flush builds a Flush, got {other:?}"),
