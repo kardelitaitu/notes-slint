@@ -270,6 +270,11 @@ pub(crate) struct TextState {
     /// paragraph does not slide to the margin and stay there. `None` until the first
     /// horizontal move; never updated by `move_vertical`, which would destroy it.
     desired_column: Option<usize>,
+    /// Bumped by every mutation of the TEXT, and by nothing else - not a caret move,
+    /// not a scroll, not a selection. This is what the bridge watches instead of
+    /// re-reading the buffer, because comparing a 2000-line string on every wake is a
+    /// cost the wire must not pay (crates/bridge-gpui/src/main.rs, `Wire`).
+    edits: u64,
 }
 
 impl TextState {
@@ -281,6 +286,7 @@ impl TextState {
             selection_reversed: false,
             marked_range: None,
             desired_column: None,
+            edits: 0,
         }
     }
 
@@ -305,6 +311,11 @@ impl TextState {
         self.selected_range = caret..caret;
         self.selection_reversed = false;
         self.marked_range = None;
+        // THE COUNTER the wire watches. Forgetting this line is not a crash and no test
+        // of the model would notice: the buffer changes, the screen changes, and the
+        // autosave never fires because the bridge is told nothing happened. Measured live
+        // exactly that way - `final flush: nothing outstanding` while 26 bytes sat unsaved.
+        self.edits += 1;
     }
 
     /// The composition replace: replace, and keep `text` marked as uncommitted.
@@ -351,6 +362,7 @@ impl TextState {
             }
         };
         self.selection_reversed = false;
+        self.edits += 1;
     }
 
     /// The byte range that is currently marked, in UTF-16 units, for the platform.
@@ -736,8 +748,7 @@ impl Editor {
         self.frame_text != self.state.content
     }
 
-    /// The line a byte offset belongs to, for the geometry methods. A byte at the very
-    /// end of the buffer - the caret after the last character, which is where typing
+    /// The line a byte offset belongs to, for the geometry methods. A byte at the very - the caret after the last character, which is where typing
     /// leaves it - has no line that CONTAINS it, so it falls to the last line.
     fn frame_for(&self, byte: usize) -> Option<&LineFrame> {
         self.frames
@@ -915,16 +926,44 @@ impl Editor {
         cx.notify();
     }
 
-    /// What S6 will refuse to flush while this is `Some`: an uncommitted composition
-    /// is not the user's text yet.
-    #[allow(dead_code)] // S2 onward
+    /// The buffer, as the wire reads it. LF inside, always - the file's own ending is
+    /// restored at the SAVE layer by core, which is the only place that knows what the
+    /// file was (section 4.5).
     pub(crate) fn text(&self) -> &str {
         &self.state.content
     }
 
-    #[allow(dead_code)] // S2 onward
+    /// Composition in progress. `Flush` is refused while this is true (D51), because
+    /// uncommitted text is not the user's words yet - and every motion path clears the
+    /// mark (S5), so this can only be true while the user is actually mid-IME.
     pub(crate) fn is_composing(&self) -> bool {
         self.state.marked_range.is_some()
+    }
+
+    /// The mutation counter the bridge watches instead of the buffer. Watching `text()`
+    /// for a change would mean cloning a 2000-line string on every 8 ms wake; this is a
+    /// u64 compare, and it counts only TEXT changes - a click, a scroll, a resize and a
+    /// selection leave it alone, so none of them can trigger a save.
+    pub(crate) fn edits(&self) -> u64 {
+        self.state.edits
+    }
+
+    /// LOAD: put a document into the editor and RESET THE VIEW STATE. Every field here
+    /// is a bug if it survives, and `caret_line_shown` is the subtle one: the
+    /// bring-into-view rule fires only when the caret LINE changed, so leaving the old
+    /// document's value in place can mean the new note opens at the old note's offset
+    /// and never corrects itself. The caret goes to the START of the new document, not
+    /// the end: opening a note and finding yourself at the bottom is not where you left
+    /// it, it is where the file ended.
+    pub(crate) fn load(&mut self, content: String, cx: &mut Context<Self>) {
+        self.state = TextState::new(content);
+        self.state.move_to(0);
+        self.frames.clear();
+        self.frame_text.clear();
+        self.scroll_y = px(0.0);
+        self.caret_line_shown = None;
+        self.dragging = false;
+        cx.notify();
     }
 }
 
@@ -1318,6 +1357,16 @@ pub(crate) struct PrepaintState {
     shown_line: Option<usize>,
 }
 
+/// Whether the bring-into-view rule should fire for a caret on `caret_line`, given
+/// the line the last painted frame showed. `None` means "nothing has been shown yet",
+/// which is exactly the state `Editor::load` puts the view back into: a loaded note
+/// whose caret lands on line 0 while the OLD document's `caret_line_shown` still says
+/// 1999 would otherwise be treated as no change, and the note would open scrolled to
+/// the previous document's offset and never correct itself.
+fn follow_required(shown: Option<usize>, caret_line: usize) -> bool {
+    shown != Some(caret_line)
+}
+
 /// The editor element: request the viewport, shape in prepaint, and in paint hand the
 /// bounds to the IME, draw, then cache the frames on the model (the example's shape,
 /// examples/input.rs:388-562, made line-addressed).
@@ -1409,6 +1458,16 @@ impl Element for EditorElement {
         // The whole prepaint, timed: shape_us alone cannot show the rebuild cost, which
         // is what the quadratic first draft of the cache was. This is the number the
         // wheel moves, because scrolling walks lines that were never shaped.
+        // IS THIS WINDOW EVEN ACTIVE? The answer to S5's open deviation, and it was a
+        // wrong QUERY, not a missing repaint: `FocusHandle::is_focused` is `window.focus
+        // == Some(*self)` (src/window.rs:237-239), which is gpui's internal focus ring
+        // WITHIN a window and stays true when the operating system puts another app in
+        // front - measured, `focused=true` across every frame while the OS foreground
+        // window was a foreign handle. What reports the OS state is
+        // `Window::is_window_active` (src/window.rs:1721-1723, "focused by the operating
+        // system (receiving key events)"), read once here because `window` cannot be
+        // borrowed inside the update closure below.
+        let active = window.is_window_active();
         let began = std::time::Instant::now();
         self.input.update(cx, |input, _cx| {
             let lines = line_ranges(&input.state.content);
@@ -1504,9 +1563,7 @@ impl Element for EditorElement {
             // away and it stays, move the caret and the view follows.
             let content_height = lh * (shaped.len() + 1) as f32;
             let caret_top = lh * caret_line as f32;
-            let mut offset = if input.caret_line_shown == Some(caret_line) {
-                f32::from(input.scroll_y)
-            } else {
+            let mut offset = if follow_required(input.caret_line_shown, caret_line) {
                 let mut offset = f32::from(input.scroll_y);
                 if caret_top - offset + lh > viewport {
                     offset = caret_top + lh - viewport;
@@ -1515,6 +1572,10 @@ impl Element for EditorElement {
                     offset = caret_top;
                 }
                 offset
+            } else {
+                // The wheel owns the offset: no line changed, so the user's scroll is left
+                // exactly where they put it.
+                f32::from(input.scroll_y)
             };
             // The clamp is not conditional on who moved the view: content can shrink under
             // a scroll the wheel owns, and an offset past the end is a blank page.
@@ -1535,7 +1596,7 @@ impl Element for EditorElement {
                     bounds: frame_bounds,
                 });
             }
-            if let Some(frame) = frames.get(caret_line) {
+            if let Some(frame) = frames.get(caret_line).filter(|_| active) {
                 let x = frame.line.x_for_index(
                     cursor
                         .saturating_sub(frame.bytes.start)
@@ -1549,24 +1610,16 @@ impl Element for EditorElement {
                     rgb(0x0033_99ff),
                 ));
             }
-            // FOCUSED OR NOT. A grey bar, not a live blue selection, when the view does
-            // not have focus - what Windows itself does, and the reason a selection in a
-            // background window must not look like the thing you are editing.
-            //
-            // There is no focus/blur EVENT to subscribe to in 0.2.2 as far as I can find
-            // (`on_focus_changed`, `FocusEvent`, `on_blur` are absent from window.rs,
-            // app.rs, interactive.rs and elements/div.rs; the only `Blur` in window.rs is
-            // a doc comment at :1406 on the window-level blur). What exists is the query
-            // `FocusHandle::is_focused`, already the door the caret uses, so the unfocused
-            // look is derived per frame rather than pushed - which is also why the probe
-            // prints `focused=`: if a focus change ever fails to produce a frame, this
-            // line is where that shows up.
-            let selection_colour = if input.focus_handle.is_focused(window) {
+            // FOCUSED OR NOT: a grey bar, not a live blue selection, and no caret at all
+            // while the window is inactive - what Windows itself does, and the reason a
+            // selection in a background window must not look like the thing you are
+            // editing. See `active` above for why this is the window and not the handle.
+            let selection_colour = if active && input.focus_handle.is_focused(window) {
                 rgb(0x2d_4a_6b)
             } else {
                 rgb(0x3f_3f_3f)
             };
-            focused_probe = input.focus_handle.is_focused(window);
+            focused_probe = active;
             if !selection.is_empty() {
                 for frame in &frames {
                     // VIEWPORT CLIP: a selection across 400 lines would draw 400 quads,
@@ -2493,5 +2546,50 @@ mod tests {
             "backspace over a right-to-left run"
         );
         assert!(!reversed.selection_reversed, "the head is now the caret");
+    }
+    /// The bug this guards: `Editor::load` cannot be reached from a headless test (a
+    /// `FocusHandle` needs a window, which is why `TextState` exists at all), so the
+    /// one decision load makes in the view rule is tested where it can be seen - a
+    /// loaded note whose caret lands on line 0 must still be followed, because the OLD
+    /// document's `caret_line_shown` said 1999 and a plain equality check would call
+    /// that "no change" and leave the note open at the previous document's offset.
+    #[test]
+    fn a_loaded_document_always_reasserts_where_the_view_is() {
+        assert!(
+            follow_required(None, 0),
+            "nothing shown yet: the view is claimed, even for line 0"
+        );
+        assert!(
+            follow_required(Some(1999), 0),
+            "the stale line from the previous note is not the new caret line"
+        );
+        assert!(
+            !follow_required(Some(0), 0),
+            "and a caret that has not changed line does NOT yank the view back - the S4 rule"
+        );
+    }
+    /// The counter the wire watches, pinned because its failure mode is invisible: an
+    /// editor that types correctly, paints correctly and NEVER SAVES. Every text
+    /// mutation raises it; a click, a drag, a selection and a scroll must not - each of
+    /// those used to be able to wake a save on a document nobody changed.
+    #[test]
+    fn only_a_text_mutation_moves_the_counter_the_wire_reads() {
+        let mut state = TextState::new("one\ntwo\nthree".to_string());
+        assert_eq!(
+            state.edits, 0,
+            "a fresh buffer is clean, however it was made"
+        );
+        state.move_to(3);
+        state.select_to(9);
+        state.select_vertical(-1);
+        assert_eq!(state.edits, 0, "motion and selection change nothing");
+        state.replace(None, "X");
+        assert_eq!(state.edits, 1, "one mutation, one step");
+        state.replace(None, "");
+        assert_eq!(state.edits, 2, "a delete is a mutation too");
+        state.replace_and_mark(None, "nihao", None);
+        assert_eq!(state.edits, 3, "so is an uncommitted composition");
+        state.select_range(0..3);
+        assert_eq!(state.edits, 3, "and a double click is not");
     }
 }

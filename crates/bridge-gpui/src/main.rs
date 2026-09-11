@@ -103,6 +103,76 @@ const ENGINE_POLL: Duration = Duration::from_millis(8);
 /// is taken on the next wake. A flood then costs latency, never the frame.
 const MAX_DRAIN_PER_WAKE: usize = 64;
 
+/// The bridge-side debounce: how long the buffer must be UNTOUCHED before a `Flush`
+/// goes out. D51 puts the decision here, not in the engine, and the engine only ever
+/// sees a Flush the bridge decided to send.
+///
+/// THE SAME NUMBER BY AGREEMENT, NOT BY ACCIDENT: the engine has its own idle of the
+/// same length at crates/api/src/engine.rs:63 (`AUTOSAVE_IDLE`), which is PRIVATE and
+/// is not re-exported - api only mentions it in a doc comment (crates/api/src/lib.rs:
+/// 170). So this bridge declares 750 ms itself, and if core or api ever moves theirs,
+/// NOTHING at compile time will say so. The one-line fix is a public constant in api;
+/// that is a request, not an edit - 13 Events and 10 Commands are pinned and the port
+/// is not mine.
+const AUTOSAVE_IDLE: Duration = Duration::from_millis(750);
+
+/// Everything the wire needs to know, in one place, so the rules that keep a user's
+/// text safe are auditable rather than spread across the pump.
+#[derive(Debug)]
+struct Wire {
+    /// The editor's mutation counter as last seen. A change here is the ONLY thing
+    /// that makes a flush worth considering - a click, a drag, a scroll and a resize
+    /// all leave it alone.
+    seen_edits: u64,
+    /// When it last changed. The debounce measures from here, so a stream of
+    /// keystrokes never flushes until the user pauses.
+    changed_at: Instant,
+    /// The counter of the text that went out last. Equal to `seen_edits` means the
+    /// engine has everything the buffer has, which is the cheapest possible answer to
+    /// "did anything change": no clone, no compare, one integer.
+    flushed_edits: u64,
+    /// A `Flush` we sent that no event has answered yet, and its revision. At most one
+    /// is ever in the air - see the reasoning on `tick`.
+    in_flight: Option<u64>,
+    /// Per-document autosave arming, straight from `FileMeta::armed` on `Loaded` and
+    /// `Rebound` (ADR-0001). A foreign file the user has never saved is NOT armed, and
+    /// the bridge does not decide otherwise on its own.
+    armed: bool,
+    /// Has the port ever LOADED a document into this buffer? Until it has, what the
+    /// editor holds is the session's own scratch note: no file exists to overwrite, and
+    /// no `FileMeta` has been sent to obey. Without this flag the untitled note is refused
+    /// a save by an arming rule the port never had a chance to state, and the text is lost
+    /// on exit - which is exactly what the first live round trip did.
+    loaded: bool,
+    /// The global toggle. There is no menu yet, so it is the engine's own default and
+    /// nothing changes it; it lives here so the UI has one place to act on later.
+    autosave: bool,
+}
+
+impl Wire {
+    fn new() -> Self {
+        Self {
+            seen_edits: 0,
+            changed_at: Instant::now(),
+            flushed_edits: 0,
+            in_flight: None,
+            armed: false,
+            loaded: false,
+            autosave: true,
+        }
+    }
+
+    /// The revision is the mutation counter. It is monotonic for the life of the
+    /// process, it is a count and not a content hash (D11), and the buffer is the only
+    /// thing that can raise it - which is exactly the property "a Flush at or below the
+    /// last saved revision means clean" needs. The bridge does not own a SECOND
+    /// revision: the engine's is whatever it answers with, and the bridge only ever
+    /// compares against the one it sent.
+    fn dirty(&self) -> bool {
+        self.seen_edits != self.flushed_edits
+    }
+}
+
 /// How many capped passes the exit drain will make before it says it ran out of
 /// patience: 64 x 64 = 4096 events, far more than a note app can queue at exit, and a
 /// bound is cheaper than a proof that an abandoned engine has stopped sending.
@@ -338,6 +408,10 @@ struct Surface {
     /// `Entity<V>` where `V: Render`, and because that entity is what the IME input
     /// handler is attached to during paint.
     editor: Entity<Editor>,
+    /// The wire's state, shared with the close path: an `Rc` rather than a field-
+    /// local because the last `Flush` has to be issued by whoever shuts the window,
+    /// and that is not this view.
+    wire: Rc<RefCell<Wire>>,
     /// Whether we have asked for the keyboard yet - first frame only, so that
     /// focusing the editor cannot fight something the user clicks into later.
     focus_requested: bool,
@@ -350,6 +424,7 @@ impl Surface {
         gateway: Rc<RefCell<Option<Gateway>>>,
         window: Rc<RefCell<Option<AnyWindowHandle>>>,
         editor: Entity<Editor>,
+        wire: Rc<RefCell<Wire>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut this = Self {
@@ -361,6 +436,7 @@ impl Surface {
             gateway,
             watch: Watch::default(),
             editor,
+            wire,
             focus_requested: false,
         };
         this.start_pump(cx);
@@ -426,6 +502,7 @@ impl Surface {
         // is the newest fact the port has given us.
         for event in &batch {
             self.status = SharedString::from(one_line(describe(event)));
+            self.apply(event, cx);
         }
         if drain.closed {
             // Terminal, and said out loud rather than left as a stale line.
@@ -445,6 +522,11 @@ impl Surface {
             }
             cx.notify();
         }
+
+        // The text half of the same wake: the debounce lives here (D51), and a wake is
+        // the only clock this bridge has. It costs one integer compare until the buffer
+        // is actually quiet, so a 2000-line note is never cloned on an idle tick.
+        self.flush_tick(cx);
 
         // The geometry half of the same wake. ONE read, ONE possible send per wake,
         // and only after the drag has settled - so a two-second drag cannot put 4000
@@ -522,6 +604,97 @@ impl Render for Surface {
 }
 
 impl Surface {
+    /// PUT THE PORT'S WORDS INTO THE BUFFER, and refuse to let a failed load leave a
+    /// lie on screen. Everything the wire needs to remember is decided here, once.
+    fn apply(&mut self, event: &Event, cx: &mut Context<Self>) {
+        match event {
+            Event::Loaded { text, meta, .. } => {
+                // LOAD RESETS THE VIEW, not just the text - see `Editor::load`. The
+                // arming comes from the port's own `FileMeta::armed` (ADR-0001): a
+                // foreign file nobody has saved once is not armed, and the bridge does
+                // not decide otherwise for it.
+                self.editor
+                    .update(cx, |editor, cx| editor.load(text.clone(), cx));
+                let mut wire = self.wire.borrow_mut();
+                wire.armed = meta.armed;
+                wire.in_flight = None;
+                wire.changed_at = Instant::now();
+                let edits = self.editor.read(cx).edits();
+                wire.seen_edits = edits;
+                wire.flushed_edits = edits;
+            }
+            Event::Rebound { meta, revision, .. } => {
+                // The SAME buffer, a new path: Save As. No text crosses back - the
+                // bridge owns it - but the write that just happened was this text, so it
+                // is clean now, and the arming follows the new path (a file chosen by
+                // hand is armed, ADR-0001).
+                let mut wire = self.wire.borrow_mut();
+                wire.armed = meta.armed;
+                wire.flushed_edits = wire.seen_edits;
+                if wire.in_flight.is_some_and(|sent| sent <= *revision) {
+                    wire.in_flight = None;
+                }
+            }
+            Event::LoadFailed { .. } => {
+                // DECISION, documented because the alternative is data loss: the buffer
+                // KEEPS the previous note. The status line above says the open failed, so
+                // the screen is not lying about what is loaded, and disarming means the
+                // kept text can never be flushed onto the path that just failed - which
+                // is how a failed open would otherwise destroy a file it never read. What
+                // the user loses is the OLD path's identity, not the words.
+                self.wire.borrow_mut().armed = false;
+            }
+            Event::Saved { revision, .. } | Event::SaveFailed { revision, .. } => {
+                let mut wire = self.wire.borrow_mut();
+                if wire.in_flight.is_some_and(|sent| sent <= *revision) {
+                    wire.in_flight = None;
+                }
+            }
+            Event::AutosaveSkipped { .. } => {
+                // ANSWERED, even though it was refused. `SkipReason` says why but the
+                // variant carries NO revision (crates/api/src/event.rs:344), so this is
+                // the second place - after the abandon path - where the bridge has to
+                // guess whether the skip was about its own flush. See the request in the
+                // commit notes: the port has no way to tie an answer to a revision.
+                self.wire.borrow_mut().in_flight = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// THE DEBOUNCE, and the one-in-the-air rule. Called from the pump, never from a
+    /// frame callback and never from a save thread (AGENTS.md: both deadlock).
+    fn flush_tick(&mut self, cx: &mut Context<Self>) {
+        let edits = self.editor.read(cx).edits();
+        let now = Instant::now();
+        {
+            let mut wire = self.wire.borrow_mut();
+            if edits != wire.seen_edits {
+                wire.seen_edits = edits;
+                wire.changed_at = now;
+            }
+        }
+        let composing = self.editor.read(cx).is_composing();
+        let quiet_for = self.wire.borrow().changed_at.elapsed();
+        if !flush_due(&self.wire.borrow(), composing, quiet_for) {
+            return;
+        }
+        let text = self.editor.read(cx).text().to_string();
+        {
+            let mut wire = self.wire.borrow_mut();
+            wire.flushed_edits = edits;
+            wire.in_flight = Some(edits);
+        }
+        report(&format!("flush: revision {edits}, {} bytes", text.len()));
+        send(
+            &self.gateway,
+            Command::Flush {
+                text,
+                revision: edits,
+            },
+        );
+    }
+
     /// The second line: the pump's own cost, live, because "it is cheap" is not
     /// evidence.
     fn counters(&self) -> SharedString {
@@ -825,6 +998,14 @@ fn main() {
                 KeyBinding::new("shift-pagedown", editor::SelectPageDown, None),
             ]);
 
+            // THE WIRE'S STATE and the editor's address, both out here rather than in
+            // the build closure below, because the close path needs them and it is not the
+            // view that runs it. The editor crosses as a slot for the same reason the
+            // window handle does: it is built inside `open_window`, and a `RefCell<Option<
+            // _>>` filled there is readable from here afterwards.
+            let wire: Rc<RefCell<Wire>> = Rc::new(RefCell::new(Wire::new()));
+            let editor_slot: Rc<RefCell<Option<Entity<Editor>>>> = Rc::new(RefCell::new(None));
+
             // STEP 2 - create the window AT the saved rect, before anything is
             // drawn. Only the bridge can: the port has no window type at all. The
             // root view owns the pump, so the wake route starts and stops with the
@@ -843,6 +1024,8 @@ fn main() {
                 let events = Rc::clone(&events);
                 let stats = Rc::clone(&stats);
                 let gateway = Rc::clone(&gateway);
+                let wire = Rc::clone(&wire);
+                let editor_slot = Rc::clone(&editor_slot);
                 let window_slot = Rc::clone(&window_slot);
                 move |_, cx| {
                     // The editor view, built before the root view so the root can
@@ -850,6 +1033,7 @@ fn main() {
                     // for on the first render, and the first shape happens on that
                     // same first paint - not here, and not at startup.
                     let editor = cx.new(Editor::new);
+                    *editor_slot.borrow_mut() = Some(editor.clone());
                     cx.new(|cx| {
                         Surface::new(
                             Rc::clone(&events),
@@ -857,6 +1041,7 @@ fn main() {
                             Rc::clone(&gateway),
                             Rc::clone(&window_slot),
                             editor,
+                            Rc::clone(&wire),
                             cx,
                         )
                     })
@@ -935,6 +1120,8 @@ fn main() {
             // has completed before this process leaves main.
             let held = Rc::clone(&subscriptions);
             let closing = Rc::clone(&gateway);
+            let wire = Rc::clone(&wire);
+            let editor_slot = Rc::clone(&editor_slot);
             //
             // UNREGISTER FIRST, then close. A dead HWND value can be reissued to
             // another process window, and a GeometryChanged still sitting in the queue
@@ -946,7 +1133,15 @@ fn main() {
             held.borrow_mut().push(cx.on_window_closed({
                 let unregistering = Rc::clone(&closing);
                 let events = Rc::clone(&events);
-                move |_cx| {
+                let editor_slot = Rc::clone(&editor_slot);
+                let wire = Rc::clone(&wire);
+                move |cx| {
+                    // LAST WORDS FIRST: the final Flush goes out before `Shutdown` is
+                    // queued by `close`, so the engine's own bounded exit does the write
+                    // and the join we already wait on waits for it. Not inside a frame -
+                    // this is the window-closed callback, the same place that already
+                    // blocks on `close()` by contract.
+                    final_flush(&unregistering, &editor_slot, &wire, cx);
                     send(&unregistering, Command::UnregisterWindow);
                     close(&closing, &events);
                 }
@@ -1068,6 +1263,90 @@ fn send(gateway: &Rc<RefCell<Option<Gateway>>>, command: Command) {
     if gateway.send(command).is_err() {
         report("the engine had already exited: a command came back undelivered");
     }
+}
+
+/// THE FLUSH RULE, as one pure function, because the four conditions are the whole of
+/// D51 and an if-chain inside a method is a place for one of them to be lost.
+///
+/// A `Flush` goes out only when: (a) the buffer changed since the last one accepted, (b)
+/// no composition is open, (c) autosave is on AND this document is armed, and (d) the
+/// engine has answered the last flush we sent. (d) is the revision guard: without it a
+/// slow save plus fast typing queues whole-document writes behind one worker, each of
+/// which is a temp write, an fsync and a rename.
+fn flush_due(wire: &Wire, composing: bool, quiet_for: Duration) -> bool {
+    if !wire.dirty() {
+        return false;
+    }
+    if composing || !wire.autosave {
+        return false;
+    }
+    // (c) A LOADED document needs the port's own `armed`; a buffer the port never
+    // loaded is the session's scratch note and has no arming to wait for. Foreign and
+    // never-armed never flushes, which is ADR-0001 doing its job.
+    if wire.loaded && !wire.armed {
+        return false;
+    }
+    if wire.in_flight.is_some() {
+        return false;
+    }
+    quiet_for >= AUTOSAVE_IDLE
+}
+
+/// THE LAST FLUSH, issued before `Shutdown` so the engine's own exit drain does the
+/// write while we are still waiting for it. Every branch says what it did in the exit
+/// trace, because the one outcome that must never be silent is text that is about to
+/// be lost - and D51's composition rule CAN cost a user a line if they close mid-IME.
+fn final_flush(
+    gateway: &Rc<RefCell<Option<Gateway>>>,
+    editor_slot: &Rc<RefCell<Option<Entity<Editor>>>>,
+    wire: &Rc<RefCell<Wire>>,
+    cx: &mut App,
+) {
+    let Some(editor) = editor_slot.borrow().clone() else {
+        report("final flush: there was no editor to flush");
+        return;
+    };
+    let edits = editor.read(cx).edits();
+    let state = wire.borrow();
+    if edits == state.flushed_edits && state.in_flight.is_none() {
+        report("final flush: nothing outstanding, the engine already has the buffer");
+        return;
+    }
+    if edits == state.flushed_edits {
+        report("final flush: nothing new to send, one flush is still unanswered");
+        return;
+    }
+    if !state.autosave {
+        report("final flush: SKIPPED, autosave is off - the text is not saved");
+        return;
+    }
+    if !state.armed {
+        // ADR-0001: an un-armed document has never been saved once by an explicit act,
+        // and writing it here would create a file the user never asked for. Exit says
+        // so, in words, because the alternative is silence and a lost note.
+        report(
+            "final flush: SKIPPED, the document is not armed for autosave - the text is NOT saved",
+        );
+        return;
+    }
+    if editor.read(cx).is_composing() {
+        report("final flush: HELD, a composition was open - that text is LOST");
+        return;
+    }
+    drop(state);
+    let text = editor.read(cx).text().to_string();
+    wire.borrow_mut().flushed_edits = edits;
+    report(&format!(
+        "final flush: revision {edits}, {} bytes",
+        text.len()
+    ));
+    send(
+        gateway,
+        Command::Flush {
+            text,
+            revision: edits,
+        },
+    );
 }
 
 fn close(gateway: &Rc<RefCell<Option<Gateway>>>, events: &Rc<RefCell<EventRx>>) {
@@ -1703,6 +1982,49 @@ mod tests {
             watch.observe(rect_at(508), stop + GEOMETRY_QUIET),
             Some(rect_at(508)),
             "and the same watch reports the moment the movement rests away from home"
+        );
+    }
+    /// Every condition D51 and the revision rule put on a `Flush`, in one place: an
+    /// un-armed document, a composition, an idle that has not run out, and an
+    /// unanswered flush each hold it back on their own.
+    #[test]
+    fn a_flush_needs_change_quiet_and_an_answered_predecessor() {
+        let quiet = Duration::from_millis(800);
+        let mut wire = Wire::new();
+        wire.armed = true;
+        wire.loaded = true;
+        assert!(!flush_due(&wire, false, quiet), "clean: nothing to send");
+        wire.seen_edits = 1;
+        assert!(
+            flush_due(&wire, false, quiet),
+            "dirty, armed, quiet, nothing in the air"
+        );
+        assert!(
+            !flush_due(&wire, true, quiet),
+            "a composition holds it (D51)"
+        );
+        wire.in_flight = Some(1);
+        assert!(
+            !flush_due(&wire, false, quiet),
+            "one unanswered flush is enough"
+        );
+        wire.in_flight = None;
+        wire.flushed_edits = 1;
+        assert!(
+            !flush_due(&wire, false, quiet),
+            "the engine already has this text"
+        );
+        wire.seen_edits = 2;
+        wire.armed = false;
+        wire.loaded = true;
+        assert!(
+            !flush_due(&wire, false, quiet),
+            "an un-armed document never flushes (ADR-0001)"
+        );
+        wire.armed = true;
+        assert!(
+            !flush_due(&wire, false, Duration::from_millis(100)),
+            "and not before the idle has run out"
         );
     }
 }
