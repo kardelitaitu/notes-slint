@@ -65,6 +65,11 @@
 //!   move never reached session.json, or the relaunch came back elsewhere. Geometry
 //!   that could not be measured prints "NOT JUDGED (advisory)" and leaves the exit
 //!   code alone - an unverifiable step must not be reported as a pass or a failure.
+//! * 7 - THE PIN LIED: WS_EX_TOPMOST on the live window did not follow what
+//!   session.json claimed (checked in both polarities, pinned:true and
+//!   pinned:false). Kept separate from 6 because the usual cause is the order of
+//!   show-then-band, not persistence, and it can also be a race - the message
+//!   says so rather than accusing the app.
 //! * 3 - DECLINED for a reason that is not the app's fault: no interactive
 //!   desktop (no sessions win32k user32.dll), no window handle even though the
 //!   app kept running, or the session path holding foreign state this harness
@@ -1007,7 +1012,7 @@ fn report_binary(exe: &Path, root: &Path, built: bool) {
 /// is in FRAME and CLIENT pixels, move it, close, read what got persisted, then
 /// relaunch and read where it came back. Prints numbers, never an assert string.
 const GEOMETRY_PROBE: &str = r#"
-param([Parameter(Mandatory)][string]$Exe, [string]$ErrFile,
+param([Parameter(Mandatory)][string]$Exe, [string]$ErrFile, [string]$Session = "",
        [int]$SeedX = 0, [int]$SeedY = 0, [int]$SeedW = 0, [int]$SeedH = 0,
        [int]$MoveX = -1, [int]$MoveY = -1,
        [int]$WindowSecs = 10, [int]$SettleMs = 4500, [int]$CloseSecs = 10)
@@ -1024,6 +1029,7 @@ public static class WIN {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+  [DllImport("user32.dll", EntryPoint="GetWindowLongW")] public static extern int GetWindowLong(IntPtr h, int i);
   [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hh, bool rep);
 }
 '@
@@ -1049,6 +1055,14 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 100
 }
 "HANDLE=$([int64]$handle)"
+# GWL_EXSTYLE (-20) and WS_EX_TOPMOST (0x8). Read only once the handle exists:
+# the platform lane PROVED that an async topmost reband applied to a hidden
+# window never lands, so a style read before the show says nothing about the pin.
+if ($handle -ne 0) {
+    $style = [WIN]::GetWindowLong($handle, -20)
+    "TOPMOST=$([int](($style -band 8) -ne 0))"
+    "EXSTYLE=$style"
+} else { 'TOPMOST=-1' }
 function Get-Frame($h) {
     $r = New-Object WIN+RECT
     if ([WIN]::GetWindowRect($h, [ref]$r)) { return "$($r.Left),$($r.Top),$($r.Right),$($r.Bottom)" }
@@ -1076,6 +1090,18 @@ if ($MoveX -ge 0) {
         "MOVED=$([int]($f2 -ne $f))"
         "FRAME_AFTER=$f2"
         "CLIENT_AFTER=$c2"
+        # The dossier's experiment: read the state file AGAIN after one flush
+        # tick but BEFORE the close. If this already carries the hint, the
+        # measured-rect write is bypassed on every save; if only the post-exit
+        # read flips, it is the shutdown path doing it.
+        if ($Session -ne "" -and (Test-Path $Session)) {
+            try {
+                $j = Get-Content -Raw -LiteralPath $Session | ConvertFrom-Json
+                $mx = [int]$j.rect.x; $my = [int]$j.rect.y
+                "MID=$($mx),$($my),$($mx + [int]$j.rect.w),$($my + [int]$j.rect.h)"
+                "MID_PIN=$([int][bool]$j.pinned)"
+            } catch { 'MID=' }
+        }
     } else { 'MOVED=0' }
 }
 if ($handle -ne 0 -and -not $p.HasExited) { [void]$p.CloseMainWindow() }
@@ -1135,13 +1161,18 @@ impl Rect {
 
 /// Where a window sits relative to the rect it was told to restore.
 ///
-/// TOLERANCE, and why a few pixels still separates the two failure modes: the
-/// app persists what gpui reports (client area), while GetWindowRect answers in
-/// frame pixels, and on this build the frame is the 8/19/8/20 chrome - a 16 px
-/// horizontal and 39 px vertical difference. A tolerance of 6 px is therefore
-/// wide enough for rounding at a non-100% DPI and narrow enough that "restored
-/// in the wrong space" cannot pass as "restored at all": it shows up as
-/// ChromeOffset with the real numbers printed, not as a green line.
+/// TOLERANCE, and the reason it is 6 and not 2 or 20. This number is set against
+/// the chrome MEASURED from the live window in the same run, never against a
+/// model: on this build the observed chrome is +8 px left, +31 px top (the
+/// documented 8/19/8/20 is gpui's own border offset, not this window's caption,
+/// and a checker that trusts the model over the machine it is testing is the bug
+/// class this repo keeps finding). A wrong-space placement is therefore off by at
+/// least 8 px in x and 31 in y at 100% scaling, and only grows with DPI, so a
+/// tolerance of 6 px still separates "restored in the wrong space" from "restored"
+/// while surviving rounding. It is deliberately below the SMALLEST measured chrome
+/// edge; print the measurement with every verdict, because if a future build
+/// shrinks the border under 6 px this rule silently weakens and only the numbers
+/// will show it.
 pub const PLACEMENT_TOLERANCE: i32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1203,6 +1234,53 @@ pub fn persisted_rect(text: &str) -> Option<Rect> {
     })
 }
 
+fn obj2_pin(value: &mut serde_json::Value) {
+    if let Some(map) = value.as_object_mut() {
+        map.insert("pinned".to_string(), serde_json::json!(true));
+    }
+}
+
+/// Flip only the pin, keeping the rect the app itself persisted.
+pub fn set_pinned(path: &Path, pinned: bool) -> Result<(), String> {
+    let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut value: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let map = value
+        .as_object_mut()
+        .ok_or_else(|| "session.json is not an object".to_string())?;
+    map.insert("pinned".to_string(), serde_json::json!(pinned));
+    fs::write(
+        path,
+        serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Was the window really on top, as the state file claims?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pin {
+    /// Read in both polarities and it agreed with session.json both times.
+    Matched {
+        pinned_true: bool,
+        pinned_false: bool,
+    },
+    /// At least one polarity contradicted the file.
+    Contradicts {
+        wanted: bool,
+        seen: Option<bool>,
+        which: &'static str,
+    },
+    /// Not measurable here, so not claimed either way.
+    NotJudged(&'static str),
+}
+
+fn topmost(probe: &Probe) -> Option<bool> {
+    match probe.number("TOPMOST") {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        _ => None,
+    }
+}
+
 /// Did the app persist the rect the harness chose, the seed, or neither?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Persisted {
@@ -1232,11 +1310,16 @@ pub enum Geometry {
     Proven {
         restore: &'static str,
         relaunch: &'static str,
+        pin: &'static str,
     },
     /// Something about the machine or the app refused to be deterministic.
     NotJudged(&'static str),
-    /// Measured, and the promise did not hold.
-    Broken(Vec<String>),
+    /// Measured, and the promise did not hold. geometry carries the rect
+    /// findings; pin_failed marks that the topmost bit specifically lied.
+    Broken {
+        notes: Vec<String>,
+        pin_failed: bool,
+    },
 }
 
 /// Where the harness put the window, and where the app thought it was.
@@ -1245,13 +1328,23 @@ pub const MOVE_BY: (i32, i32) = (53, 37);
 /// The seed is far from the built-in default (120,90,800,600) on purpose: an
 /// app that ignored the stored rect lands on the default, and an app that never
 /// opened a window lands nowhere, so a coincidence cannot produce a green run.
+/// The rect the app falls back to when it has nothing to restore. The seed is
+/// kept far from it so a run that ignored the seed can never look like a pass.
 pub const DEFAULT_RECT_HINT: &str = "120,90,800,600";
-/// Longer than one flush tick plus the poll quiet window (the bridge reports
-/// "quiet N ms, force N ms"; 4.5 s clears the observed 1 s quiet and a 3 s force).
-pub const SETTLE_MS: i32 = 4500;
-/// A geometry failure is its own verdict, so a CI annotation can name it: the
-/// app ran, closed cleanly and persisted something, but not the right thing.
+/// The window-geometry poll tick the bridge documents (750 ms quiet window, and
+/// its own log line reports the force window too).
+pub const POLL_TICK_MS: i32 = 750;
+/// How long to wait after the harness moves the window, before closing it: six
+/// ticks, because one poll must land, the port must react, and the debounced
+/// write must reach the disk. Four ticks covered the quiet window but not the
+/// force window the app reported (1000 ms), so the number is printed every run
+/// rather than trusted.
+pub const SETTLE_MS: i32 = POLL_TICK_MS * 6;
 pub const GEOMETRY_FAILED_EXIT: i32 = 6;
+/// The PIN specifically: WS_EX_TOPMOST did not follow what session.json claimed.
+/// Distinct from 6 because the fix usually lives in the show/pin ordering, not
+/// in persistence - and a failure here may be a race, so the message says that.
+pub const PIN_FAILED_EXIT: i32 = 7;
 
 /// Fit the seed inside a work area that might be one monitor, might be two, and
 /// might not be 100% scaled. None means "cannot be judged here".
@@ -1295,6 +1388,7 @@ pub fn run_probe_script(
     script: &Path,
     exe: &Path,
     err_file: &Path,
+    session: Option<&Path>,
     seed: Option<&Rect>,
     move_to: Option<(i32, i32)>,
     secs: u64,
@@ -1306,6 +1400,8 @@ pub fn run_probe_script(
         .arg(exe)
         .arg("-ErrFile")
         .arg(err_file)
+        .arg("-Session")
+        .arg(session.map(|p| p.display().to_string()).unwrap_or_default())
         .arg("-WindowSecs")
         .arg(secs.to_string())
         .arg("-SettleMs")
@@ -1344,7 +1440,13 @@ pub fn run_probe_script(
 /// Rewrite ONLY the rect numbers in the app's own session.json, keeping every
 /// other field exactly as the app wrote it. Returns the bytes that were there
 /// before, so the caller can put them back.
-pub fn seed_session(path: &Path, seed: &Rect) -> Result<Option<Vec<u8>>, String> {
+/// Write a rect, and the pin state the harness wants asserted, into the app's own
+/// session.json, leaving every other field exactly as the app wrote it.
+pub fn seed_session_with_pin(
+    path: &Path,
+    seed: &Rect,
+    pinned: bool,
+) -> Result<Option<Vec<u8>>, String> {
     let before = match fs::read(path) {
         Ok(bytes) => Some(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -1368,6 +1470,9 @@ pub fn seed_session(path: &Path, seed: &Rect) -> Result<Option<Vec<u8>>, String>
     obj.insert("y".into(), serde_json::json!(seed.t));
     obj.insert("w".into(), serde_json::json!(seed.r - seed.l));
     obj.insert("h".into(), serde_json::json!(seed.b - seed.t));
+    if pinned {
+        obj2_pin(&mut value);
+    }
     let text = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
     fs::write(path, text).map_err(|e| format!("cannot seed {}: {e}", path.display()))?;
     Ok(before)
@@ -1388,8 +1493,9 @@ fn placement_text(p: &Placement) -> &'static str {
 /// cannot be measured here becomes NotJudged with a reason rather than a pass.
 pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: &Path) -> Geometry {
     let mut notes: Vec<String> = Vec::new();
+    let mut pin_failed = false;
     // 1. Where is the screen, actually. WindowSecs 0 = report only, no launch.
-    let work = match run_probe_script(script, exe, err_file, None, None, 0) {
+    let work = match run_probe_script(script, exe, err_file, None, None, None, 0) {
         Err(e) => return Geometry::NotJudged(e.leak() as &str),
         Ok(probe) => {
             if !probe.flag("DESKTOP") {
@@ -1427,7 +1533,10 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
         seed.text(),
         moved.text()
     );
-    let before = match seed_session(session, &seed) {
+    println!(
+        "smoke: geometry: settled {SETTLE_MS} ms after the harness move = 6 x the {POLL_TICK_MS} ms poll tick"
+    );
+    let before = match seed_session_with_pin(session, &seed, true) {
         Ok(bytes) => bytes,
         Err(e) => {
             println!("SMOKE GEOMETRY: the seed could not be written: {e}");
@@ -1439,6 +1548,7 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
         script,
         exe,
         err_file,
+        Some(session),
         Some(&seed),
         Some((moved.l, moved.t)),
         SETTLE_MS as u64 / 1000 + 12,
@@ -1451,6 +1561,16 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
     };
     let frame = probe_rect(&first, "FRAME");
     let client = probe_rect(&first, "CLIENT");
+    if let (Some(f), Some(c)) = (frame, client) {
+        println!(
+            "smoke: geometry: measured chrome (frame -> client) = {:+}/{:+}/{:+}/{:+} px, and it is \
+             these numbers, not a model, that the tolerance is judged against",
+            c.l - f.l,
+            c.t - f.t,
+            c.r - f.r,
+            c.b - f.b
+        );
+    }
     let restore = place(&seed, frame.as_ref(), client.as_ref());
     match &restore {
         Placement::At { space } => println!(
@@ -1485,6 +1605,12 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
         Ok(text) => persisted_rect(&text),
         Err(_) => None,
     };
+    println!(
+        "smoke: geometry: READ 1 (after the move, one flush tick, BEFORE the close): {}",
+        probe_rect(&first, "MID")
+            .map(|r| r.text())
+            .unwrap_or_else(|| "nothing written yet".to_string())
+    );
     let candidates = [frame_after, client_after];
     let mut verdict = Persisted::NothingWritten;
     for c in candidates.iter().flatten() {
@@ -1500,6 +1626,10 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
             }
         }
     }
+    println!(
+        "smoke: geometry: READ 2 (after the app exited): {}",
+        stored.map(|r| r.text()).unwrap_or_else(|| "-".into())
+    );
     match &verdict {
         Persisted::Moved => println!(
             "smoke: geometry: PERSIST ok - session.json names the moved rect (window after the move: frame {} client {}, persisted {})",
@@ -1524,9 +1654,26 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
             session.display()
         )),
     }
-    // 5. Relaunch and see whether it comes back where it was left.
+    // 4. The pin, first polarity: the seed asked for pinned:true, so the live
+    // window's extended style must carry WS_EX_TOPMOST. Read from the same
+    // launch that produced the rects above - the window is shown, which the
+    // platform lane proved is the only state where a topmost band survives.
+    let pin_true = topmost(&first);
+    if pin_true.is_none() {
+        println!("smoke: geometry: PIN not judged - the extended style could not be read");
+    } else {
+        println!(
+            "smoke: geometry: PIN pinned:true -> WS_EX_TOPMOST={}",
+            pin_true.unwrap_or(false) as i32
+        );
+    }
+    // 5. Relaunch and see whether it comes back where it was left, and whether
+    // an unpinned file really leaves the window un-topmost.
+    if let Err(e) = set_pinned(session, false) {
+        println!("smoke: geometry: PIN second polarity not judged: {e}");
+    }
     let expect = stored.unwrap_or(moved);
-    let second = match run_probe_script(script, exe, err_file, None, None, 12) {
+    let second = match run_probe_script(script, exe, err_file, Some(session), None, None, 12) {
         Err(e) => {
             restore_session(session, before.as_deref());
             return Geometry::NotJudged(e.leak() as &str);
@@ -1549,6 +1696,37 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
             expect.text()
         )),
     }
+    let pin_false = topmost(&second);
+    println!(
+        "smoke: geometry: PIN pinned:false -> WS_EX_TOPMOST={}",
+        match pin_false {
+            Some(v) => v as i32,
+            None => -1,
+        }
+    );
+    let pin = match (pin_true, pin_false) {
+        (Some(t), Some(f)) => {
+            if t && !f {
+                Pin::Matched {
+                    pinned_true: true,
+                    pinned_false: false,
+                }
+            } else {
+                pin_failed = true;
+                notes.push(format!(
+                    "PIN: session.json said pinned:true and the window answered WS_EX_TOPMOST={t}, \
+                     then pinned:false answered {f}; the topmost bit does not follow the state file \
+                     (a show/pin race here is possible, so check the app log before blaming persistence)"
+                ));
+                Pin::Contradicts {
+                    wanted: true,
+                    seen: Some(t),
+                    which: "pinned:true",
+                }
+            }
+        }
+        _ => Pin::NotJudged("the extended style could not be read on one of the two launches"),
+    };
     // 6. Never leave the seed behind in place of what the app itself wrote.
     let still_seed = fs::read_to_string(session)
         .ok()
@@ -1562,9 +1740,14 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
         Geometry::Proven {
             restore: placement_text(&restore),
             relaunch: placement_text(&relaunch),
+            pin: match &pin {
+                Pin::Matched { .. } => "matched",
+                Pin::Contradicts { .. } => "LIED",
+                Pin::NotJudged(_) => "not-judged",
+            },
         }
     } else {
-        Geometry::Broken(notes)
+        Geometry::Broken { notes, pin_failed }
     }
 }
 
@@ -1807,7 +1990,12 @@ pub fn run(args: &[String]) -> i32 {
         match session {
             None => println!("smoke: geometry: NOT JUDGED - no session.json to seed was found"),
             Some(path) => match geometry_round_trip(&geom_script, &exe, &err_file, &path) {
-                Geometry::Proven { restore, relaunch } => {
+                Geometry::Proven {
+                    restore,
+                    relaunch,
+                    pin,
+                } => {
+                    let _ = (restore, relaunch, pin);
                     println!(
                         "smoke: geometry: PASS - restore={restore} persist=moved relaunch={relaunch}"
                     )
@@ -1815,12 +2003,19 @@ pub fn run(args: &[String]) -> i32 {
                 Geometry::NotJudged(why) => {
                     println!("smoke: geometry: NOT JUDGED (advisory) - {why}")
                 }
-                Geometry::Broken(notes) => {
+                Geometry::Broken { notes, pin_failed } => {
                     for note in &notes {
                         println!("SMOKE GEOMETRY FAIL: {note}");
                     }
-                    println!("smoke: geometry: FAIL - the window memory promise did not hold");
-                    code = GEOMETRY_FAILED_EXIT;
+                    if pin_failed {
+                        println!(
+                            "smoke: geometry: FAIL - the topmost bit did not follow session.json"
+                        );
+                        code = PIN_FAILED_EXIT;
+                    } else {
+                        println!("smoke: geometry: FAIL - the window memory promise did not hold");
+                        code = GEOMETRY_FAILED_EXIT;
+                    }
                 }
             },
         }
@@ -2555,7 +2750,7 @@ mod tests {
             "{\"rect\":{\"x\":1,\"y\":2,\"w\":3,\"h\":4},\"pinned\":true,\"maximized\":false}",
         )
         .expect("write");
-        let before = seed_session(
+        let before = seed_session_with_pin(
             &path,
             &Rect {
                 l: 100,
@@ -2563,6 +2758,7 @@ mod tests {
                 r: 700,
                 b: 500,
             },
+            false,
         )
         .expect("seeded");
         let after = fs::read_to_string(&path).expect("read");
@@ -2583,6 +2779,41 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&path).expect("back"),
             "{\"rect\":{\"x\":1,\"y\":2,\"w\":3,\"h\":4},\"pinned\":true,\"maximized\":false}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 4's own plumbing: flipping the pin must change that one field and
+    /// nothing else, because the polarity test relies on the rect the app itself
+    /// persisted staying put underneath it.
+    #[test]
+    fn the_pin_flip_touches_only_the_pin() {
+        let dir = std::env::temp_dir().join(format!("xtask-pin-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("session.json");
+        fs::write(
+            &path,
+            "{\"rect\":{\"x\":398,\"y\":297,\"w\":604,\"h\":381},\"pinned\":true}",
+        )
+        .expect("write");
+        set_pinned(&path, false).expect("flip");
+        let after = fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            persisted_rect(&after),
+            Some(Rect {
+                l: 398,
+                t: 297,
+                r: 1002,
+                b: 678
+            }),
+            "the rect the app persisted must survive the pin flip: {after}"
+        );
+        assert!(after.contains("\"pinned\": false"), "{after}");
+        set_pinned(&path, true).expect("flip back");
+        assert!(
+            fs::read_to_string(&path)
+                .expect("read")
+                .contains("\"pinned\": true")
         );
         let _ = fs::remove_dir_all(&dir);
     }
