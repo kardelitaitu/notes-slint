@@ -570,13 +570,13 @@ jobs:
       # Spell subcommands the way xtask defines them: check-deps. There is no "cargo xtask
       # deps" and no alias for it (a cargo alias cannot rename an argument), so do not write
       # that name into a step and then explain an exit 2.
-      - name: drift — cargo run -p xtask -- check (the AGENTS.md gate as one command)
+      - name: drift — cargo run --locked -p xtask -- check (the AGENTS.md gate as one command)
         id: xtask_check
         shell: bash
         run: |
           set -o pipefail
           status=0
-          cargo run -p xtask -- check 2>&1 | tee "$RUNNER_TEMP/xtask-check.log" || status=$?
+          cargo run --locked -p xtask -- check 2>&1 | tee "$RUNNER_TEMP/xtask-check.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           # xtask prints "<== [name] OUTCOME" per step; annotate the failing ones only
           # (advisory rows are excluded: they are reported, they do not gate).
@@ -627,9 +627,10 @@ jobs:
           exit $status
       # --- 4e. the unsafe ledger, now a rule instead of a claim ----------------
       # "cargo run -p xtask -- check-unsafe" (crates/xtask/src/check_unsafe.rs) scans the
-      # platform sources and enforces the six rules AGENTS.md states as an invariant that
+      # platform sources and enforces the seven rules AGENTS.md states as an invariant that
       # nothing used to prove: [unsafe-outside-platform], [unsafe-without-safety],
-      # [local-allowance], [ledger-imbalance], [lint-missing], [lint-escape]. It BLOCKS:
+      # [local-allowance], [ledger-imbalance], [raw-ffi-imbalance], [lint-missing],
+      # [lint-escape]. It BLOCKS:
       # unsafe is the one place where a polite mistake is a memory-safety bug, and until
       # this row existed the only enforcement was the honesty of whoever wrote the block.
       # The roster makes it non-quick-skippable, so the drift lock at 4c runs it too - the

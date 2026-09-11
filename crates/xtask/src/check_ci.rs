@@ -11,7 +11,12 @@
 //! * [step-missing] - a check.rs row (gate OR advisory) whose command is not a
 //!   run step in the gate job;
 //! * [step-extra] - a run step in the gate job no check.rs row knows. The one
-//!   exemption is the aggregate cargo run -p xtask check: that IS the roster,
+//!   exemption is the aggregate cargo run --locked -p xtask check: that IS the roster,
+//!   and it carries --locked because the step that runs the whole roster must resolve
+//!   the SAME Cargo.lock that is in the commit, not one cargo quietly refreshed on the
+//!   runner. The twelve rows this file compares against live in check.rs, so a
+//!   --locked added HERE without the matching rows there reddens this judge on
+//!   purpose - see the [step-missing] / [step-extra] pair.
 //!   run as one command. Exact signature match only, so no stray step can hide
 //!   behind it;
 //! * [advisory-mismatch] - a step that is advisory on one side and a gate on the
@@ -62,7 +67,7 @@ use std::path::PathBuf;
 
 const WORKFLOW_REL: &str = ".github/workflows/ci.yml";
 const GATE_JOB: &str = "gate:";
-const AGGREGATE: &str = "cargo run -p xtask check";
+const AGGREGATE: &str = "cargo run --locked -p xtask check";
 
 /// One row of the local gate, as far as CI is concerned.
 #[derive(Debug, Clone)]
@@ -739,25 +744,54 @@ mod tests {
             signature_of("cargo run -p xtask -- check-arch 2>&1 | tee log || status=$?"),
             "cargo run -p xtask check-arch"
         );
-        // The aggregate is exempt by EXACT signature, not by prefix.
+        // --locked is NOT plumbing: it is the difference between resolving against
+        // the Cargo.lock in the commit and against one cargo refreshed on the
+        // runner. signature() must keep it, which is also why adding the flag to a
+        // step means adding it to the ROW, not to a comment.
+        assert_eq!(
+            signature_of("cargo run --locked -p xtask --quiet -- check"),
+            "cargo run --locked -p xtask check"
+        );
+        assert_ne!(
+            signature_of("cargo run -p xtask -- check"),
+            signature_of("cargo run --locked -p xtask -- check"),
+            "a normaliser that dropped --locked would make this judge blind to it"
+        );
+        // The aggregate is exempt by EXACT signature, not by prefix - and the
+        // exact signature now carries the lock.
         let steps = parse_ok(&gate_text(
             "
       - name: drift
         shell: bash
         run: |
           set -o pipefail
-          cargo run -p xtask -- check 2>&1 | tee log
-",
+          cargo run --locked -p xtask -- check 2>&1 | tee log
+      ",
         ));
         assert_eq!(decide(&[], &steps), Vec::<String>::new());
+        let unlocked = parse_ok(&gate_text(
+            "
+      - name: drift
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo run -p xtask -- check 2>&1 | tee log
+      ",
+        ));
+        assert!(
+            decide(&[], &unlocked)
+                .iter()
+                .any(|v| v.contains("[step-extra]")),
+            "an UNLOCKED aggregate step is drift now, not plumbing"
+        );
         let sneaky = parse_ok(&gate_text(
             "
       - name: drift
         shell: bash
         run: |
           set -o pipefail
-          cargo run -p xtask -- check --extra-flag 2>&1 | tee log
-",
+          cargo run --locked -p xtask -- check --extra-flag 2>&1 | tee log
+      ",
         ));
         assert!(
             decide(&[], &sneaky)
@@ -766,7 +800,6 @@ mod tests {
             "an aggregate-like step must not smuggle extra work past the lock"
         );
     }
-
     #[test]
     fn a_step_ci_dropped_is_step_missing() {
         let steps = parse_ok(&gate_text(SMOKE));
