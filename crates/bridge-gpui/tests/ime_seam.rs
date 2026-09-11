@@ -34,6 +34,18 @@
 // load); as a module of this test crate they are dead code, which would otherwise fail
 // the workspace clippy gate. Scoped here, at the crate root of the TEST crate only.
 #![allow(dead_code)]
+// TWO MORE, both caused by this file being a test crate that includes editor.rs by path
+// rather than linking the bin (ac6fc37b landed with them; they are properties of the
+// arrangement, not of the select-all bug this file was written for):
+//  * `unexpected_cfgs`: the window_driven module below is gated on gpui-kit's
+//    `test-support` feature, which is a FEATURE OF THAT CRATE and so is not a cfg value
+//    this package declares. Narrowly allowed, because the gate is the point - without it
+//    the module compiles against a TestAppContext that cannot open a window.
+//  * `unused_crate_dependencies`: the package's `notes_api` and `raw_window_handle` are
+//    used by main.rs, which is NOT part of this test crate. Same reason the bridge's
+//    editor-only unit tests do not need them.
+#![allow(unexpected_cfgs)]
+#![allow(unused_crate_dependencies)]
 
 #[path = "../src/editor.rs"]
 mod editor;
@@ -148,6 +160,7 @@ fn every_motion_door_clears_an_open_composition() {
         "move_to",
         "select_to",
         "select_range",
+        "select_all",
         "unmark_text",
         "replace",
     ];
@@ -163,6 +176,9 @@ fn every_motion_door_clears_an_open_composition() {
             "move_to" => state.move_to(2),
             "select_to" => state.select_to(1),
             "select_range" => state.select_range(0..2),
+            // The sixth door, added when ac6fc37b went red: a table that lists it is how a
+            // SEVENTH gets noticed. See the invariant note at editor.rs:268.
+            "select_all" => state.select_all(),
             "unmark_text" => state.unmark_text(),
             _ => state.replace(None, "P"),
         }
@@ -205,7 +221,7 @@ fn a_pure_composition_update_does_not_clear_the_mark() {
 
 #[test]
 fn select_all_commits_an_open_composition_like_every_other_motion_door() {
-    // KNOWN RED, left red on purpose. Every other motion door clears the mark
+    // CLOSED (this commit). Every other motion door cleared the mark
     // (caret_to :410, select_to :437, select_range :494) and the flush-gate doc
     // (editor.rs:936-941) states the invariant "every motion path clears the mark, so
     // this can only be true while the user is actually mid-IME". select_all

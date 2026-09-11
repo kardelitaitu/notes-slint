@@ -265,6 +265,32 @@ pub(crate) struct TextState {
     pub(crate) selection_reversed: bool,
     /// The IME composition range: text the platform has put on screen but the user
     /// has NOT committed. Bytes, not UTF-16 units, like everything else in here.
+    /// THE MARKED RANGE - and the invariant that lives with it, because this field caused
+    /// two bugs and can cause more.
+    ///
+    /// INVARIANT: every door that moves the CARET or the SELECTION away from where the
+    /// composition sits MUST commit the mark (set it to None) on its way through - no
+    /// exceptions. The reason is not tidiness: `replacement_range` prefers this range over
+    /// the selection, so a stale mark makes the next keystroke overwrite a fragment of an
+    /// abandoned composition; and `is_composing()` reads this field, so a stale mark makes
+    /// D51 refuse to flush text the user has visibly moved on from. That is data loss with
+    /// no error anywhere.
+    ///
+    /// THE DOORS, enumerated rather than remembered: `selected_range` is written in exactly
+    /// seven places - `replace`, `replace_and_mark` (which SETS the mark), `move_to`,
+    /// `select_to`, `select_range`, `select_all` and `clear_selection`. The first six clear.
+    /// `clear_selection` is the ONE DELIBERATE EXCEPTION (Escape): cancelling a selection is
+    /// not cancelling an IME session, and it does not move the caret, so the mark still
+    /// describes where the composition is. Pinned by name in
+    /// tests/ime_seam.rs::every_motion_door_clears_an_open_composition and
+    /// ::a_pure_composition_update_does_not_clear_the_mark.
+    ///
+    /// WHY A NEW DOOR CANNOT BE CAUGHT BY A TEST ALONE: the field is `pub(crate)`, so a
+    /// function that assigns `selected_range` directly - as the test helpers do - never
+    /// passes through any door and no table can see it. Adding an eighth mover means adding
+    /// it to the list above, to the table in that test, and to the exception note if it
+    /// deliberately keeps the mark. A comment on the field is the only place all three can
+    /// be said at once.
     pub(crate) marked_range: Option<Range<usize>>,
     /// The grapheme column up and down arrows remember, so a caret walking a ragged
     /// paragraph does not slide to the margin and stay there. `None` until the first
@@ -495,9 +521,18 @@ impl TextState {
     }
 
     /// Ctrl+A.
+    ///
+    /// THE SIXTH DOOR, and the one the S5 test missed: selecting everything is motion away
+    /// from an uncommitted composition, exactly as a click or an arrow is. Left marked, the
+    /// buffer keeps `is_composing()` true - so D51 refuses to flush text the user has moved
+    /// on from - and the next plain keystroke lands in `replacement_range`, which prefers a
+    /// stale mark over the selection the user just made. Ctrl+A then typing would overwrite
+    /// a fragment of an abandoned composition instead of replacing everything.
+    /// `ime_seam.rs` (ac6fc37b) is the red this closes.
     pub(crate) fn select_all(&mut self) {
         self.selected_range = 0..self.content.len();
         self.selection_reversed = false;
+        self.marked_range = None;
     }
 
     /// Escape: drop the selection, keep the caret where the head was, and leave the
