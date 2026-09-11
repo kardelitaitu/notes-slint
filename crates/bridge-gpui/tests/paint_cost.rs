@@ -509,9 +509,7 @@ fn foil_the_rule_as_shipped_at_8404b566<Line>(
     let mut last = visible.end;
     for edge in [
         Some(caret_line),
-        marked
-            .as_ref()
-            .and_then(|m| cache.line_index_at(m.start)),
+        marked.as_ref().and_then(|m| cache.line_index_at(m.start)),
     ]
     .into_iter()
     .flatten()
@@ -541,8 +539,7 @@ fn the_widening_rule_fails_the_flatness_assertion_at_every_size() {
         let visible = geom.visible_lines(cache.lines());
         let widened =
             foil_the_rule_as_shipped_at_8404b566(&cache, &visible, 0, &marked, &selection);
-        let pinned =
-            retained_window(&cache, &visible, content.len(), 0, &marked, &selection);
+        let pinned = retained_window(&cache, &visible, content.len(), 0, &marked, &selection);
         old.push(widened.len());
         new.push(pinned.rows(cache.lines()).len());
         // The far end of the selection is not in the old set at all, which is the OTHER
@@ -553,7 +550,10 @@ fn the_widening_rule_fails_the_flatness_assertion_at_every_size() {
             "{lines}: the foil covered the far end by widening to the whole note"
         );
     }
-    println!("FOIL old-rule walked={old:?} new-rule walked={new:?} (cap {})", VIEWPORT_ROWS + 4);
+    println!(
+        "FOIL old-rule walked={old:?} new-rule walked={new:?} (cap {})",
+        VIEWPORT_ROWS + 4
+    );
     assert_eq!(new, vec![31; 3], "the new rule is flat at 31");
     assert_eq!(old, vec![200, 2000, 20000], "the old rule IS the buffer");
     assert!(
@@ -561,4 +561,3 @@ fn the_widening_rule_fails_the_flatness_assertion_at_every_size() {
         "the assertion must bite at every size: {old:?} vs {new:?}"
     );
 }
-
