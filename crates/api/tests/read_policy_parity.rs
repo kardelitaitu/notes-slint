@@ -59,6 +59,24 @@ fn open_and_watch(rx: &Receiver<Event>, path: &Path) -> Event {
     }
 }
 
+/// Waits for the Saved/SaveFailed verdict on `path`, ignoring startup chatter.
+fn save_and_watch(rx: &Receiver<Event>, path: &Path) -> Event {
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining.as_millis() > 0,
+            "no Saved/SaveFailed verdict within 5s for {}",
+            path.display()
+        );
+        match rx.recv_timeout(remaining) {
+            Ok(ev @ (Event::Saved { .. } | Event::SaveFailed { .. })) => return ev,
+            Ok(_other) => {}
+            Err(_) => panic!("timeout awaiting the save verdict on {}", path.display()),
+        }
+    }
+}
+
 fn describe(ev: &Event) -> String {
     match ev {
         Event::Loaded { text, .. } => format!("Loaded ({} text bytes)", text.len()),
@@ -350,6 +368,160 @@ fn a_refused_recent_name_is_never_statted_by_the_probe() {
         "READ-SIDE HOLE (the second funnel): the recents probe statted {} - a \
          name the read gate refuses - and lit it up as existing",
         stream.display()
+    );
+    drop(gateway);
+}
+
+// ------------------------------------------------------------------ test 7 --
+
+/// A refused Open does not REBIND the buffer: the bridge keeps showing the
+/// document it had, per the LoadFailed contract. So a refusal of a hostile
+/// name must not make THAT document unsavable - the user was mid-sentence in
+/// it. The c92494f3 shape, asked from the new gate's direction: does the
+/// refusal latch a session-wide flag that Save As then obeys?
+#[test]
+fn a_refused_open_does_not_hold_the_loaded_document_hostage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a.notes");
+    std::fs::write(&a, b"the note the user wrote\n").expect("note A");
+    let (gateway, rx) = host(dir.path());
+    gateway
+        .send(Command::Open { path: a.clone() })
+        .expect("queued");
+    let loaded = open_and_watch(&rx, &a);
+    assert_eq!(
+        name(&loaded),
+        "Loaded",
+        "premise: note A is on screen and typed into"
+    );
+
+    let stream = dir.path().join("a.notes:hidden");
+    std::fs::write(&stream, b"bytes from a stream\n").expect("ADS write");
+    assert_write_side_refuses(&stream, PathVerdict::StreamName);
+    gateway
+        .send(Command::Open {
+            path: stream.clone(),
+        })
+        .expect("queued");
+    let refused = open_and_watch(&rx, &stream);
+    assert_eq!(
+        name(&refused),
+        "LoadFailed",
+        "the gate refused the stream; observed {}",
+        describe(&refused)
+    );
+
+    // Save As carries the text the BRIDGE holds - A's typed buffer. The only
+    // question is whether the engine lets it land.
+    let saved = dir.path().join("saved.notes");
+    gateway
+        .send(Command::SaveAs {
+            path: saved.clone(),
+            text: "typed\n".to_string(),
+            revision: 0,
+        })
+        .expect("queued");
+    let ev = save_and_watch(&rx, &saved);
+    println!("SAVE AS {} -> {}", saved.display(), describe(&ev));
+    assert!(
+        matches!(ev, Event::Saved { .. }),
+        "SAVABILITY HOLE: a refused Open of {} made the loaded document \
+         unsavable; Save As answered {}",
+        stream.display(),
+        describe(&ev)
+    );
+    assert_eq!(
+        std::fs::read(&saved).expect("saved bytes"),
+        b"typed\n",
+        "the typed bytes must land whole"
+    );
+    drop(gateway);
+}
+
+// ------------------------------------------------------------------ test 8 --
+
+/// The OTHER direction: the refusal arrives with NOTHING loaded behind it -
+/// the untitled startup buffer is the only thing the user has (and session.json
+/// naming a hostile path is exactly how STEP 5 produces this on every launch).
+/// The typed bytes in that buffer are real work; Save As must take them.
+#[test]
+fn a_refused_first_open_leaves_the_untitled_buffer_a_way_out() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (gateway, rx) = host(dir.path());
+    let device = PathBuf::from(r"\\.\NUL");
+    assert_write_side_refuses(&device, PathVerdict::ReservedDevice);
+    gateway
+        .send(Command::Open {
+            path: device.clone(),
+        })
+        .expect("queued");
+    let refused = open_and_watch(&rx, &device);
+    assert_eq!(
+        name(&refused),
+        "LoadFailed",
+        "the gate refused the device; observed {}",
+        describe(&refused)
+    );
+
+    let out = dir.path().join("out.notes");
+    gateway
+        .send(Command::SaveAs {
+            path: out.clone(),
+            text: "typed before anything loaded\n".to_string(),
+            revision: 0,
+        })
+        .expect("queued");
+    let ev = save_and_watch(&rx, &out);
+    println!("SAVE AS {} -> {}", out.display(), describe(&ev));
+    assert!(
+        matches!(ev, Event::Saved { .. }),
+        "SAVABILITY HOLE (first open): the refused Open left the untitled \
+         buffer unsavable; Save As answered {}",
+        describe(&ev)
+    );
+    assert_eq!(
+        std::fs::read(&out).expect("saved bytes"),
+        b"typed before anything loaded\n",
+        "the typed bytes must land whole"
+    );
+    drop(gateway);
+}
+
+// ------------------------------------------------------------------ test 9 --
+
+/// The guard is NOT a nuisance: Save As onto the refused name itself stays
+/// refused, because that is the one target whose bytes the app never read -
+/// the measured 0-byte overwrite this guard exists for. Whatever scoping the
+/// two tests above force, this must survive.
+#[test]
+fn save_as_onto_the_refused_path_itself_stays_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("a.notes"), b"host\n").expect("host file");
+    let stream = dir.path().join("a.notes:hidden");
+    std::fs::write(&stream, b"bytes from a stream\n").expect("ADS write");
+    assert_write_side_refuses(&stream, PathVerdict::StreamName);
+    let (gateway, rx) = host(dir.path());
+    gateway
+        .send(Command::Open {
+            path: stream.clone(),
+        })
+        .expect("queued");
+    let refused = open_and_watch(&rx, &stream);
+    assert_eq!(name(&refused), "LoadFailed", "premise: the gate refused it");
+
+    gateway
+        .send(Command::SaveAs {
+            path: stream.clone(),
+            text: "over the never-read bytes\n".to_string(),
+            revision: 0,
+        })
+        .expect("queued");
+    let ev = save_and_watch(&rx, &stream);
+    println!("SAVE AS {} -> {}", stream.display(), describe(&ev));
+    assert!(
+        matches!(ev, Event::SaveFailed { .. }),
+        "Save As onto the refused name must not land; answered {}",
+        describe(&ev)
     );
     drop(gateway);
 }

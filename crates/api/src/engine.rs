@@ -231,12 +231,19 @@ pub(crate) struct Engine {
     /// it is discarded, not written into the file that replaced it (the
     /// stale-flush-overwrites-B bug).
     epoch: u64,
-    /// True when the last [`Command::Open`] was refused. One reason to exist: a
-    /// refused load leaves the bridge holding a buffer that is NOT this file, so an
-    /// explicit Save As would overwrite a document the app never read with stale or
-    /// empty text. Save As of a brand-new note stays allowed - that is not a
-    /// refusal, it is nothing yet.
-    load_refused: bool,
+    /// The path whose bytes the most recent refused [`Command::Open`] declined
+    /// to read, or None. Save As consults it for exactly ONE question - "is the
+    /// TARGET the file the app refused to read?" - because that is the measured
+    /// 0-byte overwrite the guard exists for. It is a PATH, not the bool it
+    /// replaces, and the difference is c92494f3: a refusal does not rebind the
+    /// buffer, so the document behind it is the one the user was looking at, and
+    /// a session-global flag made THAT unsavable (the deleted scratch failed a
+    /// load, the flag went true, and Save As answered NoTarget for a real note;
+    /// measured again with the read gate: a stream refusal held a loaded note
+    /// hostage and stranded the untitled buffer). Cleared by a successful
+    /// install and by the scratch restore; identity is core's `identity_key`,
+    /// the same answer is_scratch asks.
+    load_refused_for: Option<PathBuf>,
     /// Coalesced "a state file needs writing": ONE field, ONE tick, ONE deadline -
     /// never a second timer and never a second thread. It carries two bits because
     /// there are two files with two owners (D10: session.json holds window state,
@@ -349,7 +356,7 @@ impl Engine {
             detected: new_file_detected(),
             frontmatter: None,
             pending: Pending::default(),
-            load_refused: false,
+            load_refused_for: None,
             session_failure_latched: false,
             settings_failure_latched: false,
             draining: false,
@@ -563,7 +570,12 @@ impl Engine {
         // which is the same silence the comment below states for every
         // other failed load.
         if let Some(reason) = read_policy_refusal(path) {
-            self.load_refused = true;
+            // Remembered AS A PATH, not as a session-wide latch: this refusal
+            // did not rebind the buffer, so the document behind it - loaded
+            // and typed into, or the untitled startup buffer - stays savable,
+            // and only a Save As ONTO this name is held (see save_as). The
+            // bool that used to sit here held the loaded note hostage.
+            self.load_refused_for = Some(path.to_path_buf());
             self.emit(Event::LoadFailed {
                 path: path.to_path_buf(),
                 reason,
@@ -611,7 +623,7 @@ impl Engine {
             // before a single byte is read or decoded. D9's "nothing is ever refused"
             // protects the user's DOCUMENT; it does not require pretending to have
             // loaded bytes there is no buffer for.
-            self.load_refused = true;
+            self.load_refused_for = Some(path.to_path_buf());
             self.emit(Event::LoadFailed {
                 path: path.to_path_buf(),
                 reason: LoadError::TooLarge,
@@ -630,7 +642,7 @@ impl Engine {
         let raw = match decode(&bytes, detected) {
             Ok(text) => text,
             Err(err) => {
-                self.load_refused = true;
+                self.load_refused_for = Some(path.to_path_buf());
                 self.emit(Event::LoadFailed {
                     path: path.to_path_buf(),
                     reason: LoadError::Undecodable {
@@ -651,7 +663,7 @@ impl Engine {
             false,
         );
         self.detected = detected;
-        self.load_refused = false;
+        self.load_refused_for = None;
         let body = self.body_for_ui(&raw);
         // THE BUMP, announced: this buffer is a different document than the one
         // the bridge was echoing, and the number travels in the same event that
@@ -680,7 +692,7 @@ impl Engine {
     /// is core's ([`classify_io_error`] is what separates a sharing violation
     /// from a denied ACL); the port only shapes it for the UI.
     fn fail_load(&mut self, path: &Path, err: &std::io::Error) {
-        self.load_refused = true;
+        self.load_refused_for = Some(path.to_path_buf());
         self.emit(Event::LoadFailed {
             path: path.to_path_buf(),
             reason: load_error_from_io(err),
@@ -724,7 +736,7 @@ impl Engine {
         self.doc = Document::open(scratch, file_kind(scratch), false, false);
         self.detected = detected;
         self.frontmatter = None;
-        self.load_refused = false;
+        self.load_refused_for = None;
         // The DIRECTORY often goes with the file, and the ordinary flush write
         // path does not create parents (core's atomic write needs a directory to
         // put its sibling temp in). Best effort and SILENT: if the place cannot
@@ -779,11 +791,18 @@ impl Engine {
         // or fails emits no Rebound, and an unannounced generation move is
         // exactly the silence this change exists to remove. The buffer did not
         // change hands, so its stamp does not change.
-        if self.load_refused {
-            // The measured 0-byte overwrite. A refused open means the buffer on
-            // screen is not this file, so writing it would destroy a document the
-            // app never read. Refusing is the only answer that cannot cost the user
-            // their note, and the named path is the file being protected.
+        // The measured 0-byte overwrite, scoped to the file it was ever
+        // about: the TARGET is the path whose bytes a refused open declined
+        // to read, so writing here would destroy a document the app never
+        // read. A refusal of some OTHER name does not follow the buffer
+        // around - it did not rebind anything, so the document behind it is
+        // exactly the one the user was looking at, and holding THAT hostage
+        // is the c92494f3 bug in reverse. See [`Engine::load_refused_for`].
+        if self
+            .load_refused_for
+            .as_ref()
+            .is_some_and(|refused| identity_key(refused) == identity_key(path))
+        {
             self.emit(Self::document_save_failed(
                 path.to_path_buf(),
                 revision,
@@ -918,7 +937,7 @@ impl Engine {
             // [`Engine::remember`]'s split): it is a restore target, not a file
             // the user chose.
             //
-            // This mirrors save_as's body minus its load_refused guard: the
+            // This mirrors save_as's body minus its refused-target guard: the
             // refused-load state protects a FOREIGN file from a blind overwrite,
             // and the scratch is this port's own freshly created file - the
             // guard has no jurisdiction here. NeedsPath survives as the FALLBACK
