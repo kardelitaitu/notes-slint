@@ -298,6 +298,22 @@ fn identity_of(path: &Path) -> (String, bool) {
 /// `final_identity_path(path) -> Option<String>` — GetFinalPathNameByHandleW
 /// with FILE_NAME_NORMALIZED | VOLUME_NAME_GUID — and core would key on that
 /// string verbatim (platform decides nothing; core keeps the policy).
+///
+/// THE INTEGRATION CONTRACT, once that fact exists:
+/// * the GUID form is the KEY and NEVER the display or the stored path — a
+///   volume GUID in a recents menu is unreadable, and Command::Open needs an
+///   openable path, so RecentEntry keeps the user spelling / DOS-canonical
+///   form exactly as today;
+/// * a GUID key survives a drive REASSIGNMENT (its purpose) but not a
+///   reformat (a fresh volume mints a fresh GUID — a fresh install is the
+///   one place nobody expects recents to survive) and not a clone-to-
+///   another-volume (self-healing: the stale entry greys out via
+///   mark_missing and ages out);
+/// * on None, identity_of falls back to the EXISTING chain (canonicalise,
+///   then the lexical fallback already pinned by
+///   the_lexical_identity_key_pins_the_folding_rule) — the two-spelling
+///   defect resurfaces only for the duration of that fallback, which is
+///   honest and better than refusing to dedupe at all.
 fn key_from_canonical(raw: &str) -> String {
     strip_verbatim(raw)
 }
