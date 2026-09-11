@@ -241,8 +241,8 @@ jobs:
       # command is an echo always returns 0, so a real shutdown failure would render as a
       # green cell - continue-on-error keeps that red from turning the run red.
       #
-      # The exit-code contract as of 5e905c5. Six codes, and several mean more than one
-      # thing, so the arms below keep the readings apart - "your code does not build" and
+      # The exit-code contract as of 9b84bb7b: codes 0 through 7, several of them meaning
+      # more than one thing, so the arms below keep the readings apart - "your code does not build" and
       # "this runner has no desktop" are not the same story, and an infrastructure
       # emergency must never be cited as a product bug:
       #   0  passed, AND the user state it moved aside came back byte-identical
@@ -256,15 +256,32 @@ jobs:
       #   5  STALE BINARY - the exe on disk is older than the sources that build it, and
       #      the --no-build diagnostic path refuses to judge against it
       #   6  THE WINDOW-MEMORY PROMISE BROKE - the app ran, closed cleanly and persisted
-      #      something, but not the right rect (f7b295c; GEOMETRY_FAILED_EXIT)
+      #      something, but the seeded rect did not come back, or a harness-driven move
+      #      never reached session.json (f7b295c; GEOMETRY_FAILED_EXIT). Geometry that
+      #      cannot be measured prints NOT JUDGED (advisory) and leaves the code alone - an
+      #      unverifiable step is reported as neither a pass nor a failure
+      #   7  THE PIN LIED - WS_EX_TOPMOST on the live window did not follow session.json,
+      #      read in BOTH polarities (seed pinned:true must show 1; flipped to false it must
+      #      show 0) across two launches (9b84bb7b; PIN_FAILED_EXIT). Separate from 6
+      #      because the usual cause is ordering, not persistence - and already seen red.
       #
-      # Codes 4, 5 and 6 all say the same uncomfortable thing in different words: the app
-      # was not proven to work. 4 and 5 are the INSTRUMENT refusing to lie about which
-      # binary it tested - nothing was launched, no cached exe was quietly substituted, so
-      # a red 5 in particular must never be read as "the app is broken": it means the exe
-      # on disk is not the exe this commit builds, and the runtime was never probed at all.
-      # 6 is the opposite: everything ran, and the headline feature still failed.
+      # Codes 4, 5 and 6/7 say two opposite things, and the arms must not blur them. 4 and
+      # 5 are the INSTRUMENT refusing to lie about which binary it tested: nothing was
+      # launched, no cached exe was quietly substituted, so a red 5 in particular must
+      # never be read as "the app is broken" - it means the exe on disk is not the exe this
+      # commit builds, and the runtime was never probed at all. 6 and 7 are the opposite,
+      # and much worse news: everything ran, and the two headline promises - come back
+      # where the state file said, stay above what you were told to - did not hold.
       #
+      # The arms are documentation of a contract the HARNESS owns, and the step body never
+      # branches on a hand-maintained list (see the catch-all wording). The gap is real:
+      # codes 4/5, then 6, then 7 each landed with no arm waiting, because check-ci
+      # compares the ROSTER of commands and says nothing about exit codes. The fix is
+      # queued with the xtask lane, not invented in this file: smoke.rs publishes a
+      # CONTRACT table derived from its own constants and check-ci asserts
+      # [arm-missing] / [arm-extra] against this very step. Until that lands, arming the
+      # case is part of the commit that changes the contract - not part of a CI commit
+      # that happens to notice.
       # Every arm is attributable because the step prints its own identity line: "smoke:
       # tested binary <path> | <age> | built_by_this_run=YES|NO | git HEAD at that moment
       # <sha>" - so a green cell names the exact artifact and commit it proved.
@@ -312,8 +329,9 @@ jobs:
             3) echo "::notice::smoke DECLINED - the summary line above says which of the two it was: (no desktop) means no interactive session to open a window in; (BLOCKED BY FOREIGN STATE) means something that is not a session file occupies the state path, which is machine pollution and not the app - the DECLINED line prints what is sitting there, with ACLs, and says clear the occupant. Neither is a failure; the check was simply not possible on this machine." ;;
             4) echo "::error::SMOKE EXIT 4 - THE TARGET DID NOT COMPILE. THE APP WAS NEVER LAUNCHED and no cached exe was substituted to keep the row green, so this says nothing about shutdown, persistence or geometry: it is a build failure, reported as an annotation only because a GUI step must not gate a headless runner. The line above (smoke: build | error[E...]) is the first real cargo error, and the step BEFORE this one (3b/3c) usually carries the same verdict with a name - fix the code, then re-read 1 and 3; do not treat a green 3b as proof this 4 is wrong, smoke builds the test profile itself." ;;
             5) echo "::error::SMOKE EXIT 5 - STALE BINARY: the notes-gpui.exe on disk is older than the sources that build it, so smoke refused to judge the running app against a build nobody compiled from this commit (window=STALE close=STALE session=STALE, and the identity line prints the age plus built_by_this_run=NO). Read it as the instrumentation refusing to lie about WHICH binary it tested: the app was never launched at all, so this is neither a product bug nor a pass - a verdict on a stale exe would be a claim about code that no longer exists. The --no-build diagnostic path asked for this; rebuild, do not force a run." ;;
-            6) echo "::error::SMOKE EXIT 6 - THE WINDOW-MEMORY PROMISE DID NOT HOLD (GEOMETRY_FAILED_EXIT). This one IS the product: the app launched, restored a seeded rect, was moved, closed cleanly and wrote session.json - and one of those three measurements is wrong, so read the smoke: geometry: lines in the log above for which leg failed (RESTORE / PERSIST / ROUND-TRIP) with the deltas printed. A failure at tolerance is a real bug, NOT a DPI excuse: the assertion is 6 px (smoke.rs PLACEMENT_TOLERANCE) precisely because gpui persists the CLIENT rect while GetWindowRect answers in FRAME pixels, and on this build the 8/19/8/20 chrome makes a space confusion 16 px across and 39 px down - far outside 6, which is why the tool reports a space mix-up as ChromeOffset and treats it as a warning rather than calling it memory loss. So: within 6 px of the seed in one named space is a pass; 16/39 off is the frame-vs-client argument, asserted in place() and its tests rather than only commented; anything else that still misses 6 px is a genuine broken promise. Still advisory (no desktop, no real work area, so a runner cannot gate on it) - but a red arm here is the most valuable line this job can print." ;;
-            *) echo "::error::SMOKE COULD NOT JUDGE (exit $status) - the harness itself failed before any verdict: no PowerShell to post WM_CLOSE with, the probe script could not be written or run, unreadable mtimes on the sources (a broken instrument, deliberately not reported as 5/stale), or a bad invocation of cargo xtask smoke. Codes 0-6 each have their own arm above, so anything reaching here is an unknown contract change: read it as no information about the app, never as a pass and never as a missing desktop." ;;
+            6) echo "::error::SMOKE EXIT 6 - THE WINDOW-MEMORY PROMISE DID NOT HOLD (GEOMETRY_FAILED_EXIT). This one IS the product: the app launched, restored a seeded rect, was moved, closed cleanly and wrote session.json - and one of those three measurements is wrong, so read the smoke: geometry: lines in the log above for which leg failed (RESTORE / PERSIST / ROUND-TRIP) with the deltas printed. What exit 6 means is the lane's own sentence: the window did not come back where the state file said, measured in frame pixels against the rect the app itself persisted. The 6 px margin (smoke.rs PLACEMENT_TOLERANCE) is judged against the chrome MEASURED from this very window on this run - every run prints 'smoke: geometry: measured chrome (frame -> client) = +8/+31/-8/-8 px' - and never against a modelled border, because the margin is deliberately below the smallest measured chrome and if some future build shrinks the border under 6 px the rule silently weakens; that is why the number is printed every run rather than asserted once in prose, and it states the limits of its own check. A space confusion is named ChromeOffset with its deltas and stays a WARNING, not memory loss; a rect that misses 6 px in NO named space is a genuine broken promise; geometry that could not be measured prints NOT JUDGED (advisory) and leaves the code alone. Still advisory (no desktop, no real work area, so a runner cannot gate on it) - but a red arm here is the most valuable line this job can print." ;;
+            7) echo "::error::SMOKE EXIT 7 - THE PIN LIED (PIN_FAILED_EXIT). The app ran, closed cleanly and wrote the file, but WS_EX_TOPMOST on the live window did not follow session.json: both polarities were read on two launches, seed pinned:true must answer 1 and flipped to false it must answer 0, so a red here is one of the two headline product promises broken, not a measurement quibble. Do NOT jump to persistence: the usual cause is the ORDER of show-then-reband (an async topmost reband only survives on a visible window - the platform lane proved that), and the harness deliberately refuses to accuse the app because a show/pin race is possible. Read the two PIN lines above (smoke: geometry: PIN pinned:true -> WS_EX_TOPMOST=... and pinned:false -> ...) plus the app own stderr before deciding which lane owns it. Seen red on a real run already (pinned:true -> 0), so this arm is not theoretical." ;;
+            *) echo "::error::SMOKE COULD NOT JUDGE (exit $status) - the harness itself failed before any verdict: no PowerShell to post WM_CLOSE with, the probe script could not be written or run, unreadable mtimes on the sources (a broken instrument, deliberately not reported as 5/stale), or a bad invocation of cargo xtask smoke. This arm deliberately names NO numbers - an arm that enumerates codes is a list that goes out of date, and it has already gone stale twice in this file - so anything reaching here is an unknown contract change: read it as no information about the app, never as a pass and never as a missing desktop." ;;
           esac
           exit $status
 
