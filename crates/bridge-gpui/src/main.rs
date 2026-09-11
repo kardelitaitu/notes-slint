@@ -801,6 +801,10 @@ impl Surface {
             Command::Flush {
                 text,
                 revision: edits,
+                // The vocabulary now carries the buffer's OPEN GENERATION; held at
+                // 0 here until the flush carries the generation its buffer
+                // actually belongs to (the very next commit).
+                epoch: 0,
             },
         );
     }
@@ -905,12 +909,16 @@ fn describe(event: &Event) -> String {
         // ERROR rather than a silently undelivered fact. That is the whole point of
         // having no wildcard arm above.
         //
-        // Its own variant rather than a SaveFailed because a session file has no
-        // revision to report (api event.rs:338), and it is latched to fire once per
-        // failure episode, so the line does not become a per-tick toast.
-        Event::SessionWriteFailed { reason } => {
+        // The fold (9c842242): SessionWriteFailed and SettingsWriteFailed became one
+        // variant that NAMES the state file it tried to write, so the line prints
+        // the file it is TOLD about instead of assuming which call it was waiting
+        // for. A state file still has no revision to report (api event.rs:338), so
+        // this is not a SaveFailed either, and the latch discipline is unchanged:
+        // one report per failure episode, retried every tick, cleared on the next
+        // success. The `reason` is core's own sentence, passed through untranslated.
+        Event::StateWriteFailed { file, reason } => {
             format!(
-                "SessionWriteFailed · the window position was not stored · {}",
+                "StateWriteFailed · the {file} file was not stored · {}",
                 reason
             )
         }
@@ -924,14 +932,14 @@ fn describe(event: &Event) -> String {
         Event::StateDirUnusable { reason } => {
             format!("StateDirUnusable · nothing can be remembered · {}", reason)
         }
-        // Third time this slice's no-wildcard match has refused to build, and the
-        // third time it was the port growing a variant the bridge had not been told
-        // about. settings.toml has no revision either, so like its session twin this
-        // is not a SaveFailed and must not read like one: the file that refused is
-        // the preference file, not the user's note.
-        Event::SettingsWriteFailed { reason } => {
+        // Arrived in the same fold that collapsed the two state-write events into
+        // one named one (D62), keeping the vocabulary at 13. The reason is
+        // platform's own sentence for the refusal and passes through; the words
+        // around it are the bridge's, because a pin that failed and is rendered as
+        // a success is a lie in the title bar.
+        Event::PinFailed { reason } => {
             format!(
-                "SettingsWriteFailed · the preference was not stored · {}",
+                "PinFailed · the window did not stay above the others · {}",
                 reason
             )
         }
@@ -993,6 +1001,13 @@ fn skip_words(reason: SkipReason) -> &'static str {
             "a file this app did not create: save it once and it keeps saving"
         }
         SkipReason::Clean => "nothing changed since the last write",
+        // The epoch guard speaking: the debounced Flush belonged to a document the
+        // user has already replaced, so the engine DISCARDED it rather than write
+        // one note's text into another's file. Named here because a discarded edit
+        // is exactly the thing ADR-0001 forbids leaving silent.
+        SkipReason::Superseded => {
+            "the edit belonged to a note that has since been replaced, so it was discarded"
+        }
         SkipReason::NeedsPath => "this note has no file yet: use Save As",
         SkipReason::ReadOnly => "the file is read-only",
         SkipReason::Oversize => "the file is over the size guard, so writes are refused",
@@ -1514,6 +1529,9 @@ fn final_flush(
         Command::Flush {
             text,
             revision: edits,
+            // Same placeholder as the debounced flush: the field must compile;
+            // its real value comes with the generation.
+            epoch: 0,
         },
     );
 }
@@ -2118,14 +2136,19 @@ mod tests {
             Event::SettingsCorrupt {
                 reason: "expected a value at line 2".to_string(),
             },
-            Event::SessionWriteFailed {
+            Event::StateWriteFailed {
+                file: notes_api::StateFile::Session,
                 reason: "Access is denied".to_string(),
             },
             Event::StateDirUnusable {
                 reason: "the state directory C:/x/notes-gpui is not a directory".to_string(),
             },
-            Event::SettingsWriteFailed {
+            Event::StateWriteFailed {
+                file: notes_api::StateFile::Settings,
                 reason: "the file is open in another program".to_string(),
+            },
+            Event::PinFailed {
+                reason: "the topmost call was refused".to_string(),
             },
         ];
         // One name per variant, in the order above. A new variant without an arm in
@@ -2142,9 +2165,10 @@ mod tests {
             "GeometryNotRestored",
             "RecentsUpdated",
             "SettingsCorrupt",
-            "SessionWriteFailed",
+            "StateWriteFailed",
             "StateDirUnusable",
-            "SettingsWriteFailed",
+            "StateWriteFailed",
+            "PinFailed",
         ];
         assert_eq!(
             names.len(),
@@ -2167,12 +2191,27 @@ mod tests {
             (10usize, "Access is denied"),
             (11, "is not a directory"),
             (12, "open in another program"),
+            (13, "the topmost call was refused"),
         ] {
             assert!(
                 describe(&cases[index]).contains(words),
                 "variant {index} lost the sentence it was handed"
             );
         }
+        // The fold made ONE variant carry both state files, so the line must name
+        // the file it was TOLD about: StateFile's Display is the difference
+        // between "session" and "settings", and assuming which call it was is
+        // exactly what the fold removed.
+        assert!(
+            describe(&cases[10]).contains("session file"),
+            "the session polarity lost its file name: {}",
+            describe(&cases[10])
+        );
+        assert!(
+            describe(&cases[12]).contains("settings file"),
+            "the settings polarity lost its file name: {}",
+            describe(&cases[12])
+        );
         // And the payload facts, not just the kind.
         let loaded = describe(&cases[0]);
         assert!(loaded.contains("ansi cp1252") && loaded.contains("crlf"));
