@@ -1,4 +1,4 @@
 [alias]
-xtask = "run -p xtask --"
-gate = ["test", "--workspace", "--exclude", "notes-bridge-gpui"]
-arch = "run -p xtask -- check-arch"
+xtask = "run --locked -p xtask --"
+gate = ["test", "--locked", "--workspace", "--exclude", "notes-bridge-gpui"]
+arch = "run --locked -p xtask -- check-arch"
