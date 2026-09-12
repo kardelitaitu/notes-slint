@@ -216,9 +216,17 @@ pub(crate) fn clamp_range(content: &str, range: &Range<usize>) -> Range<usize> {
 
 /// The splice, as a pure function, so that "it cannot panic" is a claim a test can
 /// check for every range rather than one we hope the UI never produces.
-/// The visual lines of a buffer, as byte ranges, each without its line feed. A buffer
-/// ending in a newline gets a final empty line, which is where Enter at the end puts
-/// the caret. LF only: CRLF is normalised on the way in, see the paste handler.
+/// THE LINE MODEL, as a reference implementation: the visual lines of a buffer, as byte
+/// ranges, each without its line feed. A buffer ending in a newline gets a final empty
+/// line, which is where Enter at the end puts the caret. LF only: CRLF is normalised on
+/// the way in, see the paste handler.
+///
+/// NOTHING ON A KEYSTROKE PATH CALLS THIS ANY MORE. It is the definition the cached
+/// index is cut to match, and it stays in the tree because `tests/paint_cost.rs` asserts
+/// the shape cache against it and `TextState`'s own tests assert the line-start cache
+/// against it - an oracle nobody rewrote. One whole-buffer walk per call is exactly why
+/// the caches exist.
+#[allow(dead_code)] // reached only by the two caches' oracles, both under #[cfg(test)]
 pub(crate) fn line_ranges(content: &str) -> Vec<Range<usize>> {
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -254,7 +262,7 @@ pub(crate) fn splice(content: &str, range: &Range<usize>, text: &str) -> String 
 /// point of S1 is that the byte arithmetic is PROVEN by tests, not by a screen.
 /// Slicing the state out is what the brief's escape clause asks for: a test that
 /// needs the GPU to prove string arithmetic is a design smell in the code.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextState {
     /// UTF-8, always. The platform speaks UTF-16 only at the boundary of this struct.
     pub(crate) content: String,
@@ -301,7 +309,55 @@ pub(crate) struct TextState {
     /// not a scroll, not a selection. This is what the bridge watches instead of
     /// re-reading the buffer, because comparing a 2000-line string on every wake is a
     /// cost the wire must not pay (crates/bridge-gpui/src/main.rs, `Wire`).
+    ///
+    /// Moved on every text mutation and on nothing else, and moved in ONE place:
+    /// `bump_text_changes`, which is also where `line_starts` is re-cut. The two are
+    /// therefore never able to disagree, which is the whole invariant of this struct.
     edits: u64,
+    /// THE LINE-START CACHE: the byte offset at which each visual line begins, indexed
+    /// by line number. `line_starts[0]` is always 0 and `line_starts.len()` is always the line
+    /// count - including the phantom empty line a buffer ending in a newline has, which
+    /// is where Enter at the end puts the caret.
+    ///
+    /// LAZY, AND STAMPED WITH THE MUTATION COUNTER: `line_starts_for` holds the `edits` value the
+    /// index was cut at, so "is the index current" is one integer compare and the single
+    /// invalidation point is `bump_text_changes` moving `edits` out from under it. No second dirty
+    /// flag exists, so no second dirty flag can be forgotten.
+    ///
+    /// WHY IT EXISTS: `line_index_at` was a prefix count of line feeds and `vertical_target` built
+    /// the whole `line_ranges` vector, so ONE Up arrow walked the note - 7,170 us at 20,000
+    /// lines in this profile, a felt frame per keystroke, TWICE over. Both now binary-search
+    /// this vector: O(log lines). A walk down a note costs one cut total, not one per key.
+    ///
+    /// WHY LAZY RATHER THAN RE-CUT IN `bump_text_changes`, which would be simpler and is wrong:
+    /// measured here, in this profile, the cut is ~8.7 ms at 20,000 lines against a
+    /// ~0.16 ms `splice`, so paying it on every keystroke would make TYPING the thing that
+    /// stutters in exchange for fixing the arrow key - the trade this box was told not to
+    /// make. Lazily, a keystroke that asks nothing about lines cuts nothing, and the
+    /// keystroke that does ask pays it once.
+    ///
+    /// AND WHAT IT DOES NOT REPLACE: the paint path's own `ShapeCache::starts`. That index
+    /// exists to address shaped lines by row; this one exists so the MODEL can answer a
+    /// question about a byte with no window and no GPU in the way. Same cut, same buffer,
+    /// cut in two places that must not disagree - see `rebuild_line_starts`.
+    line_starts: Vec<usize>,
+    /// The `edits` value `line_starts` was cut at. `u64::MAX` means "never", which is what a
+    /// freshly-built or freshly-invalidated index holds, and it is unreachable by a real
+    /// counter so a stale index can never be believed by accident of wrapping.
+    line_starts_for: u64,
+}
+
+/// `Default` written by hand rather than derived, for one reason: the derived form would
+/// set `line_starts_for` to 0, which is EXACTLY the `edits` value of a fresh state - so a
+/// default-constructed `TextState` would carry an EMPTY index that every reader believes,
+/// i.e. a buffer with zero lines. That is the silent version of the bug this whole field
+/// exists to avoid: no panic at construction, just a caret that cannot find a line. The
+/// real answer is `u64::MAX` ("never cut"), and the only way to get it is to route through
+/// `new`, which is also where the `content`-at-`len` caret rule lives.
+impl Default for TextState {
+    fn default() -> Self {
+        Self::new(String::new())
+    }
 }
 
 impl TextState {
@@ -314,7 +370,93 @@ impl TextState {
             marked_range: None,
             desired_column: None,
             edits: 0,
+            line_starts: Vec::new(),
+            line_starts_for: u64::MAX,
         }
+    }
+
+    /// THE SINGLE INVALIDATION POINT: the one place `edits` moves, and therefore the one
+    /// place the line-start index becomes un-believable.
+    ///
+    /// WHY ONE DOOR IS THE DESIGN AND NOT A CONVENIENCE: the only inputs to the question
+    /// "is the index current" are `content` and `edits`, and both are written in the same two
+    /// functions - `replace` and `replace_and_mark`, which are the only two places in this file
+    /// that assign `content`. So the invariant is a single biconditional, checkable by
+    /// reading one function:
+    ///
+    /// > INVARIANT: `line_starts` describes `content` if and only if `line_starts_for == edits`.
+    ///
+    /// `edits` moves nowhere else, so no `content` change can leave a believed index behind, and
+    /// no caret move, scroll or selection can invalidate one. A second `Vec::clear()` or a
+    /// second stamp elsewhere is the shape this sentence exists to forbid.
+    ///
+    /// WHAT DELIBERATELY DOES NOT CALL IT: caret motion, selection, scrolling, marking
+    /// and unmarking. None of them moves a line start, and `only_a_text_mutation_moves_the_
+    /// counter_the_wire_reads` pins the same rule for `edits` - an arrow key must not wake
+    /// a save, and an arrow key must not re-cut an index either. That is what makes a
+    /// walk down a note cost one cut ever, rather than one cut per keystroke.
+    ///
+    /// THE HAZARD THIS LEAVES OPEN, stated because `content` is `pub(crate)`: an assignment
+    /// to `content` anywhere outside a caller of this function re-opens the bug. It is written
+    /// on the field, and the four cache tests in `mod tests` walk EVERY byte of the buffer
+    /// against `line_ranges` after every edit, so a stale index fails loudly in CI rather
+    /// than putting the caret on the wrong line for a week.
+    fn bump_text_changes(&mut self) {
+        self.edits += 1;
+        // Belt and braces on the stamp: the compare in `ensure_line_starts` already fails
+        // because `edits` moved, so this line is not what keeps the cache honest. It is here
+        // because it makes the invalidation visible at the one place it happens - a reader
+        // looking at this function can see both halves of the pair, and a reader adding a
+        // second mutation door sees which two lines they are on the hook for.
+        self.line_starts_for = u64::MAX;
+    }
+
+    /// Cut the index if and only if `edits` has moved since it was last cut. THE ONLY
+    /// READER OF THE STAMP, and the only writer of `line_starts` besides `new`.
+    ///
+    /// The whole cost model of the cache lives in this compare: it is why an arrow-key walk
+    /// down a 20,000-line note costs one scan and not twenty thousand, and why a keystroke
+    /// that never asks about a line (`select_all`, a scroll, a click) cuts nothing.
+    fn ensure_line_starts(&mut self) {
+        if self.line_starts_for == self.edits {
+            return;
+        }
+        self.rebuild_line_starts();
+        self.line_starts_for = self.edits;
+    }
+
+    /// Re-cut `line_starts` from `content`. Reached ONLY from `ensure_line_starts`.
+    ///
+    /// The cut is the same one `ShapeCache::align` makes - an entry for the head, then one
+    /// for every byte AFTER a line feed - so the model and the paint cache agree about
+    /// what line a byte is on by construction, which matters because `bounds_for_range`
+    /// answers the operating system from that one and the keyboard moves the caret from
+    /// this one. A buffer ending in a newline gets the trailing phantom line; a buffer
+    /// not ending in one has no extra entry, and its last line runs to `content.len()`.
+    fn rebuild_line_starts(&mut self) {
+        // clear, not reassign: the allocation survives the keystroke that reused it.
+        self.line_starts.clear();
+        self.line_starts.push(0);
+        for (index, byte) in self.content.bytes().enumerate() {
+            if byte == b'\n' {
+                self.line_starts.push(index + 1);
+            }
+        }
+    }
+
+    /// The byte range of line `index` out of the index, `None` past the end.
+    ///
+    /// `next - 1` cannot underflow, and it is worth saying why rather than leaving a
+    /// `checked_sub` as decoration: every entry but the head is the byte AFTER a line
+    /// feed, so it is >= 1, so subtracting the feed lands on the line's own last byte.
+    /// That is also why a line never CONTAINS its feed, which `shape_line` debug-asserts.
+    fn line_range_of(&self, index: usize) -> Option<Range<usize>> {
+        let start = *self.line_starts.get(index)?;
+        let end = match self.line_starts.get(index + 1) {
+            Some(next) => next - 1,
+            None => self.content.len(),
+        };
+        Some(start..end)
     }
 
     /// The range a replacement would act on: an explicit platform range, else the
@@ -338,11 +480,13 @@ impl TextState {
         self.selected_range = caret..caret;
         self.selection_reversed = false;
         self.marked_range = None;
-        // THE COUNTER the wire watches. Forgetting this line is not a crash and no test
-        // of the model would notice: the buffer changes, the screen changes, and the
-        // autosave never fires because the bridge is told nothing happened. Measured live
-        // exactly that way - `final flush: nothing outstanding` while 26 bytes sat unsaved.
-        self.edits += 1;
+        // THE COUNTER the wire watches, and the one invalidation of the line-start cache.
+        // Forgetting this call is not a crash and no test of the model would notice: the
+        // buffer changes, the screen changes, and the autosave never fires because the
+        // bridge is told nothing happened. Measured live exactly that way - `final flush:
+        // nothing outstanding` while 26 bytes sat unsaved. And the caret would answer
+        // from an index cut against the PREVIOUS text.
+        self.bump_text_changes();
     }
 
     /// The composition replace: replace, and keep `text` marked as uncommitted.
@@ -389,7 +533,9 @@ impl TextState {
             }
         };
         self.selection_reversed = false;
-        self.edits += 1;
+        // A composition is a text change like any other: the bytes are in the buffer and
+        // the line starts may have moved with them. Same single door.
+        self.bump_text_changes();
     }
 
     /// The byte range that is currently marked, in UTF-16 units, for the platform.
@@ -569,47 +715,62 @@ impl TextState {
             .unwrap_or(self.content.len())
     }
 
-    /// Which visual line a byte offset is on.
-    pub(crate) fn line_index_at(&self, byte: usize) -> usize {
+    /// Which visual line a byte offset is on, by BINARY SEARCH over `line_starts`.
+    ///
+    /// This was a prefix count of line feeds - O(bytes ABOVE the caret) - reached once per
+    /// Up/Down through `vertical_target`. Measured in this profile, and untouched by the paint
+    /// box that fixed `line_range_at` beside it: 69 us at 200 lines, 702 at 2,000, 7,170 at
+    /// 20,000. A felt frame per arrow key on a long note. It is now O(log lines), and the
+    /// cut it searches is amortised over the keystrokes that follow it rather than paid by
+    /// the one that caused it: twenty arrow keys after an edit are one scan and nineteen
+    /// searches, not twenty scans.
+    ///
+    /// `&mut self` because the cut is lazy, which is the whole cost argument above. It
+    /// propagates to `column_of`, `byte_at_column` and `vertical_target` and to nothing outside them -
+    /// every caller is already a mutation door (`move_to`, `select_to`, a key handler), and
+    /// `ShapeCache`, which is `&self` on this path, keeps its own index cut by `align`.
+    pub(crate) fn line_index_at(&mut self, byte: usize) -> usize {
         let byte = byte.min(self.content.len());
-        self.content.as_bytes()[..byte]
-            .iter()
-            .filter(|b| **b == b'\n')
-            .count()
+        self.ensure_line_starts();
+        // The head start is 0, so the partition point is >= 1: this subtraction cannot
+        // wrap, and the search cannot answer "no line" for a buffer that has one. (The
+        // buffer ALWAYS has one - an empty note is one empty line - see `Default` below for
+        // the state that would have broken this.)
+        self.line_starts.partition_point(|start| *start <= byte) - 1
     }
 
     /// The byte range of the line under `byte`, WITHOUT its newline (a line never
     /// contains one: gpui `shape_line` debug-asserts that its input has none,
     /// src/text_system.rs:372, and the newline is the separator, not content to draw).
-    pub(crate) fn line_range_at(&self, byte: usize) -> Range<usize> {
-        let byte = byte.min(self.content.len());
-        // Scan OUT from the byte to the two newlines that bound it, not from byte 0 to
-        // the byte. The old form counted the whole prefix to name the line, then built
-        // the full line index and walked it with `nth` to get the range - O(note) twice
-        // over, measured at 17,456 us per call on a 20,000-line note in this profile,
-        // i.e. one keystroke eating a whole 60 Hz frame. This is O(line length), which
-        // for a note is a few dozen bytes whatever the note grows to.
-        let start = match self.content.as_bytes()[..byte]
-            .iter()
-            .rposition(|b| *b == b'\n')
-        {
-            Some(newline) => newline + 1,
-            None => 0,
-        };
-        let end = match self.content.as_bytes()[byte..]
-            .iter()
-            .position(|b| *b == b'\n')
-        {
-            Some(offset) => byte + offset,
-            None => self.content.len(),
-        };
-        start..end
+    ///
+    /// O(log lines) off the same index. The scan-out-from-the-byte form that replaced the
+    /// original (17,456 us a call at 20,000 lines) was already O(line), which is why it
+    /// measured 0 us at every size in the paint box; it is kept because it is fast, and
+    /// made a search because a search is fast for a DIFFERENT reason - it does not care
+    /// how long the line is. A 20,000-character paragraph no longer costs a walk on Home,
+    /// on End, on a triple click, or on the caret's own line, and `column_of`, which is
+    /// called on every click and every shift-selection, stops being O(line) for its first
+    /// half.
+    pub(crate) fn line_range_at(&mut self, byte: usize) -> Range<usize> {
+        let index = self.line_index_at(byte);
+        // `index` came out of the same index, so it is in range. The fallback is for a
+        // future caller that gets the order wrong, and it answers with the empty line at the
+        // end of the buffer rather than panicking - the shape `line_ranges` itself produces
+        // there, so a wrong answer is at least a well-formed one. Eager `unwrap_or` is fine
+        // here and is what clippy asks for: two `len()` calls, no arithmetic, so nothing can
+        // wrap the way a `then_some` argument can.
+        self.line_range_of(index)
+            .unwrap_or(self.content.len()..self.content.len())
     }
 
     /// The grapheme column of a byte offset within its line - the sticky target up and
     /// down arrows remember. Counted in clusters, not bytes or units, so a column means
     /// the same thing on `e`+U+0301 as on `e`.
-    pub(crate) fn column_of(&self, byte: usize) -> usize {
+    ///
+    /// O(line) by nature - it has to count the clusters above the caret - and the ONLY
+    /// line it walks is the one the index names, which is what `line_range_at` is for
+    /// here.
+    pub(crate) fn column_of(&mut self, byte: usize) -> usize {
         let line = self.line_range_at(byte);
         self.content[line.start..byte.min(line.end)]
             .graphemes(true)
@@ -618,7 +779,7 @@ impl TextState {
 
     /// The byte offset of grapheme column `column` on the line starting at `start`,
     /// clamped to that line's end. This clamp is the whole of `end` on a short line.
-    pub(crate) fn byte_at_column(&self, start: usize, column: usize) -> usize {
+    pub(crate) fn byte_at_column(&mut self, start: usize, column: usize) -> usize {
         let line = self.line_range_at(start);
         self.content[line.start..line.end]
             .grapheme_indices(true)
@@ -637,30 +798,49 @@ impl TextState {
     /// caret motion and the selection motion, so the keyboard cannot disagree with
     /// itself about what a line is. Clamped to the neighbour line length, which is the
     /// whole of a short line and the remembered column on a long one.
-    pub(crate) fn vertical_target(&self, delta: isize) -> usize {
-        let lines = line_ranges(&self.content);
-        if lines.is_empty() {
-            return 0;
-        }
-        let here = self
-            .line_index_at(self.cursor_offset())
-            .min(lines.len() - 1);
+    pub(crate) fn vertical_target(&mut self, delta: isize) -> usize {
+        // THE CARET PATH, and the reason the index exists. This used to build
+        // `line_ranges` - a Vec of EVERY line in the note, allocated per arrow key - and
+        // then count line feeds to the caret to name the line it was indexing: O(note)
+        // twice over, plus an allocation, to ask one question about one neighbour. Both
+        // halves now come off the cached starts - one binary search to name the line, one
+        // index to name the neighbour - and the only walk left is the grapheme walk along
+        // that neighbour, which is O(line) and is what a sticky column has to cost.
+        //
+        // Cut first, then read: this is the one call in the arrow path that can pay the
+        // scan, and it pays it at most once per edit.
+        self.ensure_line_starts();
+        // The index always carries at least the head entry, so an empty buffer is ONE
+        // empty line rather than the special case `lines.is_empty()` used to guard, and
+        // `lines - 1` cannot wrap. That is a property of the field's invariant, not of
+        // this function: see `Default`.
+        let lines = self.line_starts.len();
+        let here = self.line_index_at(self.cursor_offset()).min(lines - 1);
         let there = if delta < 0 {
             here.saturating_sub(delta.unsigned_abs())
         } else {
-            here.saturating_add(delta as usize).min(lines.len() - 1)
+            here.saturating_add(delta as usize).min(lines - 1)
         };
         if there == here {
-            return if delta < 0 {
-                lines[here].start
-            } else {
-                lines[here].end
-            };
+            // Already at the top or the bottom: the caret goes to the NEAR end of its own
+            // line, which is the no-op that neither panics nor moves the view.
+            let own = self
+                .line_range_of(here)
+                .unwrap_or(self.content.len()..self.content.len());
+            return if delta < 0 { own.start } else { own.end };
         }
-        let wanted = self
-            .desired_column
-            .unwrap_or_else(|| self.column_of(self.cursor_offset()));
-        self.byte_at_column(lines[there].start, wanted)
+        let wanted = match self.desired_column {
+            Some(column) => column,
+            // No remembered column yet (the caret has never moved horizontally): take the
+            // one it is standing at, which is the rule that makes the first Down behave
+            // like the second.
+            None => self.column_of(self.cursor_offset()),
+        };
+        let there_start = self
+            .line_range_of(there)
+            .map(|line| line.start)
+            .unwrap_or(self.content.len());
+        self.byte_at_column(there_start, wanted)
     }
 
     pub(crate) fn move_vertical(&mut self, delta: isize) {
@@ -2844,7 +3024,9 @@ mod tests {
             "an empty buffer is one empty line"
         );
         assert_eq!(line_ranges("x\n"), vec![0..1, 2..2]);
-        let state = TextState::new("abcdef\nab\nabcdefghij".to_string());
+        // `mut`: the line index is cut on the first question now, so asking one is a
+        // mutation of the cache if not of the text.
+        let mut state = TextState::new("abcdef\nab\nabcdefghij".to_string());
         assert_eq!(state.line_index_at(5), 0);
         assert_eq!(state.line_index_at(7), 1);
         assert_eq!(state.line_range_at(15), 10..20);
@@ -2894,11 +3076,11 @@ mod tests {
     /// steps by what the user sees rather than by bytes or code units.
     #[test]
     fn columns_are_clusters_so_cjk_and_marks_count_once() {
-        let state = TextState::new("\u{4e2d}\u{6587}\nabc".to_string());
+        let mut state = TextState::new("\u{4e2d}\u{6587}\nabc".to_string());
         assert_eq!(state.line_range_at(0), 0..6, "two characters, six bytes");
         assert_eq!(state.column_of(3), 1);
         assert_eq!(state.byte_at_column(0, 2), 6);
-        let state = TextState::new("e\u{0301}z\nq".to_string());
+        let mut state = TextState::new("e\u{0301}z\nq".to_string());
         assert_eq!(
             state.byte_at_column(0, 1),
             3,
@@ -3153,5 +3335,381 @@ mod tests {
         assert_eq!(state.edits, 3, "so is an uncommitted composition");
         state.select_range(0..3);
         assert_eq!(state.edits, 3, "and a double click is not");
+    }
+
+    // -----------------------------------------------------------------------
+    // THE LINE-START CACHE
+    //
+    // A cache has one failure mode that a compiler cannot see and a happy-path test
+    // cannot reach: it is right for the edit that built it and wrong for the byte that
+    // moved since. So every case below is checked against `line_ranges` - the reference
+    // model, a whole-buffer walk nobody rewrote - at EVERY byte offset including the last,
+    // rather than at one convenient caret. Four shapes break a `Vec<usize>` silently, and
+    // the four are the point of the section: paste into a buffer that had no index, delete
+    // at the very start, end the document without a line feed, and change a line's LENGTH
+    // without changing the line COUNT - which moves every start below an earlier edit while
+    // leaving the index the same size. That last one is the case a guard on the buffer's
+    // length would not catch and a guard on the mutation counter must.
+    // -----------------------------------------------------------------------
+
+    /// THE ORACLE. Walk every byte of the buffer and demand that the cached answers agree
+    /// with `line_ranges`, the reference model, AND with the plain prefix count of line feeds
+    /// that this replaced - two oracles, one of which is the exact function being retired,
+    /// so a change that alters the ANSWER cannot pass by agreeing with itself. Byte
+    /// `content.len()` is included on purpose: it is the caret position after typing at the end,
+    /// it is the one offset NOT inside any line, and it is where an off-by-one in a
+    /// `partition_point` predicate shows up as a wrong line rather than as a slow frame.
+    fn assert_the_cache_agrees_with_the_model(state: &mut TextState, label: &str) {
+        let model = line_ranges(&state.content);
+        let bytes = state.content.as_bytes().to_vec();
+        for byte in 0..=bytes.len() {
+            let index = state.line_index_at(byte);
+            assert!(
+                index < model.len(),
+                "`{label}`: byte {byte} named line {index} of {}",
+                model.len()
+            );
+            assert_eq!(
+                index,
+                bytes[..byte].iter().filter(|b| **b == b'\n').count(),
+                "`{label}`: the line index of byte {byte} drifted from the prefix count"
+            );
+            assert_eq!(
+                state.line_range_at(byte),
+                model[index],
+                "`{label}`: byte {byte} is line {index}, and the model says {:?}",
+                model[index]
+            );
+        }
+    }
+
+    /// Case 1 of four: PASTE INTO EMPTY. The state is constructed with no index at all
+    /// (`Editor::new` on an untitled note) and the first thing the user does is Ctrl+V, so the
+    /// cut has to happen on the first query AFTER the text arrives - not on the empty buffer
+    /// the constructor saw.
+    #[test]
+    fn a_paste_into_an_empty_buffer_cuts_the_index_after_the_text_arrives() {
+        let mut state = TextState::default();
+        assert_eq!(state.content.len(), 0, "a new note is empty");
+        // Queried while empty, so an index IS cut for the empty buffer: one line, [0].
+        assert_eq!(state.line_index_at(0), 0);
+        assert_eq!(state.line_range_at(0), 0..0);
+        // The paste itself: three lines into a buffer whose index knew only one.
+        state.replace(None, "one\ntwo\nthree");
+        assert_eq!(state.content, "one\ntwo\nthree");
+        assert_the_cache_agrees_with_the_model(&mut state, "pasted into empty");
+        // The byte a stale index gets wrong in the LOUD direction: line 2 starts at byte 8
+        // now and did not exist at all before.
+        assert_eq!(state.line_index_at(8), 2);
+        assert_eq!(state.line_range_at(8), 8..13);
+    }
+
+    /// Case 2 of four: BACKSPACE AT POSITION ZERO - the one offset where a `start - 1`
+    /// underflows and where a `rposition` of nothing and a `rposition` of byte 0 are different
+    /// answers - plus its neighbour, the join at the start of line 1, which REMOVES a line
+    /// feed and so shrinks the index at the same time as the buffer.
+    #[test]
+    fn backspace_at_the_start_of_the_buffer_and_a_join_at_the_start_of_a_line() {
+        // The handler's door with an empty selection: previous_boundary, select_to, replace.
+        let mut state = TextState::new("abc".to_string());
+        state.move_to(0);
+        let at = state.previous_boundary(state.cursor_offset());
+        assert_eq!(at, 0, "there is nowhere left of byte 0, and no wrap");
+        state.select_to(at);
+        assert!(
+            state.selected_range.is_empty(),
+            "so backspace at 0 deletes nothing"
+        );
+        state.replace(None, "");
+        assert_eq!(state.content, "abc", "and the buffer did not move");
+        assert_the_cache_agrees_with_the_model(&mut state, "backspace at zero");
+
+        // Now the join: byte 1 is the start of line 1 of "\nabc", so a backspace there eats
+        // the line feed and the note loses a line AND its first start-of-note feed.
+        let mut state = TextState::new("\nabc".to_string());
+        state.move_to(1);
+        let at = state.previous_boundary(state.cursor_offset());
+        state.select_to(at);
+        assert_eq!(state.selected_range, 0..1, "the line feed is the selection");
+        state.replace(None, "");
+        assert_eq!(state.content, "abc");
+        assert_the_cache_agrees_with_the_model(&mut state, "join at a line start");
+        assert_eq!(state.line_index_at(0), 0, "and there is only line 0 now");
+        assert_eq!(
+            state.line_range_at(3),
+            0..3,
+            "whose end is the whole buffer"
+        );
+    }
+
+    /// Case 3 of four: NO TRAILING NEWLINE, against the same buffer WITH one. The two
+    /// differ by one line and zero caret positions: the caret at the end of "a\nb" is on
+    /// line 1, and the caret at the end of "a\nb\n" is on line 2 - the phantom. A cache that
+    /// forgets the phantom is why Enter at the end of a note appears to do nothing; a cache
+    /// that invents one is why Down walks past the text and the view keeps scrolling.
+    #[test]
+    fn a_document_without_a_trailing_newline_and_one_with_it_agree_with_the_model() {
+        let mut state = TextState::new("a\nb".to_string());
+        assert_the_cache_agrees_with_the_model(&mut state, "no trailing newline");
+        assert_eq!(
+            state.line_index_at(3),
+            1,
+            "the caret at the end is on line 1"
+        );
+        assert_eq!(
+            state.line_range_at(3),
+            2..3,
+            "and that line runs to the buffer"
+        );
+        assert_eq!(
+            state.line_range_at(2),
+            2..3,
+            "the last byte of the last line"
+        );
+        assert_eq!(
+            state.line_range_at(1),
+            0..1,
+            "the line feed itself is still the line ABOVE: it is the separator, and the byte
+            after it (2) is what opens line 1"
+        );
+
+        // Enter at the end: a line appears that no start described a moment ago.
+        state.move_to(state.content.len());
+        state.replace(None, "\n");
+        assert_eq!(state.content, "a\nb\n");
+        assert_the_cache_agrees_with_the_model(&mut state, "trailing newline");
+        assert_eq!(
+            state.line_index_at(4),
+            2,
+            "the phantom line is real and counted"
+        );
+        assert_eq!(state.line_range_at(4), 4..4);
+        assert_eq!(
+            state.vertical_target(1),
+            4,
+            "and Down at the bottom is a no-op"
+        );
+    }
+
+    /// Case 4 of four, and the one the brief is right about: AN EDIT INSIDE A LINE. The
+    /// line COUNT does not change, so every "did the number of lines move" reasoning says
+    /// nothing, and yet every start BELOW an edit in line 0 has to move by the delta while
+    /// the vector stays the same length. Warmed first, then edited: the only way to be
+    /// stale, and the way nobody notices for a week.
+    #[test]
+    fn an_edit_inside_a_line_moves_the_starts_below_it_and_not_the_line_count() {
+        let mut state = TextState::new("one\ntwo\nthree".to_string());
+        assert_the_cache_agrees_with_the_model(&mut state, "before the interior edit");
+        // Bytes: `one`=0..3, feed 3, `two`=4..7, feed 7, `three`=8..13. Grow the LAST
+        // line, whose end is the buffer: the count is unmoved and so is every start, and
+        // only the length of the line the edit landed in changes.
+        state.replace(Some(10..11), "tthirty chars");
+        assert_eq!(state.content, "one\ntwo\nthtthirty charsee");
+        assert_eq!(
+            line_ranges(&state.content).len(),
+            3,
+            "the line count did not move, which is the whole point"
+        );
+        assert_the_cache_agrees_with_the_model(&mut state, "after the last-line edit");
+        assert_eq!(
+            state.line_range_at(22),
+            8..25,
+            "the last line grew with its text: 8..25, not the 8..13 it was before the edit"
+        );
+        assert_eq!(
+            state.line_index_at(4),
+            1,
+            "and the lines above did not move"
+        );
+
+        // Now the same shape at the TOP: no new line, but every start below byte 3 shifts
+        // right by 4. A cache believed past this point answers the wrong line for Home,
+        // for the caret's own range, and for the selection retention that keeps the
+        // candidate window where the user is typing.
+        state.replace(Some(0..0), "zer");
+        assert_eq!(state.content, "zerone\ntwo\nthtthirty charsee");
+        assert_the_cache_agrees_with_the_model(&mut state, "after a shift at the top");
+        assert_eq!(
+            state.line_index_at(6),
+            0,
+            "`zerone` is line 0 and it runs 0..6"
+        );
+        state.select_range(6..6);
+        state.replace(Some(6..6), "\n");
+        assert_the_cache_agrees_with_the_model(&mut state, "after a feed split line 0");
+        assert_eq!(
+            state.line_index_at(7),
+            1,
+            "and the note gained a line mid-buffer"
+        );
+    }
+
+    /// THE NUMBER THE PAINT LANE HARD-WON, asserted from INSIDE the file that could break
+    /// it. `tests/paint_cost.rs` holds the same claim as a bound (<= viewport + 4) and a
+    /// flatness check across sizes; this is the exact value, 31, at the worst-case anchors
+    /// (caret at the top, a mark at the top, and a selection over the WHOLE note), because
+    /// the failure this box could cause is not "wider than the window" - it is "one more row
+    /// per anchor, forever, while nobody watches the print". A line-start index that
+    /// disagreed with `ShapeCache::starts` by one would show up HERE as a changed count,
+    /// before it showed up as a candidate window sitting over the wrong text.
+    ///
+    /// 31 = the 29 rows a 700-pixel viewport at 24-pixel rows shows, plus the caret/mark
+    /// line 0 and the far end of the whole-note selection, both above the window. The
+    /// settled frame is the other half of the claim and it stays ZERO: same retention, same
+    /// composition, text unmoved, so there is nothing the frame could learn.
+    #[test]
+    fn the_retention_window_is_still_31_rows_at_the_worst_case_anchors_and_zero_settled() {
+        struct Row;
+        let mut seen = Vec::new();
+        for lines in [200usize, 2000, 20000] {
+            let mut content = String::new();
+            for index in 0..lines {
+                if index > 0 {
+                    content.push('\n');
+                }
+                content.push_str("the quick brown fox jumps over the lazy dog ");
+                content.push_str(&index.to_string());
+            }
+            let mut cache: ShapeCache<Row> = ShapeCache::default();
+            cache.align(&content, 0);
+            // The geometry tests/paint_cost.rs drives: a 700px box, 24px rows, scrolled to
+            // the bottom so that EVERY anchor of the worst case sits above the window.
+            let geom = LineGeometry {
+                top: px(0.0),
+                left: px(0.0),
+                right: px(700.0),
+                row: px(24.0),
+                scroll_y: px(((lines - 30) * 24) as f32),
+                viewport_h: px(700.0),
+            };
+            let visible = geom.visible_lines(cache.lines());
+            let head = cache.bytes_of(&content, 0).unwrap();
+            let marked = Some(head.start..head.end.max(head.start + 1));
+            let selection = 0..content.len();
+            let retention =
+                retained_window(&cache, &visible, content.len(), 0, &marked, &selection);
+            let mut frame = PaintStats::default();
+            rebuild_shapes(
+                &content,
+                marked.clone(),
+                &retention,
+                &mut cache,
+                &mut frame,
+                &mut |_text, _mark| Row,
+            );
+            seen.push(frame.lines_examined);
+            let mut settled = PaintStats::default();
+            rebuild_shapes(
+                &content,
+                marked,
+                &retention,
+                &mut cache,
+                &mut settled,
+                &mut |_text, _mark| Row,
+            );
+            assert_eq!(settled.lines_examined, 0, "{lines} lines, a settled frame");
+        }
+        assert_eq!(
+            seen,
+            vec![31, 31, 31],
+            "the window must still be the same 31 rows at 200, 2,000 and 20,000 lines"
+        );
+    }
+
+    /// THE COST, printed at the size that used to hurt, in the same four numbers the box is
+    /// judged on. The assertion is FLATNESS, the form the paint lane chose: a microsecond
+    /// ceiling belongs to the machine, while "a lookup at 20,000 lines costs what a lookup
+    /// at 200 costs" and "an arrow key is no longer O(note)" are claims that survive any
+    /// box. The mutation column is here because the re-cut has to be paid SOMewhere and the
+    /// honest question is where: it rides on the keystroke that already rebuilds the whole
+    /// string, and `splice` is timed beside it in the same loop to show the ratio rather
+    /// than to assert a machine-specific one.
+    #[test]
+    fn a_warm_line_lookup_costs_the_same_at_200_lines_and_at_20_thousand() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut warm_at_20k = 0usize;
+        let mut walk_at_20k = 0usize;
+        for lines in [200usize, 2000, 20000] {
+            let mut content = String::new();
+            for index in 0..lines {
+                if index > 0 {
+                    content.push('\n');
+                }
+                content.push_str("the quick brown fox jumps over the lazy dog ");
+                content.push_str(&index.to_string());
+            }
+            let mut state = TextState::new(content.clone());
+            state.move_to(content.len());
+            // What a mutation cost BEFORE the index existed: one rebuild of the whole
+            // string. Beside it, what one costs NOW: the same rebuild plus the re-cut.
+            let began = Instant::now();
+            for _ in 0..10 {
+                black_box(splice(black_box(&content), &(0..0), black_box("")));
+            }
+            let splice_us = began.elapsed().as_micros() as usize / 10;
+            let began = Instant::now();
+            for _ in 0..10 {
+                state.replace(Some(0..0), "");
+            }
+            let mutation_us = began.elapsed().as_micros() as usize / 10;
+            // THE CUT, once, on a state whose text has just moved. This is the O(note) the
+            // cache still pays - it cannot not pay it - and the claim is only that it is
+            // paid ONCE per edit rather than once per question.
+            state.replace(Some(0..0), "");
+            let began = Instant::now();
+            black_box(state.line_index_at(content.len()));
+            let cut = began.elapsed().as_micros() as usize;
+            // Twenty arrow keys up from the bottom on the now-warm index: the path the
+            // brief names, and the number that was 7,170 us PER PRESS at 20,000 lines.
+            let began = Instant::now();
+            for _ in 0..20 {
+                state.move_vertical(-1);
+                black_box(state.vertical_target(1));
+            }
+            let walk = began.elapsed().as_micros() as usize / 20;
+            let began = Instant::now();
+            for _ in 0..200 {
+                black_box(state.line_index_at(black_box(content.len())));
+                black_box(state.line_range_at(black_box(content.len())));
+            }
+            let warm = began.elapsed().as_micros() as usize / 400;
+            println!(
+                "CARET lines={lines:>5} per_splice={:>6}us per_mutation={:>6}us per_edit_cut={:>6}us per_arrow_key={:>5}us warm_lookup={:>3}us",
+                splice_us, mutation_us, cut, walk, warm
+            );
+            if lines == 20000 {
+                walk_at_20k = walk;
+                warm_at_20k = warm;
+            }
+            // BOUNDS, not claims about this machine's clock. 5 us is a binary search; 50 is
+            // a search plus one line of grapheme counting - and 7,170 was a scan of the
+            // note PER KEY. The cut keeps only the "not seconds" bound: it is deliberately
+            // still O(note), because there is exactly one unavoidable scan per text change
+            // and this is the right place to spend it.
+            assert!(warm < 5, "a warm lookup is a search, not a scan: {warm}us");
+            assert!(
+                walk < 50,
+                "an arrow key must not walk the note: {walk}us at {lines} lines"
+            );
+            assert!(
+                cut < 20_000,
+                "the one cut per edit must not be seconds: {cut}us"
+            );
+        }
+        // THE FLATNESS, in the same form as the paint lane's: the number at 20,000 lines
+        // is the number at 200. Compared against the smallest size's own measurement
+        // rather than against a constant, because "flat" is the claim and "5" is not.
+        // THE FLATNESS, in the form the paint lane used: compared against the smallest
+        // size's own measurement rather than a machine constant, because "flat" is the
+        // claim and "5" is not.
+        assert!(
+            warm_at_20k < 5,
+            "the 20,000-line lookup must cost what the 200-line one costs: {warm_at_20k}us"
+        );
+        assert!(
+            walk_at_20k < 50,
+            "the 20,000-line arrow key must cost what the 200-line one costs: {walk_at_20k}us"
+        );
     }
 }
