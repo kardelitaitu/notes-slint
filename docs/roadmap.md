@@ -82,6 +82,13 @@ are exactly what the outstanding bridge slices are for.
 `platform` trait + Windows backend. Restore, validate against monitors, clamp off-screen,
 handle maximised + DPI. Test on 100/150/200% scaling and with a monitor unplugged.
 
+Status: restore, monitor validation and clamping are built; "handle maximised" is **not**
+closed. `session.maximized` still has no producer, so a maximised window reopens at its
+restore rect (check 1 under M2 above). `4a2ca317` landed the `showCmd` readback in
+`platform` and reported it through `api`; only the rect is consumed there today, and the
+`api`/bridge slices that store the flag are in flight
+(`.agents/notes/proposed/2026-09-12-maximized-persistence.md`).
+
 **M4 — Autosave & pin.**
 Debounce, periodic flush, blur/close/quit flush, external-change detection, and the
 byte-identical round-trip test suite (§4.5). Pin button + shortcut + persisted state.
