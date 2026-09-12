@@ -12,10 +12,16 @@
 //!   while the caller still holds a live Sender, which is why a UI callback can
 //!   send it and then be dropped itself.
 //! * [`Gateway::drop`] is **ABORT** - the last Sender goes with it, the engine
-//!   sees Disconnected and stops. Only this path joins, because join blocks and
-//!   drop is the one place where a caller has already said "I am done with this
+//!   sees Disconnected and stops. Only this path joins WITHOUT ANSWERING, because join
+//!   blocks and drop is the one place where a caller has already said "I am done with this
 //!   port". Dropping a Gateway that was also told to Shutdown is harmless: the
 //!   join just waits for an exit that is already under way.
+//! * BOTH JOINS ARE BOUNDED, AND `close()` NAMES WHAT ITS JOIN SAW, with an [`Exit`]:
+//!   clean, [`Exit::Abandoned`] (healthy, still working, given up on after 3 s), or
+//!   [`Exit::Panicked`]. A thread that unwound and a thread that finished look IDENTICAL from
+//!   here - both drop the command receiver and the event sender - and only `join()`'s payload
+//!   tells them apart. That difference is the one a user can lose an edit to without the app
+//!   being stuck, so it travels in the return type rather than being inferred from silence.
 //!
 //! Disk I/O is deliberately SPLIT: the pre-window reads of the two state files
 //! happen here, on the calling thread (see [`Gateway::startup_state`] for why
@@ -63,6 +69,38 @@ pub(crate) type EventTx = Sender<Event>;
 /// yet. `pinned` is a field here rather than something the bridge infers because
 /// topmost must be applied as the window appears - a window that pops up unpinned
 /// and pins itself 200 ms later is a visible lie.
+/// Why [`Gateway::close`] did not complete cleanly - the typed answer it could not have
+/// until a bridge's exit note was caught SAYING THE OPPOSITE OF THE TRUTH.
+///
+/// `close()` used to hand back the command itself: one value for every failure, and the call
+/// site said so out loud ("the port hands back ONE error for two outcomes and the bridge
+/// cannot tell them apart"). There were not even two. An engine that had PANICKED was a third
+/// outcome wearing the first one's clothes: a dead thread fails the send and joins instantly,
+/// which is observably a clean exit. The bridge then waited on `EventRx`, saw `Disconnected`
+/// (true - the panicked engine had dropped its sender), and printed "the engine finished its
+/// exit after the join deadline had passed - the final save ran". Nothing ran: the panic
+/// skipped the drain, the final flush and the session write.
+///
+/// Three named outcomes, so the sentence is chosen from a fact instead of guessed from the
+/// absence of one. Deliberately NOT an [`Event`]: the port's only `Event` sender lives in the
+/// engine, and a clone held here would delay `EventRx`'s `Disconnected` past `close()` - which
+/// would break the pinned "Disconnected means the engine is gone" contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exit {
+    /// Shutdown was never accepted, because the queue had no reader. With a thread that then
+    /// joined cleanly this is a port that had ALREADY exited on its own terms - which is not a
+    /// promise that a final save happened, only that this call did not prevent one.
+    QueueClosed,
+    /// The bounded join ran out while the engine was still running: HEALTHY, and ABANDONED. It
+    /// finishes its own exit later, final flush included; the payload is how long the caller
+    /// waited first. This is the outcome the 3 s trade was priced for.
+    Abandoned(Duration),
+    /// The engine thread unwound. Nothing after the panic ran - no drain, no final save, no
+    /// session write. The one outcome where a user loses characters to an app that is NOT
+    /// stuck, which is exactly why it may not share a value with "it went fine".
+    Panicked,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct InitialState {
     /// Where the window was: rect (frame pixels), monitor, scale, maximised,
@@ -90,6 +128,10 @@ pub struct Gateway {
     engine: Option<JoinHandle<()>>,
     /// Option because startup_state takes it: the snapshot is true exactly once.
     initial: Option<InitialState>,
+    /// HAS THE ENGINE THREAD UNWOUND? Recorded from whichever join sees it first, so the
+    /// answer survives the join that produced it - see [`Gateway::engine_panicked`].
+    /// `false` is "nothing has been seen to die", never "it is fine".
+    panicked: bool,
 }
 
 /// The state directory: created if absent (case a), accepted as-is if it is
@@ -115,17 +157,59 @@ const JOIN_DEADLINE: Duration = Duration::from_secs(3);
 /// the same bug wearing a different hat. The helper detaches and finishes
 /// whenever the engine does (the engine unblocks when its owner next pumps
 /// and completes its own exit, final flush included).
-fn join_bounded(handle: JoinHandle<()>, deadline: Duration) -> Option<Duration> {
-    let (done_tx, done_rx) = mpsc::channel::<()>();
+/// What one bounded wait concluded. THREE answers, because three different things can happen
+/// to the thread and the caller's honest sentence differs for each: it finished, it unwound,
+/// or it never came back inside the deadline.
+///
+/// The middle one is the reason this type exists. A thread that panicked drops the command
+/// receiver and the event sender on its way out, so from the outside it looks exactly like a
+/// thread that exited cleanly - and the value that says otherwise, `JoinHandle::join()`'s
+/// `Err`, used to be bound to `let _` here. See [`Exit`].
+#[derive(Debug)]
+enum Joined {
+    Clean,
+    Panicked,
+    TimedOut(Duration),
+}
+
+fn join_bounded(handle: JoinHandle<()>, deadline: Duration) -> Joined {
+    // The bool IS the join's answer, carried out on the completion channel: the helper is the
+    // only place that holds the handle after this point.
+    let (done_tx, done_rx) = mpsc::channel::<bool>();
     thread::spawn(move || {
-        let _ = handle.join();
-        let _ = done_tx.send(());
+        let _ = done_tx.send(panicked_already(handle.join()));
     });
     let started = Instant::now();
     match done_rx.recv_timeout(deadline) {
-        Ok(()) => None,
-        Err(_) => Some(started.elapsed()),
+        // `Disconnected` - the helper died without answering, which it can only do if the
+        // send was refused - joins the timeout arm exactly as before: no answer inside the
+        // deadline is the same actionable fact either way.
+        Ok(true) => Joined::Panicked,
+        Ok(false) => Joined::Clean,
+        Err(_) => Joined::TimedOut(started.elapsed()),
     }
+}
+
+/// THE SAME WAIT, WITH THE FACT THE ONE ABOVE THROWS AWAY.
+///
+/// `handle.join()` returns `Err` for a thread that unwound, and the helper above binds it
+/// to `let _`. That is the whole of an inverted claim: an engine that PANICKED inside
+/// `run()` has dropped its `EventTx` and its `Command` receiver, so `close()`'s send fails,
+/// the join of the dead thread "succeeds" instantly, and the caller cannot tell that apart
+/// from a clean exit - while the bridge's exit note said "the final save ran". It did not
+/// run: the panic skipped the drain, the final flush and the session write.
+///
+/// This variant keeps the answer. It is the private half of [`Gateway::engine_panicked`],
+/// which is where the fact becomes usable.
+fn panicked_already(joined: thread::Result<()>) -> bool {
+    joined.is_err()
+}
+
+/// The blocking-join outcome of a thread that has already finished. Unreachable if the
+/// thread is not finished, so this can never be the hang `join_bounded` exists to avoid -
+/// the caller checks `is_finished()` first. Used by [`Gateway::engine_panicked`].
+fn join_finished(handle: JoinHandle<()>) -> bool {
+    panicked_already(handle.join())
 }
 
 /// The two host seams the port owns, built or absent together (D46). Named
@@ -278,6 +362,10 @@ impl Gateway {
             // instead of this constructor unwinding.
             engine: spawned.ok(),
             initial: Some(initial),
+            // Nothing has died at birth. A thread that never STARTED (`spawned` was an
+            // Err) is not a panic either - that case is reported by EventRx closing at
+            // once, as the constructor comment says.
+            panicked: false,
         };
         (gateway, event_rx)
     }
@@ -338,19 +426,24 @@ impl Gateway {
     /// Asks the engine to shut down and WAITS for it to finish: the explicit,
     /// joinable alternative to [`impl Drop for Gateway`].
     ///
-    /// [`Command::Shutdown`] is DRAIN AND EXIT, so close() is the path that
-    /// guarantees every accepted command - and the final session write inside the
-    /// drain - has been carried out before the caller proceeds. It returns the
-    /// command back if the engine was already gone (the same [`Self::send`]
-    /// contract), and it blocks, which is precisely why it is a named method and
-    /// not something a destructor does silently.
+    /// [`Command::Shutdown`] is DRAIN AND EXIT, so an `Ok(())` is the strongest claim this
+    /// port can make: every accepted command - and the final session write inside the drain -
+    /// was carried out before the caller proceeded. Every other answer is an [`Exit`], and the
+    /// three arms are NOT interchangeable, which is the whole reason they are three. It blocks,
+    /// which is precisely why it is a named method and not something a destructor does silently.
+    ///
+    /// THE JOIN OUTRANKS THE SEND, and that ordering is the fix. `send()` failing means only
+    /// "no reader was left" - equally true of a port that exited cleanly and of one that
+    /// unwound - so answering from the send alone is how a panicked engine came to be reported
+    /// as a save that ran. Whatever the send said, the thread's own ending decides the value.
     ///
     /// Never call it from the engine thread: it joins the caller's own thread.
     /// The debug_assert in [`Self::send`] fires first if a Gateway was ever
     /// reachable from engine code, and no clone of the command Sender escapes this
     /// struct to make that possible.
-    pub fn close(mut self) -> Result<(), Command> {
-        let result = self.send(Command::Shutdown);
+    pub fn close(mut self) -> Result<(), Exit> {
+        // Not the answer on its own; see the ordering note above.
+        let accepted = self.send(Command::Shutdown).is_ok();
         if let Some(handle) = self.engine.take() {
             // BOUNDED, never a bare join: the engine can be blocked in a
             // synchronous window op whose owner is PARKED - and the thread
@@ -358,19 +451,25 @@ impl Gateway {
             // thread that owner needs in order to pump. A bare join here was
             // the measured permanent hang (12 s timed, >15 s reproduced, no
             // panic, no log, no event).
-            if let Some(waited) = join_bounded(handle, JOIN_DEADLINE) {
-                // The report is the TYPED RESULT, not an Event: the only Event
-                // sender lives in the engine, and a clone held by the Gateway
-                // would delay EventRx's Disconnected past close() - breaking
-                // the pinned "Disconnected means the engine is gone" contract
-                // (pinned by a_slow_consumer_never_blocks_the_producer). The
-                // abandoned engine's own later events still arrive on the
-                // channel, and it finishes its exit when its owner next pumps.
-                let _ = waited;
-                return Err(Command::Shutdown);
+            match join_bounded(handle, JOIN_DEADLINE) {
+                // Reported as the typed result rather than as an Event for the reason in
+                // [`Exit`]'s doc: the only Event sender lives in the engine, and a clone held
+                // by the Gateway would delay EventRx's Disconnected past close() - breaking the
+                // pinned "Disconnected means the engine is gone" contract (pinned by
+                // a_slow_consumer_never_blocks_the_producer).
+                Joined::Panicked => return Err(Exit::Panicked),
+                // The abandoned engine is HEALTHY and still working: its later events arrive on
+                // the channel and it finishes its exit when its owner next pumps - which is why
+                // the bridge gets to wait again, bounded, before it words this.
+                Joined::TimedOut(waited) => return Err(Exit::Abandoned(waited)),
+                Joined::Clean => {}
             }
         }
-        result
+        if accepted {
+            Ok(())
+        } else {
+            Err(Exit::QueueClosed)
+        }
     }
 
     /// True once this Gateway cannot accept anything: [`Self::close`] ran, it was
@@ -382,6 +481,45 @@ impl Gateway {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.cmd_tx.is_none() || self.engine.as_ref().is_some_and(|h| h.is_finished())
+    }
+
+    /// DID THE ENGINE THREAD DIE BY A PANIC?
+    ///
+    /// WHY THIS METHOD EXISTS. A panicked engine drops the command receiver and the event
+    /// sender on its way out, so `close()`'s send fails and its bounded join of an
+    /// already-dead thread returns instantly - observably IDENTICAL to a clean exit, because
+    /// the one value that says otherwise, `JoinHandle::join()`'s `Err`, was bound to `let _`.
+    /// The result was an inverted claim: the bridge's exit note told the user "the final
+    /// save ran" while the panic had skipped the drain, the final flush and the session
+    /// write. This reads that value.
+    ///
+    /// ASK BEFORE [`Self::close`], which consumes the handle. It never blocks: a thread that
+    /// has not finished answers `false`, and a finished one is joined - instant, because it
+    /// is already gone. The fact is remembered, so a second call cannot disagree with the
+    /// first and a later `close()` cannot lose it.
+    ///
+    /// BOTH WINDOWS ARE COVERED, which is the point of the pair. This call answers for a
+    /// thread that is already dead when the caller still holds the handle; [`Exit::Panicked`]
+    /// answers for one that unwinds later, inside its own exit, while `close()` is joining.
+    /// Neither one relies on the other, and neither one is asked to explain a shutdown that
+    /// succeeded - `Ok(())` from `close()` means the drain ran.
+    #[must_use]
+    pub fn engine_panicked(&mut self) -> bool {
+        if self.panicked {
+            return true;
+        }
+        // `is_finished()` first: this is the whole reason the call cannot become the hang
+        // `join_bounded` was written to avoid.
+        if self
+            .engine
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            if let Some(handle) = self.engine.take() {
+                self.panicked = join_finished(handle);
+            }
+        }
+        self.panicked
     }
 
     /// True while the engine thread is still running. A test seam worth keeping:
@@ -429,15 +567,16 @@ impl Drop for Gateway {
         );
         drop(self.cmd_tx.take());
         if let Some(handle) = self.engine.take() {
-            // BOUNDED for the same reason as close(): a bare join in a
-            // destructor is an unkillable hang. A panicked engine is not
-            // re-raised from a destructor (panicking in Drop while unwinding
-            // aborts the process); EventRx is how the caller learns the engine
-            // is gone. A timeout here CANNOT be reported - the Gateway holds no
-            // Event sender by contract - and it is the one silent path, chosen
-            // so the Disconnected contract survives; close() is the reporting
-            // shutdown path.
-            let _ = join_bounded(handle, JOIN_DEADLINE);
+            // BOUNDED for the same reason as close(): a bare join in a destructor is an
+            // unkillable hang. The join now DOES name what it saw and the panic is recorded,
+            // but the recording can never be read from here: a destructor runs precisely when
+            // the caller has given up the handle, and re-raising a panic while unwinding would
+            // abort the process. So this stays the one silent shutdown path and [`Self::close`]
+            // stays the reporting one - which is the caller's own choice, not a gap in this type.
+            match join_bounded(handle, JOIN_DEADLINE) {
+                Joined::Panicked => self.panicked = true,
+                Joined::Clean | Joined::TimedOut(_) => {}
+            }
         }
     }
 }
@@ -460,9 +599,48 @@ mod tests {
                 autosave_enabled: true,
                 pinned: false,
             }),
+            panicked: false,
         };
         assert!(!gateway.engine_is_alive());
         drop(gateway);
+    }
+
+    /// THE INVERTED CLAIM, closed. A thread that unwound and a thread that finished look
+    /// identical from the outside - both drop the channels, both join "successfully" - and
+    /// the only thing that separates them is the `Err` that `join_bounded` threw away. A
+    /// spawned thread that panics stands in for `run()`, because making the real engine
+    /// panic would mean editing `engine.rs`, which this seam must not do to prove a point
+    /// about the join.
+    #[test]
+    fn a_panicking_engine_is_not_a_clean_exit() {
+        fn gateway_of(handle: JoinHandle<()>) -> Gateway {
+            Gateway {
+                cmd_tx: None,
+                engine: Some(handle),
+                initial: None,
+                panicked: false,
+            }
+        }
+        let dead = thread::spawn(|| panic!("the engine died here"));
+        let healthy = thread::spawn(|| {});
+
+        let mut g = gateway_of(dead);
+        while !g.engine.as_ref().is_some_and(JoinHandle::is_finished) {
+            thread::yield_now();
+        }
+        assert!(g.engine_panicked(), "an unwound thread must be reported");
+        // Remembered, so the answer cannot flip when the thread is gone from the field.
+        assert!(g.engine_panicked(), "and it stays true on the second ask");
+
+        let mut ok = gateway_of(healthy);
+        while !ok.engine.as_ref().is_some_and(JoinHandle::is_finished) {
+            thread::yield_now();
+        }
+        assert!(
+            !ok.engine_panicked(),
+            "a thread that ended normally is not a death: the claim must not be inverted the \
+             other way"
+        );
     }
 
     /// The started engine is alive while its Gateway is held.
@@ -487,6 +665,7 @@ mod tests {
             cmd_tx: Some(cmd_tx),
             engine: None,
             initial: None,
+            panicked: false,
         };
         assert_eq!(
             gateway.send(Command::SetPinned(true)),
@@ -498,6 +677,7 @@ mod tests {
             cmd_tx: None,
             engine: None,
             initial: None,
+            panicked: false,
         };
         assert_eq!(closed.send(Command::Shutdown), Err(Command::Shutdown));
     }

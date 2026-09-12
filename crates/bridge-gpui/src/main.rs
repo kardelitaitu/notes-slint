@@ -79,8 +79,8 @@ use gpui_kit::{
     div, px, rgb, size,
 };
 use notes_api::{
-    Command, Encoding, Event, EventRx, FileMeta, Gateway, InitialState, LineEnding, RecentEntry,
-    Rect, Settings, SkipReason, StateDir, WindowHandle, resolve_state_dir,
+    Command, Encoding, Event, EventRx, Exit, FileMeta, Gateway, InitialState, LineEnding,
+    RecentEntry, Rect, Settings, SkipReason, StateDir, WindowHandle, resolve_state_dir,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -2260,42 +2260,70 @@ fn with_view(
 
 fn close(gateway: &Rc<RefCell<Option<Gateway>>>, events: &Rc<RefCell<EventRx>>) {
     if let Some(gateway) = gateway.borrow_mut().take() {
-        // Blocking by contract: drain, final session write, join. Legal here
-        // because this is the UI thread on its way out, not a frame, and not the
-        // engine thread.
+        // Blocking by contract: drain, final session write, join. Legal here because this is
+        // the UI thread on its way out, not a frame, and not the engine thread.
         //
-        // The port hands back ONE error for two outcomes and the bridge cannot tell
-        // them apart: either the queue was already closed, or the bounded join ran out
-        // and the engine was ABANDONED inside its own exit. The second is the one a
-        // user can lose characters to - and it names the trade: a 3 s abandoned
-        // shutdown beats the permanent hang this replaced, which was measured at 12 s
-        // timed out and >15 s lived through once with no panic, no log, and no event.
-        if gateway.close().is_err() {
-            // Do not leave main on an assumption. The port documents Disconnected on
-            // the EventRx as the terminal signal that the engine thread is gone
-            // (crates/api/src/gateway.rs:312), so the bridge can ASK instead of guessing
-            // which of the two outcomes happened - once more, bounded, because the
-            // reviewer's interleaving is real: a Flush queued behind Shutdown runs a
-            // genuine save (temp write, fsync, rename), and on slow or network storage
-            // that can outrun 3 s and the process would otherwise exit mid-syscall. That
-            // is silent loss of the newest edit, the worst failure this app can have.
-            //
-            // 10 s is the price of not hanging forever, not an expectation: an
-            // abandoned-but-healthy engine finishes its exit in tens of milliseconds in
-            // practice, so the wait almost never runs anywhere near its budget. Parking
-            // here is legal precisely because this is not a frame - the rule AGENTS.md
-            // states is no blocking on a channel inside a GPUI frame, and by now the
-            // frame loop has ended and the pump died with its window.
-            if wait_for_engine_exit(events) {
-                note_shutdown(
-                    "the engine finished its exit after the join deadline had passed - the final save ran",
-                );
-            } else {
-                note_shutdown(
-                    "the engine never answered within 10 s of being abandoned - the last edit may not be saved",
-                );
+        // THREE answers now, and they are the port's, not the bridge's guess. This call used
+        // to get ONE error value for every failure - "the port hands back ONE error for two
+        // outcomes and the bridge cannot tell them apart" is the comment that used to sit here
+        // - and there were not even two: an engine that had PANICKED drops the command receiver
+        // and the event sender on its way out, so it fails the send and joins instantly, which
+        // is observably a CLEAN EXIT from here. The result was this file telling a user "the
+        // final save ran" through a dead engine whose panic had skipped the drain, the final
+        // flush and the session write. [`Exit`]'s arms are the fix; the wording lives in
+        // `exit_note` so the claim is testable without an engine that agrees to panic.
+        match gateway.close() {
+            // The ordinary ending, and the only one that says nothing: every accepted command,
+            // the final session write included, was carried out before this returned.
+            Ok(()) => {}
+            // The queue had no reader and the thread joined cleanly: an engine that had already
+            // exited on its own terms. SILENT ON PURPOSE, and silent about one thing only -
+            // whether THIS call stopped a save (it did not, because there was nothing to stop).
+            // It is not a claim that a save happened, and inventing one is the same mistake in
+            // the other direction. The queue closing is itself already traced by the pump as
+            // "the port has closed: no more events".
+            Err(Exit::QueueClosed) => {}
+            // The trade this whole path exists for: a 3 s abandoned shutdown beats the
+            // permanent hang it replaced, which was measured at 12 s timed out and >15 s lived
+            // through once with no panic, no log and no event. But "abandoned" is a verdict about
+            // the DEADLINE, not about the engine - a Flush queued behind Shutdown runs a genuine
+            // save (temp write, fsync, rename), and on slow or network storage that outruns 3 s
+            // while the engine is perfectly healthy. Exiting mid-syscall would be silent loss of
+            // the newest edit, the worst failure this app can have, so the bridge ASKS once more
+            // before it words this: the port documents Disconnected on EventRx as the terminal
+            // signal that the engine thread is gone. The 10 s behind that wait is the price of
+            // not hanging forever, not an expectation - an abandoned-but-healthy engine finishes
+            // in tens of milliseconds in practice. Parking here is legal precisely because this
+            // is not a frame: the loop has ended and the pump died with its window.
+            Err(Exit::Abandoned(_)) => {
+                note_shutdown(exit_note(false, wait_for_engine_exit(events)));
             }
+            // Nothing after a panic runs, so nothing here may imply that it did. No wait on the
+            // channel either: it is already Disconnected BECAUSE the thread died, which is the
+            // very fact that used to be misread as proof of a finished exit.
+            Err(Exit::Panicked) => note_shutdown(exit_note(true, false)),
         }
+    }
+}
+
+/// THE EXIT SENTENCE, as data.
+/// user can lose an edit to, and the only way to test a claim about a dead engine is to take
+/// the engine out of the test: `engine.rs` is not something this crate may edit to make a
+/// test greener, so no test here can arrange a real panic. What CAN be pinned is the
+/// precedence - see `the_exit_note_never_buys_a_clean_sentence_with_a_dead_engine`.
+///
+/// `panicked` OWNS the answer and `waited` is then not consulted at all. That is not shorthand
+/// for "prefer the panic": once the engine unwound, nothing the event channel says afterwards
+/// can make "the final save ran" true, because the code that would have run it is gone. The
+/// abandoned case is the opposite situation - a HEALTHY engine that outran a deadline - and
+/// there `waited` is the whole question, which is why it gets the two honest sentences.
+fn exit_note(panicked: bool, waited: bool) -> &'static str {
+    if panicked {
+        "the engine thread died in a panic: the final save did NOT run - the newest edits are NOT on disk"
+    } else if waited {
+        "the engine finished its exit after the join deadline had passed - the final save ran"
+    } else {
+        "the engine never answered within 10 s of being abandoned - the last edit may not be saved"
     }
 }
 
@@ -2907,11 +2935,38 @@ mod tests {
         }
     }
 
+    /// THE INVERTED CLAIM, pinned as data. Before this slice the bridge had one error value
+    /// for every failed shutdown and printed "the final save ran" for a panicked engine,
+    /// because a dead thread disconnects the event channel exactly like a finished one. So the
+    /// thing worth proving is not that the panic sentence exists, it is that NOTHING CAN BUY IT
+    /// BACK: `waited` is true here - the most tempting "it did finish" signal the bridge has -
+    /// and the answer is still that the save did not run.
+    #[test]
+    fn the_exit_note_never_buys_a_clean_sentence_with_a_dead_engine() {
+        let dead = exit_note(true, true);
+        assert!(dead.contains("did NOT run"), "{dead}");
+        assert!(
+            !dead.contains("the final save ran"),
+            "the panic sentence must not contain the old claim as a substring either: {dead}"
+        );
+        // Same answer whichever way the channel answered afterwards, i.e. it is not consulted.
+        assert_eq!(exit_note(true, true), exit_note(true, false));
+        // The healthy case keeps BOTH honest sentences, and they are different claims.
+        assert!(exit_note(false, true).contains("the final save ran"));
+        assert!(exit_note(false, false).contains("may not be saved"));
+        assert_ne!(
+            exit_note(false, true),
+            exit_note(false, false),
+            "an engine that finished after the deadline and one that never answered are not \
+             the same event, and must not share a sentence"
+        );
+    }
+
     /// The flap, as numbers. A wake that ends on the SAME line is the normal case, not
     /// the rare one: the 750 ms AutosaveSkipped S6 is about to put on a timer, a retry,
     /// a duplicate. Unconditional printing (what the code did while its comment claimed
     /// otherwise) is one line per wake into a redirected log, forever. A genuine
-    /// two-state flap still prints every line, and that is the correct limit of this
+    /// alternation prints every one of them, and correctly so: that is information. The
     /// fix: this is change gating, not rate limiting.
     #[test]
     fn a_repeated_line_prints_once_and_a_real_alternation_prints_every_time() {

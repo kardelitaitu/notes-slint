@@ -80,13 +80,23 @@ fn shutdown_survives_an_engine_blocked_in_a_window_op() {
         "close() hung {:?} on a blocked engine - the join is not bounded",
         elapsed
     );
-    // And the report is honest and typed: shutdown was ACCEPTED but not
-    // completed - Err(Shutdown), not an Event, because a Gateway-held Event
-    // sender would delay the Disconnected contract (see gateway.rs).
+    // And the report is honest and TYPED: shutdown was accepted but not completed, which is
+    // its own arm - `Exit::Abandoned` - and not the arm the port used to hand out for every
+    // failure. Still a typed result rather than an Event, because a Gateway-held Event sender
+    // would delay the Disconnected contract (see gateway.rs); and still not `Panicked`, which
+    // is the third possibility this test could never have told apart before the enum existed.
     assert!(
-        matches!(outcome, Err(notes_api::Command::Shutdown)),
+        matches!(outcome, Err(notes_api::Exit::Abandoned(_))),
         "a timed-out shutdown must be reported as unfinished: {outcome:?}"
     );
+    // The payload is the wait the caller gave up after, so a bridge can print the number it
+    // actually paid instead of a constant.
+    if let Err(notes_api::Exit::Abandoned(waited)) = outcome {
+        assert!(
+            !waited.is_zero(),
+            "an abandonment that waited 0 s is a bug, not a trade"
+        );
+    }
 
     // ABANDONED IS NOT LOST - the documented trade-off, proven end to end:
     // unblock the world, and the abandoned engine finishes its OWN exit. The

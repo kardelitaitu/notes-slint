@@ -20,8 +20,9 @@ use notes_platform as _;
 use thiserror as _;
 
 use notes_api::{
-    Command, Encoding, Event, FileMeta, Gateway, InitialState, LineEnding, LoadError, RecentEntry,
-    Rect, SaveError, Session, Settings, SkipReason, StateDir, WindowHandle, resolve_state_dir,
+    Command, Encoding, Event, Exit, FileMeta, Gateway, InitialState, LineEnding, LoadError,
+    RecentEntry, Rect, SaveError, Session, Settings, SkipReason, StateDir, WindowHandle,
+    resolve_state_dir,
 };
 
 /// FCR 2: the D-STATE rule is reachable from the port. The bridge must not import
@@ -125,6 +126,47 @@ fn a_bridge_can_obey_the_startup_order_with_only_notes_api() {
     // out here is the other half of the same fact - the channel closes with the
     // engine, so no caller can be left waiting for an event that will never come.
     assert!(rx2.recv().is_err(), "EventRx closes with the engine");
+}
+
+/// THE SHUTDOWN OUTCOMES ARE REACHABLE FROM OUT HERE, and distinct.
+///
+/// This is the FCR 2 half of a claim that used to be inverted in a running app: a bridge that
+/// cannot name the difference between an engine that finished its exit, one that was given up on
+/// while still healthy, and one that UNWOUND has to guess - and guessing is how users were told
+/// "the final save ran" through a dead engine. So the type is imported by path above, the three
+/// arms are matchable, the abandonment carries its wait, and `Debug + PartialEq` mean a bridge
+/// can assert on the outcome in its own tests instead of printing it and squinting.
+#[test]
+fn the_three_ways_a_shutdown_can_end_are_named_by_the_port() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (gateway, _rx) = Gateway::start(StateDir(tmp.path().to_path_buf()), Settings::default());
+    let outcome: Result<(), Exit> = gateway.close();
+    assert!(
+        matches!(
+            outcome,
+            Ok(()) | Err(Exit::QueueClosed) | Err(Exit::Abandoned(_)) | Err(Exit::Panicked)
+        ),
+        "an outcome the bridge has no arm for: {outcome:?}"
+    );
+    // A clean quit on a temp dir is the Ok arm; if a machine ever disagrees, this says so
+    // rather than leaving the match to be reasoned about from a transcript.
+    assert!(
+        outcome.is_ok(),
+        "a healthy engine answers Ok(()) : {outcome:?}"
+    );
+    // The arms are three different facts, not one fact in three spellings.
+    assert_ne!(Exit::Panicked, Exit::QueueClosed);
+    assert_ne!(
+        Exit::Abandoned(std::time::Duration::from_millis(1)),
+        Exit::QueueClosed
+    );
+    assert_eq!(Exit::QueueClosed, Exit::QueueClosed, "and comparable");
+    // The pre-close seam: an engine that is alive answers not-panicked, and asking twice is
+    // allowed, because a bridge asks this BEFORE close() consumes the handle.
+    let (mut second, _rx2) =
+        Gateway::start(StateDir(tmp.path().to_path_buf()), Settings::default());
+    assert!(!second.engine_panicked(), "a live engine has not died");
+    assert!(!second.engine_panicked(), "and the answer is stable");
 }
 
 /// The vocabulary a status line needs is all public: a save failure, a skip reason,

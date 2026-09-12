@@ -101,12 +101,13 @@
 //! Wired now, exactly as the last slice recorded it:
 //!
 //! ```text
+//! ```text
 //! Gateway::start(state_dir: StateDir, settings: Settings) -> (Gateway, EventRx)
-//! Gateway::send(&self, command: Command)
 //! Gateway::startup_state(&mut self) -> Option<InitialState>   // once, then None
 //! Gateway::send(&self, Command) -> Result<(), Command>        // Err = never accepted
-//! Gateway::close(self) -> Result<(), Command>                 // Shutdown + join
-//! Gateway::engine_is_alive(&self) -> bool      // a test seam, see below
+//! Gateway::close(self) -> Result<(), Exit>                    // Shutdown + bounded join
+//! Gateway::engine_panicked(&mut self) -> bool   // ask BEFORE close(): did it unwind?
+//! Gateway::engine_is_alive(&self) -> bool       // a test seam, see below
 //! pub type EventRx = std::sync::mpsc::Receiver<Event>;
 //! ```
 //!
@@ -279,7 +280,10 @@ pub use engine::mark_current_thread_as_engine;
 pub use event::{
     Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason, StateFile,
 };
-pub use gateway::{EventRx, Gateway, InitialState};
+// `Exit` is the third name because `close()` answers with it: a bridge must be able to tell a
+// shutdown that ran its final save from one whose engine unwound, and that distinction is worth
+// nothing if the type carrying it is unreachable from outside the crate.
+pub use gateway::{EventRx, Exit, Gateway, InitialState};
 
 #[cfg(test)]
 mod tests {
