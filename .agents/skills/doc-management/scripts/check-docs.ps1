@@ -46,33 +46,46 @@ function Get-FrontMatter($file) {
   return $map
 }
 
-# ---- 1. build the set of valid section numbers from whitepaper.md -----------------
-# Two kinds of addressable anchor:
+# ---- 1. build the anchor set from the WHOLE plan set --------------------------------
+# The plan is split by area under docs/ but section numbers are GLOBAL across the set, so
+# §4.5 resolves from docs/features.md no matter which file cites it. Two kinds of anchor:
 #   headings    "## 5. Architecture" / "### 5.4 The API gateway"   -> 5, 5.4
 #   list items  "3. **Autosave policy...**" under "## 10."         -> 10.3
-# The second kind matters because decisions are enumerated as a list, and refs like
-# §10.3 are how the whole document points at them. Code fences are skipped, so shell
-# blocks and startup-order snippets cannot invent anchors.
-$validSections = New-Object System.Collections.Generic.HashSet[string]
+# Code fences are skipped so shell blocks and startup-order snippets cannot invent anchors.
+# Each anchor must have exactly ONE owner - that is what "never fork the plan" now means.
+$validSections = @{}      # number -> list of files claiming it
 $wp = Join-Path $Root 'whitepaper.md'
 if (-not (Test-Path -LiteralPath $wp)) {
-  Add-Finding $wp $null 'MISSING - the founding sketch must exist at the repo root'
-} else {
+  Add-Finding $wp $null 'MISSING - the index must exist at the repo root'
+}
+$planSet = @()
+if (Test-Path -LiteralPath $wp) { $planSet += Get-Item -LiteralPath $wp }
+$planSet += @(Get-ChildItem -LiteralPath (Join-Path $Root 'docs') -File -Filter '*.md' -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -ne 'README.md' })
+foreach ($f in $planSet) {
   $top = $null
   $fence = $false
-  foreach ($l in @(Get-Content -LiteralPath $wp -Encoding UTF8)) {
+  foreach ($l in @(Get-Content -LiteralPath $f.FullName -Encoding UTF8)) {
     if ($l.TrimStart().StartsWith('```')) { $fence = -not $fence; continue }
     if ($fence) { continue }
-    if ($l -match '^##\s+(\d+)(?:\.\d+)?\.?\s') {
-      $top = $matches[1]
-      [void]$validSections.Add($top)
-    }
-    elseif ($l -match '^###\s+(\d+(?:\.\d+)?)\.?\s') {
-      [void]$validSections.Add($matches[1])
+    $claimed = $null
+    if ($l -match '^##\s+(\d+)(?:\.\d+)?\.?\s') { $top = $matches[1]; $claimed = $top }
+    elseif ($l -match '^###\s+(\d+(?:\.\d+)?)\.?\s') { $claimed = $matches[1] }
+    if ($claimed) {
+      if (-not $validSections.ContainsKey($claimed)) { $validSections[$claimed] = @() }
+      $validSections[$claimed] += $f.Name
     }
     if ($top -and $l -match '^\s*(\d+)\.\s+\*?\*?[A-Za-z]') {
-      [void]$validSections.Add("$top.$($matches[1])")
+      $n = "$top.$($matches[1])"
+      if (-not $validSections.ContainsKey($n)) { $validSections[$n] = @() }
+      $validSections[$n] += $f.Name
     }
+  }
+}
+foreach ($k in $validSections.Keys) {
+  $owners = @($validSections[$k] | Select-Object -Unique)
+  if ($owners.Count -gt 1) {
+    Add-Finding (Join-Path $Root 'whitepaper.md') $null "section §$k is claimed by $($owners.Count) files ($($owners -join ', ')) - one owner per section, or the plan has forked"
   }
 }
 
@@ -92,17 +105,16 @@ foreach ($f in $all) {
   elseif ($rel -match '^\.agents/notes/README\.md$') { $ok = $true }
   elseif ($rel -match '^\.agents/skills/[^/]+/') { $ok = $true }
   elseif ($rel -match '^docs/(decisions|dev)/') { $ok = $true }
-  elseif ($rel -match '^docs/README\.md$') { $ok = $true }
-  elseif ($rel -match '^docs/[^/]+\.md$') {
-    Add-Finding $f.FullName $null 'loose file in docs/ - that root holds only README.md; a new subfolder needs a row in the placement map first'
+  elseif ($rel -match '^docs/[a-z0-9-]+\.md$') { $ok = $true }   # plan areas, indexed by whitepaper.md
+  elseif ($rel -match '^docs/') {
+    Add-Finding $f.FullName $null 'unsupported location under docs/ - use docs/<area>.md, docs/dev/, or docs/decisions/'
   }
-  elseif ($rel -match '^docs/') { $ok = $true }
   if (-not $ok) { Add-Finding $f.FullName $null 'ORPHAN - no rule in the placement map covers this location' }
 
-  # Intent has exactly one home. Two copies of a product definition guarantee that someone,
-  # eventually, reads the wrong one.
-  if ($name -match '(?i)whitepaper|roadmap' -and $rel -ne 'whitepaper.md') {
-    Add-Finding $f.FullName $null 'appears to fork whitepaper.md - there is exactly one. Edit it, or open a note in .agents/notes/proposed/.'
+  # Intent has exactly one owner per numbered section. A second copy of a section is a fork
+  # even when it has a different filename - checked against the anchor set built in step 1.
+  if ($name -match '(?i)whitepaper' -and $rel -ne 'whitepaper.md') {
+    Add-Finding $f.FullName $null 'filename claims to be the whitepaper; the index is whitepaper.md at the root and area docs must not reuse that name'
   }
 }
 
@@ -116,6 +128,18 @@ if (-not (Test-Path -LiteralPath (Join-Path $Root 'Cargo.toml'))) {
   }
   foreach ($f in $devDocs) {
     Add-Finding $f.FullName $null "premature dev doc - docs/dev/ describes code that exists, and there is no Cargo.toml yet. Keep this in whitepaper.md or a proposed/ note until the code lands."
+  }
+}
+
+# ---- 2c. every plan area doc must declare what it owns -------------------------------
+# `owns:` is what makes the split auditable: a file that does not say which sections it owns
+# is a file whose content can silently drift into another area's remit.
+foreach ($f in $planSet) {
+  if ($f.Name -eq 'whitepaper.md') { continue }
+  $fm = Get-FrontMatter $f
+  if ($null -eq $fm) { Add-Finding $f.FullName $null 'plan area doc missing frontmatter (title, type, owns, status)'; continue }
+  foreach ($k in @('title', 'type', 'owns', 'status')) {
+    if (-not $fm.ContainsKey($k)) { Add-Finding $f.FullName $null "plan area doc missing frontmatter field '$k'" }
   }
 }
 
@@ -201,8 +225,8 @@ foreach ($f in $all) {
   foreach ($l in @(Get-Content -LiteralPath $f.FullName -Encoding UTF8)) {
     $n++
     foreach ($m in [regex]::Matches($l, "$SECT(\d+(?:\.\d+)?)")) {
-      if (-not $validSections.Contains($m.Groups[1].Value)) {
-        Add-Finding $f.FullName $n "dangling reference $SECT$($m.Groups[1].Value) - no such section in whitepaper.md (renumbered? wrong document? use a path for skill sections)"
+      if (-not $validSections.ContainsKey($m.Groups[1].Value)) {
+        Add-Finding $f.FullName $n "dangling reference $SECT$($m.Groups[1].Value) - no owner anywhere in the plan set (renumbered? wrong document? use a path for skill sections)"
       }
     }
   }
