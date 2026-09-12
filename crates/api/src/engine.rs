@@ -457,7 +457,21 @@ impl Engine {
                 // The ABORT path: Gateway::drop took the last Sender. recv hands
                 // over everything already queued before reporting Disconnected,
                 // so no accepted command - and no accepted write - is stranded.
-                Err(RecvTimeoutError::Disconnected) => break,
+                // M-A: "no accepted write is stranded" was the claim; this line
+                // did not keep it. Draining a QUEUE is not the same as flushing a
+                // DIRTY BIT, and a write queued behind the last command, or armed
+                // by a tick that never got to run, used to die here with the
+                // thread - the geometry, the pin bit and the recents lost on a
+                // panic unwinding main, on the very path the drain doc above says
+                // ends with flush_state. Nothing is re-armed and nothing is asked
+                // of a window: with no live seam the measure falls back to the
+                // stored values, so this flush cannot invent a position. It runs
+                // before the Sender is dropped, so a failure is still REPORTED and
+                // still reaches whoever owns the channel.
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.flush_state();
+                    break;
+                }
             }
         }
         // Dropping self.event_tx is how the caller's EventRx learns the engine is
@@ -539,7 +553,24 @@ impl Engine {
                     // final_flush: this read-back is the last honest one there
                     // will ever be for this window.
                     self.last_move_issued = None;
+                    // C1: MEASURE, DIFF, THEN ARM. The measure writes straight
+                    // into the session, and flush_state returns at its own guard
+                    // when nothing is pending - so on a QUIT WITH NOTHING ELSE
+                    // ARMED (no GeometryChanged arrived for the last drag, no pin
+                    // change, no maximise event: the bridge is closing the window,
+                    // not reporting one) the last honest read-back updated a value
+                    // in memory that no write would ever carry. The move the user
+                    // made inside the final quiet period was lost, which is the
+                    // headline promise gone quietly on the one path built to keep
+                    // it. Arm on a REAL difference, not unconditionally: a clean
+                    // quit whose measure agreed with the file has nothing to
+                    // write, and rewriting session.json on every exit is a
+                    // battery-life bug in a notepad.
+                    let before = self.session.clone();
                     let _ = self.measure_rect();
+                    if self.session != before {
+                        self.queue(Target::Session);
+                    }
                     self.flush_state();
                 }
                 self.window = None;

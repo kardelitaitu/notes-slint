@@ -1322,3 +1322,165 @@ fn the_last_state_write_happens_before_the_window_is_gone() {
         "the measured rect is the truth, and the truth must outlive the window"
     );
 }
+
+/// C1, THE UNARMED TWIN of `the_last_state_write_happens_before_the_window_is_gone`.
+/// That one dirties the pin first, so a write was ALREADY armed and the
+/// unregister flush had a job to do. This one arms nothing: the window settles,
+/// its write lands and RETIRES the bit, the user then moves the window, and NO
+/// GeometryChanged follows - the honest shape of a quit, because the bridge is
+/// closing the window, not reporting a move. The last-chance measure still
+/// found a NEW rect; pre-fix it wrote that into the session in memory,
+/// flush_state returned at its own nothing-pending guard, and the position the
+/// user last saw was lost on the one path built to keep it.
+#[test]
+fn an_unarmed_last_measure_arms_its_own_write_before_the_window_is_gone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seeded = Rect::new(120, 90, 800, 600);
+    let settled = Rect::new(600, 300, 800, 600);
+    let dragged = Rect::new(1000, 320, 800, 600);
+    write_session(
+        dir.path(),
+        &Session {
+            rect: seeded,
+            ..Session::default()
+        },
+    )
+    .expect("write the session fixture");
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(FrameRect::new(settled.x, settled.y, settled.w, settled.h)),
+            // Stated, not taken from the fake default: an Unknown show would
+            // leave the write armed (F1) and this test would pass for the
+            // wrong reason - the clean starting point IS the claim.
+            restore_show: ShowState::Normal,
+            ..Answers::default()
+        },
+    );
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+
+    // PHASE 1: the registration write LANDS, which is also the proof the bit
+    // is now clean - a complete measure retired it.
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        if let Ok(session) = read_session(dir.path()) {
+            if session.rect == settled {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the registration write never landed, so nothing proves the bit was clean"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // PHASE 2: the move happens, and NOTHING is sent about it.
+    host.set_answers(Answers {
+        restore: Some(FrameRect::new(dragged.x, dragged.y, dragged.w, dragged.h)),
+        restore_show: ShowState::Normal,
+        ..Answers::default()
+    });
+    gateway.send(Command::UnregisterWindow).expect("queued");
+    gateway.close().expect("the quit joins");
+
+    let persisted = read_session(dir.path()).expect("the session existed before");
+    assert_eq!(
+        persisted.rect, dragged,
+        "a last-chance measure that found a different rect must arm its own write"
+    );
+}
+
+/// C1's other half, and the reason the arm is a DIFF and not unconditional: a
+/// quit whose measure AGREED with the file has nothing to say, and the
+/// unregister path now runs the measure and the flush in sequence. Rewriting
+/// session.json on every clean exit is the same battery-life bug the idle-tick
+/// test exists to fail on - and bytes cannot tell a rewrite from a no-op, so
+/// the claim is read off the modification time, recorded after a sleep that
+/// leaves any clock granularity behind it.
+#[test]
+fn a_quit_that_measured_nothing_new_writes_the_session_file_no_second_time() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seeded = Rect::new(120, 90, 800, 600);
+    let at_rest = Rect::new(600, 300, 800, 600);
+    write_session(
+        dir.path(),
+        &Session {
+            rect: seeded,
+            ..Session::default()
+        },
+    )
+    .expect("write the session fixture");
+    let (gateway, _rx, _host) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(FrameRect::new(at_rest.x, at_rest.y, at_rest.w, at_rest.h)),
+            restore_show: ShowState::Normal,
+            ..Answers::default()
+        },
+    );
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    let deadline = Instant::now() + ANSWER;
+    loop {
+        if let Ok(session) = read_session(dir.path()) {
+            if session.rect == at_rest {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "the first write never landed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let path = dir.path().join("session.json");
+    let before = std::fs::metadata(&path).expect("the settled file");
+
+    // The same answer as before: the last measure learns nothing.
+    gateway.send(Command::UnregisterWindow).expect("queued");
+    gateway.close().expect("the quit joins");
+
+    let after = std::fs::metadata(&path).expect("still there");
+    assert_eq!(
+        after.modified().expect("mtime"),
+        before.modified().expect("mtime"),
+        "a quit that learned nothing must not touch the disk a second time"
+    );
+    assert_eq!(
+        read_session(dir.path()).expect("read again").rect,
+        at_rest,
+        "and the value it did not rewrite is still the truth"
+    );
+}
+
+/// M-A: DROP WITHOUT SHUTDOWN STILL ENDS WITH THE FILE WRITTEN. Drain-and-exit
+/// and abort are two ways out of the loop and only one of them ever flushed: a
+/// write armed but never ticked died with the thread when the last Sender went
+/// away, which is exactly what a panic unwinding main looks like, and it cost
+/// the geometry, the pin bit and the recents with no event and no trace. The
+/// Gateway's Drop JOINS, so by the time the drop returns the exit has run - a
+/// proof, not a race, and no tick is anywhere near (the cadence is 750 ms off).
+#[test]
+fn a_drop_without_shutdown_still_writes_an_armed_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(
+        !dir.path().join("session.json").exists(),
+        "the file may only appear because of the engine exit itself"
+    );
+    let (gateway, _rx, _host) = start_with(dir.path(), Answers::default());
+    gateway.send(Command::SetPinned(true)).expect("queued");
+    drop(gateway);
+
+    let persisted = read_session(dir.path())
+        .expect("an abort lost the armed write: geometry, pin and recents are gone");
+    assert!(
+        persisted.pinned,
+        "the armed bit is the one that survived: {persisted:?}"
+    );
+}
