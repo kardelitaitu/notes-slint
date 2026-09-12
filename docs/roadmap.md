@@ -152,3 +152,38 @@ attribute bug. Found on day one, for free.
 - **Two checks remain undone:** presenting a dialog for real, and a human looking at whether
   the painted frame is correct. Both are minutes, and both belong before M2 is called done.
 
+### 12.5 Re-verification against gpui-kit (2026-09-12)
+
+R14's opening task: the six M0 checks re-run against the crate the bridge actually depends
+on (ADR-0002), not the gpui 0.2.2 that §12 verified. Same method as §12 — a throwaway
+plain-cargo project outside this repo, one binary printing one PASS/FAIL line per check to
+stderr — built against **`gpui-kit =0.6.1`**, which resolves **`gpui-pre 0.3.4`** (via
+`gpui-base`/`gpui-component`/`gpui-kit-assets` 0.6.1), rustc/cargo 1.98.0, Windows 11 (10.0.26200).
+The spike source lives in that throwaway directory by design and is not committed; per
+§5.2 rule 3 only its findings are recorded here.
+
+| | Question (as §12.1) | Result |
+|---|---|---|
+| Q1 | Plain `cargo` project compiles and links on Windows | **PASS** — full gpui-kit/gpui-pre tree builds and links; final incremental link 2.2 s |
+| Q2 | A window opens and enters the render loop | **PASS** |
+| Q3 | Raw HWND reachable | **PASS** — `HasWindowHandle` on `gpui::Window` (delegates to the platform window), hwnd `0x7e0cc0` |
+| Q4 | Topmost set **and cleared** | **PASS** — `WS_EX_TOPMOST` verified on (exstyle `0x240108`), then off (`0x240100`) |
+| Q5 | Explicit position/size honoured | **PASS** — creation bounds honoured; `SetWindowPos (260,180)` → `GetWindowRect (260,180)` |
+| Q6 | Native file dialogs | **PASS at the API level** — `cx.prompt_for_paths` accepted, oneshot receiver returned; presenting still needs a human |
+
+Every check passed, so at kit 0.6.1 / fork 0.3.4 R14's stale-premise risk does not
+materialise, and the chrome work can build on §12.3 as written. Three facts sharpened:
+
+- **§12.2's coordinate-space finding reproduces exactly.** The same client request
+  `(120,90) 480x320` produced the same frame rect `(112,71) 496x359` — chrome deltas
+  8/19/8/20 are a fork property too, so `platform/geometry.rs`'s one-coordinate-space
+  rule carries over unchanged.
+- **The §12.3 API facts hold under the fork**, with one migration note: `Application::new`
+  is gone; the entry point is `gpui_kit::platform::application()` (picks the platform
+  backend) plus `gpui_kit::init(cx)` before first render. HWND reachability, `WindowBounds`,
+  built-in dialogs, and the native DirectX backend (`gpui-pre-windows`: `directx_renderer.rs`,
+  `direct_write.rs`, `directx_devices.rs`, `vsync.rs`) all verified in the pinned source.
+- **§12.4's two undone checks remain undone** — presenting a dialog for real, and a human
+  eyeballing the painted frame, are still owed before M2 is called done.
+
+
