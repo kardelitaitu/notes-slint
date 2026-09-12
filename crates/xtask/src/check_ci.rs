@@ -1200,10 +1200,28 @@ mod tests {
 
     /// Direction two: an arm for a code smoke does not publish. Dead wording, or
     /// an undocumented return value - either way the two surfaces disagree.
+    ///
+    /// The probe number used to be a hardcoded 9, which was a second bug in
+    /// disguise: 9 is a published verdict as of the live-UI trace claim
+    /// (smoke::TRACE_FAILED_EXIT), so the "unpublished" arm silently became a
+    /// legitimate one and this test would have gone GREEN BY MATCHING NOTHING.
+    /// Derived from the top of the table instead - one past the highest contracted
+    /// code - so it cannot collide with a verdict again without somebody adding
+    /// eleven codes at once.
     #[test]
     fn an_arm_for_an_unpublished_code_is_reported() {
         let mut arms = full_arms();
-        arms.push(9);
+        let unpublished = crate::smoke::contract_codes()
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(0)
+            + 1;
+        assert!(
+            !arms.contains(&unpublished),
+            "the probe number {unpublished} is already a published verdict"
+        );
+        arms.push(unpublished);
         let steps = parse_ok(&gate_text(&format!("{ARCH}{}", smoke_step(&arms))));
         let out = decide_contract(&steps, crate::smoke::CONTRACT);
         let ContractOutcome::Judged(v) = out else {
@@ -1211,7 +1229,11 @@ mod tests {
         };
         assert_eq!(v.len(), 1, "{v:?}");
         assert!(v[0].contains("[arm-extra]"), "{v:?}");
-        assert!(v[0].contains("exit 9"), "{v:?}");
+        assert!(
+            v[0].contains(&format!("exit {unpublished}")),
+            "the violation must name the code it is about: {:?}",
+            v[0]
+        );
     }
 
     /// The refusal posture, both ways it can arise. A parse gap must never be

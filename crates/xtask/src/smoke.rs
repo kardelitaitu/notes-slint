@@ -74,6 +74,16 @@
 //!   pinned:false). Kept separate from 6 because the usual cause is the order of
 //!   show-then-band, not persistence, and it can also be a race - the message
 //!   says so rather than accusing the app.
+//! * 9 - THE LIVE UI NEVER SAW THE STARTUP ANNOUNCE: the app launched, closed
+//!   gracefully and persisted (exit 0's own verdicts), and yet the stderr
+//!   redirected from the LIVE process names no `RecentsUpdated` while the profile
+//!   held recents that were there to announce (TRACE_FAILED_EXIT; roadmap M2 exit
+//!   item 5). Its own code because 1 means "the shutdown or the write broke" and
+//!   this means the opposite: everything ran, and a fact the port knew never
+//!   reached the window. A capture that could not be read, and a profile with
+//!   nothing to announce, both print NOT JUDGED (advisory) and leave the code
+//!   alone - an unverifiable step is neither a pass nor a failure, exactly as
+//!   geometry treats its own unmeasurable legs.
 //! * 3 - DECLINED for a reason that is not the app's fault: no interactive
 //!   desktop (no sessions win32k user32.dll), no window handle even though the
 //!   app kept running, or the session path holding foreign state this harness
@@ -115,6 +125,11 @@ const BIN_REL: &str = "target/debug/notes-gpui.exe";
 pub const EXE_NAME: &str = "notes-gpui.exe";
 const BUILD_HINT: &str = "cargo build -p notes-bridge-gpui --bin notes-gpui";
 const SESSION_FILE: &str = "session.json";
+/// The other file in the same directory, and the one the RECENTS live in (core's
+/// settings.rs: "settings.toml holds the USER preferences and the recents"). This
+/// harness never moves or writes it - it only asks it how much there was to
+/// announce, which is what makes the trace claim judgeable at all.
+const SETTINGS_FILE: &str = "settings.toml";
 
 /// The probe. Written to a temp file and run as a -File (never through a shell
 /// string), so no path here is re-parsed by anything. It prints KEY=VALUE and
@@ -624,13 +639,173 @@ fn read_pipe(pipe: Option<&mut std::process::ChildStdout>) -> String {
     String::from_utf8_lossy(&buf).to_string()
 }
 
-fn report_captured(path: &Path, label: &str) {
-    if let Ok(text) = fs::read_to_string(path) {
-        let text = text.trim();
-        if !text.is_empty() {
-            println!("smoke: {label} said ({} bytes): {text}", text.len());
+/// Read a capture file, lossily. The app writes its own trace as UTF-8 and the
+/// one character in it that matters here is a U+00B7 separator, so a lossy read
+/// keeps every line assertable where a strict read would hand back nothing.
+fn read_capture(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Print what the launched process wrote, and RETURN the bytes so a caller can
+/// assert over them. The return exists because the capture is transient: the
+/// geometry step re-uses the same stderr path for its own launches, so the first
+/// run's evidence has to be held by whoever means to judge it.
+fn report_captured(path: &Path, label: &str) -> Option<String> {
+    let text = read_capture(path)?;
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        println!("smoke: {label} said ({} bytes): {trimmed}", trimmed.len());
+    }
+    Some(text)
+}
+
+/// One assertion about what the LIVE app's own last-resort trace must contain.
+///
+/// The shape exists because this is the first row of a list, not the whole of it.
+/// Every remaining M2 exit item that can be proven from a redirected stderr - the
+/// seeded-recent open (item 2), a byte-identical save (item 3), the menu toggle
+/// (item 6) - is a new entry in [TRACE_CLAIMS], never a new branch in run().
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceClaim {
+    /// What the claim says the running app did, in its own words, for the message.
+    pub what: &'static str,
+    /// The substring one captured line must contain. Kept to plain ASCII on
+    /// purpose: describe() separates its fields with U+00B7, and a needle that
+    /// straddles one is a needle that breaks when the copy is re-worded.
+    pub needle: &'static str,
+    /// Which roadmap M2 exit item this proves, so a red line cites the plan it
+    /// belongs to instead of being argued about from scratch.
+    pub proves: &'static str,
+}
+
+/// THE CLAIMS. Row 1 is roadmap M2 exit item 5, "Recents - not proven. Named
+/// gap: RecentsUpdated is emitted only on change, so a fresh window shows an
+/// empty list and no headless test notices" (docs/roadmap.md SS9). The engine has
+/// since grown a startup announce (api/src/engine.rs, THE STARTUP ANNOUNCE in
+/// Engine::run), and every test for it is headless: nothing has ever shown the
+/// line reaching a real UI. This row is that showing, through the one voice the
+/// bridge has when it has no console - report()'s stderr.
+pub const TRACE_CLAIMS: &[TraceClaim] = &[TraceClaim {
+    what: "the startup recents announce reached the live UI",
+    needle: "RecentsUpdated",
+    proves: "M2 exit item 5 (Recents)",
+}];
+
+/// The three answers a claim list can come back with, spelled the way Geometry
+/// spells its own: proven, broken, or not judgeable here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceVerdict {
+    /// Every claim matched; the lines are the evidence, one per claim, so a
+    /// citation names what the app actually printed rather than a bare green.
+    Proven(Vec<String>),
+    /// At least one claim matched nothing. Only reachable when the run was
+    /// judgeable at all - see the recents_at_startup gate on judge_trace.
+    Broken(Vec<String>),
+    /// The claim could not be tried: no capture to read, an empty capture, or a
+    /// profile with nothing to announce. Advisory, and never a pass.
+    NotJudged(String),
+}
+
+/// Which of the app's own voices carried a matched line, because the three carry
+/// different facts. "status line:" is a line the UI RENDERED (bridge main.rs,
+/// where record_shown gates it on a real change); "undisplayed:" is an event the
+/// port delivered that never got a frame, printed by the exit drain; anything
+/// else is one of the app's other report() lines. Naming the voice is what keeps
+/// this honest: the needle alone says the app KNEW the list, and only a rendered
+/// line says the window was told. So the claim asserts the weaker fact - the one
+/// that holds on every machine, because a startup batch may let a later event win
+/// the single printed line - and prints the strength it actually got.
+fn trace_voice(line: &str) -> &'static str {
+    if line.contains("status line:") {
+        "rendered"
+    } else if line.contains("undisplayed:") {
+        "delivered, never rendered"
+    } else {
+        "traced"
+    }
+}
+
+/// Decide the claim list over a captured trace. Pure: no files, no process, so
+/// all three outcomes are provable without a desktop.
+///
+/// * captured - the bytes the LIVE app wrote to its own stderr on this launch,
+///   or None when the file could not be read.
+/// * recents_at_startup - how many recents the profile held before the launch.
+///   Zero makes the assertion UNMEASURABLE rather than satisfied: the engine
+///   announces only when there is something to announce, so on a fresh install no
+///   line can appear, and a run that "passed" would be a run that asserted nothing.
+pub fn judge_trace(
+    captured: Option<&str>,
+    recents_at_startup: usize,
+    claims: &[TraceClaim],
+) -> TraceVerdict {
+    let Some(text) = captured else {
+        return TraceVerdict::NotJudged(
+            "the app's stderr capture could not be read, so no claim about what the live UI saw was \
+             tried"
+                .to_string(),
+        );
+    };
+    if text.trim().is_empty() {
+        return TraceVerdict::NotJudged(
+            "the app wrote NOTHING to its own trace (0 bytes). A graceful exit always writes its exit \
+             trace, so an empty capture means the instrument failed to see the app rather than that the \
+             app said nothing - which is exactly why it is not a FAIL either"
+                .to_string(),
+        );
+    }
+    if recents_at_startup == 0 {
+        return TraceVerdict::NotJudged(
+            "the profile held no recents before this launch, and the engine announces only a NON-EMPTY \
+             list by design (api/src/engine.rs, THE STARTUP ANNOUNCE): there was nothing for the live UI \
+             to be shown, so the item stands unproven rather than disproven"
+                .to_string(),
+        );
+    }
+    let mut proven = Vec::new();
+    let mut broken = Vec::new();
+    for claim in claims {
+        match text.lines().find(|line| line.contains(claim.needle)) {
+            Some(line) => proven.push(format!("{}: [{}] {line}", claim.what, trace_voice(line.trim()))),
+            None => broken.push(format!(
+                "SMOKE TRACE FAIL: {} - no line of the live app's stderr contains {:?}, and {} recents \
+                 WERE in the profile to announce ({})",
+                claim.what, claim.needle, recents_at_startup, claim.proves
+            )),
         }
     }
+    if broken.is_empty() {
+        TraceVerdict::Proven(proven)
+    } else {
+        TraceVerdict::Broken(broken)
+    }
+}
+
+/// Count the "[[recents]]" array-of-tables headers in core's settings.toml. A
+/// text count, not a parse: xtask takes no new dependency (the independence rule
+/// check-arch exists to protect), and the only question asked here is "was there
+/// anything to announce". Both ways of being wrong stay visible rather than
+/// silent: an over-count asserts against a live UI that stayed quiet, and an
+/// under-count prints NOT JUDGED.
+pub fn count_recents_blocks(toml_text: &str) -> usize {
+    toml_text
+        .lines()
+        .filter(|line| line.trim() == "[[recents]]")
+        .count()
+}
+
+/// How many recents the profile held, checked in the same candidate order the
+/// artefact search uses (a portable data dir beside the exe, then the roaming
+/// profile). 0 covers both "no file" and "every path unreadable", which is the
+/// honest answer for this claim: nothing was known to be there to announce.
+fn recents_at_startup(exe: &Path) -> usize {
+    for dir in candidate_state_dirs(exe) {
+        if let Ok(text) = fs::read_to_string(dir.join(SETTINGS_FILE)) {
+            return count_recents_blocks(&text);
+        }
+    }
+    0
 }
 
 /// What the run ended up doing with the user's bytes, decided from what is
@@ -926,6 +1101,10 @@ pub const CONTRACT: &[Contract] = &[
     Contract(STALE_BINARY_EXIT, "binary older than sources"),
     Contract(GEOMETRY_FAILED_EXIT, "window-memory broke"),
     Contract(PIN_FAILED_EXIT, "the pin lied"),
+    Contract(
+        TRACE_FAILED_EXIT,
+        "the live UI never saw the startup announce",
+    ),
 ];
 
 /// One row of the contract. A struct rather than a tuple so the number and the
@@ -1437,6 +1616,13 @@ pub const GEOMETRY_FAILED_EXIT: i32 = 6;
 /// Distinct from 6 because the fix usually lives in the show/pin ordering, not
 /// in persistence - and a failure here may be a race, so the message says that.
 pub const PIN_FAILED_EXIT: i32 = 7;
+/// What the LIVE app's own stderr did not show. Distinct from 1 because 1 is
+/// "the shutdown or the write broke" and this is the opposite: every one of those
+/// passed, and the thing that failed is invisible to a window handle - an event
+/// the port knew about never reached the rendered UI. In CONTRACT, so the ci.yml
+/// smoke step is required to arm it: check-ci's [arm-missing] rule is what stops a
+/// new verdict landing as an annotation nobody wrote.
+pub const TRACE_FAILED_EXIT: i32 = 9;
 
 /// Fit the seed inside a work area that might be one monitor, might be two, and
 /// might not be 100% scaled. None means "cannot be judged here".
@@ -2073,6 +2259,14 @@ pub fn run(args: &[String]) -> i32 {
         return DECLINED_EXIT;
     }
 
+    // How much there WAS to announce, read before anything launches: the app
+    // rewrites its own settings on the way out, so asking afterwards would be
+    // asking about the run instead of about its opening state. This is the one
+    // number that turns the trace claim from a guess into a judgement.
+    let startup_recents = recents_at_startup(&exe);
+    println!(
+        "smoke: recents in the profile at startup: {startup_recents} (the trace claim below is          judgeable only above 0)"
+    );
     let script = temp_path("probe", "ps1");
     // The geometry step gets its own reporter script: the first phase must stay
     // exactly as it was proven, and a shared script would let a change to one
@@ -2085,6 +2279,10 @@ pub fn run(args: &[String]) -> i32 {
     }
     let out_file = temp_path("stdout", "txt");
     let err_file = temp_path("stderr", "txt");
+    // Held in memory because the path is re-used: the geometry step redirects its
+    // own launches onto the same file, so the first run's stderr exists nowhere
+    // else once that step has run.
+    let mut app_stderr: Option<String> = None;
     let mut code = match fs::File::create(&script).and_then(|mut f| f.write_all(PROBE.as_bytes())) {
         Err(e) => {
             eprintln!(
@@ -2114,8 +2312,8 @@ pub fn run(args: &[String]) -> i32 {
                     if !status.success() {
                         println!("smoke: note - the probe child itself exited {status}");
                     }
-                    report_captured(&err_file, "the app on stderr");
-                    report_captured(&out_file, "the app on stdout");
+                    app_stderr = report_captured(&err_file, "the app on stderr");
+                    let _ = report_captured(&out_file, "the app on stdout");
                     let (artefact, tried) = find_artefact(&exe, launched);
                     println!(
                         "smoke: pid={} handle={} title={:?} launch_ms={}",
@@ -2169,10 +2367,59 @@ pub fn run(args: &[String]) -> i32 {
         },
     };
 
+    // What the LIVE app's own stderr proved about the run that just passed.
+    //
+    // Exit 9, TRACE_FAILED_EXIT, and only here: it is documented at the constant
+    // and at the module's exit-code table, and it is ARMED IN ci.yml IN THE SAME
+    // CHANGESET because check-ci's [arm-missing] rule requires an arm for every
+    // row of CONTRACT. Advisory like every other smoke verdict - this step can
+    // print a red, it can never redden a run.
+    //
+    // Gated on the first launch having PASSED (exit 0 out of the probe block),
+    // which is the desktop guard: no interactive session declines with 3, and a
+    // failed launch has no live UI to read, so nothing here runs headless and
+    // nothing here can turn a decline into a product failure.
+    let launch_passed = code == 0;
+    let mut trace_failed = false;
+    if launch_passed {
+        match judge_trace(app_stderr.as_deref(), startup_recents, TRACE_CLAIMS) {
+            TraceVerdict::Proven(lines) => {
+                for line in &lines {
+                    println!("smoke: trace: {line}");
+                }
+                println!(
+                    "smoke: trace: PASS - {} claim(s) met by the live app's own stderr",
+                    lines.len()
+                );
+            }
+            TraceVerdict::NotJudged(why) => {
+                println!("smoke: trace: NOT JUDGED (advisory) - {why}")
+            }
+            TraceVerdict::Broken(notes) => {
+                for note in &notes {
+                    println!("{note}");
+                }
+                println!("smoke: trace: FAIL - the startup announce did not reach the live UI");
+                trace_failed = true;
+                code = TRACE_FAILED_EXIT;
+            }
+        }
+    } else {
+        println!(
+            "smoke: trace: NOT RUN - the first launch did not pass, so there is no live UI whose              trace could be judged"
+        );
+    }
+
     // The window-memory round trip, run INSIDE the guard that owns the user's
     // state: it seeds session.json, moves the window and relaunches the app, so
     // every file it touches is a file the guard will put back or justify.
-    if code == 0 {
+    //
+    // Guarded on the LAUNCH, not on `code`: a trace failure has already set 9 and
+    // must not cost the run its geometry evidence. Where both went wrong this one
+    // code wins, because the window-memory promise is the older and better
+    // understood product claim - so the trace note is printed here rather than
+    // left to be inferred from the absence of a code.
+    if launch_passed {
         let session = candidate_state_dirs(&exe)
             .into_iter()
             .map(|dir| dir.join(SESSION_FILE))
@@ -2205,6 +2452,12 @@ pub fn run(args: &[String]) -> i32 {
                     } else {
                         println!("smoke: geometry: FAIL - the window memory promise did not hold");
                         code = GEOMETRY_FAILED_EXIT;
+                    }
+                    if trace_failed {
+                        println!(
+                            "smoke: note - the stderr trace claim failed too (its own code is {});                              geometry outranks it here, so read the SMOKE TRACE FAIL line above as                              part of this verdict, not as lost news",
+                            TRACE_FAILED_EXIT
+                        );
                     }
                 }
             },
@@ -3142,9 +3395,176 @@ mod tests {
         );
         assert_eq!(
             CONTRACT.len(),
-            8,
-            "the default-invocation codes, unchanged by this slice"
+            9,
+            "the default-invocation codes plus the live-UI trace verdict"
         );
+    }
+
+    /// The length moved from 8 to 9 because the trace claim is a DEFAULT-invocation
+    /// verdict on a desktop machine, so unlike exit 8 it is in the table and has to
+    /// be armed in ci.yml in the same changeset - which is what [arm-missing] checks.
+    #[test]
+    fn the_trace_verdict_is_the_ninth_contracted_code_and_is_distinct() {
+        assert_eq!(TRACE_FAILED_EXIT, 9);
+        assert!(
+            CONTRACT.iter().any(|c| c.0 == TRACE_FAILED_EXIT),
+            "a code a default run can return must be published, or check-ci reads it as drift"
+        );
+        assert_eq!(
+            CONTRACT.len(),
+            9,
+            "the default-invocation codes, one more now that the live-UI trace is asserted"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for code in contract_codes() {
+            assert!(seen.insert(code), "exit {code} is published twice");
+        }
+        assert!(
+            seen.contains(&TRACE_FAILED_EXIT),
+            "9 came out of the published table, so the distinctness check covered it"
+        );
+        assert!(
+            !seen.contains(&MANIFEST_NOT_OURS_EXIT),
+            "8 stays the flag-only code outside the table"
+        );
+    }
+
+    /// A trace line from a real launch, spelled the way the bridge spells it:
+    /// report() prefixes "notes-gpui: ", the rendered status line is
+    /// "status line: {describe(event)}", and describe() renders the recents as
+    /// "RecentsUpdated - {n} in the list - {names}" with a U+00B7 separator.
+    fn rendered_announce() -> String {
+        "notes-gpui: startup: asking the port for C:\\Notes\\idea.notes\n\
+         notes-gpui: status line: RecentsUpdated \u{b7} 1 in the list \u{b7} untitled.notes\n\
+         notes-gpui: status line: Loaded C:\\Notes\\idea.notes \u{b7} 12 chars \u{b7} utf-8, lf\n"
+            .to_string()
+    }
+
+    #[test]
+    fn a_rendered_announce_in_the_trace_proves_the_claim_and_keeps_its_line() {
+        let verdict = judge_trace(Some(&rendered_announce()), 1, TRACE_CLAIMS);
+        let TraceVerdict::Proven(lines) = verdict else {
+            panic!("a rendered line naming the announce is the evidence asked for: {verdict:?}");
+        };
+        assert_eq!(lines.len(), TRACE_CLAIMS.len());
+        assert!(
+            lines[0].contains("[rendered]"),
+            "the voice is part of the evidence: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("status line: RecentsUpdated"),
+            "and so is the line itself: {}",
+            lines[0]
+        );
+    }
+
+    /// The weaker-but-real case, pinned rather than hidden: an event that reached
+    /// the port and never got a frame is printed by the exit drain as
+    /// "undisplayed:". That still answers roadmap item 5's actual question (did the
+    /// list get as far as the running app), and the verdict says WHICH it was.
+    #[test]
+    fn an_announce_named_only_in_the_exit_drain_is_still_evidence_and_says_so() {
+        let trace = "notes-gpui: exit drain: 1 event(s) accounted for\n\
+                     notes-gpui: undisplayed: RecentsUpdated \u{b7} 3 in the list\n";
+        let verdict = judge_trace(Some(trace), 3, TRACE_CLAIMS);
+        let TraceVerdict::Proven(lines) = verdict else {
+            panic!("the trace names the announce: {verdict:?}");
+        };
+        assert!(
+            lines[0].contains("[delivered, never rendered]"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn a_trace_that_never_names_the_announce_breaks_the_claim_naming_the_needle() {
+        let trace = "notes-gpui: status line: Saved C:\\Notes\\idea.notes \u{b7} revision 2\n\
+                     notes-gpui: pump: 9 wakes, 4 had work, 5 events\n";
+        let verdict = judge_trace(Some(trace), 2, TRACE_CLAIMS);
+        let TraceVerdict::Broken(notes) = verdict else {
+            panic!("recents to announce and no line naming them is the finding: {verdict:?}");
+        };
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("SMOKE TRACE FAIL:"), "{}", notes[0]);
+        assert!(notes[0].contains("RecentsUpdated"), "{}", notes[0]);
+        assert!(notes[0].contains("2 recents"), "{}", notes[0]);
+        assert!(notes[0].contains("M2 exit item 5"), "{}", notes[0]);
+    }
+
+    /// The clause that stops a false red - and a false green. An empty profile
+    /// CANNOT produce the line: the engine announces only a non-empty list. So the
+    /// absence of it proves nothing here, and the step refuses to read it either
+    /// way. A matching line would not change that (it could only have come from a
+    /// later change, not from the startup announce), so the gate runs first.
+    #[test]
+    fn a_profile_with_nothing_to_announce_is_not_judged_never_passed() {
+        let trace = "notes-gpui: status line: Loaded C:\\a.notes \u{b7} 1 chars\n";
+        let verdict = judge_trace(Some(trace), 0, TRACE_CLAIMS);
+        assert!(
+            matches!(&verdict, TraceVerdict::NotJudged(why) if why.contains("no recents")),
+            "{verdict:?}"
+        );
+        let TraceVerdict::NotJudged(why) = judge_trace(Some("anything"), 0, TRACE_CLAIMS) else {
+            panic!("0 recents is not judgeable whatever the trace says")
+        };
+        assert!(why.contains("NON-EMPTY"), "{why}");
+    }
+
+    /// Absent evidence is not evidence of absence: the capture is the harness's
+    /// own instrument, and a file that could not be read - or that the redirect
+    /// filled with nothing - is this runner's blind spot, not the app's silence.
+    #[test]
+    fn an_unreadable_or_empty_capture_is_not_judged_and_never_a_failure() {
+        for capture in [None, Some(""), Some("   \n\n  \n")] {
+            let verdict = judge_trace(capture, 5, TRACE_CLAIMS);
+            assert!(
+                matches!(&verdict, TraceVerdict::NotJudged(_)),
+                "capture {capture:?} must not be judged: {verdict:?}"
+            );
+        }
+    }
+
+    /// The reason the claims are a TABLE: the next slice adds a row (the seeded
+    /// recent opened from the menu) and every claim is tried, with only the
+    /// unmet ones reported. Proven here without touching run().
+    #[test]
+    fn every_claim_in_the_table_is_tried_not_just_the_first() {
+        let extra = TraceClaim {
+            what: "the seeded recent was opened",
+            needle: "menu: open",
+            proves: "M2 exit item 2 (Open)",
+        };
+        let claims = [TRACE_CLAIMS[0], extra];
+        let matched = format!("{}\nnotes-gpui: menu: open\n", rendered_announce());
+        let TraceVerdict::Proven(lines) = judge_trace(Some(&matched), 2, &claims) else {
+            panic!("both needles are present");
+        };
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let TraceVerdict::Broken(notes) = judge_trace(Some(&rendered_announce()), 2, &claims)
+        else {
+            panic!("the second needle is absent");
+        };
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("menu: open"), "{}", notes[0]);
+        assert!(notes[0].contains("item 2"), "{}", notes[0]);
+    }
+
+    /// Counted against the serialisation core's own settings.rs test pins, plus
+    /// the empty-by-default file a fresh install would read.
+    #[test]
+    fn recents_are_counted_from_the_settings_the_app_actually_reads() {
+        assert_eq!(count_recents_blocks("autosave_enabled = true\n"), 0);
+        let one = "autosave_enabled = false\ncodepage = 1252\n\n[[recents]]\npath = 'C:\\\\Notes\\\\idea.notes'\ndisplay = \"idea.notes\"\nexists = true\n";
+        assert_eq!(count_recents_blocks(one), 1);
+        assert_eq!(
+            count_recents_blocks(&format!("{one}\n[[recents]]\npath = 'C:\\\\a.notes'\n")),
+            2
+        );
+        // A path or display value that happens to contain the header text is not
+        // a second entry, because the count is over LINES, not over the file.
+        assert_eq!(count_recents_blocks("path = 'x [[recents]] y'\n"), 0);
     }
 
     /// The clause that stops a STATE being read as a CAUSE: the exe cannot say
