@@ -22,7 +22,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use notes_core::session::{read_session, write_session};
-use notes_platform::FrameRect;
+use notes_platform::{FrameRect, ShowState};
 
 use host_mock::{Answers, Host};
 use notes_api::{Command, Event, Gateway, Rect, Session, Settings, StateDir, WindowHandle};
@@ -145,6 +145,146 @@ fn a_maximized_session_is_never_moved_but_still_pinned() {
         host.topmost(),
         vec![(0x100, true)],
         "the pin is not part of the move question"
+    );
+}
+
+/// THE WRITE SIDE OF "COMES BACK MAXIMISED" (D48's other half): the port's own
+/// measure stores the show bit, and the rect it was measured with lands in the SAME
+/// write. Both halves are asserted because the note's reopening condition is that
+/// the restore rect keeps being stored WHILE maximised - a bit that costs the rect
+/// would trade one lost state for another.
+#[test]
+fn a_maximised_measure_stores_the_bit_beside_the_restore_rect() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_session(
+        dir.path(),
+        &Session {
+            rect: Rect::new(10, 10, 800, 600),
+            ..Session::default()
+        },
+    )
+    .expect("write the session fixture");
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(FrameRect::new(320, 240, 1024, 768)),
+            restore_show: ShowState::Maximized,
+            ..Answers::default()
+        },
+    );
+
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    wait_for_calls(&host, 1, "the registration's platform calls");
+    // close() runs the final flush, which lifts the move-in-flight guard and lets
+    // THIS measure store: the shutdown write is the one that carries the bit.
+    gateway.close().expect("shutdown joins the engine");
+
+    let persisted = read_session(dir.path()).expect("the shutdown write landed");
+    assert!(
+        persisted.maximized,
+        "a window measured maximised must be persisted maximised, or the launch \
+         promise is still dead code: {persisted:?}"
+    );
+    assert_eq!(
+        persisted.rect,
+        Rect::new(320, 240, 1024, 768),
+        "the NORMAL position is stored while maximised - it is where the user lands \
+         when they un-maximise"
+    );
+}
+
+/// The other direction, and the one that makes the bit a MEASUREMENT rather than a
+/// claim: a window measured un-maximised clears a stored `maximized`. Without this
+/// the file would latch maximised forever after one maximised session, and the app
+/// would reopen full-screen on a user who deliberately un-maximised it.
+#[test]
+fn a_normal_measure_clears_a_stored_maximized_bit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_session(
+        dir.path(),
+        &Session {
+            maximized: true,
+            ..Session::default()
+        },
+    )
+    .expect("write the maximised fixture");
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        Answers {
+            restore_show: ShowState::Normal,
+            ..Answers::default()
+        },
+    );
+
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    wait_for_calls(&host, 1, "the registration's pin");
+    gateway.close().expect("shutdown joins the engine");
+
+    let persisted = read_session(dir.path()).expect("the shutdown write landed");
+    assert!(
+        !persisted.maximized,
+        "SW_SHOWNORMAL is the window NOT being maximised: the stored bit must not \
+         survive it: {persisted:?}"
+    );
+    assert!(
+        host.restore_reads() >= 1,
+        "the clear came from a measure, not from a write that never asked"
+    );
+}
+
+/// THE ANTI-LATCH PIN, and the reason `Unknown` is its own case: a seam that cannot
+/// answer the show question (a minimised window, or any code platform does not name)
+/// must leave the stored bit EXACTLY as it found it - while still storing the rect
+/// it did measure. `Unknown` is the absence of an answer, never a `No`: spending a
+/// real bit on it would clear a user's maximised window because they happened to
+/// minimise it at close.
+#[test]
+fn an_unknown_measure_leaves_the_bit_alone_and_still_stores_the_rect() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_session(
+        dir.path(),
+        &Session {
+            rect: Rect::new(10, 10, 800, 600),
+            maximized: true,
+            ..Session::default()
+        },
+    )
+    .expect("write the fixture");
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        // restore_show is Unknown by default: the fake reports a rect and no view.
+        Answers {
+            restore: Some(FrameRect::new(640, 480, 800, 600)),
+            ..Answers::default()
+        },
+    );
+
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    wait_for_calls(&host, 1, "the registration's pin");
+    gateway.close().expect("shutdown joins the engine");
+
+    let persisted = read_session(dir.path()).expect("the shutdown write landed");
+    assert!(
+        persisted.maximized,
+        "an unanswered show state writes nothing: {persisted:?}"
+    );
+    assert_eq!(
+        persisted.rect,
+        Rect::new(640, 480, 800, 600),
+        "and the refusal to guess the bit costs the rect nothing - both came from \
+         the same measure"
     );
 }
 

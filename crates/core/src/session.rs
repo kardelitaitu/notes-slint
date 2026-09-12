@@ -27,6 +27,10 @@ pub struct Session {
     /// DPI scale factor of that monitor at save time (1.0, 1.25, 1.5, ...).
     pub scale_factor: f32,
     /// Whether the window was maximised (restored as maximised, not to rect).
+    /// Its ONLY writer is the port's own measure: `api`'s `measure_rect` stores it
+    /// from `GetWindowPlacement`'s show state on a flush tick, and leaves the bit as
+    /// found when the seam cannot answer the question (a minimised window). Never a
+    /// user request - no `Command` carries it.
     pub maximized: bool,
     /// D10: the pin bit lives ONLY here. A pinned: key in .notes frontmatter
     /// is preserved byte-for-byte by the round-trip rule but is NOT acted on

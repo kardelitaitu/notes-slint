@@ -50,7 +50,7 @@ use crate::command::{Command, WindowHandle};
 use crate::event::{
     Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason, StateFile,
 };
-use notes_platform::{FrameRect, HostFacts, PinOutcome, WindowBackend};
+use notes_platform::{FrameRect, HostFacts, PinOutcome, ShowState, WindowBackend};
 
 use crate::gateway::EventTx;
 
@@ -1210,6 +1210,14 @@ impl Engine {
             // Pinned anyway. The session is marked dirty WITHOUT measuring: the
             // fresh-install fix below, and the measurement belongs to the flush
             // tick (MEASURE LATER, in flush_state).
+            //
+            // And it stays SILENT, deliberately: a maximised startup restored nothing
+            // because nothing failed. The bridge already holds both halves of the
+            // guidance on the read path it uses anyway - `session.maximized` plus
+            // `session.rect`, the un-maximise target, from the same file - and
+            // [`Event::GeometryNotRestored`] is the FAILURE channel the status line
+            // reads as an error, so sentencing every healthy maximised launch to it
+            // would teach the user that the state they chose is broken.
             self.apply_topmost(handle);
             self.queue(Target::Session);
             return;
@@ -1367,21 +1375,38 @@ impl Engine {
                 // A success re-arms the report (MAJOR 6): the next distinct
                 // failure is news again.
                 self.measure_failure_latched = false;
-                // Only the rect is read here: `placement.show` is reported by the
-                // seam and consumed by nothing yet (slice 2), and what to do with
-                // it is a decision this port does not own.
                 let rect = to_rect(placement.restore_rect);
                 // MAJOR 5: within two idle periods of issuing an async move,
                 // this read-back may be the PRE-MOVE or MID-DRAG position - the
                 // call returns before the move lands. Trust it for the latch
                 // bookkeeping, never for storage: the stored rect is protected
                 // from the stale read, and the next GeometryChanged persists
-                // the landed position.
+                // the landed position. The show bit is under the SAME guard: an
+                // async move can un-maximise a window on its way in, and a bit
+                // written from that frame is a bit the user never left.
                 let move_in_flight = self
                     .last_move_issued
                     .is_some_and(|at| at.elapsed() < 2 * AUTOSAVE_IDLE);
-                if !move_in_flight && rect != self.session.rect {
-                    self.session.rect = rect;
+                if !move_in_flight {
+                    if rect != self.session.rect {
+                        self.session.rect = rect;
+                    }
+                    // THE SHOW BIT, and the only writer this field has ever had.
+                    // `maximized` is core's persisted bit and both read paths
+                    // already honour it (this engine's no-move branch, and the
+                    // bridge creating the window maximised); until now NOTHING
+                    // wrote it, which is what made "comes back maximised" a
+                    // promise the code could not keep. The mapping is a
+                    // MEASUREMENT, not a decision: Maximized and Normal are what
+                    // the window is now. Unknown is not a No - it is the absence
+                    // of an answer, usually a minimised window - so it leaves
+                    // the stored bit exactly as it found it rather than
+                    // spending a real bit on a question nobody was asked.
+                    match placement.show {
+                        ShowState::Maximized => self.session.maximized = true,
+                        ShowState::Normal => self.session.maximized = false,
+                        ShowState::Unknown => {}
+                    }
                 }
                 true
             }

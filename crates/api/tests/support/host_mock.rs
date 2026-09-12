@@ -54,10 +54,15 @@ pub struct Answers {
     pub work_area: FrameRect,
     pub monitor_id: u32,
     /// The rect [`restore_frame_rect`] reports as its `Placement::restore_rect` -
-    /// the value D48 persists. The show state is not an answer this fixture models:
-    /// the seam reports `ShowState::Unknown`, which is what "the fake has no view"
-    /// honestly means.
+    /// the value D48 persists.
     pub restore: Option<FrameRect>,
+    /// The show state [`restore_frame_rect`] reports as its `Placement::show` - the
+    /// answer the measured `maximized` bit is stored from. `Unknown` by default:
+    /// that is what "this fake has no view" honestly means, and it is also what
+    /// keeps every fixture written before the show bit existed byte-identical, because
+    /// the port stores nothing on an `Unknown`. A test that is ABOUT the bit answers
+    /// `Maximized` or `Normal` here.
+    pub restore_show: ShowState,
     /// [`ansi_codepage`]: a stand-in for a measurement, never a guess.
     pub codepage: u16,
     /// Each [`Some`] is the OS message that call answers with.
@@ -84,6 +89,7 @@ impl Default for Answers {
             work_area: FrameRect::new(0, 0, 1920, 1032),
             monitor_id: 1,
             restore: None,
+            restore_show: ShowState::Unknown,
             codepage: 1252,
             fail_move: None,
             fail_topmost: None,
@@ -208,7 +214,7 @@ impl WindowBackend for Host {
         }
         Ok(Placement {
             restore_rect: answers.restore.unwrap_or(answers.work_area),
-            show: ShowState::Unknown,
+            show: answers.restore_show,
         })
     }
 
