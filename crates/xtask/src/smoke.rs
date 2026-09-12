@@ -1135,16 +1135,42 @@ fn summary(verdict: &Verdict, p: &Probe, elapsed: Duration, relocation: &Relocat
 /// and the exe's mtime is then compared against the newest source that
 /// produces it. Freshness is proven, never trusted.
 const BUILD_ARGS: &[&str] = &["build", "-p", "notes-bridge-gpui", "--bin", "notes-gpui"];
-/// The crates whose sources end up inside that binary, plus the two manifests
-/// that decide the graph. Anything newer than the exe means the exe is not this
-/// tree.
+/// The crates whose SOURCE DIRECTORIES end up inside that binary, named as
+/// "<crate>/src" rather than "<crate>" on purpose. Cargo's own fingerprint remains
+/// the authority on what rebuilds what; this list is only the guard that exists
+/// because a stale exe was once judged as if it were current. A whole-crate mtime
+/// scan cannot see a dependency graph, and it over-claims: a crate's tests/,
+/// benches/ and examples/ are NOT inputs to the bin (cargo builds them for that
+/// package's own test target and nowhere else), yet a newer file in one of them
+/// aborted a live run with exit 5 while smoke's OWN build step had just rebuilt the
+/// exe - measured on f61d850d, where the named file was
+/// crates/api/tests/geometry.rs, committed 84s before the run, in a log that also
+/// printed built_by_this_run=yes. A guard that contradicts the build it ships behind
+/// is worse than no guard: it teaches people to distrust exit 5.
+///
+/// The scope is strict, not loose. The exe's own crate's sources stay in it, so a
+/// crates/bridge-gpui/src edit newer than the exe is still a loud 5. What left the
+/// scope is a non-input, not a granted exception.
 const SOURCE_ROOTS: &[&str] = &[
-    "crates/bridge-gpui",
-    "crates/api",
-    "crates/core",
-    "crates/platform",
+    "crates/bridge-gpui/src",
+    "crates/api/src",
+    "crates/core/src",
+    "crates/platform/src",
 ];
-const SOURCE_FILES: &[&str] = &["Cargo.toml", "Cargo.lock"];
+/// Inputs that live OUTSIDE a src dir, named one by one because a scan that walked
+/// whole crate dirs would walk their tests with them: the workspace manifest and the
+/// lock (the lock decides the entire external graph), one manifest per crate above (a
+/// feature or dependency line there changes the binary), and the bridge's build.rs (it
+/// decides the embedded manifest, so a stale build script is a stale exe).
+const SOURCE_FILES: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/bridge-gpui/Cargo.toml",
+    "crates/bridge-gpui/build.rs",
+    "crates/api/Cargo.toml",
+    "crates/core/Cargo.toml",
+    "crates/platform/Cargo.toml",
+];
 /// The target did not compile: its own verdict, not a decline (the desktop is
 /// fine) and not a step failure (nothing was launched).
 pub const BUILD_FAILED_EXIT: i32 = 4;
@@ -3195,7 +3221,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xtask-stale-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         for root in SOURCE_ROOTS {
-            fs::create_dir_all(dir.join(root).join("src")).expect("source tree");
+            fs::create_dir_all(dir.join(root)).expect("source tree");
         }
         let exe = dir.join("notes-gpui.exe");
         fs::write(&exe, b"MZ").expect("write the exe");
@@ -3240,6 +3266,91 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The f61d850d incident, pinned as a rule: a test file belonging to ANOTHER
+    /// crate is not an input to notes-gpui.exe, so it cannot make that exe stale -
+    /// while a source of the bridge itself still can, loudly. Both directions are
+    /// asserted because narrowing a guard without re-asserting its teeth is how a
+    /// check becomes decoration.
+    #[test]
+    fn another_crate_test_file_is_not_an_input_to_the_binary() {
+        let dir = std::env::temp_dir().join(format!("xtask-scope-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for root in SOURCE_ROOTS {
+            fs::create_dir_all(dir.join(root)).expect("src tree");
+        }
+        fs::create_dir_all(dir.join("crates/api/tests")).expect("tests tree");
+        let exe = dir.join("notes-gpui.exe");
+        fs::write(&exe, b"MZ").expect("exe");
+        let src = dir.join("crates/bridge-gpui/src/main.rs");
+        fs::write(&src, "fn main() {}\n").expect("src");
+        // Everything this scan is allowed to see is as old as the exe...
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        set_mtime(&exe, past);
+        set_mtime(&src, past);
+        for root in SOURCE_ROOTS {
+            if let Ok(f) = fs::File::open(dir.join(root).join("lib.rs")) {
+                let _ = f;
+            }
+        }
+        // ...and only a NON-INPUT is newer than it.
+        let foreign_test = dir.join("crates/api/tests/geometry.rs");
+        fs::write(&foreign_test, "// a test of another crate\n").expect("test file");
+        set_mtime(&foreign_test, std::time::SystemTime::now());
+        assert_eq!(
+            staleness(mtime_of(&exe), newest_source(&dir)),
+            Stale::Fresh,
+            "a newer tests/ file of another crate must not abort the run it built"
+        );
+        // The teeth: the same newer-than-exe condition on a real input is still a
+        // loud 5, and it names the file.
+        set_mtime(
+            &src,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+        );
+        match staleness(mtime_of(&exe), newest_source(&dir)) {
+            Stale::OlderThan { source, .. } => assert_eq!(source, src),
+            other => panic!("a newer bridge source is real staleness: {other:?}"),
+        }
+        // And nothing in SOURCE_FILES may name a tests/ path: that is the whole bug.
+        for f in SOURCE_FILES {
+            assert!(!f.contains("tests"), "a test path is not an input: {f}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Narrowing the walk must not have dropped a real input that happens to live
+    /// outside a src dir: each crate's manifest and the one build script in the
+    /// workspace are all listed, and each one wins the scan when it is the newest.
+    #[test]
+    fn every_input_outside_a_src_dir_is_still_watched() {
+        let dir = std::env::temp_dir().join(format!("xtask-files-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        for (n, f) in SOURCE_FILES.iter().enumerate() {
+            let path = dir.join(f);
+            fs::create_dir_all(path.parent().unwrap()).expect("parent");
+            fs::write(&path, "input\n").expect("write");
+            // Stepping the stamp each round matters: the scan keeps the FIRST file at
+            // a tie, so identical stamps would test the loop order, not the scope.
+            set_mtime(&path, future + std::time::Duration::from_secs(n as u64 + 1));
+            let newest = newest_source(&dir).expect("a source");
+            assert_eq!(
+                newest.1, path,
+                "{f} must be in scope: newest came back as {:?}",
+                newest.1
+            );
+        }
+        // The build script is the only one, so the scan names it exactly once.
+        assert_eq!(
+            SOURCE_FILES
+                .iter()
+                .filter(|f| f.ends_with("build.rs"))
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// newest_source must look at every crate that feeds the binary, not just
     /// the bridge - an api edit is what made a cached exe lie here.
     #[test]
@@ -3248,7 +3359,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         for (i, root) in SOURCE_ROOTS.iter().enumerate() {
-            let file = dir.join(root).join("src").join("lib.rs");
+            let file = dir.join(root).join("lib.rs");
             fs::create_dir_all(file.parent().unwrap()).expect("tree");
             fs::write(&file, "// newest candidate").expect("write");
             if i == SOURCE_ROOTS.len() - 1 {
