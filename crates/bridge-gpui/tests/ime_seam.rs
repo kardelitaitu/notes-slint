@@ -320,6 +320,153 @@ fn a_committed_insert_lands_at_the_utf16_offset_the_platform_named() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. The commit string: what the IME finally says, end to end
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pinyin_composition_commits_its_final_string_into_a_cjk_and_emoji_line() {
+    // THE COMMIT-STRING PATH, headless. Group 2 pins what the platform is TOLD (the
+    // marked range, in its units); group 4 pins one commit. This walks the whole
+    // event order the Windows backend actually delivers - GCS_LRESULTSTR repeated
+    // through replace_and_mark_text_in_range (events.rs:760), then GCS_RESULTSTR
+    // once through replace_text_in_range(None, ...) (events.rs:744) - and asserts
+    // that the bytes which SURVIVE are only the commit string. It is the
+    // machine-provable half of D52: no test can put a candidate window on a screen,
+    // but a test can show the seam turns "nihao" into 你好 exactly once, in place,
+    // with the mark gone and the caret where the platform will next look for it.
+    let mut state = TextState::new(LINE.to_string());
+    state.move_to(19);
+    assert_eq!(state.selected_range, 19..19, "caret after 語, mid-line");
+    assert_eq!(
+        editor::offset_to_utf16(&state.content, 19),
+        8,
+        "byte 19 is unit 8: the 21-vs-10 gap is entirely BEHIND the caret, so every index the platform names from here is a unit index the model must convert"
+    );
+
+    // The preedit, as it grows. Each update carries the WHOLE composition string -
+    // the IME never sends a delta - with new_selected_range measured inside it (the
+    // entire preedit selected, which is what Microsoft Pinyin does).
+    for step in ["ni", "nha", "nihao"] {
+        state.replace_and_mark(None, step, Some(0..step.len()));
+        assert_eq!(
+            state.content,
+            format!("{}{step}{}", &LINE[..19], &LINE[19..]),
+            "{step:?}: an update REPLACES the previous preedit, it does not append"
+        );
+        let mark = state
+            .marked_range
+            .clone()
+            .expect("still composing: the mark is what the candidate window attaches to");
+        assert_eq!(
+            &state.content[mark.clone()],
+            step,
+            "{step:?}: the mark covers exactly the preedit and nothing else"
+        );
+        assert!(
+            state.content.is_char_boundary(mark.start) && state.content.is_char_boundary(mark.end),
+            "{step:?}: a mark on a non-boundary would be an illegal splice index for the commit"
+        );
+        println!(
+            "preedit {step:?}: bytes {mark:?} = units {:?}",
+            state.marked_text_range()
+        );
+    }
+    assert_eq!(state.marked_range, Some(19..24), "the last update wins");
+    assert_eq!(
+        state.marked_text_range(),
+        Some(8..13),
+        "the platform reads the preedit back in UTF-16 units, never bytes"
+    );
+    assert_eq!(
+        state.cursor_offset(),
+        24,
+        "the caret sits at the end of the preedit"
+    );
+
+    // GCS_RESULTSTR. The range is None, so replacement_range prefers the MARK over
+    // the selection (editor.rs:464-473) - which is why the same call is right
+    // wherever inside the preedit the caret happens to be.
+    state.replace(None, "你好");
+    let committed = "e\u{301}\u{2611}\u{FE0F} 日本語你好 x";
+    assert_eq!(
+        state.content, committed,
+        "the commit string IS the final text"
+    );
+    assert_eq!(
+        state.content.len(),
+        27,
+        "21 + 5 - 5 + 6: the preedit's five bytes go, 你好's six arrive"
+    );
+    assert!(
+        !state.content.contains('n') && !state.content.contains('h'),
+        "no pinyin residue anywhere: {:?}",
+        state.content
+    );
+    assert_eq!(
+        &state.content[19..25],
+        "你好",
+        "the committed bytes are the commit string's own UTF-8, in place"
+    );
+    assert_eq!(state.marked_range, None, "a commit ends the composition");
+    // Editor::is_composing() (editor.rs:1636-1638) is exactly marked_range.is_some(),
+    // and D51 refuses to Flush while it is true. So this None is the moment the
+    // buffer becomes saveable: the on-screen half of D52 stays manual, the flush-gate
+    // half is proven here.
+    let caret = state.cursor_offset();
+    assert_eq!(caret, 25, "the caret lands after the committed characters");
+    assert_eq!(
+        editor::offset_to_utf16(&state.content, caret),
+        10,
+        "the same caret in the units the platform names"
+    );
+    assert_eq!(
+        state.content[..caret].graphemes(true).count(),
+        8,
+        "and in clusters - all three agree, which is the whole point"
+    );
+    assert_eq!(state.selected_text_range().range, 10..10);
+
+    // The same commit with the platform NAMING the range: the units it read back
+    // from marked_text_range above, handed straight to replace_text_in_range.
+    let mut named = TextState::new(LINE.to_string());
+    named.move_to(19);
+    named.replace_and_mark(None, "nihao", Some(0..5));
+    named.replace(Some(8..13), "你好");
+    assert_eq!(
+        named.content, committed,
+        "the unit-named commit is the same commit"
+    );
+    assert_eq!(named.cursor_offset(), caret);
+    assert_eq!(named.marked_range, None);
+
+    // And a commit string the platform cannot index as one unit: an emoji is TWO
+    // UTF-16 units and FOUR UTF-8 bytes. Same seam, same arithmetic, and the
+    // surrogate pair is the shape that used to be the D52 killer.
+    let mut emoji = TextState::new(LINE.to_string());
+    emoji.move_to(19);
+    emoji.replace_and_mark(None, "nihao", Some(0..5));
+    emoji.replace(Some(8..13), "\u{1F600}");
+    assert_eq!(
+        emoji.content, "e\u{301}\u{2611}\u{FE0F} 日本語\u{1F600} x",
+        "the pictograph arrives whole, not as half a pair"
+    );
+    assert_eq!(emoji.cursor_offset(), 23, "19 + 4 UTF-8 bytes");
+    assert_eq!(
+        editor::offset_to_utf16(&emoji.content, 23),
+        10,
+        "8 + 2 UTF-16 units - the same unit answer 你好 gave"
+    );
+    assert_eq!(
+        emoji.content[..emoji.cursor_offset()]
+            .graphemes(true)
+            .count(),
+        7,
+        "one cluster, whatever the units say"
+    );
+    assert_eq!(emoji.marked_range, None);
+}
+
+// ---------------------------------------------------------------------------
 // 5. The defaults' runtime values - feature-gated, NOT evidence until enabled
 // ---------------------------------------------------------------------------
 

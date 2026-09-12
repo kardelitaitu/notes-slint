@@ -1,6 +1,6 @@
 {
   "ansi_codepage": 1252,
-  "count": 28,
+  "count": 30,
   "files": [
     {
       "bom_present": false,
@@ -61,6 +61,30 @@
       "note": "a file that is only a BOM",
       "sha256_hex": "f1945cd6c19e56b3c1c78943ef5ec18116907a4ca1efc40a57d48ab1db7adfc5",
       "trailing_newline": false
+    },
+    {
+      "bom_present": true,
+      "bytes": 20,
+      "encoding": "utf16le",
+      "extension": "txt",
+      "file": "edge__cjk-utf16le.txt",
+      "foreign": true,
+      "line_ending": "lf",
+      "note": "the same CJK run and non-BMP emoji in UTF-16LE: the surrogate pair is the IME commit string's wire form, and detect/decode must not split it",
+      "sha256_hex": "4024c62642bf8f5a75cf51ba5b2666a85663ab356a85066c59719dbc7a57807f",
+      "trailing_newline": true
+    },
+    {
+      "bom_present": false,
+      "bytes": 23,
+      "encoding": "utf8",
+      "extension": "txt",
+      "file": "edge__cjk-utf8.txt",
+      "foreign": true,
+      "line_ending": "lf",
+      "note": "CJK run plus a non-BMP emoji, UTF-8: the IME commit string's own bytes must survive the round trip",
+      "sha256_hex": "12986b8bd436b64a207a0ebbfea45291acbd41b9283a38fbbd55320e2313d086",
+      "trailing_newline": true
     },
     {
       "bom_present": false,

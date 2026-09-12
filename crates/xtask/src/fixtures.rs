@@ -293,6 +293,26 @@ fn edge_specs() -> Vec<Spec> {
             note: "UTF-8 containing U+1F600, outside CP1252: the ansi1252 tests point at this file".to_string(),
         },
         Spec {
+            file: "edge__cjk-utf8.txt".to_string(),
+            bytes: "日本語のメモ\u{1F600}\n".as_bytes().to_vec(),
+            encoding: "utf8",
+            line_ending: "lf",
+            trailing_newline: true,
+            bom_present: false,
+            note: "CJK run plus a non-BMP emoji, UTF-8: the IME commit string's own bytes must survive the round trip".to_string(),
+        },
+        Spec {
+            file: "edge__cjk-utf16le.txt".to_string(),
+            bytes: Enc::Utf16Le
+                .encode("日本語のメモ\u{1F600}\n")
+                .expect("utf16le needs no CP1252"),
+            encoding: "utf16le",
+            line_ending: "lf",
+            trailing_newline: true,
+            bom_present: true,
+            note: "the same CJK run and non-BMP emoji in UTF-16LE: the surrogate pair is the IME commit string's wire form, and detect/decode must not split it".to_string(),
+        },
+        Spec {
             file: "edge__frontmatter.notes".to_string(),
             bytes: concat!(
                 "---\n",
@@ -1301,7 +1321,7 @@ mod tests {
         assert!(
             violations
                 .iter()
-                .any(|v| v.contains("manifest count is 5, generator says 28")),
+                .any(|v| v.contains("manifest count is 5, generator says 30")),
             "{violations:?}"
         );
     }
