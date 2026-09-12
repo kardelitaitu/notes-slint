@@ -1018,12 +1018,8 @@ fn sweep_stale_seeds(older_than: std::time::Duration) -> usize {
 /// seed THIS machine's real profile, which is exactly the harm SeedGuard exists to
 /// prevent.
 fn seed_settings(exe: &Path) -> Result<(SeedGuard, PathBuf), String> {
-    let marker = exe
-        .parent()
-        .map(|d| d.join("data").is_dir())
-        .unwrap_or(false);
-    let dir = state_dir_for(exe, std::env::var_os("APPDATA").as_deref(), marker)
-        .ok_or("the app's state dir cannot be resolved from the exe path")?;
+    let dir =
+        app_state_dir(exe).ok_or("the app's state dir cannot be resolved from the exe path")?;
     seed_settings_at(&dir)
 }
 
@@ -1642,6 +1638,7 @@ public static class WIN {
   [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
   [DllImport("user32.dll", EntryPoint="GetWindowLongW")] public static extern int GetWindowLong(IntPtr h, int i);
   [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hh, bool rep);
+  [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
 }
 '@
 if (-not (Add-Type -TypeDefinition $code -PassThru)) { 'WIN32=0'; 'PROBE_DONE=1'; exit 0 }
@@ -1686,6 +1683,10 @@ while ((Get-Date) -lt $deadline) {
 # failure - with the last EXSTYLE and the waited time printed, because "never
 # became topmost in 2000ms" and "was topmost at 512ms" are different bugs and
 # only the first print tells them apart.
+# The maximised leg reads the SHOW state at creation, before any move or band: did
+# the file's maximized:true actually put the window in the zoomed style? -1 when there
+# is no handle is an absent answer, never a no.
+if ($handle -ne 0) { "ZOOM=$([int][WIN]::IsZoomed($handle))" } else { 'ZOOM=-1' }
 if ($handle -ne 0) {
     # -1 = no polarity was seeded, so there is nothing to wait FOR and the read
     # stays a single sample. Anything else is the answer session.json demands.
@@ -2058,6 +2059,144 @@ fn pin_refusal(read: PinRead, which: &str) -> String {
     }
 }
 
+/// The one place the maximised leg reads the app's OWN state dir from, so it can
+/// never repeat the dossier mistake of watching %APPDATA% while the portable marker
+/// sent the process to target/debug/data. The candidate-dir SEARCH list is a
+/// different question (it answers "where is a file that might be ours"), and the
+/// geometry lane still uses it - a known follow-up, deliberately not copied here.
+fn app_state_dir(exe: &Path) -> Option<PathBuf> {
+    let portable = exe
+        .parent()
+        .map(|d| d.join("data").is_dir())
+        .unwrap_or(false);
+    state_dir_for(exe, std::env::var_os("APPDATA").as_deref(), portable)
+}
+
+/// The chrome that walks, as a delta: what the relaunch rect gained over the launch
+/// rect in x, y, width and height. A working restore gives all four zeros; the
+/// frame/client double-count shows up as the non-client border exactly (-8, -4,
+/// +16, +8 at 100% on this machine, which is smoke's own measured chrome).
+///
+/// Kept a pure function because the whole point is the NUMBER: a print that already
+/// had to think about the arithmetic could not be checked, and the assert armed
+/// below is this function compared against zero.
+pub fn rect_drift(before: Option<Rect>, after: Option<Rect>) -> Option<(i32, i32, i32, i32)> {
+    let (b, a) = (before?, after?);
+    Some((
+        a.l - b.l,
+        a.t - b.t,
+        (a.r - a.l) - (b.r - b.l),
+        (a.b - a.t) - (b.b - b.t),
+    ))
+}
+
+/// The maximised cycle, INFO ONLY: seed the file to say maximized:true, launch it,
+/// close it clean, relaunch, and print what the restore did to the rect.
+///
+/// Why this exists as a leg of its own rather than as another case inside
+/// geometry_round_trip: that function OWNS an exit code (6 and 7), and this cycle
+/// must not change any verdict yet - the ratchet fix is landing in platform/api as a
+/// separate commit (df57), and a leg that asserted it here would turn smoke red at
+/// the commit that DOCUMENTS the bug rather than the one that fixes it. Nothing in
+/// this function can fail the run; every line is printed as INFO and the function
+/// returns nothing.
+///
+/// The seed is the second reason this is explicit: like the M5 lesson on the rect
+/// lane, a seed that INHERITS the show state inherits whatever a previous run left.
+/// Here the leg wants maximised, so it says so.
+fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) {
+    println!("smoke: maximised: INFO - the cycle is observational, not a verdict (see M9 below)");
+    // Keep the position the user's file already names; this leg is about the SHOW
+    // state, so inventing a rect here would confound the two.
+    let keep = match fs::read_to_string(session) {
+        Ok(text) => persisted_rect(&text).unwrap_or(Rect {
+            l: 320,
+            t: 240,
+            r: 920,
+            b: 640,
+        }),
+        Err(e) => {
+            println!("smoke: maximised: INFO - not run, {session:?} unreadable: {e}");
+            return;
+        }
+    };
+    let before = match seed_session_with_state(session, &keep, false, true) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            println!("smoke: maximised: INFO - could not seed a maximised session: {e}");
+            return;
+        }
+    };
+    // Launch one: the file says maximised, so ZOOM at creation is the READ half of
+    // the promise and FRAME is the rect that will be persisted on the way out.
+    let first = match run_probe_script(script, exe, err_file, Some(session), None, None, 12) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("smoke: maximised: INFO - first launch did not report: {e}");
+            restore_session(session, before.as_deref());
+            return;
+        }
+    };
+    // Headless insurance: the first launch already reported whether there is a
+    // desktop to place a window on, and this leg has no business starting a second
+    // process on a machine that has none. The geometry lane declines the same way.
+    if !first.flag("DESKTOP") {
+        println!(
+            "smoke: maximised: INFO - not run, no interactive desktop to maximise a window on"
+        );
+        restore_session(session, before.as_deref());
+        return;
+    }
+    let rect_before = probe_rect(&first, "FRAME");
+    // Launch two: the same file, relaunched, is where a frame/client double-count
+    // becomes visible, because the persisted rect is applied as bounds and measured
+    // back as a frame again.
+    let second = match run_probe_script(script, exe, err_file, Some(session), None, None, 12) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("smoke: maximised: INFO - relaunch did not report: {e}");
+            restore_session(session, before.as_deref());
+            return;
+        }
+    };
+    let rect_after = probe_rect(&second, "FRAME");
+    let persisted = fs::read_to_string(session).ok().and_then(|t| {
+        let r = persisted_rect(&t);
+        let m = t.contains("\"maximized\": true");
+        println!("smoke: maximised: INFO - session.json after the cycle persists rect {} with maximized:{}", r.map(|x| x.text()).unwrap_or_else(|| "-".into()), m);
+        r
+    });
+    let zoom = |p: &Probe| match p.number("ZOOM") {
+        Some(1) => "zoomed at creation",
+        Some(0) => "NOT zoomed at creation",
+        _ => "zoom unread",
+    };
+    println!(
+        "smoke: maximised: INFO - launch 1 rect {} ({})",
+        rect_before.map(|r| r.text()).unwrap_or_else(|| "-".into()),
+        zoom(&first)
+    );
+    println!(
+        "smoke: maximised: INFO - launch 2 rect {} ({})",
+        rect_after.map(|r| r.text()).unwrap_or_else(|| "-".into()),
+        zoom(&second)
+    );
+    let drift = rect_drift(rect_before, rect_after);
+    println!(
+        "smoke: maximised: INFO - drift across one cycle (dx, dy, dw, dh) = {drift:?}; the rect launch 1 persisted was {}, and the chrome measured this run is (+8, +0, -8, -8) - a non-zero quadruple matching that border is the frame/client double-count, not a race",
+        persisted.map(|r| r.text()).unwrap_or_else(|| "-".into())
+    );
+    // M9 (armed): this is the line that becomes the verdict once df57's ratchet fix
+    // lands. The flip is two lines -
+    //     let _ = drift;   ->   if drift != Some((0, 0, 0, 0)) { notes.push(...) }
+    // and the notes travel out through the geometry lane as Geometry::Broken, i.e.
+    // exit 6, which already means "the window-memory promise did not hold". Nothing
+    // else about this leg changes: the seeds, the INFO prints and the restore all
+    // stay, because a failing assertion is still worth reading in the same words.
+    let _ = drift;
+    restore_session(session, before.as_deref());
+}
+
 /// Did this launch's window die while the pin poll was waiting for it?
 fn poll_crashed(probe: &Probe) -> bool {
     probe.flag("PIN_POLL_CRASHED")
@@ -2303,6 +2442,19 @@ pub fn seed_session_with_pin(
     seed: &Rect,
     pinned: bool,
 ) -> Result<Option<Vec<u8>>, String> {
+    seed_session_with_state(path, seed, pinned, false)
+}
+
+/// The same seed with the SHOW state named out loud, which is the M5 lesson
+/// generalised: a seed that inherits maximized from the file it is overwriting
+/// inherits whatever the last run left there, and a leg that believes it asked for a
+/// maximised window then measures the accident. Every caller states it.
+pub fn seed_session_with_state(
+    path: &Path,
+    seed: &Rect,
+    pinned: bool,
+    maximized: bool,
+) -> Result<Option<Vec<u8>>, String> {
     let before = match fs::read(path) {
         Ok(bytes) => Some(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -2340,7 +2492,7 @@ pub fn seed_session_with_pin(
     // reuse this function's forcing - which is why the forcing lives here and not
     // in the JSON seeding helper it sits beside.
     if let Some(map) = value.as_object_mut() {
-        map.insert("maximized".to_string(), serde_json::json!(false));
+        map.insert("maximized".to_string(), serde_json::json!(maximized));
     }
     if pinned {
         obj2_pin(&mut value);
@@ -3131,6 +3283,22 @@ pub fn run(args: &[String]) -> i32 {
                 }
             },
         }
+        // The maximised cycle, printed as INFO and unable to change the code. Its
+        // directory comes from state_dir_for through app_state_dir, NOT from the
+        // candidate search list the lane above uses: the 2026-09-13 dossier lost a
+        // whole reading to the roaming profile while the portable marker had the live
+        // process writing target/debug/data, and a probe is not allowed to make that
+        // mistake twice. The search list above is now a known follow-up rather than
+        // something to copy.
+        match app_state_dir(&exe)
+            .map(|dir| dir.join(SESSION_FILE))
+            .filter(|p| p.is_file())
+        {
+            Some(path) => maximised_cycle(&geom_script, &exe, &err_file, &path),
+            None => println!(
+                "smoke: maximised: INFO - not run, the app-resolved dir holds no session.json to seed"
+            ),
+        }
     } else {
         println!(
             "smoke: geometry: NOT RUN - the first launch did not succeed, so there is nothing to round trip"
@@ -3882,6 +4050,76 @@ mod tests {
         assert!(text.contains("\"pinned\": true"), "{text}");
         assert!(text.contains("\"maximized\": false"), "{text}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The number the armed assert will compare against zero, tested as data so it
+    /// cannot agree with the print by accident. The honest case, the exact chrome
+    /// quadruple the dossier measured, and the unreadable case are all pinned: a
+    /// missing rect must never read as zero drift, which is the same rule that keeps a
+    /// missing TOPMOST out of a pass.
+    #[test]
+    fn the_drift_is_four_numbers_and_not_a_vibes_check() {
+        let at = |l, t, w, h| Rect {
+            l,
+            t,
+            r: l + w,
+            b: t + h,
+        };
+        assert_eq!(
+            rect_drift(Some(at(100, 100, 800, 600)), Some(at(100, 100, 800, 600))),
+            Some((0, 0, 0, 0))
+        );
+        assert_eq!(
+            rect_drift(Some(at(382, 274, 636, 428)), Some(at(374, 270, 652, 436))),
+            Some((-8, -4, 16, 8)),
+            "the measured inflation, in the order the leg prints"
+        );
+        assert_eq!(rect_drift(None, Some(at(0, 0, 10, 10))), None);
+        assert_eq!(rect_drift(Some(at(0, 0, 10, 10)), None), None);
+    }
+
+    /// A seed must be able to SAY maximised, not merely fail to clear it: the cycle leg
+    /// reads the restore, so its premise has to be in the file it seeds. And the
+    /// wrapper the rect lane uses must still clear the bit - two call sites must not
+    /// collapse into one by forgetting a default.
+    #[test]
+    fn a_seed_can_state_the_show_state_it_wants() {
+        let dir = std::env::temp_dir().join(format!("xtask-mx-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("session.json");
+        let seed = Rect {
+            l: 320,
+            t: 240,
+            r: 920,
+            b: 640,
+        };
+        seed_session_with_state(&path, &seed, false, true).expect("maximised seed");
+        let text = fs::read_to_string(&path).expect("written");
+        assert!(text.contains(r#""maximized": true"#), "{text}");
+        assert_eq!(persisted_rect(&text), Some(seed), "the rect is as stated");
+        seed_session_with_pin(&path, &seed, false).expect("plain seed");
+        let text = fs::read_to_string(&path).expect("written again");
+        assert!(text.contains(r#""maximized": false"#), "{text}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Without IsZoomed in the script the leg prints "zoom unread" forever and still
+    /// looks like an observation that works, so the probe half is pinned too.
+    #[test]
+    fn the_probe_reports_the_show_state_at_creation() {
+        assert!(
+            GEOMETRY_PROBE.contains("public static extern bool IsZoomed"),
+            "the script must be able to ask"
+        );
+        assert!(
+            GEOMETRY_PROBE.contains("ZOOM=$([int][WIN]::IsZoomed($handle))"),
+            "and answer at creation, before any move or band"
+        );
+        assert!(
+            GEOMETRY_PROBE.contains("'ZOOM=-1'"),
+            "no handle is an absent answer, never a no"
+        );
     }
 
     /// The f61d850d incident, pinned as a rule: a test file belonging to ANOTHER
