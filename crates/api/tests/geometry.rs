@@ -772,6 +772,135 @@ fn the_first_event_names_the_persisted_recents_before_any_command() {
     gateway.close().expect("shutdown joins the engine");
 }
 
+/// THE SILENT HALF of that announce, and the settings branch that earns it.
+/// With NO settings.toml, gateway.rs takes the `Ok(None) => settings` arm: the
+/// CALLER'S default fills the gap, and core's default recents list is empty -
+/// which is already the bridge's opening state, so there is nothing to say.
+/// The failure this pins is the opposite reading: an engine that announced the
+/// default it had just applied would put a `RecentsUpdated` on the wire that
+/// describes no user history, and no pump can tell that list from a real one.
+/// This is also exactly where headless and live diverge: a developer machine
+/// with a settings.toml never walks the branch, a fresh install always does.
+#[test]
+fn a_missing_settings_file_announces_nothing_even_though_the_caller_default_is_what_fills_in() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(
+        !dir.path().join("settings.toml").exists(),
+        "fixture: this must be the ABSENT-file launch, not a seeded one"
+    );
+    // Gateway::start, not start_with_host: the point of this run is the whole
+    // pre-window read, including which settings it found. No RegisterWindow is
+    // ever sent, so no host seam is reached from here either way.
+    let (gateway, rx) = Gateway::start(StateDir(dir.path().to_path_buf()), Settings::default());
+
+    // The claim is that NOTHING arrives, and nothing has no signal to wait on,
+    // so the wait is bounded: two tick periods covers any delay the announce
+    // could honestly have had, because it is emitted before the first command
+    // is even received.
+    let quiet_until = Instant::now() + Duration::from_millis(750 * 2 + 100);
+    let mut strays: Vec<Event> = Vec::new();
+    while let Ok(event) = rx.recv_timeout(quiet_until.saturating_duration_since(Instant::now())) {
+        strays.push(event);
+    }
+    assert!(
+        strays
+            .iter()
+            .all(|e| !matches!(e, Event::RecentsUpdated(_))),
+        "an absent settings file is no history to announce: {strays:?}"
+    );
+    // SILENCE IS NOT A DEAD PIPE, and an assertion that cannot tell the two
+    // apart proves nothing: the same handle still answers a command, and the
+    // answer to THIS one is the empty list - the change that is news.
+    assert!(
+        gateway.send(Command::ClearRecents).is_ok(),
+        "the engine is up and simply had nothing to say"
+    );
+    let answered = rx
+        .recv_timeout(ANSWER)
+        .expect("an explicit change to the list IS announced");
+    match answered {
+        Event::RecentsUpdated(entries) => assert!(
+            entries.is_empty(),
+            "and the announced list is the empty default, now as a fact: {entries:?}"
+        ),
+        other => panic!("expected RecentsUpdated, got {other:?}"),
+    }
+    gateway.close().expect("shutdown joins the engine");
+}
+
+/// THE PAIRED POSITIVE, and the half that makes the test above mean something:
+/// a persisted list is announced even when EVERY file in it is gone. D13's rule
+/// is that a vanished path STAYS in the list, greyed - `mark_missing` drops the
+/// exists flags and the is_file() probe relights only what survives - so an
+/// all-missing list is precisely the shape in which "grey the row" can quietly
+/// degrade into "delete the row", and a menu that forgets the notes it could not
+/// find right now is the worse app (a share that is merely offline still holds
+/// the note). Seeded through core's own writer with exists: TRUE, because that
+/// is what a live session persisted: the grey must be RE-PROBED, not stored.
+#[test]
+fn recents_whose_files_are_all_gone_are_announced_greyed_and_never_dropped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Paths INSIDE this private temp dir, none of them created: the probe stats
+    // real names without reaching a real profile or anyone else's state dir.
+    let gone_one = dir.path().join("one.notes");
+    let gone_two = dir.path().join("two.notes");
+    assert!(
+        !gone_one.exists() && !gone_two.exists(),
+        "fixture: neither file may exist - that is the case under test"
+    );
+    let settings = Settings {
+        recents: vec![
+            notes_core::recent::RecentEntry {
+                path: gone_one.clone(),
+                display: "one.notes".to_string(),
+                exists: true,
+            },
+            notes_core::recent::RecentEntry {
+                path: gone_two.clone(),
+                display: "two.notes".to_string(),
+                exists: true,
+            },
+        ],
+        ..Settings::default()
+    };
+    notes_core::settings::write_settings(&StateDir(dir.path().to_path_buf()), &settings)
+        .expect("seed settings.toml");
+
+    // The caller default is EMPTY, so a list that arrives can only have come
+    // from the file: this is the Ok(Some(persisted)) arm, the exact branch the
+    // test above proves is silent.
+    let (gateway, rx) = Gateway::start_with_host(
+        StateDir(dir.path().to_path_buf()),
+        Settings::default(),
+        None,
+        None,
+    );
+    let first = rx
+        .recv_timeout(ANSWER)
+        .expect("a persisted list is announced even when every file is missing");
+    match first {
+        Event::RecentsUpdated(entries) => {
+            assert_eq!(
+                entries.len(),
+                2,
+                "greyed is not gone: a vanished path still holds its row and its cap"
+            );
+            assert_eq!(entries[0].path, gone_one, "most-recent-first, as stored");
+            assert_eq!(entries[1].path, gone_two);
+            assert!(
+                entries.iter().all(|e| !e.exists),
+                "exists is the PROBED fact, never the stored one: {entries:?}"
+            );
+            assert!(
+                entries.iter().all(|e| !e.display.is_empty()),
+                "a greyed row is still a row the menu can render: {entries:?}"
+            );
+        }
+        other => panic!("expected RecentsUpdated as the FIRST event, got {other:?}"),
+    }
+    gateway.close().expect("shutdown joins the engine");
+}
+
 /// The settings contract's middle case, through the port's OWN seam: the
 /// settings left the codepage unset, and the host's ANSI code page fills the
 /// gap - here the fake's CP932, which must turn a CP1252 byte stream into a
