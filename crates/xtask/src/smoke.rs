@@ -76,14 +76,21 @@
 //!   says so rather than accusing the app.
 //! * 9 - THE LIVE UI NEVER SAW THE STARTUP ANNOUNCE: the app launched, closed
 //!   gracefully and persisted (exit 0's own verdicts), and yet the stderr
-//!   redirected from the LIVE process names no `RecentsUpdated` while the profile
-//!   held recents that were there to announce (TRACE_FAILED_EXIT; roadmap M2 exit
-//!   item 5). Its own code because 1 means "the shutdown or the write broke" and
-//!   this means the opposite: everything ran, and a fact the port knew never
-//!   reached the window. A capture that could not be read, and a profile with
-//!   nothing to announce, both print NOT JUDGED (advisory) and leave the code
+//!   redirected from the LIVE process names no `RecentsUpdated` while the state dir
+//!   the APP RESOLVED held recents that were there to announce (TRACE_FAILED_EXIT;
+//!   roadmap M2 exit item 5 - and counted from ONE directory on purpose: an earlier
+//!   draft walked every candidate state dir and armed this verdict against a
+//!   settings.toml in the roaming profile while the portable marker sent the app to
+//!   target/debug/data, which held no settings file at all. That produced a real
+//!   false exit 9). Its own code because 1 means "the shutdown or the write broke"
+//!   and this means the opposite: everything ran, and a fact the port knew never
+//!   reached the window. A capture that could not be read, and an app-resolved dir
+//!   with nothing to announce, both print NOT JUDGED (advisory) and leave the code
 //!   alone - an unverifiable step is neither a pass nor a failure, exactly as
-//!   geometry treats its own unmeasurable legs.
+//!   geometry treats its own unmeasurable legs. The evidence line names the VOICE
+//!   that carried the match - [rendered] is a status line the UI showed, [arrived]
+//!   is the per-arrival event line, [delivered, never rendered] is the exit drain -
+//!   and the strongest voice present is the one cited, never the first written.
 //! * 3 - DECLINED for a reason that is not the app's fault: no interactive
 //!   desktop (no sessions win32k user32.dll), no window handle even though the
 //!   app kept running, or the session path holding foreign state this harness
@@ -719,10 +726,29 @@ pub enum TraceVerdict {
 fn trace_voice(line: &str) -> &'static str {
     if line.contains("status line:") {
         "rendered"
+    } else if line.contains("event: ") {
+        // The arrival voice: the bridge names every drained event once, before the
+        // last-wins collapse and ungated on purpose (bridge main.rs, the
+        // report of "event: {words}"), so this is the strongest voice that is
+        // ALWAYS true - it survives a batch that hides the announce behind a later
+        // event, which is the exact case "status line:" cannot cover.
+        "arrived"
     } else if line.contains("undisplayed:") {
         "delivered, never rendered"
     } else {
         "traced"
+    }
+}
+
+/// How strong a voice is, best last. A claim cites the STRONGEST line that
+/// matched rather than the first one written, so a run never downgrades its own
+/// evidence to whatever the app happened to print first.
+fn voice_rank(line: &str) -> u8 {
+    match trace_voice(line) {
+        "rendered" => 3,
+        "arrived" => 2,
+        "delivered, never rendered" => 1,
+        _ => 0,
     }
 }
 
@@ -731,10 +757,13 @@ fn trace_voice(line: &str) -> &'static str {
 ///
 /// * captured - the bytes the LIVE app wrote to its own stderr on this launch,
 ///   or None when the file could not be read.
-/// * recents_at_startup - how many recents the profile held before the launch.
-///   Zero makes the assertion UNMEASURABLE rather than satisfied: the engine
-///   announces only when there is something to announce, so on a fresh install no
-///   line can appear, and a run that "passed" would be a run that asserted nothing.
+/// * recents_at_startup - how many recents the APP-RESOLVED state dir held before
+///   the launch: the one directory the app itself opens (see recents_at_startup,
+///   which follows core's resolution rule), never the first settings.toml some
+///   candidate happens to hold. Zero makes the assertion UNMEASURABLE rather than
+///   satisfied: the engine announces only when there is something to announce, so
+///   on a fresh install no line can appear, and a run that "passed" would be a run
+///   that asserted nothing.
 pub fn judge_trace(
     captured: Option<&str>,
     recents_at_startup: usize,
@@ -757,16 +786,24 @@ pub fn judge_trace(
     }
     if recents_at_startup == 0 {
         return TraceVerdict::NotJudged(
-            "the profile held no recents before this launch, and the engine announces only a NON-EMPTY \
-             list by design (api/src/engine.rs, THE STARTUP ANNOUNCE): there was nothing for the live UI \
-             to be shown, so the item stands unproven rather than disproven"
+            "the app-resolved state dir held no recents before this launch (its settings.toml is \
+             absent, unreadable, or lists none), and the engine announces only a NON-EMPTY list by \
+             design (api/src/engine.rs, THE STARTUP ANNOUNCE): there was nothing for the live UI to be \
+             shown, so the item stands unproven rather than disproven"
                 .to_string(),
         );
     }
     let mut proven = Vec::new();
     let mut broken = Vec::new();
     for claim in claims {
-        match text.lines().find(|line| line.contains(claim.needle)) {
+        // The STRONGEST voice that matched, not the first line written: a run that
+        // both announced and rendered the list cites the rendered line, and one
+        // whose announce lost the last-wins collapse still cites its arrival.
+        match text
+            .lines()
+            .filter(|line| line.contains(claim.needle))
+            .max_by_key(|line| voice_rank(line))
+        {
             Some(line) => proven.push(format!("{}: [{}] {line}", claim.what, trace_voice(line.trim()))),
             None => broken.push(format!(
                 "SMOKE TRACE FAIL: {} - no line of the live app's stderr contains {:?}, and {} recents \
@@ -795,17 +832,57 @@ pub fn count_recents_blocks(toml_text: &str) -> usize {
         .count()
 }
 
-/// How many recents the profile held, checked in the same candidate order the
-/// artefact search uses (a portable data dir beside the exe, then the roaming
-/// profile). 0 covers both "no file" and "every path unreadable", which is the
-/// honest answer for this claim: nothing was known to be there to announce.
-fn recents_at_startup(exe: &Path) -> usize {
-    for dir in candidate_state_dirs(exe) {
-        if let Ok(text) = fs::read_to_string(dir.join(SETTINGS_FILE)) {
-            return count_recents_blocks(&text);
+/// The ONE directory the app itself persists into, by the rule
+/// crates/core/src/paths.rs documents AND in its order - the caller-side shape in
+/// that file's own doc comment: portable (exe_dir/data) when the marker exists OR
+/// there is no usable roaming profile, installed (appdata/notes-gpui) only
+/// otherwise. Pure over its inputs for core's own reason: the marker probe is one
+/// caller-side exists() and appdata is passed in, so both halves are testable
+/// without touching this machine's profile. An empty APPDATA is not a usable
+/// profile, exactly as core defines it - and note this is the OPPOSITE order from
+/// candidate_state_dirs, which is a search list for the artefact, not the rule the
+/// app applies. Getting them confused is how a claim gets armed against a file the
+/// running process never opens.
+pub fn state_dir_for(
+    exe: &Path,
+    appdata: Option<&std::ffi::OsStr>,
+    portable_marker: bool,
+) -> Option<PathBuf> {
+    let exe_dir = exe.parent()?;
+    let usable = appdata.filter(|a| !a.is_empty());
+    if portable_marker || usable.is_none() {
+        Some(exe_dir.join("data"))
+    } else {
+        Some(PathBuf::from(usable?).join("notes-gpui"))
+    }
+}
+
+/// What the app had to announce: the recents in the settings.toml of the ONE
+/// directory it will actually open, plus that path for the log.
+///
+/// This used to walk every candidate state dir and take the first readable
+/// settings.toml, which armed the claim against a file the running process never
+/// opened - measured on a real run: target/debug/data held NO settings.toml (and
+/// the portable marker sent the app there) while the roaming profile held one
+/// recent, so smoke printed exit 9 about a directory the app ignored. Resolved dir
+/// only, and 0 when its settings.toml is missing or unreadable: a NOT JUDGED
+/// verdict then means "the app had nothing to announce", never "some profile
+/// somewhere had something".
+fn recents_at_startup(exe: &Path) -> (usize, PathBuf) {
+    let marker = exe
+        .parent()
+        .map(|d| d.join("data").is_dir())
+        .unwrap_or(false);
+    match state_dir_for(exe, std::env::var_os("APPDATA").as_deref(), marker) {
+        None => (0, PathBuf::from("<state dir unresolvable>")),
+        Some(dir) => {
+            let settings = dir.join(SETTINGS_FILE);
+            let count = fs::read_to_string(&settings)
+                .map(|text| count_recents_blocks(&text))
+                .unwrap_or(0);
+            (count, settings)
         }
     }
-    0
 }
 
 /// What the run ended up doing with the user's bytes, decided from what is
@@ -2457,9 +2534,12 @@ pub fn run(args: &[String]) -> i32 {
     // rewrites its own settings on the way out, so asking afterwards would be
     // asking about the run instead of about its opening state. This is the one
     // number that turns the trace claim from a guess into a judgement.
-    let startup_recents = recents_at_startup(&exe);
+    let (startup_recents, startup_settings) = recents_at_startup(&exe);
     println!(
-        "smoke: recents in the profile at startup: {startup_recents} (the trace claim below is          judgeable only above 0)"
+        "smoke: recents at startup: {startup_recents} read from {} - the app's OWN resolved state \
+         dir, so a settings.toml in some other candidate dir is not counted (the trace claim below \
+         is judgeable only above 0)",
+        startup_settings.display()
     );
     let script = temp_path("probe", "ps1");
     // The geometry step gets its own reporter script: the first phase must stay
@@ -3829,6 +3909,87 @@ mod tests {
             "{}",
             lines[0]
         );
+    }
+
+    /// The case the arrival voice exists for: a startup wake that took
+    /// RecentsUpdated and then Loaded renders ONE line (last event wins), so the
+    /// announce never appears in a "status line:" - yet it did arrive, named per
+    /// event, ungated. That is a PROVEN claim citing [arrived], not a fail and not
+    /// a shrug; before this class existed the same run was proven only by luck.
+    #[test]
+    fn an_announce_that_lost_the_last_wins_collapse_is_proven_as_arrived() {
+        let trace = "notes-gpui: event: RecentsUpdated with 2 entries\n\
+                     notes-gpui: status line: Loaded a file with 4 chars\n";
+        let verdict = judge_trace(Some(trace), 2, TRACE_CLAIMS);
+        let TraceVerdict::Proven(lines) = verdict else {
+            panic!("the announce arrived, so the claim holds: {verdict:?}");
+        };
+        assert!(lines[0].contains("[arrived]"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("event: RecentsUpdated"),
+            "and it cites the arrival line itself: {}",
+            lines[0]
+        );
+    }
+
+    /// Ordering between the voices, stated once so no future edit can quietly
+    /// re-rank them - and the reason the claim no longer needs "the first line that
+    /// matched": a run that both announced AND rendered the list must be cited on
+    /// the rendered line, because first-match would report weaker news than earned.
+    #[test]
+    fn the_voices_rank_rendered_then_arrived_then_undisplayed() {
+        assert_eq!(voice_rank("notes-gpui: status line: RecentsUpdated"), 3);
+        assert_eq!(voice_rank("notes-gpui: event: RecentsUpdated"), 2);
+        assert_eq!(voice_rank("notes-gpui: undisplayed: RecentsUpdated"), 1);
+        assert_eq!(voice_rank("notes-gpui: pump: 9 wakes"), 0);
+        assert_eq!(trace_voice("notes-gpui: event: Pinned on"), "arrived");
+        // Strongest wins when both are in the same capture.
+        let both = "notes-gpui: event: RecentsUpdated first\nnotes-gpui: status line: RecentsUpdated second\n";
+        let TraceVerdict::Proven(lines) = judge_trace(Some(both), 1, TRACE_CLAIMS) else {
+            panic!("both voices present");
+        };
+        assert!(lines[0].contains("[rendered]"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("second"),
+            "not the first line: {}",
+            lines[0]
+        );
+    }
+
+    /// The rule that turned an unjudgeable run into a false exit 9: the recents
+    /// counted are the ones in the directory THE APP opens, and the portable marker
+    /// outranks a roaming profile - core's own documented caller rule, and the
+    /// OPPOSITE precedence from candidate_state_dirs' search order.
+    #[test]
+    fn the_settings_counted_are_the_ones_in_the_dir_the_app_resolves_to() {
+        let appdata = std::ffi::OsStr::new("C:/Users/u/AppData/Roaming");
+        let exe = Path::new("C:/dev/notes/target/debug/notes-gpui.exe");
+        assert_eq!(
+            state_dir_for(exe, Some(appdata), true),
+            Some(PathBuf::from("C:/dev/notes/target/debug/data")),
+            "the marker wins even though a profile exists - the machine that failed"
+        );
+        assert_eq!(
+            state_dir_for(exe, Some(appdata), false),
+            Some(PathBuf::from("C:/Users/u/AppData/Roaming/notes-gpui"))
+        );
+        assert_eq!(
+            state_dir_for(exe, None, false),
+            Some(PathBuf::from("C:/dev/notes/target/debug/data")),
+            "no profile at all is portable, not a guess at one"
+        );
+        assert_eq!(
+            state_dir_for(exe, Some(std::ffi::OsStr::new("")), false),
+            Some(PathBuf::from("C:/dev/notes/target/debug/data")),
+            "an empty APPDATA is not a usable profile, per core"
+        );
+        // And a resolved dir with no settings.toml counts 0, which judge_trace
+        // refuses to judge - naming the app-resolved dir in the reason.
+        let why = match judge_trace(Some("notes-gpui: event: Loaded a file"), 0, TRACE_CLAIMS) {
+            TraceVerdict::NotJudged(why) => why,
+            other => panic!("0 recents is not judgeable: {other:?}"),
+        };
+        assert!(why.contains("app-resolved state dir"), "{why}");
     }
 
     #[test]
