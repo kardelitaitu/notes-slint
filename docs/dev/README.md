@@ -3,19 +3,19 @@
 **Developer documentation — how to build, test, and change this code.** Human-facing,
 present-tense, and describing what exists rather than what is planned.
 
-> **Most of this cannot be written yet.** There is no code in this repository. The list
-> below is a contract about *when* each file gets written, not a request to fill it in
-> speculatively. A dev doc written before its code exists is a description of something that
-> may never be built, and it reads with authority regardless.
+> M0 answered yes and the workspace builds: two files from the contract below now
+> exist — [`getting-started.md`](getting-started.md) and
+> [`testing.md`](testing.md). The rest of the table still describes *when* each
+> file gets written, not a request to fill it in speculatively.
 
 ## Intended contents, and the milestone that unlocks each
 
 | File | Covers | Write it when |
 |---|---|---|
-| `getting-started.md` | Toolchain, `rust-toolchain.toml`, first build, first run, GPUI version pin | **M0 answers yes** — before it, "how to build" has no honest answer |
+| `getting-started.md` | Toolchain, `rust-toolchain.toml`, first build, first run, GPUI version pin | **Written** — M0 answered yes |
 | `architecture.md` | The four crates, `api` port, bridges, startup order, threading | M2, once the layering is real rather than designed |
 | `invariants.md` | The `cargo tree` checks and *why* each exists, long-form | M1 (the commands themselves live in `AGENTS.md`) |
-| `testing.md` | Round-trip fixtures, headless session tests through `api`, `cargo test` | M1 |
+| `testing.md` | Round-trip fixtures, headless session tests through `api`, `cargo test` | **Written** — M1 landed |
 | `packaging.md` | The five artifacts, CI matrix, signing/notarisation setup | M5, gated by the §10.8 account decision |
 | `windows.md` | DPI awareness manifest, `SetWindowPos` behaviours, per-monitor scaling gotchas | M3 |
 
