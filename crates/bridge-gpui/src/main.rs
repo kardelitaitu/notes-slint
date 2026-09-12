@@ -1798,12 +1798,39 @@ fn main() {
 ///
 /// `session.scale_factor` is the scale of the monitor the rect was saved on, so it
 /// is the only divisor that can be honest here, and it is applied per component.
-/// The chrome step is genuinely missing: GPUI wants client bounds, the session
-/// stores frame bounds, and the difference (about 8/19/8/20 at 100%) is not
-/// knowable before a window exists. So the window opens one title bar and border
-/// low-right of where it was left - visible, constant, and never written back, so
-/// it does not accumulate. Fixing it needs a frame-to-client conversion the port
-/// does not carry yet (see the report).
+///
+/// THE UNIT MISMATCH IS THE POINT OF THIS DOC, because the two branches behave
+/// DIFFERENTLY about it and only one of them is safe. `session.rect` is FRAME pixels
+/// (core's own field doc); gpui reads these bounds as CLIENT pixels and adds its
+/// `border_offset` back when it writes the placement (`calculate_window_rect`,
+/// gpui-pre-windows window.rs:1477-1502). So every restore of a stored rect starts one
+/// chrome too wide - 16 px across, 8 down at 100 %, measured.
+///
+/// * WINDOWED: harmless, because the port then applies the stored FRAME rect itself
+///   through `SetWindowPos` (`restore_and_pin`, engine.rs:1274+), which lives in the
+///   same space the session stores. The apply overwrites what gpui did, the measure reads
+///   back what was applied, and the round trip is closed in frame space - it cannot drift.
+///   This is the fix the comment at `rect_of` records (`16 px across, 39 px down` per
+///   cycle, gone).
+/// * MAXIMISED: `restore_and_pin` SKIPS the apply on purpose (moving a maximised window
+///   means un-maximising it first, and platform refuses to make that decision -
+///   crates/platform/src/lib.rs:23-26). With no apply, gpui's client conversion is the
+///   ONLY thing that touches the placement, and the inflated value is what the next
+///   `restore_frame_rect` measures and stores. MAXIMISE -> QUIT -> RELAUNCH therefore
+///   grows the stored rect by exactly one chrome EVERY cycle: measured monotonic over 4
+///   cycles at -8,-4 origin / +16,+8 size, matching `border_offset` split half per edge.
+///   The window opens at the right place while maximised, so nothing is visible - the
+///   damage is the invisible restore rect, and it compounds.
+///
+/// WHAT THIS BRANCH CANNOT DO HERE, and why the fix is not a subtraction in this function:
+/// cancelling that chrome needs the non-client offset as a NUMBER, and no seam this bridge
+/// may touch provides one before a window exists - gpui's `WindowBorderOffset` is
+/// `pub(crate)` (window.rs:1336), reading it needs `GetWindowRect`+`GetClientRect`, and
+/// a `windows` dependency in a bridge is exactly what AGENTS.md and `xtask check-arch`
+/// forbid. Guessing a constant per theme/scale/DWM version would repeat the mistake the
+/// windowed lane already paid for: an unmeasured number winning a write into a field core
+/// documents as FRAME pixels. The three seams that could carry the value, in the order
+/// they cost least to believe, are named in this slice's report.
 fn bounds_for(initial: &InitialState) -> WindowBounds {
     let session = &initial.session;
     let scale = if session.scale_factor.is_finite() && session.scale_factor > 0.0 {
