@@ -114,7 +114,7 @@ const MAX_DRAIN_PER_WAKE: usize = 64;
 /// is not re-exported - api only mentions it in a doc comment (crates/api/src/lib.rs:
 /// 170). So this bridge declares 750 ms itself, and if core or api ever moves theirs,
 /// NOTHING at compile time will say so. The one-line fix is a public constant in api;
-/// that is a request, not an edit - 13 Events and 10 Commands are pinned and the port
+/// that is a request, not an edit - 14 Events and 10 Commands are pinned and the port
 /// is not mine.
 const AUTOSAVE_IDLE: Duration = Duration::from_millis(750);
 
@@ -157,6 +157,10 @@ struct Wire {
     recents: Vec<RecentEntry>,
     /// The global toggle, as last stated by the ENGINE (see `new`).
     autosave: bool,
+    /// The pin state as last CONFIRMED by the engine (`Event::Pinned`), for the
+    /// title-bar slice (C3b) to consume. Set only from the port's answer - a
+    /// check mark that follows what the UI asked for proves nothing.
+    pin: bool,
     /// THE PORT'S LAST ANNOUNCED OPEN GENERATION (143b1c52). The bridge does
     /// not count rebinds any more - the prediction (`Wire::rebind`, bumped at
     /// every Open/SaveAs send) is DELETED - because a bump the bridge predicts
@@ -178,7 +182,7 @@ struct Wire {
 }
 
 impl Wire {
-    fn new(autosave: bool) -> Self {
+    fn new(autosave: bool, pin: bool) -> Self {
         Self {
             seen_edits: 0,
             changed_at: Instant::now(),
@@ -193,6 +197,10 @@ impl Wire {
             // the only visible proof that the settings reload path works. Same one-way door
             // the pin was: a check that follows what the UI asked for proves nothing.
             autosave,
+            // SEEDED FROM THE PORT like `autosave`: `InitialState::pinned` is
+            // read out of session.json, and the first `Event::Pinned` (the
+            // registration apply confirms the bit) keeps it the engine's truth.
+            pin,
             // The engine's generation starts at 0 and so does the stored echo:
             // an untitled note has never been announced, and 0 is the honest
             // value to flush under until `Loaded` or `Rebound` says otherwise.
@@ -812,6 +820,13 @@ impl Surface {
                 self.wire.borrow_mut().recents = entries.clone();
                 self.refresh_menus(cx);
             }
+            Event::Pinned(on) => {
+                // THE PIN READBACK: the engine confirmed the pin state - a
+                // SetPinned answer, or the registration apply's verdict.
+                // Stored, never inferred from a request, so the title bar
+                // renders the port's answer and never the UI's own ask.
+                self.wire.borrow_mut().pin = *on;
+            }
             _ => {}
         }
     }
@@ -1029,6 +1044,14 @@ fn describe(event: &Event) -> String {
                 reason
             )
         }
+        // The readback twin of the PinFailed arm: the state the engine
+        // CONFIRMED, as the port's own bool. `apply` stores it; this renders
+        // it, because a confirmed fact the status line never shows is a fact
+        // nobody can check. C3b (title bar) consumes the stored value.
+        Event::Pinned(on) => format!(
+            "Pinned · the window is {} above the others",
+            if *on { "held" } else { "not held" }
+        ),
     }
 }
 
@@ -1230,8 +1253,10 @@ fn main() {
             // _>>` filled there is readable from here afterwards.
             // Seeded from the port's own setting, so the menu's check mark on the first
             // frame is a readback of session.json and not a bridge-side opinion.
-            let wire: Rc<RefCell<Wire>> =
-                Rc::new(RefCell::new(Wire::new(initial.autosave_enabled)));
+            let wire: Rc<RefCell<Wire>> = Rc::new(RefCell::new(Wire::new(
+                initial.autosave_enabled,
+                initial.pinned,
+            )));
             let editor_slot: Rc<RefCell<Option<Entity<Editor>>>> = Rc::new(RefCell::new(None));
             // The root view's handle, filled below, so a menu handler can put a sentence on
             // the status line - the only place this app can say "save as cancelled".
@@ -2611,7 +2636,7 @@ mod tests {
     #[test]
     fn a_flush_needs_change_quiet_and_an_answered_predecessor() {
         let quiet = Duration::from_millis(800);
-        let mut wire = Wire::new(true);
+        let mut wire = Wire::new(true, false);
         wire.armed = true;
         wire.loaded = true;
         assert!(!flush_due(&wire, false, quiet), "clean: nothing to send");
@@ -2660,7 +2685,7 @@ mod tests {
     #[test]
     fn a_flush_fires_with_the_generation_its_edit_entered_the_debounce_with() {
         let t0 = Instant::now();
-        let mut wire = Wire::new(true);
+        let mut wire = Wire::new(true, false);
         wire.loaded = true;
         wire.armed = true;
         // The user types in A: revision 5 enters the debounce at generation 0.
@@ -2700,7 +2725,7 @@ mod tests {
     #[test]
     fn an_edit_after_the_rebind_flushes_under_the_new_generation() {
         let t0 = Instant::now();
-        let mut wire = Wire::new(true);
+        let mut wire = Wire::new(true, false);
         wire.loaded = true;
         wire.armed = true;
         wire.note_edit(5, t0);
@@ -2731,7 +2756,7 @@ mod tests {
     #[test]
     fn a_refused_load_issues_no_generation_and_the_untitled_note_keeps_saving() {
         let t0 = Instant::now();
-        let mut wire = Wire::new(true);
+        let mut wire = Wire::new(true, false);
         // The user types in the untitled note: revision 5, generation 0.
         wire.note_edit(5, t0);
         // The user presses Ctrl+O and picks a path that cannot load. The bridge

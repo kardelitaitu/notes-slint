@@ -518,6 +518,15 @@ impl Engine {
                 if self.session.pinned != on {
                     self.session.pinned = on;
                     self.queue(Target::Session);
+                    // THE READBACK: the stored bit changed and the session
+                    // will carry it - say so. Before this event the port
+                    // could report only a pin that FAILED, so a bridge had no
+                    // honest source for its pin state and would have had to
+                    // believe its own request. A repeat that changes nothing
+                    // stays silent, and no window work happens here - the
+                    // apply belongs to `apply_topmost`; "pinning is not a
+                    // window operation" is the invariant the D10 test pins.
+                    self.emit(Event::Pinned(on));
                 }
             }
             Command::ClearRecents => {
@@ -1240,7 +1249,12 @@ impl Engine {
         // strings are platform's own sentences, so a richer verdict flows
         // through without a second vocabulary change.
         match backend.set_topmost(handle.0 as isize, on) {
-            PinOutcome::Applied => {}
+            // THE CONFIRMED STATE: the platform read the style back as asked,
+            // so this is the one place the port states what the window IS
+            // rather than what failed about it. `NotApplied` is NOT this -
+            // a call that changed nothing (the hidden-window case) is the
+            // PinFailed below, never a Pinned.
+            PinOutcome::Applied => self.emit(Event::Pinned(on)),
             PinOutcome::Failed(err) => {
                 self.emit(Event::PinFailed {
                     reason: err.to_string(),
@@ -1803,6 +1817,7 @@ fn existing_detected(path: &Path, codepage: Option<u16>) -> Detected {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notes_platform::{PlatformError, PlatformResult};
     use std::path::PathBuf;
 
     /// REVIEWER ITEM 3: the marking call inside [`Engine::run`] is what arms the
@@ -2061,6 +2076,132 @@ mod tests {
         assert!(engine.session.pinned);
         assert_eq!(pending(&engine), 1, "a pin change needs persisting");
         assert_eq!(engine.window, None, "pinning is not a window operation");
+    }
+
+    /// A one-answer backend for the pin tests: `set_topmost` answers with the
+    /// verdict the fixture chose, and every other seam is a HOLE - a call the
+    /// fixture never expected turns a typo into a panic, the same rule
+    /// tests/support/host_mock.rs states. `PinOutcome` is not `Clone`, so
+    /// the answer is rebuilt per call.
+    struct PinBackend {
+        applied: bool,
+    }
+
+    impl WindowBackend for PinBackend {
+        fn set_topmost(&mut self, _handle: isize, _on: bool) -> PinOutcome {
+            if self.applied {
+                PinOutcome::Applied
+            } else {
+                PinOutcome::Failed(PlatformError::Win32 {
+                    api: "SetWindowPos",
+                    message: "access is denied. (os error 5)".to_string(),
+                })
+            }
+        }
+
+        fn frame_rect(&self, _handle: isize) -> PlatformResult<FrameRect> {
+            panic!("the pin fixture has no answer for frame_rect")
+        }
+
+        fn restore_frame_rect(&self, _handle: isize) -> PlatformResult<FrameRect> {
+            panic!("the pin fixture has no answer for restore_frame_rect")
+        }
+
+        fn set_frame_rect(
+            &mut self,
+            _handle: isize,
+            _rect: FrameRect,
+            _scale: f32,
+        ) -> PlatformResult<()> {
+            panic!("the pin fixture has no answer for set_frame_rect")
+        }
+
+        fn primary_work_area(&self) -> PlatformResult<FrameRect> {
+            panic!("the pin fixture has no answer for primary_work_area")
+        }
+    }
+
+    /// An engine whose only seam answers pins, with the event channel the test
+    /// holds BOTH ends of: what the engine SAID is the assertion surface.
+    /// `maximized: true` sends a registration down the no-move branch of
+    /// `restore_and_pin`, so the fixture needs no host facts - registration
+    /// goes straight to the pin, which is the path under test.
+    fn pin_engine(applied: bool, pinned: bool) -> (Engine, mpsc::Receiver<Event>) {
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let engine = Engine::new(
+            cmd_rx,
+            event_tx,
+            StateDir(PathBuf::from("unused-in-these-tests")),
+            Session {
+                maximized: true,
+                pinned,
+                ..Session::default()
+            },
+            Settings::default(),
+            Some(Box::new(PinBackend { applied })),
+            None,
+        );
+        (engine, event_rx)
+    }
+
+    /// Everything emitted so far, in order.
+    fn drain(rx: &mpsc::Receiver<Event>) -> Vec<Event> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    /// The readback contract, state half: a SetPinned that changes the bit
+    /// answers `Pinned(on)`, a repeat that changes nothing answers nothing,
+    /// and an unpin answers `Pinned(false)`.
+    #[test]
+    fn set_pinned_emits_pinned_on_change_and_nothing_on_a_repeat() {
+        let (mut engine, events) = pin_engine(true, false);
+        engine.handle(Command::SetPinned(true));
+        assert_eq!(drain(&events), vec![Event::Pinned(true)]);
+        engine.handle(Command::SetPinned(true));
+        assert!(drain(&events).is_empty(), "a repeat says nothing");
+        engine.handle(Command::SetPinned(false));
+        assert_eq!(drain(&events), vec![Event::Pinned(false)]);
+    }
+
+    /// The readback contract, apply half: registration restores-and-pins, and
+    /// a CONFIRMED apply (`PinOutcome::Applied`) announces the state the
+    /// platform read back - the RegisterWindow restore path of the contract.
+    #[test]
+    fn a_confirmed_pin_apply_on_registration_emits_pinned() {
+        let (mut engine, events) = pin_engine(true, true);
+        engine.handle(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        });
+        assert_eq!(drain(&events), vec![Event::Pinned(true)]);
+    }
+
+    /// The readback contract, failure half: a refused apply is `PinFailed`
+    /// in the platform's own words, and NOT `Pinned` - the two never travel
+    /// together, because a pin that failed and rendered as pinned is a lie in
+    /// the title bar.
+    #[test]
+    fn a_failed_pin_apply_emits_pinfailed_and_never_pinned() {
+        let (mut engine, events) = pin_engine(false, true);
+        engine.handle(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        });
+        let out = drain(&events);
+        assert_eq!(out.len(), 1, "one event for the refusal: {out:?}");
+        assert!(
+            !out.iter().any(|e| matches!(e, Event::Pinned(_))),
+            "a failed apply is never announced as pinned: {out:?}"
+        );
+        match &out[0] {
+            Event::PinFailed { reason } => {
+                assert!(reason.contains("access is denied"), "{reason}");
+            }
+            other => panic!("expected PinFailed, got {other:?}"),
+        }
     }
 
     /// RegisterWindow stores the handle and emits nothing (see the §5.5 steps).

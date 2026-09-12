@@ -515,6 +515,13 @@ mod tests {
             "a live engine accepts commands"
         );
         gateway.close().expect("the Shutdown was accepted");
+        // THE PIN READBACK: the SetPinned above changed the bit, so the
+        // engine's answer under the new contract is one `Pinned` event ahead
+        // of the Disconnected marker. Drain exactly it, then assert silence.
+        assert!(
+            matches!(rx.recv(), Ok(Event::Pinned(true))),
+            "the accepted pin change must be announced before the channel closes"
+        );
         assert!(
             rx.recv().is_err(),
             "the engine exited, so EventRx reports Disconnected"

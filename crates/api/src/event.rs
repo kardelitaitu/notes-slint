@@ -466,6 +466,22 @@ pub enum Event {
         /// The platform's own words for the refusal.
         reason: String,
     },
+    /// The pin state the engine holds, announced when it is CONFIRMED or
+    /// CHANGED: `true` = pinned above every other window. The success twin of
+    /// [`Event::PinFailed`], and its opposite number in the same contract:
+    /// before this variant the port could report only that a pin FAILED,
+    /// never what the state IS, so a bridge had no honest source to render a
+    /// pin indicator from - a check mark that flips on the ask is the UI
+    /// believing its own request, the same ruling the autosave toggle is
+    /// held to. Fired at exactly two sites, and never on a failure:
+    /// [`Command::SetPinned`](crate::Command::SetPinned) when the stored bit
+    /// actually changes (a repeat that changes nothing says nothing), and
+    /// the [`Command::RegisterWindow`](crate::Command::RegisterWindow)
+    /// restore path (`restore_and_pin` -> `apply_topmost`) when the
+    /// platform reads the window's style back as asked (`PinOutcome::Applied`).
+    /// A refused apply is [`Event::PinFailed`](crate::Event::PinFailed) and
+    /// never `Pinned` - the two never travel together.
+    Pinned(bool),
 }
 
 #[cfg(test)]
@@ -548,6 +564,7 @@ mod tests {
             Event::PinFailed { reason } => Event::PinFailed {
                 reason: reason.clone(),
             },
+            Event::Pinned(on) => Event::Pinned(*on),
         }
     }
 
@@ -568,6 +585,7 @@ mod tests {
             },
             Event::StateDirUnusable { .. } => "StateDirUnusable",
             Event::PinFailed { .. } => "PinFailed",
+            Event::Pinned(_) => "Pinned",
 
             Event::RecentsUpdated(_) => "RecentsUpdated",
         }
@@ -635,6 +653,7 @@ mod tests {
             Event::PinFailed {
                 reason: "SetWindowPos refused: access denied".to_string(),
             },
+            Event::Pinned(true),
         ]
     }
 
@@ -655,12 +674,14 @@ mod tests {
         // Loaded, LoadFailed, Saved, GeometryNotRestored, SaveFailed,
         // ExternalChange, AutosaveSkipped, RecentsUpdated, SettingsCorrupt,
         // StateWriteFailed (the Settings twin is the same variant),
-        // StateDirUnusable, PinFailed. The wave that added PinFailed folded
-        // SessionWriteFailed+SettingsWriteFailed into StateWriteFailed{file}:
-        // +1 -1 = 13, the same deliberate count (D62). A bounded-join timeout
-        // is reported through close()'s typed Err, not through an Event: a
-        // Gateway-held Event sender would delay the Disconnected contract.)
-        assert_eq!(all.len(), 13, "Event gained or lost a variant");
+        // StateDirUnusable, PinFailed, Pinned. The wave that added PinFailed
+        // folded SessionWriteFailed+SettingsWriteFailed into
+        // StateWriteFailed{file}: +1 -1 = 13, the same deliberate count (D62);
+        // the pin-readback wave added Pinned: 13 + 1 = 14. A bounded-join
+        // timeout is reported through close()'s typed Err, not through an
+        // Event: a Gateway-held Event sender would delay the Disconnected
+        // contract.)
+        assert_eq!(all.len(), 14, "Event gained or lost a variant");
 
         for event in &all {
             assert_eq!(event, &event.clone(), "{event:?} clone is not equal");

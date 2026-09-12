@@ -179,8 +179,9 @@ fn shutdown_drains_commands_queued_behind_it() {
         "the fixture must be the file the engine actually read",
     );
 
-    // SetPinned changes state silently, so the counted batch is Flushes — one
-    // event each — and the pin goes in first to prove the engine is warm.
+    // SetPinned is answered with one `Pinned` readback event now, which this
+    // batch does not count: the counted batch is Flushes — one event each —
+    // and the pin goes in first to prove the engine is warm.
     let _ = gateway.send(Command::SetPinned(true));
     const N: u64 = 25;
     for revision in 1..=N {
