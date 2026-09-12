@@ -1,6 +1,8 @@
 # notes-gpui — Project Whitepaper
 
-> **Version 0.0.1** — M0 spike complete and passed (see §12). Still no application code.
+> **Version 0.0.1** — M0 spike complete and passed (see §12). M1 (headless engine), M3
+> (window persistence) and M4 (autosave, pin, recents) are built and tested; M2, the first
+> usable UI, is in flight.
 > Working title: `notes-gpui`. Real name TBD. 0.0.1 is the target version; §7.4 explains
 > what that number drives.
 

@@ -106,7 +106,8 @@ When they disagree, the code wins — edit the doc, leave the note standing.
   turn into the other in place.
 - **A plan is not a dev doc.** Do not write `docs/dev/` about code that does not exist yet —
   promote a plan into `docs/dev/` when it is implemented, not when it is agreed. Today that
-  means `docs/dev/` holds only its README.
+  means `docs/dev/` holds its README plus `getting-started.md` and `testing.md` — the two
+  files whose code now exists.
 - `implemented` means the code exists and works — **not** "we agreed to it".
 - `status:` in frontmatter must match the folder.
 - **Never fork the plan.** `whitepaper.md` is the index; the plan lives in the area docs
