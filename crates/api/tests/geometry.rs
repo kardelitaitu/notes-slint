@@ -288,6 +288,182 @@ fn an_unknown_measure_leaves_the_bit_alone_and_still_stores_the_rect() {
     );
 }
 
+/// F1: AN UNANSWERED SHOW STATE DOES NOT RETIRE THE WRITE. A flush tick whose
+/// measure lands while the window is minimised gets a rect and NO show state;
+/// `Unknown` is the absence of an answer, so the stored maximised bit is left
+/// exactly as it found it - and if that write also cleared the pending bit, the
+/// state the user last saw is dropped on the floor (maximise, minimise, quit:
+/// the file keeps an answer from before the maximise forever). Completeness is
+/// therefore part of the measure result, not assumed from the call happening.
+///
+/// NO COMMAND SEPARATES THE TWO PHASES, and that is the whole shape of the
+/// proof: only an idle tick retrying a STILL-ARMED write can deliver phase two.
+/// Red on the pre-fix gate (`pending.session = !measured.rect`), which clears
+/// the bit on the first write and never comes back for the show answer.
+#[test]
+fn an_unanswered_show_state_writes_the_rect_and_keeps_the_session_write_armed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_session(
+        dir.path(),
+        &Session {
+            rect: Rect::new(10, 10, 800, 600),
+            maximized: true,
+            ..Session::default()
+        },
+    )
+    .expect("write the maximised fixture");
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(FrameRect::new(320, 240, 1024, 768)),
+            // Stated rather than taken from the fake default, because
+            // the test DEPENDS on it: a rect and no view, like a
+            // minimised window whose show state Windows will not answer.
+            restore_show: ShowState::Unknown,
+            ..Answers::default()
+        },
+    );
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+
+    // PHASE 1: the incomplete measure DID write - the rect is the proof.
+    let deadline = Instant::now() + ANSWER;
+    let first = loop {
+        if let Ok(session) = read_session(dir.path()) {
+            if session.rect == Rect::new(320, 240, 1024, 768) {
+                break session;
+            }
+        }
+        assert!(Instant::now() < deadline, "the rect must still be written");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        first.maximized,
+        "Unknown never spends the real bit it did not answer: {first:?}"
+    );
+
+    // PHASE 2: the window is restored and the seam CAN answer now - and
+    // this test sends NOTHING to say so.
+    host.set_answers(Answers {
+        restore: Some(FrameRect::new(320, 240, 1024, 768)),
+        restore_show: ShowState::Normal,
+        ..Answers::default()
+    });
+    let deadline = Instant::now() + ANSWER;
+    let settled = loop {
+        if let Ok(session) = read_session(dir.path()) {
+            if !session.maximized {
+                break session;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "an incomplete write retired pending.session and the bit was lost"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        settled.rect,
+        Rect::new(320, 240, 1024, 768),
+        "and the retry cost the rect nothing: both halves came from one measure"
+    );
+    gateway.close().expect("shutdown joins the engine");
+}
+
+/// F2: THE MAXIMISED BRANCH CLAMPS - it only skips the MOVE. A maximised window
+/// is never moved, but `session.rect` still names the position it un-maximises
+/// INTO, and after a monitor is unplugged that number can be entirely off the
+/// remaining screen. Nothing corrected it, and every tick measured the host's
+/// `rcNormalPosition` - still off-screen, because Windows restores the position
+/// it was given - and re-persisted the same impossible rect forever, which makes
+/// the README promise false for exactly the state that hides it. The expected
+/// value comes from core's own rule for the same reason the moved-branch test
+/// takes it from there: the clamp is core's judgement, and the port is only
+/// being proven to APPLY it before publishing anywhere.
+#[test]
+fn a_maximised_restore_rect_is_clamped_before_it_is_persisted_and_never_moved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let saved = Rect::new(1900, 100, 800, 600);
+    write_session(
+        dir.path(),
+        &Session {
+            rect: saved,
+            maximized: true,
+            ..Session::default()
+        },
+    )
+    .expect("write the off-screen maximised fixture");
+    let (gateway, rx, host) = start_with(
+        dir.path(),
+        Answers {
+            // The host reports back the SAME off-screen normal position
+            // it was given: this is the re-persist that smuggled it home.
+            restore: Some(FrameRect::new(saved.x, saved.y, saved.w, saved.h)),
+            restore_show: ShowState::Maximized,
+            ..Answers::default()
+        },
+    );
+    let clamped = saved.clamped_to(Rect::new(0, 0, 1920, 1032), 32);
+    assert_ne!(
+        clamped, saved,
+        "fixture: the saved un-maximise target really does not fit the work area"
+    );
+
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+
+    // ORDER, from the pin contract: the Z-order verdict first, the
+    // geometry sentence LAST - and a clamp nobody could see is reported.
+    let pin = rx
+        .recv_timeout(ANSWER)
+        .expect("the registration applies the pin before anything else");
+    assert!(
+        matches!(pin, Event::Pinned(false)),
+        "nothing pinned this launch, and the apply is what says so: {pin:?}"
+    );
+    let warning = rx
+        .recv_timeout(ANSWER)
+        .expect("a correction to the restore rect must not be silent");
+    match warning {
+        Event::GeometryNotRestored { rect, reason } => {
+            assert_eq!(rect, saved, "the rect the port started from");
+            assert!(reason.contains("clamped back on screen"), "{reason}");
+        }
+        other => panic!("expected GeometryNotRestored, got {other:?}"),
+    }
+
+    gateway.close().expect("shutdown joins the engine");
+    // NEVER MOVED: a clamp of a NUMBER is not a window operation.
+    assert!(host.moves().is_empty(), "a maximised window is not moved");
+    let persisted = read_session(dir.path()).expect("the session persisted");
+    assert_eq!(
+        persisted.rect, clamped,
+        "the clamped target survives, and the re-persist cannot smuggle the off-screen one back"
+    );
+    assert!(
+        persisted.maximized,
+        "clamping a rect is not an un-maximise command: {persisted:?}"
+    );
+    // ONE report for the correction, not one per tick: every later flush
+    // re-measured and re-clamped the same off-screen position.
+    let mut strays = Vec::new();
+    while let Ok(event) = rx.recv_timeout(Duration::from_millis(50)) {
+        strays.push(event);
+    }
+    assert!(
+        strays
+            .iter()
+            .all(|e| !matches!(e, Event::GeometryNotRestored { .. })),
+        "a clamp must not become a per-tick stream: {strays:?}"
+    );
+}
+
 /// A second registration is a recreate, not a restore: the user may have moved
 /// the window by hand in between, and the port must never yank it back.
 #[test]

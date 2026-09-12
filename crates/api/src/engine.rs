@@ -156,6 +156,43 @@ enum Target {
     Settings,
 }
 
+/// F1: what ONE measure established, as two bits, because they license two
+/// different things.
+///
+/// `rect` says a position was read, so the stored rect may be replaced.
+/// `show` says the platform ALSO answered the maximised question -
+/// `Maximized` or `Normal`, not [`ShowState::Unknown`]. A write retired on a
+/// measure that skipped that question is a write that never comes back for
+/// it: a GeometryChanged tick landing on a minimised window stores the rect,
+/// leaves `session.maximized` exactly as it found it, and would otherwise
+/// clear the pending bit with the user's last-seen state still unwritten
+/// (maximise, minimise, quit: the bit is lost). So the rect may write, but
+/// only a COMPLETE measure may retire it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Measurement {
+    rect: bool,
+    show: bool,
+}
+
+impl Measurement {
+    /// The headless reading: no seam exists to answer anything, so nothing
+    /// can contradict the stored value and the write is vacuously complete.
+    const VACUOUS: Measurement = Measurement {
+        rect: true,
+        show: true,
+    };
+
+    /// Nothing was established: the caller writes no rect and keeps the bit.
+    const NONE: Measurement = Measurement {
+        rect: false,
+        show: false,
+    };
+
+    fn complete(self) -> bool {
+        self.rect && self.show
+    }
+}
+
 /// Whether the loop keeps going after handling a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flow {
@@ -502,7 +539,7 @@ impl Engine {
                     // final_flush: this read-back is the last honest one there
                     // will ever be for this window.
                     self.last_move_issued = None;
-                    self.measure_rect();
+                    let _ = self.measure_rect();
                     self.flush_state();
                 }
                 self.window = None;
@@ -1206,6 +1243,19 @@ impl Engine {
     fn restore_and_pin(&mut self, handle: WindowHandle) {
         let rect = self.session.rect;
         if self.session.maximized || self.backend.is_none() || self.facts.is_none() {
+            // F2: what this branch skips is the MOVE, never the CLAMP. A
+            // maximised window is not moved, but session.rect still names the
+            // position it un-maximises INTO - and on a launch after a monitor
+            // was unplugged that number can be entirely off the remaining
+            // screen. Nothing here corrected it, so every flush measured the
+            // host's rcNormalPosition (still off-screen, because Windows
+            // restores what it was given) and re-persisted the same impossible
+            // rect forever: the promise "including when a monitor has been
+            // unplugged" was false for exactly the state that hides it. So the
+            // restore rect goes through the SAME clamp the moved branch uses,
+            // BEFORE the value is queued, written, or left for the bridge to
+            // build WindowBounds::Maximized(rect) from on the next launch.
+            let clamp_warning = self.clamp_restore_rect();
             // No move to make, or no seam on this build (see [`Engine::backend`]).
             // Pinned anyway. The session is marked dirty WITHOUT measuring: the
             // fresh-install fix below, and the measurement belongs to the flush
@@ -1220,6 +1270,13 @@ impl Engine {
             // would teach the user that the state they chose is broken.
             self.apply_topmost(handle);
             self.queue(Target::Session);
+            // F2's ordering rule is this branch's too: the pin verdict first,
+            // the geometry sentence last. No clamp, no event - the healthy
+            // maximised launch stays silent for exactly the reason the
+            // paragraph above states.
+            if let Some(event) = clamp_warning {
+                self.emit(event);
+            }
             return;
         }
         // F2: THE PIN IS STATED FIRST, THE GEOMETRY WARNING LAST. The platform
@@ -1304,6 +1361,39 @@ impl Engine {
         }
     }
 
+    /// F2: pulls the stored `session.rect` back onto a screen that exists, with
+    /// core's own rule (`Rect::clamped_to`, MIN_VISIBLE) and the same work area
+    /// the moved branch resolves - so a maximised launch and a normal one cannot
+    /// disagree about what "on screen" means. Returns the one event a REAL
+    /// correction earns, and [`None`] when the rect already fit or this build has
+    /// no facts to ask: silence there is not a swallowed failure, because with
+    /// no seam there is no monitor to be wrong about (see [`Engine::backend`]).
+    ///
+    /// It writes the clamped value into the session, which is the whole point:
+    /// the number the bridge will build the un-maximise bounds from on the NEXT
+    /// launch, and the number every later measure compares against, must be the
+    /// possible one. Nothing is queued here - both callers already queue the
+    /// session write on this path.
+    fn clamp_restore_rect(&mut self) -> Option<Event> {
+        let rect = self.session.rect;
+        let (work, _) = self
+            .facts
+            .as_ref()?
+            .work_area_for_rect(to_frame(rect))
+            .ok()?;
+        let clamped = rect.clamped_to(to_rect(work), Self::MIN_VISIBLE);
+        if clamped == rect {
+            return None;
+        }
+        self.session.rect = clamped;
+        Some(Event::GeometryNotRestored {
+            rect,
+            reason: String::from(
+                "the saved position does not fully fit any monitor; it was clamped back on screen",
+            ),
+        })
+    }
+
     /// 5.5 step 4, which until this slice was "stored, never used": the pin bit
     /// lives only in session.json (D10) and this is the one place that acts on it.
     /// A refusal is reported rather than swallowed, because a session that was pinned
@@ -1361,14 +1451,13 @@ impl Engine {
     /// or no seam: nothing to ask, and the last known rect stays - it was measured or
     /// clamped when it was written, so keeping it is not a new claim. A seam that
     /// answers with an error did refuse, and the refusal is reported: the alternative
-    /// is persisting a rect known to be wrong. Returns whether a rect was actually
-    /// measured: [@@false@@] is the caller's instruction to write nothing new.
-    fn measure_rect(&mut self) -> bool {
+    /// is persisting a rect known to be wrong. The result says WHAT was
+    fn measure_rect(&mut self) -> Measurement {
         let Some(handle) = self.window else {
-            return false;
+            return Measurement::NONE;
         };
         let Some(backend) = self.backend.as_mut() else {
-            return false;
+            return Measurement::NONE;
         };
         match backend.restore_frame_rect(handle.0 as isize) {
             Ok(placement) => {
@@ -1387,6 +1476,11 @@ impl Engine {
                 let move_in_flight = self
                     .last_move_issued
                     .is_some_and(|at| at.elapsed() < 2 * AUTOSAVE_IDLE);
+                // F1: hoisted out of the guard, because the RESULT is built
+                // either way. Nothing inside the guard ran while a move was in
+                // flight, so nothing was learned about the show state - which is
+                // exactly what an incomplete Measurement means.
+                let mut show_learned = false;
                 if !move_in_flight {
                     if rect != self.session.rect {
                         self.session.rect = rect;
@@ -1403,12 +1497,37 @@ impl Engine {
                     // the stored bit exactly as it found it rather than
                     // spending a real bit on a question nobody was asked.
                     match placement.show {
-                        ShowState::Maximized => self.session.maximized = true,
-                        ShowState::Normal => self.session.maximized = false,
+                        ShowState::Maximized => {
+                            self.session.maximized = true;
+                            show_learned = true;
+                        }
+                        ShowState::Normal => {
+                            self.session.maximized = false;
+                            show_learned = true;
+                        }
+                        // F1: the rect above WAS learned, so it may be written;
+                        // the show half was not, so the write stays armed and
+                        // a later tick finishes the job the window could not
+                        // answer while it was minimised.
                         ShowState::Unknown => {}
                     }
+                    // F2, the other half: while the window is maximised the
+                    // stored rect is the UN-MAXIMISE target, and the host reports
+                    // it back exactly as off-screen as it was stored (Windows
+                    // restores the rcNormalPosition it was given). Clamping only
+                    // at registration would therefore be undone by the very next
+                    // tick - which is the whole bug in one sentence. Re-clamp
+                    // after every stored measure. No event from here: the
+                    // registration already said it once, and a clamp that repeats
+                    // every 750 ms is the flood MAJOR 6 exists to prevent.
+                    if self.session.maximized {
+                        let _ = self.clamp_restore_rect();
+                    }
                 }
-                true
+                Measurement {
+                    rect: true,
+                    show: show_learned,
+                }
             }
             Err(err) => {
                 // MAJOR 6: this runs every flush tick while the bit stays set,
@@ -1425,7 +1544,7 @@ impl Engine {
                         reason: err.to_string(),
                     });
                 }
-                false
+                Measurement::NONE
             }
         }
     }
@@ -1503,7 +1622,7 @@ impl Engine {
             } else {
                 // Headless (no backend): nothing can contradict the stored
                 // value, so the measure is vacuously good.
-                true
+                Measurement::VACUOUS
             };
             // THE GATE, both halves:
             // * overwrite - only a successful measure may replace the stored
@@ -1515,7 +1634,7 @@ impl Engine {
             //   write is PROVISIONAL: the pending bit stays set so the next
             //   tick - guard expired, measure honest - re-writes with the
             //   measured rect instead of trusting an unmeasured one forever.
-            let write_allowed = (measurable && measured) || !has_previous;
+            let write_allowed = (measurable && measured.rect) || !has_previous;
             if !move_in_flight {
                 // MAJOR 2/5: monitor identity is refreshed HERE, in the one
                 // moment the port's picture of the window updates - together
@@ -1563,7 +1682,10 @@ impl Engine {
                     Ok(()) => {
                         // A measure-backed write is done; an absence write is
                         // provisional and keeps the bit armed (see above).
-                        self.pending.session = !measured || move_in_flight;
+                        // F1: COMPLETE, not merely measured. A write backed by
+                        // a rect and no show answer leaves the bit armed, so the
+                        // next tick can still learn the maximised state.
+                        self.pending.session = !measured.complete() || move_in_flight;
                         // Success re-arms the report: the next distinct failure is
                         // news again (M5).
                         self.session_failure_latched = false;
