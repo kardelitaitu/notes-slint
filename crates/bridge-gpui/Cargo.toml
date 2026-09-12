@@ -8,6 +8,22 @@ publish.workspace = true
 [lints]
 workspace = true
 
+# THE ONE FEATURE OF THIS PACKAGE, and it exists for a test file. `tests/ime_seam.rs`
+# carries a `window_driven` module - the only way to read the RUNTIME value of the
+# `EntityInputHandler` defaults the platform actually calls - and a window cannot exist
+# without GPUI's test harness, which the kit hides behind a feature of ITS OWN. This
+# pass-through is what makes that module compile; without it the `cfg` there is a
+# condition that can never be true and the three tests inside it have never run.
+#
+# Deliberately NOT a default: `cargo test --workspace` builds the shipped graph, where
+# a window genuinely cannot exist. Run the evidence on purpose -
+#   cargo test -p notes-bridge-gpui --features test-support --test ime_seam
+# - which is also what `--all-features` does. And declaring it here is what stops
+# `unexpected_cfgs` in that file from being a lie: the cfg now names a feature THIS
+# package has.
+[features]
+test-support = ["gpui-kit/test-support"]
+
 # The shipped artifact is notes-gpui(.exe). The package name stays
 # notes-bridge-gpui because it names the adapter, not the product.
 [[bin]]

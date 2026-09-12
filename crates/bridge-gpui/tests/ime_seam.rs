@@ -15,12 +15,15 @@
 //!    is the constant None (input.rs:94-100) and text_input_editable_range is the
 //!    constant None (input.rs:117-123). set_selected_text_range's default is an EMPTY
 //!    BODY (input.rs:85-91) - a silent no-op, not a forward to our methods.
-//!    prefers_ime_for_printable_keys does delegate to accepts_text_input
-//!    (input.rs:262-265), whose default is true (input.rs:103-105), and paste forwards
-//!    to our replace_text_in_range (input.rs:42-46). The runtime value of those
-//!    defaults is asserted in the window_driven module below, which only compiles with
-//!    the test-support feature (the two manifest lines are in the report) - until then
-//!    they are NOT evidence and are not claimed as any.
+//!    The one method that is NOT on this trait at all: prefers_ime_for_printable_keys
+//!    lives on the platform-facing InputHandler, where ElementInputHandler<V> answers it
+//!    by calling view.accepts_text_input (input.rs:262-265) - whose default is true
+//!    (input.rs:103-105). paste DOES forward to our replace_text_in_range
+//!    (input.rs:42-46). The runtime value of those defaults is asserted in the
+//!    window_driven module below, which compiles only when this package's `test-support`
+//!    feature is on - declared in Cargo.toml as the one-line pass-through to
+//!    `gpui-kit/test-support`, deliberately NOT a default, so the evidence is on purpose:
+//!    `cargo test -p notes-bridge-gpui --features test-support --test ime_seam`.
 //! 2. On Windows the IME consumer surface is narrow (gpui-pre-windows-0.3.4/src/
 //!    events.rs): the commit is replace_text_in_range(None, ...) (:744), a composition
 //!    update is replace_and_mark_text_in_range (:760), the candidate rect is
@@ -34,17 +37,20 @@
 // load); as a module of this test crate they are dead code, which would otherwise fail
 // the workspace clippy gate. Scoped here, at the crate root of the TEST crate only.
 #![allow(dead_code)]
-// TWO MORE, both caused by this file being a test crate that includes editor.rs by path
-// rather than linking the bin (ac6fc37b landed with them; they are properties of the
+// ONE MORE, caused by this file being a test crate that includes editor.rs by path
+// rather than linking the bin (ac6fc37b landed with it; it is a property of the
 // arrangement, not of the select-all bug this file was written for):
-//  * `unexpected_cfgs`: the window_driven module below is gated on gpui-kit's
-//    `test-support` feature, which is a FEATURE OF THAT CRATE and so is not a cfg value
-//    this package declares. Narrowly allowed, because the gate is the point - without it
-//    the module compiles against a TestAppContext that cannot open a window.
 //  * `unused_crate_dependencies`: the package's `notes_api` and `raw_window_handle` are
 //    used by main.rs, which is NOT part of this test crate. Same reason the bridge's
 //    editor-only unit tests do not need them.
-#![allow(unexpected_cfgs)]
+//
+// The `unexpected_cfgs` allow that used to sit here is GONE, and it is gone for a
+// reason worth stating: it existed because `#[cfg(feature = "test-support")]` below named
+// a feature of gpui-kit, which this package did not declare, so the gate could never be
+// true and the window_driven module it guarded had never compiled. Cargo.toml now
+// declares the feature, the cfg is expected, and the gate is a real switch instead of a
+// condition that is always false. Leaving the allow in place would keep that story
+// wrong.
 #![allow(unused_crate_dependencies)]
 
 #[path = "../src/editor.rs"]
@@ -472,10 +478,19 @@ fn a_pinyin_composition_commits_its_final_string_into_a_cjk_and_emoji_line() {
 
 // These drive the trait the way the platform adapter does (gpui-pre input.rs:145-284
 // forwards every platform call into a view method taking &mut Window and the view's
-// Context). A window cannot exist without the test-support harness, which the bridge
-// does not enable; the two manifest lines that switch this on are in the report.
-// Nothing in this module is claimed as a proof until
-// "cargo test -p notes-bridge-gpui --features test-support --test ime_seam" runs it.
+// Context). A window cannot exist without GPUI's test harness, so the module is gated
+// on this package's `test-support` feature, which is the one-line pass-through to
+// `gpui-kit/test-support` in Cargo.toml. Run it on purpose:
+//   cargo test -p notes-bridge-gpui --features test-support --test ime_seam
+// What that bought, first hand: ONE of the four defaults this module came to read has
+// MOVED. `prefers_ime_for_printable_keys` is not a method of `EntityInputHandler` in
+// 0.3.4 at all - the trait ends at `text_input_editable_range` (input.rs:117-133) - it
+// exists only on the platform-facing `InputHandler`, where `ElementInputHandler<V>`
+// answers it by calling `view.accepts_text_input` (input.rs:262-265). So the file's
+// original claim that the runtime value of that default is ours to read was wrong about
+// the seam, not about the value: what is readable is `accepts_text_input`, and what is
+// provable about the delegation is the type-level fact that the wrapper implementing it
+// covers our Editor. Both halves are asserted below.
 #[cfg(feature = "test-support")]
 mod window_driven {
     use super::*;
@@ -488,32 +503,44 @@ mod window_driven {
         })
     }
 
+    /// The delegation, as the TYPE fact it actually is: the platform's
+    /// `prefers_ime_for_printable_keys` answer for any view comes from
+    /// `impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V>`
+    /// (input.rs:145, body :262-265), which forwards to `view.accepts_text_input`.
+    /// Compiling this witness is the proof that OUR Editor is inside that `V` - a
+    /// generation that renames the wrapper or stops implementing the trait for it
+    /// fails here, at compile time, which is the only place this particular seam can
+    /// be read.
+    fn assert_the_wrapper_covers_our_editor()
+    where
+        gpui_kit::ElementInputHandler<editor::Editor>: gpui_kit::InputHandler,
+    {
+    }
+
     #[gpui_kit::test]
     fn the_defaults_the_platform_reads(cx: &mut TestAppContext) {
+        assert_the_wrapper_covers_our_editor();
+
         let window = editor_window(cx);
         window
             .update(cx, |editor, window, cx| {
                 let length = EntityInputHandler::text_length_utf16(editor, window, cx);
                 let editable = EntityInputHandler::text_input_editable_range(editor, window, cx);
                 let accepts = EntityInputHandler::accepts_text_input(editor, window, cx);
-                let prefers =
-                    EntityInputHandler::prefers_ime_for_printable_keys(editor, window, cx);
                 println!("text_length_utf16 = {length:?} (the buffer is 10 units)");
                 println!("text_input_editable_range = {editable:?}");
-                println!(
-                    "accepts_text_input = {accepts}, prefers_ime_for_printable_keys = {prefers}"
-                );
-                // 0.3.4 pin (input.rs:94-123): the length and editable-range answers
+                println!("accepts_text_input = {accepts}");
+                // 0.3.4 pin (input.rs:105-133): the length and editable-range answers
                 // are constant None, NOT delegations to our buffer. If a future
                 // generation starts answering with a number, this fails - and the
                 // number had better be 10, not 21.
                 assert_eq!(length, None);
                 assert_eq!(editable, None);
-                assert!(accepts);
-                assert!(
-                    prefers,
-                    "delegates to accepts_text_input (input.rs:262-265)"
-                );
+                // The value the wrapper above will hand the platform for
+                // `prefers_ime_for_printable_keys`, read at the one door that exists:
+                // `accepts_text_input`'s default is `true` (input.rs:103-105) and the
+                // Editor overrides neither.
+                assert!(accepts, "the default: the view takes text input");
             })
             .unwrap();
     }
@@ -523,9 +550,19 @@ mod window_driven {
         let window = editor_window(cx);
         window
             .update(cx, |editor, window, cx| {
-                let before = EntityInputHandler::selected_text_range(editor, false, window, cx);
+                // `selected_text_range` answers `Option<UTF16Selection>` in this
+                // generation (input.rs:24-29; the struct is platform.rs:1684, which
+                // derives Debug and NOT PartialEq), so the pair is compared by its
+                // fields. That is the same two numbers - the UTF-16 range and which end
+                // is the head - and nothing else the type carries.
+                let observed = |s: Option<gpui_kit::UTF16Selection>| {
+                    s.map(|s| (s.range, s.reversed))
+                };
+                let before =
+                    observed(EntityInputHandler::selected_text_range(editor, false, window, cx));
                 EntityInputHandler::set_selected_text_range(editor, 0..1, window, cx);
-                let after = EntityInputHandler::selected_text_range(editor, false, window, cx);
+                let after =
+                    observed(EntityInputHandler::selected_text_range(editor, false, window, cx));
                 println!("selection before {before:?}, after the default set_selected_text_range {after:?}");
                 // The default body is empty (input.rs:85-91): the platform cannot move
                 // our caret through it. Harmless today because the Windows backend has
