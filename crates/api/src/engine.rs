@@ -1287,6 +1287,20 @@ impl Engine {
             // BEFORE the value is queued, written, or left for the bridge to
             // build WindowBounds::Maximized(rect) from on the next launch.
             let clamp_warning = self.clamp_restore_rect();
+            // THE RATCHET CLOSES HERE. This branch skipped the MOVE and never
+            // replaced it with anything, which left the toolkit as the only
+            // writer of rcNormalPosition for a maximised window - and the
+            // toolkit reads our stored FRAME rect as client pixels and adds its
+            // own border offset back. The next measure stored that frame again,
+            // so every maximise -> close -> relaunch inflated the persisted rect
+            // by exactly the chrome (-8,-4 origin / +16,+8 size, measured four
+            // cycles running) with nothing able to stop it, because nothing on
+            // this side ever put the number back. The windowed lane never
+            // drifted: it SetWindowPos-s the stored frame itself, so its write
+            // and its read are the same space. This is that closure, through the
+            // door this branch is allowed to use - the restore seam, show state
+            // untouched, no chrome number known or invented here.
+            let push_warning = self.push_restore_rect(handle);
             // No move to make, or no seam on this build (see [`Engine::backend`]).
             // Pinned anyway. The session is marked dirty WITHOUT measuring: the
             // fresh-install fix below, and the measurement belongs to the flush
@@ -1305,7 +1319,11 @@ impl Engine {
             // the geometry sentence last. No clamp, no event - the healthy
             // maximised launch stays silent for exactly the reason the
             // paragraph above states.
-            if let Some(event) = clamp_warning {
+            // Exactly ONE geometry sentence per registration, as F2 left it:
+            // a rect that was clamped AND refused on the way back is one report
+            // carrying the value that survives, and the clamp reason is the
+            // actionable one - both events name the same rect anyway.
+            if let Some(event) = clamp_warning.or(push_warning) {
                 self.emit(event);
             }
             return;
@@ -1423,6 +1441,40 @@ impl Engine {
                 "the saved position does not fully fit any monitor; it was clamped back on screen",
             ),
         })
+    }
+
+    /// The OTHER HALF of closing a maximised launch: hand the stored - and
+    /// therefore already clamped - restore rect BACK to the window through the
+    /// seam that reads it, so what the next cycle measures is what this cycle
+    /// decided. [`WindowBackend::set_restore_frame_rect`] is a
+    /// `SetWindowPlacement` of `rcNormalPosition` ALONE: the show state is not
+    /// touched, nothing visible moves, and no chrome number exists anywhere on
+    /// this side of the call.
+    ///
+    /// Skipping it is what let the toolkit become the only writer of that field
+    /// on a maximised window, and its client-pixels-plus-border conversion then
+    /// ratcheted the persisted rect by the chrome every cycle - the drift the
+    /// windowed lane never had, because that lane already writes the frame it
+    /// stores. `set_frame_rect` is NOT a substitute: on a maximised window it
+    /// places the full-screen frame, which is a different number.
+    ///
+    /// It deliberately does NOT stamp `last_move_issued`: nothing visible is in
+    /// flight, and arming the guard on account of this call would make a quit
+    /// inside the window skip its final honest measure for a phantom move.
+    /// Returns the event a refusal earns, or [`None`] on success - and on a build
+    /// with no seam, where there is no window to have written to.
+    fn push_restore_rect(&mut self, handle: WindowHandle) -> Option<Event> {
+        let rect = self.session.rect;
+        // No seam on this build: there is no window to have written to, and no
+        // refusal to report (see [`Engine::backend`]).
+        let backend = self.backend.as_mut()?;
+        match backend.set_restore_frame_rect(handle.0 as isize, to_frame(rect)) {
+            Ok(()) => None,
+            Err(error) => Some(Event::GeometryNotRestored {
+                rect,
+                reason: error.to_string(),
+            }),
+        }
     }
 
     /// 5.5 step 4, which until this slice was "stored, never used": the pin bit
@@ -2381,6 +2433,19 @@ mod tests {
             _scale: f32,
         ) -> PlatformResult<()> {
             panic!("the pin fixture has no answer for set_frame_rect")
+        }
+
+        /// ANSWERED, not a hole: `pin_engine` seeds a MAXIMISED session,
+        /// so every pin test runs the no-move branch of `restore_and_pin` - and
+        /// that branch now writes the stored rect back. The tests are not about
+        /// the write, but they do reach it, and a fixture that panics on a call
+        /// its own path makes is a fixture that cannot be used.
+        fn set_restore_frame_rect(
+            &mut self,
+            _handle: isize,
+            _rect: FrameRect,
+        ) -> PlatformResult<()> {
+            Ok(())
         }
 
         fn primary_work_area(&self) -> PlatformResult<FrameRect> {

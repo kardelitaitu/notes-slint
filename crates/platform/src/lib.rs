@@ -192,6 +192,24 @@ pub trait WindowBackend: Send {
     /// "un-maximize first?") stays a decision above this crate.
     fn restore_frame_rect(&self, handle: isize) -> PlatformResult<Placement>;
 
+    /// Writes ONLY the window's RESTORE rect - `SetWindowPlacement's
+    /// `rcNormalPosition` - and leaves the show state exactly as it found it.
+    ///
+    /// The reason this is its own seam and not [`WindowBackend::set_frame_rect`]:
+    /// that call is a `SetWindowPos`, and on a maximised window a `SetWindowPos`
+    /// moves the FULL-SCREEN frame - not the number the user lands on when they
+    /// click the restore button. The persisted rect IS that number, so the port
+    /// has to write it through the same door it read it from
+    /// (`GetWindowPlacement` / `SetWindowPlacement`), or a position somebody
+    /// else chose can never be corrected by whoever owns the state.
+    ///
+    /// The show state is preserved by construction: the implementation reads the
+    /// current [`Placement`], replaces `rcNormalPosition` and nothing else, and
+    /// hands the pair back - so a maximised window stays maximised and a normal
+    /// one stays normal, and the objection that this would un-maximise the window
+    /// does not apply. Whether the write is wanted is still not this crate's call.
+    fn set_restore_frame_rect(&mut self, handle: isize, rect: FrameRect) -> PlatformResult<()>;
+
     /// Places and sizes the window at `r`.
     ///
     /// `scale` is the single unit conversion this seam performs: it is applied to `r`
@@ -317,6 +335,12 @@ mod tests {
                 restore_rect: FrameRect::new(5, 6, 7, 8),
                 show: ShowState::Normal,
             })
+        }
+
+        fn set_restore_frame_rect(&mut self, handle: isize, rect: FrameRect) -> PlatformResult<()> {
+            self.calls
+                .push(format!("set_restore_frame_rect {handle:#x} {rect:?}"));
+            Ok(())
         }
 
         fn set_frame_rect(

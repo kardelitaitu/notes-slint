@@ -9,6 +9,11 @@
 //! abandon the thread. The whole test is bounded at roughly the deadline plus
 //! margin, so the worst it can ever do to CI is fail.
 
+/// The shared fake carries a helper only tests/geometry.rs needs (`restore_sets`
+/// - the maximised lane never calls `set_frame_rect`, so that file owns the
+/// write-back receipt). Silenced HERE, following the precedent
+/// roundtrip_port.rs states: the shared support file stays untouched.
+#[allow(dead_code)]
 #[path = "support/host_mock.rs"]
 mod host_mock;
 

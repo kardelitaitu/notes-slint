@@ -1484,3 +1484,108 @@ fn a_drop_without_shutdown_still_writes_an_armed_session() {
         "the armed bit is the one that survived: {persisted:?}"
     );
 }
+
+/// THE MAXIMISED RECT RATCHET, and the seam that closes it. Measured live over
+/// four cycles (dossier 377): maximise -> close -> relaunch -> close inflated
+/// the stored rect by exactly the window chrome, every cycle, for ever: -8 in x,
+/// -4 in y, +16 wide, +8 tall. The mechanism was an OPEN LOOP.
+///
+/// `restore_and_pin` early-returns on a maximised window, so nothing on this
+/// side ever wrote `rcNormalPosition` back - the toolkit was the only writer,
+/// and it reads our stored FRAME rect as client pixels and adds its own border
+/// offset. The next measure read that inflated frame and persisted it as the
+/// truth. The windowed lane cannot drift because the port SetWindowPos-s the
+/// very frame it stores; the maximised lane had no such closure. Now it has one
+/// ([`WindowBackend::set_restore_frame_rect`]).
+///
+/// THE FAKE'S ROLE. `placement_round_trip` makes a written restore rect the
+/// next reported one, which is what SetWindowPlacement actually does. And each
+/// launch the test hands the window the inflated rect a toolkit conversion
+/// produces, because the inflation is the toolkit's act - this crate has no
+/// chrome number to invent, and must not. The claim is only about what survives
+/// on disk: three launches deep the stored rect is still the frame the first
+/// launch read. Pre-fix, the FIRST cycle already moves it.
+#[test]
+fn a_maximised_cycle_stores_the_rect_it_started_with() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let at_rest = Rect::new(600, 300, 800, 600);
+    write_session(
+        dir.path(),
+        &Session {
+            rect: at_rest,
+            maximized: true,
+            ..Session::default()
+        },
+    )
+    .expect("seed a maximised session");
+    let path = dir.path().join("session.json");
+    let chrome = |r: Rect| FrameRect::new(r.x - 8, r.y - 4, r.w + 16, r.h + 8);
+    let frame = |r: Rect| FrameRect::new(r.x, r.y, r.w, r.h);
+
+    for launch in 0..3u32 {
+        let handle = 0x100 + launch as i64;
+        let stored = read_session(dir.path()).expect("the session exists").rect;
+        let (gateway, _rx, host) = start_with(
+            dir.path(),
+            Answers {
+                restore: Some(chrome(stored)),
+                restore_show: ShowState::Maximized,
+                placement_round_trip: true,
+                ..Answers::default()
+            },
+        );
+        gateway
+            .send(Command::RegisterWindow {
+                handle: WindowHandle(handle),
+            })
+            .expect("queued");
+        // THE CLOSURE: this registration wrote a restore rect back, and wrote
+        // the frame this port owns - not the inflated one it was handed.
+        let deadline = Instant::now() + ANSWER;
+        loop {
+            if !host.restore_sets().is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "launch {launch}: a maximised registration wrote nothing back, so the loop is still open"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            host.restore_sets()[0],
+            (handle as isize, frame(stored)),
+            "launch {launch}: the pushed rect must be the stored frame, unadorned"
+        );
+        // Measure, flush, quit: the next launch reads the file, not this host.
+        gateway.send(Command::GeometryChanged).expect("queued");
+        let before = std::fs::metadata(&path).expect("session file");
+        let deadline = Instant::now() + ANSWER;
+        loop {
+            let now = std::fs::metadata(&path).expect("session file");
+            if now.modified().expect("mtime") != before.modified().expect("mtime") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "launch {launch}: nothing ever wrote"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        gateway.close().expect("the quit joins");
+        let after = read_session(dir.path()).expect("the session exists");
+        assert_eq!(
+            after.rect, at_rest,
+            "launch {launch} moved the stored rect: {after:?}"
+        );
+        assert!(
+            after.maximized,
+            "closing the loop must not un-maximise the window it annotates"
+        );
+        assert!(
+            host.moves().is_empty(),
+            "a maximised window is never placed with SetWindowPos: {:?}",
+            host.moves()
+        );
+    }
+}

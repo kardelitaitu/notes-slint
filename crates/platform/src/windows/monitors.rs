@@ -14,7 +14,8 @@ use ::windows::Win32::Graphics::Gdi::{
 };
 use ::windows::Win32::UI::WindowsAndMessaging::{
     GetWindowPlacement, GetWindowRect, SET_WINDOW_POS_FLAGS, SW_SHOW, SW_SHOWMAXIMIZED,
-    SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, WINDOWPLACEMENT,
+    SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPlacement,
+    SetWindowPos, WINDOWPLACEMENT,
 };
 
 use super::{to_hwnd, win32_error};
@@ -259,6 +260,53 @@ pub fn set_frame_rect(handle: isize, r: FrameRect, scale: f32) -> PlatformResult
         )
     }
     .map_err(|error| win32_error("SetWindowPos", error))
+}
+
+/// Writes `rcNormalPosition` and NOTHING ELSE - see
+/// [`crate::WindowBackend::set_restore_frame_rect`].
+///
+/// This is deliberately a read-modify-write of one field rather than a
+/// hand-built `WINDOWPLACEMENT`: `showCmd`, `flags` and the min/max tracking sizes
+/// come back out of `GetWindowPlacement` and go straight back in untouched, so the
+/// window keeps the show state it has (a maximised window stays maximised) and the
+/// `WPF_RESTORETOMAXIMIZED` bit a toolkit set is not quietly rewritten by a port
+/// that only wanted to correct a number. A zeroed struct passed to
+/// `SetWindowPlacement` would have un-maximised the window it meant to annotate,
+/// which is the opposite of the seam.
+///
+/// No `SWP_` flags exist on this call - `SetWindowPlacement` takes none - and it is
+/// NOT documented as async: like `SetWindowPos` without `SWP_ASYNCWINDOWPOS` it may
+/// send to the window owner, so a caller on another thread can wait for a pump.
+/// That is why nothing in `api` stamps a move-in-flight guard from here, and why
+/// the un-maximise TARGET (which is what this writes) is allowed to land late.
+pub fn set_restore_frame_rect(handle: isize, rect: FrameRect) -> PlatformResult<()> {
+    let hwnd = to_hwnd(handle)?;
+    let mut placement = WINDOWPLACEMENT {
+        length: core::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..WINDOWPLACEMENT::default()
+    };
+    // SAFETY (read half): GetWindowPlacement reads only `length`, set above to
+    // exactly `size_of::<WINDOWPLACEMENT>()` as the API demands, and writes its
+    // fields into a live repr(C) local that outlives the call. The HWND is the
+    // one `to_hwnd` accepted from IsWindow; a window destroyed since makes the
+    // call fail rather than fault.
+    unsafe { GetWindowPlacement(hwnd, &mut placement) }
+        .map_err(|error| win32_error("GetWindowPlacement", error))?;
+    // Corner-based in, corner-based out: width and height are saturated
+    // additions so an extreme stored rect cannot wrap into negative extents.
+    placement.rcNormalPosition = RECT {
+        left: rect.x,
+        top: rect.y,
+        right: rect.x.saturating_add(rect.width()),
+        bottom: rect.y.saturating_add(rect.height()),
+    };
+    // SAFETY (write half): SetWindowPlacement reads the same local - every
+    // field of WINDOWPLACEMENT is by value (RECT and POINT), so there is no
+    // nested pointer for Win32 to follow - and applies it to the HWND Win32
+    // re-validates, failing closed on a window that died since the check. The
+    // struct is passed by const pointer and is not used again after the call.
+    unsafe { SetWindowPlacement(hwnd, &placement) }
+        .map_err(|error| win32_error("SetWindowPlacement", error))
 }
 
 /// The work area of the monitor `handle` sits on: that monitor minus the taskbar and

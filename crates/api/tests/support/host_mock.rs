@@ -34,6 +34,10 @@ pub enum Call {
     RestoreRect {
         handle: isize,
     },
+    SetRestoreFrame {
+        handle: isize,
+        rect: FrameRect,
+    },
     FrameRect {
         handle: isize,
     },
@@ -69,6 +73,17 @@ pub struct Answers {
     pub fail_move: Option<String>,
     pub fail_topmost: Option<String>,
     pub fail_restore: Option<String>,
+    /// What [`set_restore_frame_rect`] answers with [`Some`]. Separate from
+    /// `fail_restore` because the READ and the WRITE are two calls: refusing one
+    /// must not silently refuse the other.
+    pub fail_restore_set: Option<String>,
+    /// Model the `SetWindowPlacement` -> `GetWindowPlacement` ROUND TRIP: a
+    /// written `rcNormalPosition` is what the next read reports. OFF by default,
+    /// because a fake that answers one question forever is what every fixture
+    /// written before the maximised ratchet was found depends on - and a stateful
+    /// placement would silently rewrite what those tests measure. ON, it is the
+    /// only way to say "a cycle stores the rect it started with" without a window.
+    pub placement_round_trip: bool,
     pub fail_work_area: Option<String>,
     /// MAJOR: how long `set_frame_rect` BLOCKS before answering, in
     /// milliseconds. Zero by default. This is the hang reproducer: a window op
@@ -94,6 +109,8 @@ impl Default for Answers {
             fail_move: None,
             fail_topmost: None,
             fail_restore: None,
+            fail_restore_set: None,
+            placement_round_trip: false,
             fail_work_area: None,
             block_move_ms: 0,
             scale: 1.0,
@@ -164,6 +181,20 @@ impl Host {
             .collect()
     }
 
+    /// Every [`set_restore_frame_rect`]: (handle, rect). This is the port pushing
+    /// a frame-space number BACK through the same door it read it from. The
+    /// maximised launch has no [`set_frame_rect`] to assert on, so this list is
+    /// the whole receipt that the loop closed in frame space.
+    pub fn restore_sets(&self) -> Vec<(isize, FrameRect)> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::SetRestoreFrame { handle, rect } => Some((handle, rect)),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn restore_reads(&self) -> usize {
         self.calls()
             .into_iter()
@@ -216,6 +247,24 @@ impl WindowBackend for Host {
             restore_rect: answers.restore.unwrap_or(answers.work_area),
             show: answers.restore_show,
         })
+    }
+
+    fn set_restore_frame_rect(&mut self, handle: isize, rect: FrameRect) -> PlatformResult<()> {
+        self.record(Call::SetRestoreFrame { handle, rect });
+        let mut answers = self.answers();
+        if let Some(message) = answers.fail_restore_set.clone() {
+            return Err(PlatformError::Win32 {
+                api: "SetWindowPlacement",
+                message,
+            });
+        }
+        if answers.placement_round_trip {
+            // THE ROUND TRIP: what SetWindowPlacement wrote IS what the next
+            // GetWindowPlacement reports. Gated (see the field) because a fake
+            // that answers one number forever is what the older fixtures lean on.
+            answers.restore = Some(rect);
+        }
+        Ok(())
     }
 
     fn set_frame_rect(&mut self, handle: isize, r: FrameRect, scale: f32) -> PlatformResult<()> {

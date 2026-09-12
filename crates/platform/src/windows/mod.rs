@@ -47,6 +47,10 @@ impl WindowBackend for Backend {
         monitors::set_frame_rect(handle, r, scale)
     }
 
+    fn set_restore_frame_rect(&mut self, handle: isize, rect: FrameRect) -> PlatformResult<()> {
+        monitors::set_restore_frame_rect(handle, rect)
+    }
+
     fn primary_work_area(&self) -> PlatformResult<FrameRect> {
         monitors::primary_work_area()
     }
