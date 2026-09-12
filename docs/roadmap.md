@@ -37,6 +37,32 @@ startup order in §5.5. **Exit criterion: you can use it as a notepad.** The chr
 M0 checks against gpui-kit (R14), then builds the title bar and runs R11's verification
 checklist.
 
+The exit criterion resolves to **seven user-visible yes/no checks**. This list is the
+milestone's definition of done — a check is PASS only when a machine proves it, not when the
+code looks finished. Status as of the current bridge slice (through `507db7f0`):
+
+- [x] **1. Window memory** — **PASS.** Seeded rect, real drag, `WM_CLOSE`, relaunch returns
+      there; proven end to end (`74a3c90`), asserted in `crates/api/tests/geometry.rs`.
+      *Known-false sub-case:* a maximised window does not come back maximised —
+      `session.maximized` is never written, so the flag has no producer.
+- [ ] **2. Open** — **not proven.** The dialog API is verified (§12.5 Q6) but presenting one
+      still needs a human, and no test drives dialog → text in the window.
+- [ ] **3. Save byte-identical (§4.5)** — **not proven end to end.** Core round-trip fixtures
+      pass; the exit check is the user-visible path, which has no assertion behind it.
+- [ ] **4. Save As** — **not proven end to end.** Path rebinding is proven headless; the
+      bridge route to it is untested.
+- [ ] **5. Recents** — **not proven.** Named gap: `RecentsUpdated` is emitted only on
+      *change*, so a fresh window shows an empty list and no headless test notices.
+- [ ] **6. Autosave toggle** — **not proven.** Debounce and flush are tested
+      (`crates/api/tests/debounce.rs`); the menu toggle driving them is not.
+- [ ] **7. Type and idle** — **half landed.** The scratch-note half is machine-proven: type,
+      flush, quit, relaunch reopens `<StateDir>/notes/untitled.notes` with its text and CRLF
+      intact (`crates/api/tests/first_run.rs`, `crates/api/tests/scratch_restart.rs`). The
+      idle/blur flush through a live window is still owed.
+
+**2 of 7 machine-proven** (1, and the scratch half of 7). The remaining four are exactly what
+the outstanding bridge slices are for.
+
 **M3 — Window persistence.**
 `platform` trait + Windows backend. Restore, validate against monitors, clamp off-screen,
 handle maximised + DPI. Test on 100/150/200% scaling and with a monitor unplugged.
