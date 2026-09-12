@@ -197,6 +197,17 @@ fn a_refused_move_is_reported_not_swallowed() {
             handle: WindowHandle(0x100),
         })
         .expect("queued");
+    // F2: the ORDER is part of the claim. The same registration applies the
+    // pin, and that verdict comes out FIRST - a refused move must not be the
+    // last thing said about a window whose Z-order was also being restored,
+    // because the bridge pump keeps a last-wins status line.
+    let pin = rx
+        .recv_timeout(ANSWER)
+        .expect("the registration applies the pin before anything else");
+    assert!(
+        matches!(pin, Event::Pinned(false)),
+        "this launch is not pinned, and the apply is what says so: {pin:?}"
+    );
     let event = rx
         .recv_timeout(ANSWER)
         .expect("the refusal must be emitted, never silenced");

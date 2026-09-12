@@ -52,6 +52,8 @@ to leak onto.
 - `PlatformError` / `PlatformResult` - the error contract. Every fallible function
   returns it, and nothing in this crate panics.
 - `WindowBackend` - the trait `api` consumes.
+- `ShowState` / `Placement` - what one `GetWindowPlacement` call reports: the restore
+  rect, and how the window is shown right now. Reported together, interpreted above.
 - `HostFacts` - the handle-free machine facts (the process ANSI code page), on the
   same seam rules; platform-only facts enter through `api`, never through the
   bridge, which may not import this crate at all.
@@ -130,6 +132,29 @@ pub enum PinOutcome {
     NotApplied { expected: bool, actual: bool },
 }
 
+/// How the window is shown right now, from GetWindowPlacement's showCmd.
+/// Minimised is deliberately NOT a case: Unknown is the honest answer for it.
+/// Decides nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowState {
+    Normal,
+    Maximized,
+    Unknown,
+}
+
+/// What GetWindowPlacement reports about a window: the rect it would be restored
+/// to, and how it is shown right now. Both halves are measurements reported
+/// together because one Win32 call answers both; reading `show` and acting on it
+/// is a decision above this crate - see
+/// [`WindowBackend::restore_frame_rect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    /// `rcNormalPosition`: the rect the window returns to when un-maximised.
+    pub restore_rect: FrameRect,
+    /// The mapped `showCmd`: how the window is shown at this instant.
+    pub show: ShowState,
+}
+
 /// The window-handle seams that `api` consumes.
 ///
 /// Object-safe and `Send`: a bridge registers one implementation (`windows::Backend`
@@ -160,11 +185,12 @@ pub trait WindowBackend: Send {
     /// EXCEEDS the monitor by the invisible borders, so storing it would persist
     /// a lie; this is the only correct source for the persisted rect.
     ///
-    /// The normal position is returned regardless of the current show state:
-    /// whether the window is maximized right now is what `WNDPLACEMENT`'s
-    /// `showCmd` and `flags` fields report, and interpreting them - "restore it
-    /// maximized?", "un-maximize first?" - is a decision above this crate.
-    fn restore_frame_rect(&self, handle: isize) -> PlatformResult<FrameRect>;
+    /// Both halves are returned together because one call answers both:
+    /// [`Placement::restore_rect`] is the normal position whatever the current
+    /// show state, and [`Placement::show`] is `showCmd` reported as a
+    /// [`ShowState`] - nothing more. Acting on it ("restore it maximized?",
+    /// "un-maximize first?") stays a decision above this crate.
+    fn restore_frame_rect(&self, handle: isize) -> PlatformResult<Placement>;
 
     /// Places and sizes the window at `r`.
     ///
@@ -260,7 +286,10 @@ pub trait HostFacts: Send {
 }
 #[cfg(test)]
 mod tests {
-    use super::{FrameRect, HostFacts, PinOutcome, PlatformError, PlatformResult, WindowBackend};
+    use super::{
+        FrameRect, HostFacts, PinOutcome, Placement, PlatformError, PlatformResult, ShowState,
+        WindowBackend,
+    };
 
     /// A stand-in for `api`: it implements the seam with no window, no desktop and
     /// no `windows` dependency, which is the point of the shape - bare `isize`
@@ -280,10 +309,14 @@ mod tests {
             Ok(FrameRect::new(1, 2, 3, 4))
         }
 
-        fn restore_frame_rect(&self, _handle: isize) -> PlatformResult<FrameRect> {
+        fn restore_frame_rect(&self, _handle: isize) -> PlatformResult<Placement> {
             // Not recorded: the trait method takes &self (a rect read is a query),
-            // so the mock cannot push into its call log through it.
-            Ok(FrameRect::new(5, 6, 7, 8))
+            // so the mock cannot push into its call log through it. The show state
+            // is the mock's own stand-in, never a measurement.
+            Ok(Placement {
+                restore_rect: FrameRect::new(5, 6, 7, 8),
+                show: ShowState::Normal,
+            })
         }
 
         fn set_frame_rect(
@@ -369,7 +402,9 @@ mod tests {
         let backend: Box<dyn WindowBackend> = Box::new(Mock::default());
         assert!(matches!(
             backend.restore_frame_rect(0x1234),
-            Ok(rect) if rect == FrameRect::new(5, 6, 7, 8)
+            Ok(placement)
+                if placement.restore_rect == FrameRect::new(5, 6, 7, 8)
+                    && placement.show == ShowState::Normal
         ));
         let facts: Box<dyn HostFacts> = Box::new(Mock::default());
         // The mock's answers are stand-in constants; the real ones are measured

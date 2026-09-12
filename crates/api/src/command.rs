@@ -98,6 +98,14 @@ pub enum Command {
 
     /// Pin the window above every other window. Persisted in `session.json`,
     /// which is the one home of pin state (D10).
+    ///
+    /// With a window registered this is a WINDOW OPERATION: the port drives the
+    /// topmost apply and the answer is whatever that apply reports -
+    /// [`Event::Pinned`](crate::Event::Pinned) or
+    /// [`Event::PinFailed`](crate::Event::PinFailed), never a restatement of the
+    /// ask. With nothing registered it stores the bit and says nothing, and a
+    /// repeat of an already-confirmed state is silent too; the cases are on the
+    /// event, not here.
     SetPinned(bool),
 
     /// Empty the recent-files list. Answers with

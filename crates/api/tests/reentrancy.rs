@@ -179,9 +179,11 @@ fn shutdown_drains_commands_queued_behind_it() {
         "the fixture must be the file the engine actually read",
     );
 
-    // SetPinned is answered with one `Pinned` readback event now, which this
-    // batch does not count: the counted batch is Flushes — one event each —
-    // and the pin goes in first to prove the engine is warm.
+    // SetPinned is answered with NOTHING here, and that is the contract: no
+    // window was ever registered on this Gateway, so there is no style to read
+    // back and the readback belongs to the apply (see the three silent cases on
+    // Event::Pinned). The counted batch is Flushes — one event each — and the
+    // pin goes in first only to prove the engine is warm.
     let _ = gateway.send(Command::SetPinned(true));
     const N: u64 = 25;
     for revision in 1..=N {

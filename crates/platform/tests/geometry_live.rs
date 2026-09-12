@@ -324,7 +324,12 @@ fn an_async_move_and_reband_land_when_the_owner_pumps() {
     let pump_elapsed = pump_started.elapsed();
     eprintln!("[phase B] owner drained its queue in {pump_elapsed:?}");
     let landing = wait_for_landing(
-        || matches!(backend.restore_frame_rect(handle), Ok(rect) if rect == requested),
+        || {
+            matches!(
+                backend.restore_frame_rect(handle),
+                Ok(placement) if placement.restore_rect == requested,
+            )
+        },
         Duration::from_secs(2),
     )
     .expect("the requested rect never landed within 2s");

@@ -515,17 +515,24 @@ mod tests {
             "a live engine accepts commands"
         );
         gateway.close().expect("the Shutdown was accepted");
-        // THE PIN READBACK: the SetPinned above changed the bit, so the
-        // engine's answer under the new contract is one `Pinned` event ahead
-        // of the Disconnected marker. Drain exactly it, then assert silence.
+        // P3: the Result is BOUND, not matched inline, so a run that says
+        // something wrong prints WHAT it said instead of a bare false.
+        let answer = rx.recv();
+        // NOTHING IS SAID HERE, and that is the contract rather than a gap:
+        // this Gateway never received a RegisterWindow, so the SetPinned above
+        // stored and persisted a bit and touched no window - the readback is
+        // an APPLY (see the three silent cases on [`Event::Pinned`]), and
+        // there was no window to apply it to. The Err is therefore the whole
+        // of what close() leaves: the engine is gone and the channel is shut.
         assert!(
-            matches!(rx.recv(), Ok(Event::Pinned(true))),
-            "the accepted pin change must be announced before the channel closes"
+            answer.is_err(),
+            "an unregistered pin change is stored, never announced: {answer:?}"
         );
-        assert!(
-            rx.recv().is_err(),
-            "the engine exited, so EventRx reports Disconnected"
-        );
+        // (b) YET IT WAS DONE, which is the half of close() this test exists
+        // to prove: the drain carried the accepted command and its write.
+        let persisted = notes_core::session::read_session(dir.path())
+            .expect("the drained session write must exist");
+        assert!(persisted.pinned, "the accepted SetPinned was drained");
     }
 
     /// REVIEWER ITEM 5: startup_state() is a snapshot handed over ONCE, not a live

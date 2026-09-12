@@ -13,12 +13,12 @@ use ::windows::Win32::Graphics::Gdi::{
     MONITORINFOEXW, MonitorFromPoint, MonitorFromRect, MonitorFromWindow,
 };
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowPlacement, GetWindowRect, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-    SWP_NOZORDER, SetWindowPos, WINDOWPLACEMENT,
+    GetWindowPlacement, GetWindowRect, SET_WINDOW_POS_FLAGS, SW_SHOW, SW_SHOWMAXIMIZED,
+    SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, WINDOWPLACEMENT,
 };
 
 use super::{to_hwnd, win32_error};
-use crate::{FrameRect, PlatformError, PlatformResult};
+use crate::{FrameRect, Placement, PlatformError, PlatformResult, ShowState};
 
 /// `SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS`: placing a window must not
 /// change the z-order (that is the topmost seam) and must not steal focus. Origin
@@ -61,9 +61,28 @@ pub fn frame_rect(handle: isize) -> PlatformResult<FrameRect> {
     Ok(from_win32(rect))
 }
 
-/// The restore (normal) frame rect of `handle` - see
+/// Maps `WINDOWPLACEMENT.showCmd` to a [`ShowState`]: the one place this crate
+/// reads that field, and a pure function, so the mapping is testable without a
+/// window.
+///
+/// The test is EQUALITY against `SW_SHOWMAXIMIZED` - the same test gpui itself
+/// uses - and not the `WPF_RESTORETOMAXIMIZED` bit of `flags`: that bit names
+/// where the window would go WHEN restored, so it survives an un-maximise and
+/// reading it here would latch a stale "maximised". `showCmd` is the current
+/// state, and nothing here acts on it.
+fn show_state(cmd: u32) -> ShowState {
+    if cmd == SW_SHOWMAXIMIZED.0 as u32 {
+        ShowState::Maximized
+    } else if cmd == SW_SHOWNORMAL.0 as u32 || cmd == SW_SHOW.0 as u32 {
+        ShowState::Normal
+    } else {
+        ShowState::Unknown
+    }
+}
+
+/// The restore rect and current show state of `handle` - see
 /// [`crate::WindowBackend::restore_frame_rect`].
-pub fn restore_frame_rect(handle: isize) -> PlatformResult<FrameRect> {
+pub fn restore_frame_rect(handle: isize) -> PlatformResult<Placement> {
     let hwnd = to_hwnd(handle)?;
     let mut placement = WINDOWPLACEMENT {
         length: core::mem::size_of::<WINDOWPLACEMENT>() as u32,
@@ -75,11 +94,14 @@ pub fn restore_frame_rect(handle: isize) -> PlatformResult<FrameRect> {
     // HWND is the one `to_hwnd` accepted from IsWindow at check time; a window
     // destroyed since makes the call return FALSE rather than fault, and the
     // returned Result maps that FALSE into an error carrying this call's OS code.
-    // `rcNormalPosition` is reported whatever the current show state; the
-    // show-state fields are copied but never interpreted here.
+    // `rcNormalPosition` is reported whatever the current show state; both it and
+    // `showCmd` are copied out and mapped, never acted on.
     unsafe { GetWindowPlacement(hwnd, &mut placement) }
         .map_err(|error| win32_error("GetWindowPlacement", error))?;
-    Ok(from_win32(placement.rcNormalPosition))
+    Ok(Placement {
+        restore_rect: from_win32(placement.rcNormalPosition),
+        show: show_state(placement.showCmd),
+    })
 }
 
 /// The numeric suffix of Win32's display-device name (\\.\\DISPLAY<n>) - the
@@ -297,15 +319,17 @@ fn work_area_of(monitor: HMONITOR) -> PlatformResult<FrameRect> {
 mod tests {
     use super::{
         PLACEMENT_FLAGS, frame_rect, from_win32, monitor_work_area, primary_work_area,
-        restore_frame_rect, scale_for_rect, scale_of_monitor, set_frame_rect, work_area_for_rect,
-        work_area_of,
+        restore_frame_rect, scale_for_rect, scale_of_monitor, set_frame_rect, show_state,
+        work_area_for_rect, work_area_of,
     };
-    use crate::{FrameRect, PlatformError, PlatformResult, WindowBackend};
+    use crate::{FrameRect, PlatformError, PlatformResult, ShowState, WindowBackend};
     use ::windows::Win32::Foundation::RECT;
     use ::windows::Win32::Graphics::Gdi::HMONITOR;
     use ::windows::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SET_WINDOW_POS_FLAGS, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
-        SM_XVIRTUALSCREEN, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER,
+        SM_XVIRTUALSCREEN, SW_HIDE, SW_SHOW, SW_SHOWDEFAULT, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
+        SW_SHOWMINNOACTIVE, SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER,
+        WPF_RESTORETOMAXIMIZED,
     };
 
     #[test]
@@ -342,6 +366,65 @@ mod tests {
             bottom: 400,
         };
         assert_eq!(from_win32(second), FrameRect::new(-1920, -200, 800, 600));
+    }
+
+    /// The mapper is the whole of this crate's reading of `showCmd`, so its three
+    /// answers are pinned here - no window, no desktop, no `GetWindowPlacement`.
+    ///
+    /// The maximised case is the one that matters: the test is EQUALITY against
+    /// `SW_SHOWMAXIMIZED`, the same test gpui itself uses. `WPF_RESTORETOMAXIMIZED`
+    /// is a bit of a DIFFERENT field (`flags`) and says where the window would go on
+    /// restore, so a window that was un-maximised long ago still carries it - reading
+    /// it would latch a stale "maximised" into the saved session. Its value (2) IS
+    /// the iconic `showCmd`, so it is asserted here as not reaching Maximized.
+    #[test]
+    fn the_maximised_show_cmd_is_the_only_one_that_maps_to_maximized() {
+        assert_eq!(
+            show_state(SW_SHOWMAXIMIZED.0 as u32),
+            ShowState::Maximized,
+            "SW_SHOWMAXIMIZED ({}) is the maximised state",
+            SW_SHOWMAXIMIZED.0,
+        );
+        assert_eq!(
+            show_state(WPF_RESTORETOMAXIMIZED.0),
+            ShowState::Unknown,
+            "the restore target (flags bit {}) is not a show state",
+            WPF_RESTORETOMAXIMIZED.0,
+        );
+    }
+
+    /// The two codes that describe an ordinary on-screen window both map to Normal:
+    /// `SW_SHOWNORMAL` (also `SW_RESTORE`'s value) and `SW_SHOW`.
+    #[test]
+    fn an_ordinary_window_maps_to_normal() {
+        for cmd in [SW_SHOWNORMAL, SW_SHOW] {
+            assert_eq!(
+                show_state(cmd.0 as u32),
+                ShowState::Normal,
+                "{cmd:?} is an ordinary window",
+            );
+        }
+    }
+
+    /// Minimised has no case, by contract: `SW_SHOWMINIMIZED` (the iconic state) and
+    /// every other code this mapper does not name answer `Unknown`. Calling an icon
+    /// "Normal" would claim a case this enum does not have, and calling it
+    /// "Maximized" would be worse - `Unknown` decides nothing, which is the point.
+    #[test]
+    fn an_iconic_and_an_unnamed_code_map_to_unknown() {
+        assert_eq!(
+            show_state(SW_SHOWMINIMIZED.0 as u32),
+            ShowState::Unknown,
+            "minimised is not a case of its own",
+        );
+        for cmd in [SW_HIDE, SW_SHOWMINNOACTIVE, SW_SHOWDEFAULT] {
+            assert_eq!(
+                show_state(cmd.0 as u32),
+                ShowState::Unknown,
+                "{cmd:?} names nothing this mapper claims",
+            );
+        }
+        assert_eq!(show_state(u32::MAX), ShowState::Unknown);
     }
 
     #[test]

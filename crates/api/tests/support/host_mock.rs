@@ -15,7 +15,8 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use notes_platform::{
-    FrameRect, HostFacts, PinOutcome, PlatformError, PlatformResult, WindowBackend,
+    FrameRect, HostFacts, PinOutcome, Placement, PlatformError, PlatformResult, ShowState,
+    WindowBackend,
 };
 
 /// One recorded call, in the order it happened.
@@ -52,7 +53,10 @@ pub struct Answers {
     /// exactly one reason.
     pub work_area: FrameRect,
     pub monitor_id: u32,
-    /// The rect [`restore_frame_rect`] reports - the value D48 persists.
+    /// The rect [`restore_frame_rect`] reports as its `Placement::restore_rect` -
+    /// the value D48 persists. The show state is not an answer this fixture models:
+    /// the seam reports `ShowState::Unknown`, which is what "the fake has no view"
+    /// honestly means.
     pub restore: Option<FrameRect>,
     /// [`ansi_codepage`]: a stand-in for a measurement, never a guess.
     pub codepage: u16,
@@ -193,7 +197,7 @@ impl WindowBackend for Host {
         Ok(self.answers().work_area)
     }
 
-    fn restore_frame_rect(&self, handle: isize) -> PlatformResult<FrameRect> {
+    fn restore_frame_rect(&self, handle: isize) -> PlatformResult<Placement> {
         self.record(Call::RestoreRect { handle });
         let answers = self.answers();
         if let Some(message) = answers.fail_restore.clone() {
@@ -202,7 +206,10 @@ impl WindowBackend for Host {
                 message,
             });
         }
-        Ok(answers.restore.unwrap_or(answers.work_area))
+        Ok(Placement {
+            restore_rect: answers.restore.unwrap_or(answers.work_area),
+            show: ShowState::Unknown,
+        })
     }
 
     fn set_frame_rect(&mut self, handle: isize, r: FrameRect, scale: f32) -> PlatformResult<()> {

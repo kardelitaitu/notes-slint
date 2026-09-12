@@ -18,7 +18,9 @@ pub mod topmost;
 use ::windows::Win32::Foundation::HWND;
 use ::windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
-use crate::{FrameRect, HostFacts, PinOutcome, PlatformError, PlatformResult, WindowBackend};
+use crate::{
+    FrameRect, HostFacts, PinOutcome, Placement, PlatformError, PlatformResult, WindowBackend,
+};
 
 /// The Win32 implementation of [`WindowBackend`].
 ///
@@ -37,7 +39,7 @@ impl WindowBackend for Backend {
         monitors::frame_rect(handle)
     }
 
-    fn restore_frame_rect(&self, handle: isize) -> PlatformResult<FrameRect> {
+    fn restore_frame_rect(&self, handle: isize) -> PlatformResult<Placement> {
         monitors::restore_frame_rect(handle)
     }
 

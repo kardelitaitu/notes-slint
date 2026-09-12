@@ -466,21 +466,45 @@ pub enum Event {
         /// The platform's own words for the refusal.
         reason: String,
     },
-    /// The pin state the engine holds, announced when it is CONFIRMED or
-    /// CHANGED: `true` = pinned above every other window. The success twin of
-    /// [`Event::PinFailed`], and its opposite number in the same contract:
-    /// before this variant the port could report only that a pin FAILED,
-    /// never what the state IS, so a bridge had no honest source to render a
-    /// pin indicator from - a check mark that flips on the ask is the UI
-    /// believing its own request, the same ruling the autosave toggle is
-    /// held to. Fired at exactly two sites, and never on a failure:
-    /// [`Command::SetPinned`](crate::Command::SetPinned) when the stored bit
-    /// actually changes (a repeat that changes nothing says nothing), and
-    /// the [`Command::RegisterWindow`](crate::Command::RegisterWindow)
-    /// restore path (`restore_and_pin` -> `apply_topmost`) when the
-    /// platform reads the window's style back as asked (`PinOutcome::Applied`).
-    /// A refused apply is [`Event::PinFailed`](crate::Event::PinFailed) and
-    /// never `Pinned` - the two never travel together.
+    /// What the WINDOW is, not what was asked for: `true` = confirmed above
+    /// every other window, read back out of the window's own style. The
+    /// success twin of [`Event::PinFailed`] and its opposite number in one
+    /// contract: a bridge renders its pin indicator from HERE and never from
+    /// its own ask, because a check mark that flips on the request is the UI
+    /// believing itself - the same ruling the autosave toggle is held to.
+    ///
+    /// ONE FIRING SITE: `apply_topmost`, on `PinOutcome::Applied` only. Two
+    /// routes reach it - the
+    /// [`Command::RegisterWindow`](crate::Command::RegisterWindow) restore
+    /// path, and [`Command::SetPinned`](crate::Command::SetPinned) WHILE A
+    /// WINDOW IS REGISTERED, which is what makes one click on the pin item
+    /// actually topmost the live window rather than merely remember an
+    /// intention. A refused or non-sticking apply is
+    /// [`Event::PinFailed`](crate::Event::PinFailed) and never `Pinned`; the
+    /// two never travel together.
+    ///
+    /// THREE SILENT CASES, each one "the window was not touched", so there is
+    /// no fact to announce:
+    ///
+    /// 1. `SetPinned` with NO window registered - the bit is stored and
+    ///    persisted (D10: `session.json` is the one home of pin state) and
+    ///    the first registration's apply is where it becomes a fact.
+    /// 2. A repeat of a state the platform ALREADY confirmed. This silence is
+    ///    what keeps a held-down accelerator from rewriting the style every
+    ///    time - and it is broken on purpose by the retry half of the
+    ///    contract: after a `PinFailed` nothing stands confirmed, so the next
+    ///    `SetPinned` with the SAME bit attempts the apply and answers again.
+    /// 3. No seam on this build (`backend: None`, see the field doc on
+    ///    `Engine::backend`): notes-platform has no Win32 module to offer,
+    ///    so nothing was asked, nothing was refused and nothing was read
+    ///    back. A build-time fact about a host this app does not ship to, not
+    ///    a refused action - hence silence rather than `PinFailed`, exactly
+    ///    like the geometry path sitting beside it.
+    ///
+    /// ORDER IS PART OF THE CONTRACT: on a registration this event is emitted
+    /// BEFORE any [`Event::GeometryNotRestored`] from the same restore, so a
+    /// pump that keeps the last event says the thing about the window's
+    /// position last, over the bookkeeping of the Z-order.
     Pinned(bool),
 }
 

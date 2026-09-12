@@ -280,6 +280,18 @@ pub(crate) struct Engine {
     /// position - true of the screen for a moment, poison for the file. The
     /// flush refuses to store a rect measured inside that window.
     last_move_issued: Option<Instant>,
+    /// F3 (the retry half of the pin readback): the pin state the platform
+    /// last CONFIRMED by reading the window's style back, or `None` when
+    /// nothing is confirmed - no apply has run, or the last apply was refused.
+    ///
+    /// It exists because "what the session says" and "what the window is" are
+    /// two different facts, and only the second one may be announced. Without
+    /// it, a `SetPinned(true)` after a `PinFailed` is indistinguishable from a
+    /// repeat that needs nothing: the stored bit already reads `true`, so the
+    /// arm would stay silent and the user's second click would do literally
+    /// nothing. With it, a repeat is silent ONLY when the platform already
+    /// agreed, and is an attempt every other time.
+    pin_confirmed: Option<bool>,
 }
 
 impl Engine {
@@ -363,6 +375,9 @@ impl Engine {
             measure_failure_latched: false,
             epoch: 0,
             last_move_issued: None,
+            // Nothing is a fact about the window until an apply has read it
+            // back, including on a restart whose session.json says `pinned`.
+            pin_confirmed: None,
             backend,
             facts,
             deadline: Instant::now() + AUTOSAVE_IDLE,
@@ -491,6 +506,12 @@ impl Engine {
                     self.flush_state();
                 }
                 self.window = None;
+                // F3: a confirmation was a fact about THAT window. The handle is
+                // gone, so nothing is confirmed any more - and a later
+                // `SetPinned` must therefore attempt the apply rather than
+                // believe a stale read-back about a destroyed HWND (MAJOR 3's
+                // recycled-number trap, applied to the pin instead of the rect).
+                self.pin_confirmed = None;
             }
             Command::GeometryChanged => {
                 // A TRIGGER, nothing more (the payload was removed deliberately:
@@ -515,18 +536,36 @@ impl Engine {
                 }
             }
             Command::SetPinned(on) => {
-                if self.session.pinned != on {
+                let changed = self.session.pinned != on;
+                if changed {
                     self.session.pinned = on;
                     self.queue(Target::Session);
-                    // THE READBACK: the stored bit changed and the session
-                    // will carry it - say so. Before this event the port
-                    // could report only a pin that FAILED, so a bridge had no
-                    // honest source for its pin state and would have had to
-                    // believe its own request. A repeat that changes nothing
-                    // stays silent, and no window work happens here - the
-                    // apply belongs to `apply_topmost`; "pinning is not a
-                    // window operation" is the invariant the D10 test pins.
-                    self.emit(Event::Pinned(on));
+                }
+                // THE READBACK IS AN APPLY, NOT AN ECHO (F1). Until now this arm
+                // emitted `Pinned(on)` before and instead of any platform call -
+                // the port stating the request as if it were the result, which is
+                // the exact anti-pattern [`Event::Pinned`]'s own doc forbids (a
+                // check mark that flips on the ask is the UI believing itself).
+                // The honest shape: with a window registered, ONE CLICK MUST
+                // ACTUALLY TOPMOST IT - the README's product promise was never
+                // "we remembered a bit" - and the event that follows is whatever
+                // the apply path reports, never this arm. `apply_topmost` is the
+                // single emitter of both `Pinned` and `PinFailed`.
+                //
+                // The gate is `changed || not-yet-confirmed`, which is F3's retry
+                // half: a repeat whose state the platform already read back does
+                // nothing (no second SetWindowPos, no second event), while a
+                // repeat after a `PinFailed` attempts again instead of dying
+                // silently on a stored bit that already read `true`.
+                //
+                // NO WINDOW: the bit is stored and persisted and NOTHING IS
+                // SAID - the third silent case, documented on [`Event::Pinned`].
+                // D10's invariant survives untouched: a pin command with nothing
+                // registered invents no window and touches no handle.
+                if let Some(handle) = self.window {
+                    if changed || self.pin_confirmed != Some(on) {
+                        self.apply_topmost(handle);
+                    }
                 }
             }
             Command::ClearRecents => {
@@ -1175,6 +1214,17 @@ impl Engine {
             self.queue(Target::Session);
             return;
         }
+        // F2: THE PIN IS STATED FIRST, THE GEOMETRY WARNING LAST. The platform
+        // calls keep their order (move, then topmost - a Z-order change issued
+        // before the move lands is the parked-owner problem platform documents
+        // against); what changes is the EMIT order. The bridge's pump keeps a
+        // LAST-WINS status line, so a registration whose pin was refused and
+        // whose position was also clamped used to end on the geometry sentence
+        // and quietly lose the more actionable one - and, in the applied case,
+        // the warning was the last thing said about a pin that had just worked.
+        // The warning is therefore COLLECTED here and emitted below, after the
+        // apply, still exactly once per registration: countable, not silent.
+        let mut warning: Option<Event> = None;
         match self
             .facts
             .as_ref()
@@ -1206,7 +1256,7 @@ impl Engine {
                             // happen as asked. Once per registration - a real,
                             // countable fallback, not a silent one (D42's
                             // unanswered question: how many users hit this?).
-                            self.emit(Event::GeometryNotRestored {
+                            warning = Some(Event::GeometryNotRestored {
                                 rect,
                                 reason: String::from(
                                     "the saved position does not fully fit any monitor; it was clamped back on screen",
@@ -1215,16 +1265,20 @@ impl Engine {
                             self.queue(Target::Session);
                         }
                     }
-                    Err(err) => self.emit(Event::GeometryNotRestored {
-                        rect: clamped,
-                        reason: err.to_string(),
-                    }),
+                    Err(err) => {
+                        warning = Some(Event::GeometryNotRestored {
+                            rect: clamped,
+                            reason: err.to_string(),
+                        });
+                    }
                 }
             }
-            Err(err) => self.emit(Event::GeometryNotRestored {
-                rect,
-                reason: err.to_string(),
-            }),
+            Err(err) => {
+                warning = Some(Event::GeometryNotRestored {
+                    rect,
+                    reason: err.to_string(),
+                });
+            }
         }
         // THE FRESH-INSTALL DIRTY MARK, kept from the D54 fix: without it a
         // user who never drags the window never gets a session.json (the flush
@@ -1234,6 +1288,12 @@ impl Engine {
         // stores the pre-move rect and D48 becomes quietly false (probe5).
         self.queue(Target::Session);
         self.apply_topmost(handle);
+        // ... and the geometry sentence comes AFTER it (F2), unchanged in
+        // content: one GeometryNotRestored per registration, still countable,
+        // still carrying the rect the port asked for.
+        if let Some(event) = warning {
+            self.emit(event);
+        }
     }
 
     /// 5.5 step 4, which until this slice was "stored, never used": the pin bit
@@ -1243,6 +1303,14 @@ impl Engine {
     fn apply_topmost(&mut self, handle: WindowHandle) {
         let on = self.session.pinned;
         let Some(backend) = self.backend.as_mut() else {
+            // THE THIRD SILENT CASE, and it stays silent on purpose: no seam
+            // exists on this build, so nothing was refused and nothing was
+            // read back - there is no fact about a window to announce, in
+            // either direction. The bit is still stored in session.json, which
+            // is all a host this app does not ship to can honestly promise.
+            // Documented on [`Event::Pinned`]; emitting here would be a claim
+            // with no evidence behind it.
+            self.pin_confirmed = None;
             return;
         };
         // Platform's verdict, mapped straight onto the event: the reason
@@ -1254,13 +1322,24 @@ impl Engine {
             // rather than what failed about it. `NotApplied` is NOT this -
             // a call that changed nothing (the hidden-window case) is the
             // PinFailed below, never a Pinned.
-            PinOutcome::Applied => self.emit(Event::Pinned(on)),
+            PinOutcome::Applied => {
+                // The one confirmation there is, remembered: a repeat of the
+                // same ask now does nothing, while a repeat of an ask this
+                // arm is about to refuse is a real attempt (F3).
+                self.pin_confirmed = Some(on);
+                self.emit(Event::Pinned(on));
+            }
             PinOutcome::Failed(err) => {
+                // A refusal confirms nothing, and it retires whatever the
+                // previous read-back said: the caller's next click must reach
+                // the platform again.
+                self.pin_confirmed = None;
                 self.emit(Event::PinFailed {
                     reason: err.to_string(),
                 });
             }
             PinOutcome::NotApplied { expected, actual } => {
+                self.pin_confirmed = None;
                 self.emit(Event::PinFailed {
                     reason: format!(
                         "the pin did not stick: asked for topmost={expected}, the window read back {actual}"
@@ -1284,11 +1363,14 @@ impl Engine {
             return false;
         };
         match backend.restore_frame_rect(handle.0 as isize) {
-            Ok(frame) => {
+            Ok(placement) => {
                 // A success re-arms the report (MAJOR 6): the next distinct
                 // failure is news again.
                 self.measure_failure_latched = false;
-                let rect = to_rect(frame);
+                // Only the rect is read here: `placement.show` is reported by the
+                // seam and consumed by nothing yet (slice 2), and what to do with
+                // it is a decision this port does not own.
+                let rect = to_rect(placement.restore_rect);
                 // MAJOR 5: within two idle periods of issuing an async move,
                 // this read-back may be the PRE-MOVE or MID-DRAG position - the
                 // call returns before the move lands. Trust it for the latch
@@ -1817,7 +1899,7 @@ fn existing_detected(path: &Path, codepage: Option<u16>) -> Detected {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notes_platform::{PlatformError, PlatformResult};
+    use notes_platform::{Placement, PlatformError, PlatformResult};
     use std::path::PathBuf;
 
     /// REVIEWER ITEM 3: the marking call inside [`Engine::run`] is what arms the
@@ -2078,18 +2160,25 @@ mod tests {
         assert_eq!(engine.window, None, "pinning is not a window operation");
     }
 
-    /// A one-answer backend for the pin tests: `set_topmost` answers with the
-    /// verdict the fixture chose, and every other seam is a HOLE - a call the
-    /// fixture never expected turns a typo into a panic, the same rule
-    /// tests/support/host_mock.rs states. `PinOutcome` is not `Clone`, so
-    /// the answer is rebuilt per call.
+    /// The verdict the fake platform gives, held in an `Arc<AtomicBool>` and NOT
+    /// a plain field because the retry contract needs a seam that CAN CHANGE ITS
+    /// MIND: refuse the first apply, accept the next one, and watch whether the
+    /// engine actually asks again. `WindowBackend: Send`, so the fixture moves
+    /// into the engine and the test keeps this second handle on it.
+    type PinAnswer = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+    /// A one-answer backend for the pin tests: `set_topmost` answers from the
+    /// shared cell, and every other seam is a HOLE - a call the fixture never
+    /// expected turns a typo into a panic, the same rule
+    /// tests/support/host_mock.rs states. `PinOutcome` is not `Clone`, so the
+    /// verdict is rebuilt per call.
     struct PinBackend {
-        applied: bool,
+        applied: PinAnswer,
     }
 
     impl WindowBackend for PinBackend {
         fn set_topmost(&mut self, _handle: isize, _on: bool) -> PinOutcome {
-            if self.applied {
+            if self.applied.load(std::sync::atomic::Ordering::SeqCst) {
                 PinOutcome::Applied
             } else {
                 PinOutcome::Failed(PlatformError::Win32 {
@@ -2103,7 +2192,7 @@ mod tests {
             panic!("the pin fixture has no answer for frame_rect")
         }
 
-        fn restore_frame_rect(&self, _handle: isize) -> PlatformResult<FrameRect> {
+        fn restore_frame_rect(&self, _handle: isize) -> PlatformResult<Placement> {
             panic!("the pin fixture has no answer for restore_frame_rect")
         }
 
@@ -2127,6 +2216,14 @@ mod tests {
     /// `restore_and_pin`, so the fixture needs no host facts - registration
     /// goes straight to the pin, which is the path under test.
     fn pin_engine(applied: bool, pinned: bool) -> (Engine, mpsc::Receiver<Event>) {
+        pin_engine_answering(
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(applied)),
+            pinned,
+        )
+    }
+
+    /// The same fixture with the verdict kept in the test's hands.
+    fn pin_engine_answering(applied: PinAnswer, pinned: bool) -> (Engine, mpsc::Receiver<Event>) {
         let (_cmd_tx, cmd_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let engine = Engine::new(
@@ -2154,18 +2251,127 @@ mod tests {
         out
     }
 
-    /// The readback contract, state half: a SetPinned that changes the bit
-    /// answers `Pinned(on)`, a repeat that changes nothing answers nothing,
-    /// and an unpin answers `Pinned(false)`.
+    /// F1, THE READBACK CONTRACT: with a window registered, a `SetPinned` is
+    /// an APPLY. One click, one `set_topmost`, one event - and that event is
+    /// the platform's verdict, never the request restated. The old version of
+    /// this test asserted the echo (one event from an arm that called no
+    /// seam), which is the shape the reviewer rejected: it locked in a port
+    /// that reported a Z-order it had never asked for. A confirmed repeat
+    /// stays silent, because asking twice for a thing the window already
+    /// agrees to changes nothing.
     #[test]
-    fn set_pinned_emits_pinned_on_change_and_nothing_on_a_repeat() {
+    fn a_pin_change_on_a_registered_window_goes_through_the_apply() {
         let (mut engine, events) = pin_engine(true, false);
+
+        // Registration restores-and-pins FIRST: the confirmed state at this
+        // moment really is unpinned, and that is what the apply says.
+        engine.handle(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        });
+        assert_eq!(drain(&events), vec![Event::Pinned(false)]);
+
+        // The click: the seam is driven, and exactly one Pinned comes back
+        // from it.
         engine.handle(Command::SetPinned(true));
-        assert_eq!(drain(&events), vec![Event::Pinned(true)]);
+        assert_eq!(
+            drain(&events),
+            vec![Event::Pinned(true)],
+            "one click, one apply, one verdict"
+        );
+        assert!(engine.session.pinned, "and the bit moved with it");
+
         engine.handle(Command::SetPinned(true));
-        assert!(drain(&events).is_empty(), "a repeat says nothing");
+        assert!(
+            drain(&events).is_empty(),
+            "a repeat the platform already confirmed says nothing"
+        );
+
         engine.handle(Command::SetPinned(false));
         assert_eq!(drain(&events), vec![Event::Pinned(false)]);
+    }
+
+    /// The other half of F1: with NO window registered there is nothing to
+    /// apply to, so a pin change is stored and persisted and NOT announced.
+    /// The D10 discipline - session.json is the one home of pin state - is
+    /// untouched by the readback, and an event here would be a claim about a
+    /// window that does not exist.
+    #[test]
+    fn a_pin_change_with_no_window_registered_is_stored_in_silence() {
+        let (mut engine, events) = pin_engine(true, false);
+        engine.handle(Command::SetPinned(true));
+        assert!(
+            drain(&events).is_empty(),
+            "no window, no apply, no statement"
+        );
+        assert!(engine.session.pinned, "the bit is still stored");
+        assert_eq!(pending(&engine), 1, "and still needs persisting");
+    }
+
+    /// F3, THE RETRY: a `PinFailed` must leave the next click working. The
+    /// stored bit already reads `true` here, so an arm that only ever looked
+    /// at the session would treat the second click as a repeat and do nothing:
+    /// the user would click the pin forever and the window would never move.
+    /// The apply-path verdict is what makes this test bite: `Pinned(true)` is
+    /// ONLY reachable through a second, real `set_topmost`, and the fixture
+    /// flips its answer between the two calls, so nothing else can produce it.
+    #[test]
+    fn a_repeat_after_a_failed_apply_asks_the_platform_again() {
+        let answer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut engine, events) = pin_engine_answering(answer.clone(), true);
+        engine.handle(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        });
+        let refused = drain(&events);
+        assert_eq!(refused.len(), 1, "one verdict for the refusal: {refused:?}");
+        assert!(
+            matches!(refused[0], Event::PinFailed { .. }),
+            "a failed apply is never announced as pinned: {refused:?}"
+        );
+        assert!(
+            engine.pin_confirmed.is_none(),
+            "a refusal confirms nothing - that is what the retry reads"
+        );
+
+        // The platform heals, and the user clicks the SAME thing again.
+        answer.store(true, std::sync::atomic::Ordering::SeqCst);
+        engine.handle(Command::SetPinned(true));
+        assert_eq!(
+            drain(&events),
+            vec![Event::Pinned(true)],
+            "the repeat re-attempted, and the apply is what said so"
+        );
+        assert_eq!(engine.pin_confirmed, Some(true));
+
+        engine.handle(Command::SetPinned(true));
+        assert!(
+            drain(&events).is_empty(),
+            "now it IS a confirmed repeat: silence, and no third SetWindowPos"
+        );
+    }
+
+    /// The third silent case, from the P2 finding: a build with no seam at all
+    /// (backend None - notes-platform has no Win32 module to offer) cannot
+    /// apply a pin, and says NOTHING about one. Not a `PinFailed`: nothing was
+    /// refused. The bit is still stored, because persisting it is not a window
+    /// operation.
+    #[test]
+    fn a_pin_change_with_no_seam_says_nothing_at_all() {
+        let (mut engine, _cmd_tx, events) = wired();
+        engine.handle(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        });
+        engine.handle(Command::SetPinned(true));
+        engine.handle(Command::SetPinned(true));
+        engine.handle(Command::SetPinned(false));
+        assert!(
+            drain(&events).is_empty(),
+            "no seam is a build fact, not a refusal: the port stays quiet"
+        );
+        assert!(
+            !engine.session.pinned,
+            "while the bit still tracks the clicks"
+        );
+        assert_eq!(engine.pin_confirmed, None, "and nothing is confirmed");
     }
 
     /// The readback contract, apply half: registration restores-and-pins, and

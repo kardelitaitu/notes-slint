@@ -129,6 +129,7 @@
 //! 2. create the window   bridge, AT the rect from step 1
 //! 3. register the handle Gateway::send(Command::RegisterWindow { .. })
 //! 4. apply topmost       the port, on registration, from session.pinned (D46)
+//!                        again on every SetPinned that names a live window
 //!
 //! ```
 //! Step 1 is consume-once on purpose: [`Gateway::startup_state`] is the snapshot
