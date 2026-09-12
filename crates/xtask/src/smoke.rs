@@ -362,9 +362,16 @@ pub fn decide(p: &Probe, artefact: Option<&Artefact>, relocation: &Relocation) -
 /// depend on the crates it checks - so a changed rule surfaces here as "looked
 /// in the wrong place", which the failure path prints in full.
 fn candidate_state_dirs(exe: &Path) -> Vec<PathBuf> {
+    candidate_state_dirs_in(exe, std::env::var_os("APPDATA").as_deref())
+}
+
+/// The same rule with the profile root injected, the shape core's own pure
+/// resolve_state_dir takes, so a test can prove both halves without inheriting
+/// (or mutating) the machine's APPDATA.
+fn candidate_state_dirs_in(exe: &Path, appdata: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     let exe_dir = exe.parent().unwrap_or(Path::new(".")).to_path_buf();
     let mut out = vec![exe_dir.join("data")];
-    if let Some(appdata) = std::env::var_os("APPDATA") {
+    if let Some(appdata) = appdata {
         if !appdata.is_empty() {
             out.push(PathBuf::from(appdata).join("notes-gpui"));
         }
@@ -2491,12 +2498,40 @@ mod tests {
 
     #[test]
     fn the_state_dir_search_covers_both_halves_of_the_rule() {
-        let dirs = candidate_state_dirs(Path::new("C:/dev/notes/target/debug/notes-gpui.exe"));
-        assert_eq!(dirs[0], PathBuf::from("C:/dev/notes/target/debug/data"));
+        // The only test that proves BOTH halves of the search rule, so it must
+        // not inherit the machine it runs on: the exe comes from a scratch
+        // fixture and the profile root is injected, the way core's own
+        // resolve_state_dir tests work. Reading APPDATA directly used to delete
+        // the installed half on any machine with no roaming profile, and the
+        // run failed here on a rule the code never broke.
+        let tag = format!("xtask-smoke-state-dirs-{}", std::process::id());
+        let dir = std::env::temp_dir().join(&tag);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let exe = dir.join("notes-gpui.exe");
+        let profile = dir.join("roaming");
+        let dirs = candidate_state_dirs_in(&exe, Some(profile.as_os_str()));
+        assert_eq!(
+            dirs[0],
+            dir.join("data"),
+            "the portable half is searched first: data next to the exe"
+        );
         assert!(
             dirs.iter().any(|d| d.ends_with("notes-gpui")),
             "the installed candidate must be searched too: {dirs:?}"
         );
+        assert_eq!(
+            dirs[1],
+            profile.join("notes-gpui"),
+            "and the installed half is <profile>/notes-gpui, second"
+        );
+        // No profile is not an error: the portable half alone still stands.
+        assert_eq!(
+            candidate_state_dirs_in(&exe, None),
+            vec![dir.join("data")],
+            "an absent profile root must not invent an installed candidate"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// THE point of the guard: the user's bytes come back even when nobody
