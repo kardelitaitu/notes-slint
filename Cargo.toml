@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core","crates/api","crates/platform","crates/bridge-gpui","crates/xtask"]
+members = ["crates/core","crates/api","crates/platform","crates/bridge-gpui","crates/bridge-slint","crates/xtask"]
 
 [workspace.package]
 version = "0.0.1"
@@ -38,6 +38,20 @@ raw-window-handle = "0.6"
 # (slice S4) and for a caret that does not split a combining sequence. Verified present in the offline
 # registry cache (1.12.0 and 1.13.3) so it resolves with --offline, which CI depends on.
 unicode-segmentation = "1"
+# THE SECOND BRIDGE'S TOOLKIT - and note what this entry is NOT: it does not replace
+# gpui-kit, notes-bridge-gpui still owns the shipped app, and slice 0 of this spike
+# compiles a bridge with no UI at all. 1.17.1 is what "1.17" resolves to today (the lock
+# records the pair; the range is what is declared).
+#
+# Why it is safe to add while the other entry above is a linker minefield: Slint embeds
+# no application manifest of its own, so the duplicate-resource failure that forced the
+# gpui manifest migration does not exist here. If that turns out to be wrong on a real
+# window, the fix is the same post-link step, not a second manifest.
+#
+# And why the gate can already see it: "slint" is a ROOT in arch.rs's UI_TOOLKITS list,
+# so "a second toolkit may not reach core, the port or platform" is enforced from the
+# first commit of the spike rather than added after the first leak.
+slint = "1.17"
 windows = { version = "0.61", features = ["Win32_Foundation","Win32_UI_WindowsAndMessaging","Win32_UI_Shell","Win32_Graphics_Gdi"] }
 
 [workspace.lints.rust]

@@ -1,0 +1,25 @@
+# SLINT SPIKE, slice 0: the skeleton only. There is NO Slint UI in here yet - see
+# src/main.rs for what this crate is for and what slice 1 starts from.
+#
+# It is a BRIDGE, so the layering instrument holds it to the same rule as bridge-gpui:
+# it may import notes-api and its OWN toolkit, nothing else in this repo (arch.rs,
+# "bridge-sees-only-api" - now one row per bridge, not one row for one bridge).
+[package]
+name = "notes-bridge-slint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "notes-slint"
+path = "src/main.rs"
+
+[dependencies]
+notes-api = { workspace = true }
+# 1.17.1 is what "1.17" resolves to today (cargo search on this branch; the lock
+# records the exact pair). Declared ONCE, in the workspace table, never spelled here.
+slint = { workspace = true }

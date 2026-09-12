@@ -74,6 +74,13 @@ const NOTES_CORE: &str = "notes-core";
 const NOTES_API: &str = "notes-api";
 const NOTES_PLATFORM: &str = "notes-platform";
 const NOTES_BRIDGE: &str = "notes-bridge-gpui";
+/// The SECOND bridge, and the reason this file has a rule row per bridge instead of
+/// one row that happens to name one. Slint spike slice 0 lands a crate with no UI in it
+/// so that the instrument is already watching when slice 1 starts writing panels: the
+/// reach this rule exists to catch (a bridge importing notes-core or notes-platform
+/// because its own toolkit made something awkward) is cheapest to refuse on the day the
+/// first line of drawing code appears, and by then the row already exists.
+const NOTES_BRIDGE_SLINT: &str = "notes-bridge-slint";
 const XTASK: &str = "xtask";
 
 /// UI toolkit and browser-boundary FAMILIES: belong only behind the api port,
@@ -232,6 +239,25 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "bridge-sees-only-api",
         package: NOTES_BRIDGE,
+        scope: Scope::Corridor,
+        forbidden: Forbidden::Members {
+            allowed: &[NOTES_API],
+            also: &[],
+        },
+    },
+    // THE SAME ROW FOR THE SECOND BRIDGE. Two things about it are the point, and both
+    // are easy to get wrong. FIRST: its id is IDENTICAL to the row above, because the
+    // rule is the invariant and the invariant does not have a favourite toolkit - a
+    // violation message reads "[rule: bridge-sees-only-api]" whichever bridge caused it.
+    // SECOND: `allowed` is api ONLY, with no `also` entry for the other bridge. A second
+    // bridge importing the first is not a second adapter, it is one adapter borrowing the
+    // other's window, and the whole claim that the toolkit is swappable dies quietly the
+    // day it is allowed. The forbidden set is structural and grows on its own: adding
+    // NOTES_BRIDGE_SLINT to the workspace means the row above now forbids it to
+    // notes-bridge-gpui as well, with no edit to that row.
+    Rule {
+        id: "bridge-sees-only-api",
+        package: NOTES_BRIDGE_SLINT,
         scope: Scope::Corridor,
         forbidden: Forbidden::Members {
             allowed: &[NOTES_API],
@@ -929,7 +955,14 @@ mod tests {
     use super::*;
 
     fn workspace() -> Vec<&'static str> {
-        vec![NOTES_CORE, NOTES_API, NOTES_PLATFORM, NOTES_BRIDGE, XTASK]
+        vec![
+            NOTES_CORE,
+            NOTES_API,
+            NOTES_PLATFORM,
+            NOTES_BRIDGE,
+            NOTES_BRIDGE_SLINT,
+            XTASK,
+        ]
     }
 
     /// Mirrors the real workspace: exactly what the rule table calls allowed,
@@ -957,6 +990,12 @@ mod tests {
                     &["windows", "raw-window-handle", "winres"],
                 ),
                 ("notes-bridge-gpui", &["notes-api", "gpui"]),
+                // The second bridge, in its shape: the port, its own toolkit, nothing
+                // else. Present in the CLEAN fixture so the row added for it is exercised
+                // as a pass and not only as a trap - a rule that has never been seen
+                // satisfied is a rule nobody can tell apart from a rule that always
+                // fires.
+                ("notes-bridge-slint", &["notes-api", "slint"]),
                 ("xtask", &["serde_json"]),
             ],
             &[
@@ -1010,6 +1049,11 @@ mod tests {
                 ("notes-api", &["notes-core", "notes-platform", "gpui"]),
                 ("notes-platform", &["windows", "raw-window-handle"]),
                 ("notes-bridge-gpui", &["notes-api", "gpui", "notes-core"]),
+                // Clean on purpose. The poison fixture is where a NEW row is proved NOT
+                // to misfire: with a second bridge under the same rule id, a row that
+                // flagged its sanctioned edges would add a ninth finding here and the
+                // count assertion below would go red for the wrong reason.
+                ("notes-bridge-slint", &["notes-api", "slint"]),
                 ("xtask", &["serde_json", "gpui-kit"]),
             ],
             &[
@@ -1202,9 +1246,63 @@ mod tests {
         assert!(v.human_hint().contains("cargo tree -p notes-core -i gpui"));
     }
 
+    /// SIX, and the number is the test. A second bridge that nobody added a row for
+    /// would leave this green while the new crate sat outside the gate entirely: every
+    /// other rule is either about the first four members or keyed on a name this crate
+    /// does not have, so nothing else in the file would notice. `checked_packages()` is
+    /// derived from RULES, so the only way to move the count is to add or remove a row -
+    /// which is the property this assertion exists to keep.
     #[test]
     fn rule_table_covers_five_packages() {
-        assert_eq!(checked_packages().len(), 5);
+        assert_eq!(checked_packages().len(), 6);
+    }
+
+    /// The row itself, named: count is necessary, not sufficient - a table with six
+    /// entries could still be six entries about the same four crates.
+    #[test]
+    fn the_second_bridge_is_checked_by_the_same_rule_as_the_first() {
+        let ids: Vec<&'static str> = RULES
+            .iter()
+            .filter(|r| r.package == NOTES_BRIDGE_SLINT)
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["bridge-sees-only-api"],
+            "the slint bridge is policed by the bridge invariant, under the same id"
+        );
+        let gpui_row = RULES
+            .iter()
+            .find(|r| r.package == NOTES_BRIDGE && r.id == "bridge-sees-only-api")
+            .expect("the first bridge's row");
+        let slint_row = RULES
+            .iter()
+            .find(|r| r.package == NOTES_BRIDGE_SLINT)
+            .expect("the second bridge's row");
+        assert!(
+            matches!(
+                (gpui_row.scope, slint_row.scope),
+                (Scope::Corridor, Scope::Corridor)
+            ),
+            "both rows must reach around the port the same way"
+        );
+        // And the other bridge is NOT in the new row's allowed set. Read from the real
+        // graph, because that is where the ban has to bite: two adapters, one port.
+        let g = graph(
+            &workspace(),
+            &[(NOTES_BRIDGE_SLINT, &[NOTES_API, "slint", NOTES_BRIDGE])],
+            &[],
+        );
+        let found = evaluate(&g);
+        let hits: Vec<&Violation> = found
+            .iter()
+            .filter(|v| v.package == NOTES_BRIDGE_SLINT && v.dep == NOTES_BRIDGE)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a second bridge importing the first is a reach-around, not a dependency: {found:?}"
+        );
     }
 
     /// Minimal cargo-metadata fixture: proves identity matching runs on

@@ -135,8 +135,98 @@ const CLOSE_SECS: u64 = 10;
 /// internally, so a wedged child cannot hang the gate.
 const OUTER_SECS: u64 = WINDOW_SECS + CLOSE_SECS + 20;
 
-const BIN_REL: &str = "target/debug/notes-gpui.exe";
-/// Just the file name, for a CARGO_TARGET_DIR that replaces the whole tree.
+/// One built artifact the harness can point at: which package, which bin inside it,
+/// where the exe lands by default, which build script decides its embedded resources,
+/// and what may make it stale. The struct exists because there are now TWO bridges in
+/// this workspace and every field below used to be six string literals that quietly
+/// named only one of them - the shape of bug where a second lane is added and the
+/// harness keeps judging the first one.
+///
+/// It is a description, not an abstraction: nothing loops over targets, and smoke still
+/// runs exactly one of them (gpui) with exactly the literals it always had. Adding
+/// [SLINT_TARGET] changes no verdict, no path and no exit code on this branch; it makes
+/// the second bridge visible to the next person who wires a leg, which is the whole
+/// point of slice 0.
+pub struct ArtifactTarget {
+    /// The cargo package name, as `-p` takes it.
+    pub pkg: &'static str,
+    /// The bin target inside it, as `--bin` takes it.
+    pub bin: &'static str,
+    /// Where the exe sits when nobody set CARGO_TARGET_DIR.
+    pub exe_rel: &'static str,
+    /// The build script that decides the embedded manifest. Empty until the target has
+    /// one - and see [crate::smoke::embeds_at_link_time], which reads it.
+    pub build_rs: &'static str,
+    /// Source DIRECTORIES that are inputs to this exe. `<crate>/src`, never `<crate>`:
+    /// the long reason is at [SOURCE_ROOTS].
+    pub freshness_roots: &'static [&'static str],
+    /// Inputs outside a src dir, named one by one for the same reason.
+    pub freshness_files: &'static [&'static str],
+}
+
+/// THE TARGET SMOKE ACTUALLY RUNS. Every literal the harness has always used is now a
+/// field of this value, and the consts below are projections of it - deliberately, so
+/// the exit behaviour is byte-identical to the day before the struct existed while the
+/// strings live in exactly one place.
+const GPUI_TARGET: ArtifactTarget = ArtifactTarget {
+    pkg: "notes-bridge-gpui",
+    bin: "notes-gpui",
+    exe_rel: "target/debug/notes-gpui.exe",
+    build_rs: "crates/bridge-gpui/build.rs",
+    freshness_roots: &[
+        "crates/bridge-gpui/src",
+        "crates/api/src",
+        "crates/core/src",
+        "crates/platform/src",
+    ],
+    freshness_files: &[
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/bridge-gpui/Cargo.toml",
+        "crates/bridge-gpui/build.rs",
+        "crates/api/Cargo.toml",
+        "crates/core/Cargo.toml",
+        "crates/platform/Cargo.toml",
+    ],
+};
+
+/// THE SECOND BRIDGE, described and not driven. No smoke leg runs this exe on this
+/// branch, so the only thing to check about this row is that it names real paths: the
+/// crate exists, its sources and `ui/` exist, and `build_rs` is the name slice 1 will
+/// give its build script when (not if) Slint starts needing one - it has none today,
+/// which is why [SLINT_TARGET_HAS_NO_BUILD_SCRIPT_YET] pins the empty string instead of
+/// letting a plausible-looking path stand in for a fact.
+#[allow(dead_code)] // described, not driven: no smoke leg runs this exe on this branch
+const SLINT_TARGET: ArtifactTarget = ArtifactTarget {
+    pkg: "notes-bridge-slint",
+    bin: "notes-slint",
+    exe_rel: "target/debug/notes-slint.exe",
+    build_rs: "",
+    freshness_roots: &[
+        "crates/bridge-slint/src",
+        // Empty on slice 0 and listed anyway: `.slint` files are inputs to that exe the
+        // moment they exist, and a root the guard does not look at cannot make anything
+        // stale. Listed now, the first UI edit is caught; listed never, it is a bug
+        // waiting for someone to remember.
+        "crates/bridge-slint/ui",
+        "crates/api/src",
+        "crates/core/src",
+    ],
+    freshness_files: &[
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/bridge-slint/Cargo.toml",
+        "crates/api/Cargo.toml",
+        "crates/core/Cargo.toml",
+    ],
+};
+
+const BIN_REL: &str = GPUI_TARGET.exe_rel;
+/// Just the file name, for a CARGO_TARGET_DIR that replaces the whole tree. Stays a
+/// literal for one reason: `concat!` cannot read a const struct's field, and a
+/// `format!` at this position would stop it being a const. What keeps it honest is
+/// [exe_name_is_the_bin_target_plus_the_windows_extension], which fails the day the
+/// two stop agreeing.
 pub const EXE_NAME: &str = "notes-gpui.exe";
 const BUILD_HINT: &str = "cargo build -p notes-bridge-gpui --bin notes-gpui";
 const SESSION_FILE: &str = "session.json";
@@ -1361,7 +1451,7 @@ fn summary(verdict: &Verdict, p: &Probe, elapsed: Duration, relocation: &Relocat
 /// is built first, a compile failure is a hard verdict with its own exit code,
 /// and the exe's mtime is then compared against the newest source that
 /// produces it. Freshness is proven, never trusted.
-const BUILD_ARGS: &[&str] = &["build", "-p", "notes-bridge-gpui", "--bin", "notes-gpui"];
+const BUILD_ARGS: &[&str] = &["build", "-p", GPUI_TARGET.pkg, "--bin", GPUI_TARGET.bin];
 /// The crates whose SOURCE DIRECTORIES end up inside that binary, named as
 /// "<crate>/src" rather than "<crate>" on purpose. Cargo's own fingerprint remains
 /// the authority on what rebuilds what; this list is only the guard that exists
@@ -1378,26 +1468,13 @@ const BUILD_ARGS: &[&str] = &["build", "-p", "notes-bridge-gpui", "--bin", "note
 /// The scope is strict, not loose. The exe's own crate's sources stay in it, so a
 /// crates/bridge-gpui/src edit newer than the exe is still a loud 5. What left the
 /// scope is a non-input, not a granted exception.
-const SOURCE_ROOTS: &[&str] = &[
-    "crates/bridge-gpui/src",
-    "crates/api/src",
-    "crates/core/src",
-    "crates/platform/src",
-];
+const SOURCE_ROOTS: &[&str] = GPUI_TARGET.freshness_roots;
 /// Inputs that live OUTSIDE a src dir, named one by one because a scan that walked
 /// whole crate dirs would walk their tests with them: the workspace manifest and the
 /// lock (the lock decides the entire external graph), one manifest per crate above (a
 /// feature or dependency line there changes the binary), and the bridge's build.rs (it
 /// decides the embedded manifest, so a stale build script is a stale exe).
-const SOURCE_FILES: &[&str] = &[
-    "Cargo.toml",
-    "Cargo.lock",
-    "crates/bridge-gpui/Cargo.toml",
-    "crates/bridge-gpui/build.rs",
-    "crates/api/Cargo.toml",
-    "crates/core/Cargo.toml",
-    "crates/platform/Cargo.toml",
-];
+const SOURCE_FILES: &[&str] = GPUI_TARGET.freshness_files;
 /// The target did not compile: its own verdict, not a decline (the desktop is
 /// fine) and not a step failure (nothing was launched).
 pub const BUILD_FAILED_EXIT: i32 = 4;
@@ -2918,7 +2995,7 @@ pub fn build_embeds_manifest(root: &Path) -> Option<bool> {
     }))
 }
 /// The build script whose behaviour explains the exe's manifest.
-pub const BUILD_RS_REL: &str = "crates/bridge-gpui/build.rs";
+pub const BUILD_RS_REL: &str = GPUI_TARGET.build_rs;
 
 /// Read the manifest back out of the exe we are about to launch. Same discipline
 /// as the tested-binary line: name the thing, do not assume it. smoke JUDGES and
