@@ -44,9 +44,9 @@ recents and menu work now in the tree):
 
 - [x] **1. Window memory** — **PASS.** Seeded rect, real drag, `WM_CLOSE`, relaunch returns
       there; proven end to end (`74a3c90`), asserted in `crates/api/tests/geometry.rs`.
-      *Sub-case now implemented, live proof pending:* a maximised window is written back —
-      `session.maximized` has a measured writer (see M3 below) — but no automated
-      maximise → quit → relaunch cycle has been run.
+      *Sub-case PASS on manual proof:* a maximised window comes back maximised — proven twice
+      on a live window by the `IsZoomed` cycle under M3 (persisted through `WM_CLOSE`, true at
+      creation on relaunch). Not machine-proven: the smoke harness has no show-state leg yet.
 - [ ] **2. Open** — **not proven.** The dialog API is verified (§12.5 Q6) but presenting one
       still needs a human, and no test drives dialog → text in the window.
 - [ ] **3. Save byte-identical (§4.5)** — **not proven end to end.** Core round-trip fixtures
@@ -83,8 +83,8 @@ are exactly what the outstanding bridge slices are for.
 `platform` trait + Windows backend. Restore, validate against monitors, clamp off-screen,
 handle maximised + DPI. Test on 100/150/200% scaling and with a monitor unplugged.
 
-Status: **done for code, pending one live proof.** Restore, monitor validation and clamping
-are built, and "handle maximised" is now closed in code: `session.maximized` has a measured
+Status: **done — code and live proof.** Restore, monitor validation and clamping
+are built, and "handle maximised" is **closed**: `session.maximized` has a measured
 writer (`crates/api/src/engine.rs:1405-1409`, on the flush-tick measure — `ShowState::Maximized`
 sets the bit, `Normal` clears it, `Unknown` leaves the stored bit alone), the bridge's geometry
 watch wakes on a show flip and not only a rect change (`crates/bridge-gpui/src/main.rs:453-474`
@@ -92,11 +92,17 @@ watch wakes on a show flip and not only a rect change (`crates/bridge-gpui/src/m
 branch (`crates/api/src/engine.rs:1208`) and the bridge creating the window as
 `WindowBounds::Maximized` (`crates/bridge-gpui/src/main.rs:1816-1820`).
 
-Outstanding: **no automated live cycle.** `crates/xtask/src/smoke.rs` names `maximized` only
-inside `session.json` unit fixtures (`:3031`, `:3393`, `:3415`, `:3446`) — nothing launches the
-app maximised, quits and relaunches. So the promotion is manual, and the single act that makes
-it true is one maximise → quit → relaunch on a real window. Landed in `8cda7bd0`, `e401e513`,
-`3324766a`; record note: `.agents/notes/proposed/2026-09-12-maximized-persistence.md`.
+**Live proof: done, twice, on a real window.** `ShowWindow(3)` — `IsZoomed` true —
+`WM_CLOSE` — `session.json` persisted `maximized: true` — relaunch — `IsZoomed`
+**true at creation**, so the window is born maximised rather than maximised a frame later. The show
+bit, the watch that wakes on a flip, and both read paths are observed behaviour now, not inferred
+from a diff. Landed in `8cda7bd0`, `e401e513`, `3324766a`; record note:
+`.agents/notes/implemented/2026-09-12-maximized-persistence.md`.
+
+What the proof is not: **automated**. `crates/xtask/src/smoke.rs` asserts a persisted `maximized` field
+but has no leg that drives a real show-state flip through a live window and reads `IsZoomed`
+back, so a regression that stopped the bit being written would not fail a build. That leg is what
+M3 still owes; the behaviour itself is settled.
 
 **M4 — Autosave & pin.**
 Debounce, periodic flush, blur/close/quit flush, external-change detection, and the

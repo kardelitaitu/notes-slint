@@ -19,7 +19,7 @@ product, and the editing surface can stay deliberately minimal.
 
 | | |
 |---|---|
-| **Remembers the window** | Exact size and position on every launch — including when a monitor has been unplugged or scaling has changed. Coming back *maximised* is implemented and reads the measured show state, with one live maximise → quit → relaunch cycle still unproven. |
+| **Remembers the window** | Exact size and position on every launch — including when a monitor has been unplugged or scaling has changed. A maximised window comes back maximised. |
 | **Autosaves** | Continuously, debounced, atomically. No save dialog and no "save changes?" prompt. Toggleable. |
 | **Pins** | One click (plus a shortcut) puts it above every other window. State persists. |
 | **Plays nicely with files** | Native `.notes` format, but opens ordinary text files too — and will not silently change their encoding or line endings. |
@@ -62,7 +62,7 @@ placement validator fails the build when two files claim the same section.
 | **M0** | **Spike — done 2026-09-10.** Does a standalone GPUI app build and run on Windows, and can we set topmost, set position, and open a native file dialog? Verdict: viable, every blocking question passed ([docs/roadmap.md](docs/roadmap.md) §12). |
 | M1 | **Done.** Core engine, headless. Tested with no window at all. |
 | M2 | **In flight.** First usable UI — *you can use it as a notepad.* |
-| M3 | **Done** for size and position — restore, monitor validation, DPI. Coming back maximised is still a work item (see *Remembers the window*). |
+| M3 | **Done.** Restore, monitor validation, DPI, and coming back maximised — the last one proven by hand on a live window, not yet by the harness. |
 | M4 | **Done.** Autosave and pin. |
 | M5 | Polish, and the Windows portable + installer builds. |
 | M6–M8 | Cross-platform seams, then mac and Linux builds. |
@@ -74,8 +74,9 @@ Detail: [docs/roadmap.md](docs/roadmap.md) §9. Ship targets: `win-install`, `wi
 
 Tracked in §10 ([docs/open-questions.md](docs/open-questions.md)), and worked through one
 at a time in [`.agents/notes/proposed/`](.agents/notes/proposed/), which currently holds
-three open notes: how autosave arms on a foreign file when the port has no plain Save
-command, coming back maximised, and the title-bar `Root` overlay.
+two open notes: how autosave arms on a foreign file when the port has no plain Save
+command, and the title-bar `Root` overlay. Coming back maximised is settled and shipped
+([`2026-09-12-maximized-persistence`](.agents/notes/implemented/2026-09-12-maximized-persistence.md)).
 
 The rule that used to block M1 — autosave on files the app did not create — is settled:
 [ADR-0001](docs/decisions/0001-autosave-arms-on-explicit-save.md) arms autosave only after

@@ -1,6 +1,6 @@
 ---
 title: Making "comes back maximised" actually true
-status: proposed
+status: implemented
 id: 2026-09-12-maximized-persistence
 created: 2026-09-12
 updated: 2026-09-12
@@ -83,8 +83,10 @@ not a request for the next launch.
 
 Out of scope: minimised and tray state. This note fixes one bit, not a placement system.
 
-Until this lands the §4.1 sentence is aspirational, and this note is where that is recorded —
-a persisted bit nothing ever writes is worse than no bit, because it reads as implemented.
+(At the time of writing, the §4.1 sentence was still aspirational, and this note is where that was
+recorded: a persisted bit nothing ever writes is worse than no bit, because it reads as
+implemented. Both status-update sections below close that out — the bit now has a writer, and the
+behaviour has been watched.)
 
 ## Reopening conditions
 
@@ -119,16 +121,37 @@ Verified against the tree, not against the commit messages:
   (`engine.rs:1208`, rationale `:1181-1182`) and the bridge creating the window as
   `WindowBounds::Maximized` (`main.rs:1816-1820`).
 
-**What is still not proven, and why this note stays here.** No automated proof exists of the
-whole cycle: `crates/xtask/src/smoke.rs` names `maximized` only inside `session.json` unit
-fixtures (`:3031`, `:3393`, `:3415`, `:3446`), and the bridge coverage is headless
-(`main.rs:2681-2697`, a synthetic flip). Nothing has launched the real app, maximised it,
-quit and relaunched it. `implemented` means the code exists *and works*, so the note stays
-`proposed/` — the writer works in tests, the behaviour is unobserved.
+**What was not proven when this landed, and why the note stayed in `proposed/`.** No
+automated proof of the whole cycle existed: `crates/xtask/src/smoke.rs` named `maximized` only as
+`session.json` literals inside its own tests, and the bridge coverage was headless
+(`main.rs:2681-2697`, a synthetic flip). Nothing had launched the real app, maximised it, quit
+and relaunched it. `implemented` means the code exists *and works*, so the note stayed put —
+the writer worked in tests, the behaviour was unobserved.
 
-**The single act that promotes this note:** maximise the window, quit, relaunch, and see it
-come back maximised. On that yes — move the file to `../implemented/`, set `status:` and
-`updated:` in the same commit, mark M3's live-proof line closed, and drop the caveat from
-README's "Remembers the window" row. On a no — keep it here and record what came back instead,
-because "a persisted bit nothing writes" has been replaced by "a written bit nobody has watched
-land", which is a different bug and a better one.
+**The single act that would promote this note:** maximise the window, quit, relaunch, and see
+it come back maximised. That act was the whole standard of proof here, and nothing less — not
+a green test suite, not a writer in the diff — was allowed to move this file.
+
+## Promoted — 2026-09-12, live proof done
+
+The act named above was run, on a real window, twice. Verdict: **yes**, both times.
+
+- `ShowWindow(3)` (SW_MAXIMIZE) — `IsZoomed` **True**.
+- `WM_CLOSE` — `session.json` persisted `maximized: true` — written by the measured writer,
+  not guessed from a size.
+- Relaunch — `IsZoomed` **True at creation** — the window was born maximised, not maximised
+  a frame later, so the read path (`main.rs:1816-1820`, `WindowBounds::Maximized`) and the
+  engine's no-move branch (`engine.rs:1208`) are both on the record, not just in the diff.
+
+That closes the maximised sub-case of the §4.1 promise: **shipped and observed**, not shipped
+and assumed. One thing stays open, and it is the reason this is still a note: the proof is
+**manual**. `smoke.rs` can assert a persisted `maximized` field but has no leg that drives a real
+show-state flip through a live window and reads `IsZoomed` back, so a regression that stopped
+the bit being written would not fail a build. The cheapest home for that leg is the harness that
+already launches the app, waits for a verdict and reads `session.json` back; a maximise /
+relaunch pass there converts this from observed-once to checked-every-run.
+
+Promotion mechanics, recorded because this note is now the citation: moved `proposed/` —
+`implemented/` with `status:` and `updated:` in the same commit; README's "Remembers the window" row
+reduced to the shipped truth; docs/roadmap.md M3 and M2 check 1 updated to cite this cycle.
+No code changed to make this section true.
