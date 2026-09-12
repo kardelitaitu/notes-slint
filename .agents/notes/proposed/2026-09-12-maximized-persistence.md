@@ -96,3 +96,39 @@ a persisted bit nothing ever writes is worse than no bit, because it reads as im
   grab-bag; reopen the enum-vs-variant question then.
 - §4.1's maximised promise is dropped from the product → delete the field rather than wiring
   it.
+
+## Status update — 2026-09-12 (`8cda7bd0`, `e401e513`, `3324766a`)
+
+**Recommendation B landed in its measurement form**, and the §4.1 promise is now true in code.
+Verified against the tree, not against the commit messages:
+
+- **The bit has a writer — one, and it is a measurement.** `crates/api/src/engine.rs:1405-1409`
+  maps the platform's show state onto the field: `ShowState::Maximized` sets it,
+  `ShowState::Normal` clears it, `ShowState::Unknown` leaves the stored bit alone — Unknown is
+  the honest answer for a minimised window (`crates/platform/src/lib.rs:136-142`), not a No.
+  It runs on the flush-tick measure (`engine.rs:1375-1411`) and sits inside the MAJOR-5
+  move-in-flight guard (`engine.rs:1387-1390`), so the bit is protected from the same stale
+  read-back as the rect. This is the "no `Command` for a fact the engine can already measure"
+  shape the recommendation asked for: `GeometryChanged` is still payload-free.
+- **The Watch wakes on a show flip, not just a rect change** — the failure mode option B had
+  to survive. `crates/bridge-gpui/src/main.rs:453-457` adds `Fingerprint { rect, maximized }`,
+  read at `:468-474` from `window.is_maximized()`; the reason it is necessary is gpui's own
+  note that a maximised Windows window can report identical bounds
+  (`main.rs:440-449`). A rect-only diff would have shipped a writer that never fired.
+- **Both read paths are live now, not dead code.** The engine's no-move branch
+  (`engine.rs:1208`, rationale `:1181-1182`) and the bridge creating the window as
+  `WindowBounds::Maximized` (`main.rs:1816-1820`).
+
+**What is still not proven, and why this note stays here.** No automated proof exists of the
+whole cycle: `crates/xtask/src/smoke.rs` names `maximized` only inside `session.json` unit
+fixtures (`:3031`, `:3393`, `:3415`, `:3446`), and the bridge coverage is headless
+(`main.rs:2681-2697`, a synthetic flip). Nothing has launched the real app, maximised it,
+quit and relaunched it. `implemented` means the code exists *and works*, so the note stays
+`proposed/` — the writer works in tests, the behaviour is unobserved.
+
+**The single act that promotes this note:** maximise the window, quit, relaunch, and see it
+come back maximised. On that yes — move the file to `../implemented/`, set `status:` and
+`updated:` in the same commit, mark M3's live-proof line closed, and drop the caveat from
+README's "Remembers the window" row. On a no — keep it here and record what came back instead,
+because "a persisted bit nothing writes" has been replaced by "a written bit nobody has watched
+land", which is a different bug and a better one.

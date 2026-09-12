@@ -19,7 +19,7 @@ product, and the editing surface can stay deliberately minimal.
 
 | | |
 |---|---|
-| **Remembers the window** | Exact size and position on every launch — including when a monitor has been unplugged or scaling has changed. Coming back *maximised* is not shipped: the flag is honoured on restore but nothing writes it yet, so it is a work item (`.agents/notes/proposed/2026-09-12-maximized-persistence.md`). |
+| **Remembers the window** | Exact size and position on every launch — including when a monitor has been unplugged or scaling has changed. Coming back *maximised* is implemented and reads the measured show state, with one live maximise → quit → relaunch cycle still unproven. |
 | **Autosaves** | Continuously, debounced, atomically. No save dialog and no "save changes?" prompt. Toggleable. |
 | **Pins** | One click (plus a shortcut) puts it above every other window. State persists. |
 | **Plays nicely with files** | Native `.notes` format, but opens ordinary text files too — and will not silently change their encoding or line endings. |

@@ -44,8 +44,9 @@ recents and menu work now in the tree):
 
 - [x] **1. Window memory** — **PASS.** Seeded rect, real drag, `WM_CLOSE`, relaunch returns
       there; proven end to end (`74a3c90`), asserted in `crates/api/tests/geometry.rs`.
-      *Known-false sub-case:* a maximised window does not come back maximised —
-      `session.maximized` is never written, so the flag has no producer.
+      *Sub-case now implemented, live proof pending:* a maximised window is written back —
+      `session.maximized` has a measured writer (see M3 below) — but no automated
+      maximise → quit → relaunch cycle has been run.
 - [ ] **2. Open** — **not proven.** The dialog API is verified (§12.5 Q6) but presenting one
       still needs a human, and no test drives dialog → text in the window.
 - [ ] **3. Save byte-identical (§4.5)** — **not proven end to end.** Core round-trip fixtures
@@ -82,12 +83,20 @@ are exactly what the outstanding bridge slices are for.
 `platform` trait + Windows backend. Restore, validate against monitors, clamp off-screen,
 handle maximised + DPI. Test on 100/150/200% scaling and with a monitor unplugged.
 
-Status: restore, monitor validation and clamping are built; "handle maximised" is **not**
-closed. `session.maximized` still has no producer, so a maximised window reopens at its
-restore rect (check 1 under M2 above). `4a2ca317` landed the `showCmd` readback in
-`platform` and reported it through `api`; only the rect is consumed there today, and the
-`api`/bridge slices that store the flag are in flight
-(`.agents/notes/proposed/2026-09-12-maximized-persistence.md`).
+Status: **done for code, pending one live proof.** Restore, monitor validation and clamping
+are built, and "handle maximised" is now closed in code: `session.maximized` has a measured
+writer (`crates/api/src/engine.rs:1405-1409`, on the flush-tick measure — `ShowState::Maximized`
+sets the bit, `Normal` clears it, `Unknown` leaves the stored bit alone), the bridge's geometry
+watch wakes on a show flip and not only a rect change (`crates/bridge-gpui/src/main.rs:453-474`
+`Fingerprint { rect, maximized }`), and both read paths honour the flag — the engine's no-move
+branch (`crates/api/src/engine.rs:1208`) and the bridge creating the window as
+`WindowBounds::Maximized` (`crates/bridge-gpui/src/main.rs:1816-1820`).
+
+Outstanding: **no automated live cycle.** `crates/xtask/src/smoke.rs` names `maximized` only
+inside `session.json` unit fixtures (`:3031`, `:3393`, `:3415`, `:3446`) — nothing launches the
+app maximised, quits and relaunches. So the promotion is manual, and the single act that makes
+it true is one maximise → quit → relaunch on a real window. Landed in `8cda7bd0`, `e401e513`,
+`3324766a`; record note: `.agents/notes/proposed/2026-09-12-maximized-persistence.md`.
 
 **M4 — Autosave & pin.**
 Debounce, periodic flush, blur/close/quit flush, external-change detection, and the
