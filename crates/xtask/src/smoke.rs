@@ -1286,7 +1286,12 @@ const GEOMETRY_PROBE: &str = r#"
 param([Parameter(Mandatory)][string]$Exe, [string]$ErrFile, [string]$Session = "",
        [int]$SeedX = 0, [int]$SeedY = 0, [int]$SeedW = 0, [int]$SeedH = 0,
        [int]$MoveX = -1, [int]$MoveY = -1,
-       [int]$WindowSecs = 10, [int]$SettleMs = 4500, [int]$CloseSecs = 10)
+       [int]$WindowSecs = 10, [int]$SettleMs = 4500, [int]$CloseSecs = 10,
+       # The polarity this launch was seeded with (1 pinned, 0 unpinned, -1 not
+       # asserted), and how long the TOPMOST poll may wait for it. Both are
+       # passed in by run_probe_script from PIN_WAIT_MS / PIN_TICK_MS below, so
+       # the Rust verdict and the script cannot disagree about the budget.
+       [int]$ExpectPinned = -1, [int]$PinWaitMs = 2000, [int]$PinTickMs = 50)
 $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 $wa = [System.Windows.Forms.SystemInformation]::WorkingArea
@@ -1329,10 +1334,44 @@ while ((Get-Date) -lt $deadline) {
 # GWL_EXSTYLE (-20) and WS_EX_TOPMOST (0x8). Read only once the handle exists:
 # the platform lane PROVED that an async topmost reband applied to a hidden
 # window never lands, so a style read before the show says nothing about the pin.
+#
+# ONE read after the handle appears is not enough either, and 8d0e5055 is the
+# proof: the app pinned itself (an OS probe on that very build read
+# exstyle=0x240108 - WS_EX_TOPMOST set - at handle+512ms and still set three
+# seconds later, with 'status line: Pinned' in the stderr), and this script
+# answered 7 anyway because it read the style on the SAME tick the handle was
+# first sighted. RegisterWindow -> restore_and_pin is downstream of visibility,
+# so the bit is legitimately in flight: the read must be a BOUNDED POLL that
+# stops the moment the seeded polarity is seen, not a single sample that loses
+# the race and reports the app as a liar.
+#
+# What this deliberately does NOT do is turn the verdict into "eventually
+# whatever it turned out to be". ExpectPinned is what the harness seeded into
+# session.json, the loop only ENDS EARLY on a match, and an expiry is still a
+# failure - with the last EXSTYLE and the waited time printed, because "never
+# became topmost in 2000ms" and "was topmost at 512ms" are different bugs and
+# only the first print tells them apart.
 if ($handle -ne 0) {
+    # -1 = no polarity was seeded, so there is nothing to wait FOR and the read
+    # stays a single sample. Anything else is the answer session.json demands.
+    $want = [int]$ExpectPinned
+    $sw = [Diagnostics.Stopwatch]::StartNew()
     $style = [WIN]::GetWindowLong($handle, -20)
-    "TOPMOST=$([int](($style -band 8) -ne 0))"
+    $top = [int](($style -band 8) -ne 0)
+    while ($want -ge 0 -and $top -ne $want -and $sw.ElapsedMilliseconds -lt $PinWaitMs) {
+        Start-Sleep -Milliseconds $PinTickMs
+        # A dead window has no style to read, and polling a corpse is how a
+        # timeout gets reported as a pin failure.
+        $p.Refresh()
+        if ($p.HasExited) { break }
+        $style = [WIN]::GetWindowLong($handle, -20)
+        $top = [int](($style -band 8) -ne 0)
+    }
+    "TOPMOST=$top"
     "EXSTYLE=$style"
+    "TOPMOST_WANTED=$want"
+    "TOPMOST_WAIT_MS=$($sw.ElapsedMilliseconds)"
+    "TOPMOST_POLLED=$([int]($sw.ElapsedMilliseconds -gt 0))"
 } else { 'TOPMOST=-1' }
 function Get-Frame($h) {
     $r = New-Object WIN+RECT
@@ -1544,6 +1583,85 @@ pub enum Pin {
     NotJudged(&'static str),
 }
 
+/// The evidence a pin verdict is worth citing: the LAST extended style the poll
+/// saw, and how long it waited for the seeded polarity. Both come from the
+/// script's own stopwatch, so a run that answered on the first sample prints 0 ms
+/// and one that spent the budget prints 2000 - and that difference is exactly
+/// what an exit 7 has to be able to say out loud: "never banded" and "banded
+/// late" are different bugs, and only the wait time separates them.
+///
+/// An absent key prints as unknown, never as 0: the rule that a truncated probe
+/// transcript may not look like a fast answer is the same rule that keeps an
+/// absent TOPMOST out of a pass.
+fn pin_wait_note(probe: &Probe) -> String {
+    let style = match probe.number("EXSTYLE") {
+        Some(v) => format!("last EXSTYLE=0x{:X}", v as u32),
+        None => "EXSTYLE=unread".to_string(),
+    };
+    let waited = match probe.number("TOPMOST_WAIT_MS") {
+        Some(v) => format!("{v} ms of the {PIN_WAIT_MS} ms budget"),
+        None => "wait unread".to_string(),
+    };
+    format!("({style}, {waited})")
+}
+
+/// The harness distrusting its OWN plumbing, which is the only reading of a pin
+/// verdict worth having. The script prints the polarity it actually waited for
+/// (TOPMOST_WANTED); if that does not name the polarity this launch was SEEDED
+/// with, the two halves disagree about which launch is which, and a TOPMOST
+/// reading in that state is meaningless whatever it says. So it is refused -
+/// never quietly converted into a pass, and never into a failure of the app
+/// either, because the app did nothing to cause it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRead {
+    /// The reported polarity matches the seeded one, and the style answered.
+    Read(bool),
+    /// The script reported no polarity at all: an old or truncated transcript, so
+    /// nothing can be said about which launch this reading came from.
+    Unreported,
+    /// The script waited for a DIFFERENT polarity than this launch was seeded
+    /// with - the argument plumbing disagrees with the state file.
+    Mismatch { asked: bool, reported: bool },
+    /// Polarity agreed; the extended style itself could not be read.
+    Unreadable,
+}
+
+pub fn read_pin(probe: &Probe, asked: bool) -> PinRead {
+    // Written as two arms rather than matches!(v, 0): anything that is not exactly
+    // one of those two answers is Unreported, including a script that grew a third
+    // polarity the harness has not been told about.
+    let reported = match probe.number("TOPMOST_WANTED") {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return PinRead::Unreported,
+    };
+    if reported != asked {
+        return PinRead::Mismatch { asked, reported };
+    }
+    match topmost(probe) {
+        Some(bit) => PinRead::Read(bit),
+        None => PinRead::Unreadable,
+    }
+}
+
+/// Why a polarity was refused, in the words an operator needs: "not judged" is
+/// the app's silence, and these three sentences are the harness's own. Kept as a
+/// function so both halves print the same explanation of the same shape.
+fn pin_refusal(read: PinRead, which: &str) -> String {
+    match read {
+        PinRead::Unreported => format!(
+            "the transcript reported no polarity to wait for, so which launch {which} belongs to is              unknown and no reading of it can be trusted"
+        ),
+        PinRead::Mismatch { asked, reported } => format!(
+            "this launch was seeded {which} but the poll waited for pinned:{reported} - the harness              and the script disagree about which window is which, so this is an instrument fault, not              an app verdict (asked {asked})"
+        ),
+        PinRead::Unreadable => {
+            format!("{which}: the extended style could not be read on the live window")
+        }
+        PinRead::Read(_) => unreachable!("a reading is not a refusal"),
+    }
+}
+
 fn topmost(probe: &Probe) -> Option<bool> {
     match probe.number("TOPMOST") {
         Some(0) => Some(false),
@@ -1611,6 +1729,16 @@ pub const POLL_TICK_MS: i32 = 750;
 /// force window the app reported (1000 ms), so the number is printed every run
 /// rather than trusted.
 pub const SETTLE_MS: i32 = POLL_TICK_MS * 6;
+/// How long the pin read may wait for the seeded polarity to appear on the live
+/// window, and how often it looks. 2000 ms is 4x the 512 ms the platform lane
+/// measured for the band to land, and 50 ms is far below both, so a slow-but-real
+/// apply is credited and a missing one is still caught - the budget is a wait, not
+/// a pass. Passed INTO the script, so the two halves cannot drift apart.
+pub const PIN_WAIT_MS: i32 = 2_000;
+pub const PIN_TICK_MS: i32 = 50;
+// Compile-time, so a budget that stops being a wait cannot compile: four ticks is
+// the floor under which the poll could expire between two samples.
+const _: () = assert!(PIN_WAIT_MS >= 4 * PIN_TICK_MS);
 pub const GEOMETRY_FAILED_EXIT: i32 = 6;
 /// The PIN specifically: WS_EX_TOPMOST did not follow what session.json claimed.
 /// Distinct from 6 because the fix usually lives in the show/pin ordering, not
@@ -1662,13 +1790,23 @@ pub fn seed_in(work: &Rect, size: (i32, i32), default_hint: &Rect) -> Option<(Re
     Some((seed, moved))
 }
 
+/// The seed rect and where the harness drags the window to, which always arrive
+/// together (`seed_in` returns the pair) and are meaningless apart. Bundled
+/// because `run_probe_script` grew a real argument with the pin polarity and the
+/// eighth would have been a clippy suppression instead of a shape.
+#[derive(Debug, Clone, Copy)]
+pub struct Drag<'a> {
+    pub seed: &'a Rect,
+    pub to: (i32, i32),
+}
+
 pub fn run_probe_script(
     script: &Path,
     exe: &Path,
     err_file: &Path,
     session: Option<&Path>,
-    seed: Option<&Rect>,
-    move_to: Option<(i32, i32)>,
+    expect_pinned: Option<bool>,
+    drag: Option<Drag<'_>>,
     secs: u64,
 ) -> Result<Probe, String> {
     let mut cmd = std::process::Command::new("pwsh");
@@ -1680,21 +1818,35 @@ pub fn run_probe_script(
         .arg(err_file)
         .arg("-Session")
         .arg(session.map(|p| p.display().to_string()).unwrap_or_default())
+        // The polarity this launch was SEEDED with, so the script polls for the
+        // answer it already knows and reports the wait. None means "not asserted",
+        // which keeps that launch's read a single sample rather than a guess.
+        .arg("-ExpectPinned")
+        .arg(match expect_pinned {
+            Some(true) => "1",
+            Some(false) => "0",
+            None => "-1",
+        })
+        .arg("-PinWaitMs")
+        .arg(PIN_WAIT_MS.to_string())
+        .arg("-PinTickMs")
+        .arg(PIN_TICK_MS.to_string())
         .arg("-WindowSecs")
         .arg(secs.to_string())
         .arg("-SettleMs")
         .arg(SETTLE_MS.to_string())
         .arg("-MoveX")
-        .arg(match move_to {
-            Some((x, _)) => x.to_string(),
+        .arg(match drag {
+            Some(d) => d.to.0.to_string(),
             None => "-1".to_string(),
         })
         .arg("-MoveY")
-        .arg(match move_to {
-            Some((_, y)) => y.to_string(),
+        .arg(match drag {
+            Some(d) => d.to.1.to_string(),
             None => "-1".to_string(),
         });
-    if let Some(s) = seed {
+    if let Some(d) = drag {
+        let s = d.seed;
         cmd.arg("-SeedX")
             .arg(s.l.to_string())
             .arg("-SeedY")
@@ -1709,7 +1861,11 @@ pub fn run_probe_script(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start the geometry probe: {e}"))?;
-    match wait_bounded(&mut child, OUTER_SECS) {
+    // The outer backstop is widened by the pin budget: the script now waits up
+    // to PIN_WAIT_MS INSIDE its own bounded phases, and a harness that kills a
+    // child for doing the work it was told to do turns a slow apply into a
+    // spurious red. Still strictly larger than everything bounded internally.
+    match wait_bounded(&mut child, OUTER_SECS + PIN_WAIT_MS as u64 / 1000 + 1) {
         Ok(Some(_)) => Ok(parse_probe(&read_pipe(child.stdout.as_mut()))),
         Ok(None) => Err("the geometry probe outlived its deadline".to_string()),
         Err(e) => Err(e),
@@ -1822,13 +1978,20 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
         }
     };
     // 2. Launch, and see where the window really is.
+    // The seed asked for pinned:true, so THIS launch is polled for WS_EX_TOPMOST
+    // and the wait is reported. The polarity is passed in rather than guessed at:
+    // asking the script for the answer the harness already wrote into session.json
+    // is what turns "did the bit eventually land" into "did it land as claimed".
     let first = match run_probe_script(
         script,
         exe,
         err_file,
         Some(session),
-        Some(&seed),
-        Some((moved.l, moved.t)),
+        Some(true),
+        Some(Drag {
+            seed: &seed,
+            to: (moved.l, moved.t),
+        }),
         SETTLE_MS as u64 / 1000 + 12,
     ) {
         Err(e) => {
@@ -1936,22 +2099,35 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
     // window's extended style must carry WS_EX_TOPMOST. Read from the same
     // launch that produced the rects above - the window is shown, which the
     // platform lane proved is the only state where a topmost band survives.
-    let pin_true = topmost(&first);
-    if pin_true.is_none() {
-        println!("smoke: geometry: PIN not judged - the extended style could not be read");
-    } else {
-        println!(
-            "smoke: geometry: PIN pinned:true -> WS_EX_TOPMOST={}",
-            pin_true.unwrap_or(false) as i32
-        );
-    }
+    let pin_true = match read_pin(&first, true) {
+        PinRead::Read(bit) => {
+            println!(
+                "smoke: geometry: PIN pinned:true -> WS_EX_TOPMOST={} {}",
+                bit as i32,
+                pin_wait_note(&first)
+            );
+            Some(bit)
+        }
+        refusal => {
+            println!(
+                "smoke: geometry: PIN pinned:true REFUSED - {}",
+                pin_refusal(refusal, "pinned:true")
+            );
+            None
+        }
+    };
     // 5. Relaunch and see whether it comes back where it was left, and whether
     // an unpinned file really leaves the window un-topmost.
     if let Err(e) = set_pinned(session, false) {
         println!("smoke: geometry: PIN second polarity not judged: {e}");
     }
     let expect = stored.unwrap_or(moved);
-    let second = match run_probe_script(script, exe, err_file, Some(session), None, None, 12) {
+    // Same bounded wait on the FALSE half. Nothing races today - an unpinned
+    // restore simply does not band - but "it was 0 on the first read" is luck
+    // wearing the clothes of a proof, and the poll costs nothing when the answer
+    // is already right on the first sample.
+    let second = match run_probe_script(script, exe, err_file, Some(session), Some(false), None, 12)
+    {
         Err(e) => {
             restore_session(session, before.as_deref());
             return Geometry::NotJudged(e.leak() as &str);
@@ -1974,14 +2150,23 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
             expect.text()
         )),
     }
-    let pin_false = topmost(&second);
-    println!(
-        "smoke: geometry: PIN pinned:false -> WS_EX_TOPMOST={}",
-        match pin_false {
-            Some(v) => v as i32,
-            None => -1,
+    let pin_false = match read_pin(&second, false) {
+        PinRead::Read(bit) => {
+            println!(
+                "smoke: geometry: PIN pinned:false -> WS_EX_TOPMOST={} {}",
+                bit as i32,
+                pin_wait_note(&second)
+            );
+            Some(bit)
         }
-    );
+        refusal => {
+            println!(
+                "smoke: geometry: PIN pinned:false REFUSED - {}",
+                pin_refusal(refusal, "pinned:false")
+            );
+            None
+        }
+    };
     let pin = match (pin_true, pin_false) {
         (Some(t), Some(f)) => {
             if t && !f {
@@ -1991,10 +2176,17 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
                 }
             } else {
                 pin_failed = true;
+                // Both waits printed, because the two halves fail differently: a
+                // pinned:true that spent its whole budget is the band never
+                // arriving, and a pinned:false that answers 1 immediately is the
+                // app topmost-ing a window the file told it not to.
                 notes.push(format!(
-                    "PIN: session.json said pinned:true and the window answered WS_EX_TOPMOST={t}, \
-                     then pinned:false answered {f}; the topmost bit does not follow the state file \
-                     (a show/pin race here is possible, so check the app log before blaming persistence)"
+                    "PIN: session.json said pinned:true and the window answered WS_EX_TOPMOST={t} {}, \
+                     then pinned:false answered {f} {}; the topmost bit does not follow the state file \
+                     even after waiting up to {PIN_WAIT_MS} ms for it, so this is not a first-read race \
+                     any more - check the app's own stderr for a Pinned line before blaming persistence",
+                    pin_wait_note(&first),
+                    pin_wait_note(&second)
                 ));
                 Pin::Contradicts {
                     wanted: true,
@@ -2003,7 +2195,9 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
                 }
             }
         }
-        _ => Pin::NotJudged("the extended style could not be read on one of the two launches"),
+        _ => Pin::NotJudged(
+            "one of the two launches was refused: either its extended style could not be read, or it              did not report the polarity it waited for (see the REFUSED line above)",
+        ),
     };
     // 6. Never leave the seed behind in place of what the app itself wrote.
     let still_seed = fs::read_to_string(session)
@@ -3426,6 +3620,165 @@ mod tests {
         assert!(
             !seen.contains(&MANIFEST_NOT_OURS_EXIT),
             "8 stays the flag-only code outside the table"
+        );
+    }
+
+    /// The harness distrusting its own plumbing: a TOPMOST reading is refused when
+    /// the script did not confirm it waited for THIS launch's polarity, because in
+    /// that state the two halves disagree about which window is which and the bit
+    /// means nothing. Refused is not judged - never a pass, and never a red the app
+    /// caused.
+    #[test]
+    fn a_pin_reading_without_a_matching_wanted_polarity_is_refused() {
+        // Agreed plumbing on both halves, so the reading stands.
+        let pinned = probe(&[("TOPMOST", "1"), ("TOPMOST_WANTED", "1")]);
+        assert_eq!(read_pin(&pinned, true), PinRead::Read(true));
+        let loose = probe(&[("TOPMOST", "0"), ("TOPMOST_WANTED", "0")]);
+        assert_eq!(read_pin(&loose, false), PinRead::Read(false));
+        // WANTED missing: an old or truncated transcript cannot be attributed.
+        let blind = probe(&[("TOPMOST", "1")]);
+        assert_eq!(read_pin(&blind, true), PinRead::Unreported);
+        // WANTED present but the OTHER polarity: the seeded file and the poll
+        // disagree, which is an instrument fault and not an app verdict.
+        let crossed = probe(&[("TOPMOST", "1"), ("TOPMOST_WANTED", "0")]);
+        assert_eq!(
+            read_pin(&crossed, true),
+            PinRead::Mismatch {
+                asked: true,
+                reported: false
+            }
+        );
+        // WANTED garbage is Unreported, not a coincidence that happens to match.
+        let junk = probe(&[("TOPMOST", "1"), ("TOPMOST_WANTED", "7")]);
+        assert_eq!(read_pin(&junk, true), PinRead::Unreported);
+        // Agreed polarity, unreadable style: still not a verdict.
+        let no_style = probe(&[("TOPMOST", "-1"), ("TOPMOST_WANTED", "1")]);
+        assert_eq!(read_pin(&no_style, true), PinRead::Unreadable);
+        // And each refusal says why, in a sentence that blames the instrument.
+        assert!(pin_refusal(PinRead::Unreported, "pinned:true").contains("unknown"));
+        assert!(pin_refusal(PinRead::Unreadable, "pinned:true").contains("could not be read"));
+        let why = pin_refusal(
+            PinRead::Mismatch {
+                asked: true,
+                reported: false,
+            },
+            "pinned:true",
+        );
+        assert!(why.contains("instrument fault"), "{why}");
+        assert!(why.contains("pinned:false"), "{why}");
+    }
+
+    /// A refusal must not be able to look like the app failing: it carries no exit
+    /// code, and the pin verdict it produces is not-judged, which the caller prints
+    /// and leaves alone.
+    #[test]
+    fn a_refused_polarity_is_not_judged_and_cannot_redden_the_pin() {
+        // The raw style read is still a 1 - which is the point: it is read_pin's
+        // attribution gate, not the bit, that refuses this reading.
+        let blind = probe(&[("TOPMOST", "1")]);
+        assert_eq!(topmost(&blind), Some(true));
+        assert_eq!(read_pin(&blind, true), PinRead::Unreported);
+        let pin = Pin::NotJudged("refused");
+        assert!(matches!(pin, Pin::NotJudged(_)));
+        // A real contradiction still reaches the exit-7 note, so the new refusal
+        // path has not swallowed the case the code exists for.
+        let first = probe(&[
+            ("TOPMOST", "0"),
+            ("TOPMOST_WANTED", "1"),
+            ("TOPMOST_WAIT_MS", "2000"),
+            ("EXSTYLE", "2359552"),
+        ]);
+        assert_eq!(read_pin(&first, true), PinRead::Read(false));
+        assert!(pin_wait_note(&first).contains("2000 ms of the 2000 ms budget"));
+    }
+
+    /// The pin read is a POLL now, and this is the test that keeps it a poll: delete
+    /// the loop, the wait key or the polarity argument from the heredoc and it
+    /// fails. Written as a guard because the alternative is 8d0e5055 - a green
+    /// product reported as exit 7 by a harness that sampled the style once.
+    #[test]
+    fn the_pin_read_polls_the_seeded_polarity_within_a_bounded_budget() {
+        let script = GEOMETRY_PROBE;
+        // The polarity under test is passed IN, never guessed by the script.
+        assert!(script.contains("$ExpectPinned"), "no polarity argument");
+        assert!(
+            script.contains("$want -ge 0"),
+            "an expiry must still be able to fail, so the loop cannot be unconditional"
+        );
+        // Bounded on both sides: a tick and a deadline.
+        assert!(
+            script.contains("$sw.ElapsedMilliseconds -lt $PinWaitMs"),
+            "the wait must be bounded by the budget"
+        );
+        assert!(script.contains("Start-Sleep -Milliseconds $PinTickMs"));
+        // The keys the Rust verdict reads to build an honest failure line.
+        for key in ["TOPMOST=", "EXSTYLE=", "TOPMOST_WAIT_MS="] {
+            assert!(
+                script.contains(key),
+                "the script must print the key it was asked for"
+            );
+        }
+        // Every knob is a DECLARED parameter, so run_probe_script hands the script
+        // the same budget the failure message prints (the dash form lives in that
+        // function's arg list, which the compiler checks; this checks the half the
+        // compiler cannot see - a parameter deleted from a string literal).
+        for param in ["[int]$ExpectPinned", "[int]$PinWaitMs", "[int]$PinTickMs"] {
+            assert!(script.contains(param), "undeclared parameter {param}");
+        }
+        // The four-tick floor is enforced where it belongs - a const assertion
+        // beside the constants, so a shrinking budget is a compile error rather
+        // than a test that only fails when someone runs it.
+    }
+
+    /// Waiting must not become excusing. A poll that expires with the bit still
+    /// wrong gives the SAME reading as a single wrong sample: the verdict consumes
+    /// the final answer, so a spent budget is a fail, not a shrug.
+    #[test]
+    fn an_expired_wait_is_still_a_fail_and_never_softens_into_not_judged() {
+        let spent = PIN_WAIT_MS.to_string();
+        let timed_out = probe(&[
+            ("TOPMOST", "0"),
+            ("TOPMOST_WANTED", "1"),
+            ("TOPMOST_WAIT_MS", spent.as_str()),
+            ("EXSTYLE", "2359552"),
+        ]);
+        assert_eq!(
+            topmost(&timed_out),
+            Some(false),
+            "an expired wait reads as the answer it got, so the pin verdict fails"
+        );
+        let late = probe(&[("TOPMOST", "1"), ("TOPMOST_WAIT_MS", "512")]);
+        assert_eq!(
+            topmost(&late),
+            Some(true),
+            "and a match is credited at 512ms"
+        );
+        // An unread style is not a verdict at all: never judged, never a pass.
+        assert_eq!(topmost(&probe(&[("TOPMOST", "-1")])), None);
+    }
+
+    /// What a red pin line now has to carry: the last extended style seen, in hex
+    /// because that is how every Windows document writes it, and the time spent,
+    /// because 0 ms and 2000 ms are two different bugs wearing one exit code.
+    #[test]
+    fn the_pin_note_names_the_last_style_and_the_time_waited() {
+        // 0x240108 is the value the OS probe read off the live window at
+        // handle+512ms on 8d0e5055 - the run this fix exists for.
+        let p = probe(&[
+            ("TOPMOST", "1"),
+            ("EXSTYLE", "2359560"),
+            ("TOPMOST_WAIT_MS", "512"),
+        ]);
+        let note = pin_wait_note(&p);
+        assert!(note.contains("last EXSTYLE=0x240108"), "{note}");
+        assert!(note.contains("512 ms of the 2000 ms budget"), "{note}");
+        // Absent evidence reads as absent, never as a reassuring zero.
+        let blind = pin_wait_note(&probe(&[("TOPMOST", "1")]));
+        assert!(blind.contains("EXSTYLE=unread"), "{blind}");
+        assert!(blind.contains("wait unread"), "{blind}");
+        assert!(
+            !blind.contains("0 ms"),
+            "a lost key is not a fast answer: {blind}"
         );
     }
 
