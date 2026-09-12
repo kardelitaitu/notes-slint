@@ -46,7 +46,8 @@ recents and menu work now in the tree):
       there; proven end to end (`74a3c90`), asserted in `crates/api/tests/geometry.rs`.
       *Sub-case PASS on manual proof:* a maximised window comes back maximised — proven twice
       on a live window by the `IsZoomed` cycle under M3 (persisted through `WM_CLOSE`, true at
-      creation on relaunch). Not machine-proven: the smoke harness has no show-state leg yet.
+      creation on relaunch). **Now machine-proven as well:** the harness's M9 leg asserts the restore
+      rect is a fixed point across that cycle, so a regression fails the run.
 - [ ] **2. Open** — **not proven.** The dialog API is verified (§12.5 Q6) but presenting one
       still needs a human, and no test drives dialog → text in the window.
 - [ ] **3. Save byte-identical (§4.5)** — **not proven end to end.** Core round-trip fixtures
@@ -92,17 +93,27 @@ watch wakes on a show flip and not only a rect change (`crates/bridge-gpui/src/m
 branch (`crates/api/src/engine.rs:1208`) and the bridge creating the window as
 `WindowBounds::Maximized` (`crates/bridge-gpui/src/main.rs:1816-1820`).
 
-**Live proof: done, twice, on a real window.** `ShowWindow(3)` — `IsZoomed` true —
-`WM_CLOSE` — `session.json` persisted `maximized: true` — relaunch — `IsZoomed`
-**true at creation**, so the window is born maximised rather than maximised a frame later. The show
-bit, the watch that wakes on a flip, and both read paths are observed behaviour now, not inferred
-from a diff. Landed in `8cda7bd0`, `e401e513`, `3324766a`; record note:
+**Live proof: done, and now machine-proven.** The manual cycle — `ShowWindow(3)` → `IsZoomed`
+true → `WM_CLOSE` → `session.json` persisted `maximized: true` → relaunch → `IsZoomed` true — was
+run twice by hand and then turned into a check: **M9, armed** in
+`crates/xtask/src/smoke.rs:2184-2224`. Its assertion is the **restore-rect fixed point**
+(`rect_drift`, `:2083`): one maximise → close → relaunch → close must move the rect by
+`(dx, dy, dw, dh) = (0, 0, 0, 0)`, and any other quadruple exits **6** — the code that already
+means “the window did not come back where it was”. Measured live at `40bb5057`, armed at
+`9f12c10d`. Landed in `8cda7bd0`, `e401e513`, `3324766a`, plus two correctness fixes under
+it tonight: `eb4a3812` (the quit-time measure now arms its own write, so a drag or maximise
+in the last quiet beat is persisted — mutation-proven both ways) and `5c2516e8`, whose new
+`WindowBackend::set_restore_frame_rect` seam closed the per-cycle chrome inflation the pre-fix
+cycles measured at `(-8, -4) / (+16, +8)` per round trip. Record note:
 `.agents/notes/implemented/2026-09-12-maximized-persistence.md`.
 
-What the proof is not: **automated**. `crates/xtask/src/smoke.rs` asserts a persisted `maximized` field
-but has no leg that drives a real show-state flip through a live window and reads `IsZoomed`
-back, so a regression that stopped the bit being written would not fail a build. That leg is what
-M3 still owes; the behaviour itself is settled.
+Two limits stay honest. M9 asserts **drift, not `ZOOM`**: the probe reads `IsZoomed` the
+instant the handle appears, before gpui's async show apply lands, so a genuinely maximised window
+can answer 0 there — a known harness weakness, documented at `smoke.rs:2198-2205`. And the
+geometry lane still resolves its `session.json` through the candidate list (`smoke.rs:3273`)
+rather than through `state_dir_for` (`:1073`), the rule the app itself applies; M9's own directory
+comes from `state_dir_for` (`:2072`), so the verdict is armed against the right file, and the
+older seed path is a follow-up rather than a wrong answer.
 
 **M4 — Autosave & pin.**
 Debounce, periodic flush, blur/close/quit flush, external-change detection, and the

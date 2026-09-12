@@ -62,7 +62,7 @@ placement validator fails the build when two files claim the same section.
 | **M0** | **Spike — done 2026-09-10.** Does a standalone GPUI app build and run on Windows, and can we set topmost, set position, and open a native file dialog? Verdict: viable, every blocking question passed ([docs/roadmap.md](docs/roadmap.md) §12). |
 | M1 | **Done.** Core engine, headless. Tested with no window at all. |
 | M2 | **In flight.** First usable UI — *you can use it as a notepad.* |
-| M3 | **Done.** Restore, monitor validation, DPI, and coming back maximised — the last one proven by hand on a live window, not yet by the harness. |
+| M3 | **Done.** Restore, monitor validation, DPI, and coming back maximised — the last one machine-proven, the smoke harness asserting the restore rect is unchanged across a real maximise-close-relaunch. |
 | M4 | **Done.** Autosave and pin. |
 | M5 | Polish, and the Windows portable + installer builds. |
 | M6–M8 | Cross-platform seams, then mac and Linux builds. |

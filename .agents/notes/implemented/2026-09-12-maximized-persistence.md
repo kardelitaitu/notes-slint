@@ -3,7 +3,7 @@ title: Making "comes back maximised" actually true
 status: implemented
 id: 2026-09-12-maximized-persistence
 created: 2026-09-12
-updated: 2026-09-12
+updated: 2026-09-13
 relates: [§4.1, §5.4, §5.5]
 decision: null
 ---
@@ -143,15 +143,57 @@ The act named above was run, on a real window, twice. Verdict: **yes**, both tim
   a frame later, so the read path (`main.rs:1816-1820`, `WindowBounds::Maximized`) and the
   engine's no-move branch (`engine.rs:1208`) are both on the record, not just in the diff.
 
-That closes the maximised sub-case of the §4.1 promise: **shipped and observed**, not shipped
-and assumed. One thing stays open, and it is the reason this is still a note: the proof is
-**manual**. `smoke.rs` can assert a persisted `maximized` field but has no leg that drives a real
-show-state flip through a live window and reads `IsZoomed` back, so a regression that stopped
-the bit being written would not fail a build. The cheapest home for that leg is the harness that
-already launches the app, waits for a verdict and reads `session.json` back; a maximise /
-relaunch pass there converts this from observed-once to checked-every-run.
+That closed the maximised sub-case of the §4.1 promise: shipped and observed. The one thing this
+section left open — that the proof was manual, and that `smoke.rs` had no leg driving a real
+show-state flip — is itself closed by the section below. The paragraphs above stand as what was
+true on 2026-09-12, not as the current limit.
 
 Promotion mechanics, recorded because this note is now the citation: moved `proposed/` —
 `implemented/` with `status:` and `updated:` in the same commit; README's "Remembers the window" row
 reduced to the shipped truth; docs/roadmap.md M3 and M2 check 1 updated to cite this cycle.
 No code changed to make this section true.
+
+
+## Machine-proven — 2026-09-13 (`eb4a3812`, `5c2516e8`, `40bb5057`, `9f12c10d`)
+
+Three things changed since the promotion above, each verified against the code rather than
+against the commit subject that describes it.
+
+- **The cycle is a verdict now, not a print.** The smoke harness's maximised leg
+  (`crates/xtask/src/smoke.rs:2184-2224`, armed by `9f12c10d`) computes `rect_drift`(`before`,
+  `after`) (`:2083`) — the four-number `(dx, dy, dw, dh)` delta of the restore rect across one real
+  maximise → close → relaunch → close — and the budget is **zero**: `Some((0, 0, 0, 0))` prints
+  PASS, any other quadruple returns exit **6**, the code that already means “the window did not
+  come back where it was” (`:2189-2196`, `:2206-2224`). An unreadable rect is “NOT JUDGED”, never
+  silently zero drift (`:2207-2212`, pinned by `the_drift_is_four_numbers_and_not_a_vibes_check` at
+  `:4099`). Live fixed point measured `Some((0, 0, 0, 0))` at `40bb5057`.
+- **What the leg deliberately does NOT assert: `ZOOM` at creation.** That is a known probe
+  weakness, stated at `smoke.rs:2198-2205`: `IsZoomed` is read the instant the handle is first
+  sighted, before gpui's async show apply lands, so a genuinely maximised window can answer 0 there
+  — one run printed “NOT zoomed at creation” for a window whose frame covered the entire
+  3448x1400 work area while a SetWindow-driven probe on the same window said True. Asserting it
+  would measure when the harness looked, not what the product did. **Drift is the assert; zoom is
+  INFO.** Re-arming zoom means re-ordering the probe to re-read after a settle — a part-3 question.
+- **Two correctness fixes landed underneath it.**
+  - `eb4a3812`: the quit-time measure now arms its own write. A drag or maximise inside the last
+    quiet beat before quit was measured into memory and then dropped, because no command had armed
+    the session bit. Diff-then-arm now, mutation-proven in both directions, so a clean quit still
+    does not rewrite `session.json`.
+  - `5c2516e8`: the new `WindowBackend::set_restore_frame_rect` seam
+    (`crates/platform/src/lib.rs:211`, Windows impl
+    `crates/platform/src/windows/monitors.rs:282`) writes `rcNormalPosition` without touching show
+    state, and the engine's maximised branch pushes the clamped frame rect through it
+    (`crates/api/src/engine.rs:1449-1471`). That closed the per-cycle chrome inflation the pre-fix
+    cycles measured at `(-8, -4) / (+16, +8)` per round trip — exactly what `9f12c10d`'s zero
+    budget now guards.
+
+**Residual limits — the harness's, not the product's.** (1) The zoom timing above: the leg proves
+the rect is a fixed point and that the bit round-trips; it does not prove the window is zoomed at
+the first instant a probe can look. (2) The geometry lane still resolves its `session.json`
+through the candidate list (`smoke.rs:3273`, `candidate_state_dirs`) rather than through
+`state_dir_for` (`:1073`), which is the rule the app actually applies — the same trap
+`:1090` records as having armed the recents claim against a file the running process never
+opened. The maximised leg takes its own directory through `state_dir_for` (`:2072`,
+`:3316`), so M9 is armed against the right file; the older seed path is the follow-up.
+(3) One cycle per run, on the machine running it — multi-cycle fixed-point drift is asserted
+headlessly in `crates/api/tests/geometry.rs`, not repeated live.
