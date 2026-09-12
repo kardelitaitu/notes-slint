@@ -2094,18 +2094,20 @@ pub fn rect_drift(before: Option<Rect>, after: Option<Rect>) -> Option<(i32, i32
 /// close it clean, relaunch, and print what the restore did to the rect.
 ///
 /// Why this exists as a leg of its own rather than as another case inside
-/// geometry_round_trip: that function OWNS an exit code (6 and 7), and this cycle
-/// must not change any verdict yet - the ratchet fix is landing in platform/api as a
-/// separate commit (df57), and a leg that asserted it here would turn smoke red at
-/// the commit that DOCUMENTS the bug rather than the one that fixes it. Nothing in
-/// this function can fail the run; every line is printed as INFO and the function
-/// returns nothing.
+/// geometry_round_trip: it needed its OWN seeds (maximised on purpose, per the M5
+/// lesson) and its own two launches, and it reports through the geometry lane's code
+/// rather than inventing a fourth one. Part 1 shipped it as INFO while the ratchet
+/// fix was still landing elsewhere - asserting it there would have reddened the commit
+/// that documented the bug instead of the one that fixed it; part 2 (this) arms it.
 ///
 /// The seed is the second reason this is explicit: like the M5 lesson on the rect
 /// lane, a seed that INHERITS the show state inherits whatever a previous run left.
 /// Here the leg wants maximised, so it says so.
-fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) {
-    println!("smoke: maximised: INFO - the cycle is observational, not a verdict (see M9 below)");
+/// Returns Some(note) when the cycle BROKE the promise and None when it held or
+/// could not be judged - the geometry lane's three answers, minus the pass claim
+/// this leg has no business making (the lane above already owns that word).
+fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) -> Option<String> {
+    println!("smoke: maximised: the cycle is armed (M9) - drift beyond zero is exit 6");
     // Keep the position the user's file already names; this leg is about the SHOW
     // state, so inventing a rect here would confound the two.
     let keep = match fs::read_to_string(session) {
@@ -2116,15 +2118,15 @@ fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) {
             b: 640,
         }),
         Err(e) => {
-            println!("smoke: maximised: INFO - not run, {session:?} unreadable: {e}");
-            return;
+            println!("smoke: maximised: NOT JUDGED - session file unreadable: {e}");
+            return None;
         }
     };
     let before = match seed_session_with_state(session, &keep, false, true) {
         Ok(bytes) => bytes,
         Err(e) => {
-            println!("smoke: maximised: INFO - could not seed a maximised session: {e}");
-            return;
+            println!("smoke: maximised: NOT JUDGED - could not seed: {e}");
+            return None;
         }
     };
     // Launch one: the file says maximised, so ZOOM at creation is the READ half of
@@ -2132,20 +2134,18 @@ fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) {
     let first = match run_probe_script(script, exe, err_file, Some(session), None, None, 12) {
         Ok(p) => p,
         Err(e) => {
-            println!("smoke: maximised: INFO - first launch did not report: {e}");
+            println!("smoke: maximised: NOT JUDGED - first launch did not report: {e}");
             restore_session(session, before.as_deref());
-            return;
+            return None;
         }
     };
     // Headless insurance: the first launch already reported whether there is a
     // desktop to place a window on, and this leg has no business starting a second
     // process on a machine that has none. The geometry lane declines the same way.
     if !first.flag("DESKTOP") {
-        println!(
-            "smoke: maximised: INFO - not run, no interactive desktop to maximise a window on"
-        );
+        println!("smoke: maximised: NOT JUDGED - no interactive desktop to maximise a window on");
         restore_session(session, before.as_deref());
-        return;
+        return None;
     }
     let rect_before = probe_rect(&first, "FRAME");
     // Launch two: the same file, relaunched, is where a frame/client double-count
@@ -2154,9 +2154,9 @@ fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) {
     let second = match run_probe_script(script, exe, err_file, Some(session), None, None, 12) {
         Ok(p) => p,
         Err(e) => {
-            println!("smoke: maximised: INFO - relaunch did not report: {e}");
+            println!("smoke: maximised: NOT JUDGED - relaunch did not report: {e}");
             restore_session(session, before.as_deref());
-            return;
+            return None;
         }
     };
     let rect_after = probe_rect(&second, "FRAME");
@@ -2186,15 +2186,44 @@ fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) {
         "smoke: maximised: INFO - drift across one cycle (dx, dy, dw, dh) = {drift:?}; the rect launch 1 persisted was {}, and the chrome measured this run is (+8, +0, -8, -8) - a non-zero quadruple matching that border is the frame/client double-count, not a race",
         persisted.map(|r| r.text()).unwrap_or_else(|| "-".into())
     );
-    // M9 (armed): this is the line that becomes the verdict once df57's ratchet fix
-    // lands. The flip is two lines -
-    //     let _ = drift;   ->   if drift != Some((0, 0, 0, 0)) { notes.push(...) }
-    // and the notes travel out through the geometry lane as Geometry::Broken, i.e.
-    // exit 6, which already means "the window-memory promise did not hold". Nothing
-    // else about this leg changes: the seeds, the INFO prints and the restore all
-    // stay, because a failing assertion is still worth reading in the same words.
-    let _ = drift;
+    // M9, ARMED - the exact flip promised in part 1, and the budget is zero. The fix
+    // is 5c2516e8's ratchet; the fixed point was measured live as Some((0, 0, 0, 0))
+    // at 40bb5057 and again in the manager's cycles (rect unchanged across
+    // maximise-close-relaunch-close, with maximized:true round-tripping). Any other
+    // quadruple is the frame/client double-count walking the restore rect, which IS
+    // the window-memory promise breaking - so it reports as 6, the code that already
+    // means exactly that, and the seeds / prints / restore all stay because a failing
+    // assertion is still worth reading in the same words.
+    //
+    // DRIFT ONLY, deliberately not the ZOOM line above. Known probe weakness, not an
+    // app finding: ZOOM is read the instant the handle is first sighted, which is
+    // BEFORE gpui's async show apply lands, so a genuinely maximised window can answer
+    // 0 there - part 1 printed "NOT zoomed at creation" for a window whose frame was
+    // the entire 3448x1400 work area, while a SetWindow-driven probe reading the same
+    // window says True. Asserting that would measure when the harness looked, not what
+    // the product did; arming it needs the probe re-ordered to re-read after a settle,
+    // which is a part-3 question with its own evidence.
+    let verdict = match drift {
+        None => {
+            println!(
+                "smoke: maximised: NOT JUDGED - a rect was unreadable, so there is nothing to compare"
+            );
+            None
+        }
+        Some((0, 0, 0, 0)) => {
+            println!("smoke: maximised: PASS - the restore rect is a fixed point across one cycle");
+            None
+        }
+        Some(d) => Some(format!(
+            "MAXIMISED: one maximise-close-relaunch cycle moved the restore rect by (dx, dy, dw, dh) = {d:?} \
+             (launch 1 {r1}, launch 2 {r2}); the rect persisted while maximised is not the rect the next \
+             launch came back at, which is the frame/client ratchet walking the window by its own chrome",
+            r1 = rect_before.map(|r| r.text()).unwrap_or_else(|| "-".into()),
+            r2 = rect_after.map(|r| r.text()).unwrap_or_else(|| "-".into())
+        )),
+    };
     restore_session(session, before.as_deref());
+    verdict
 }
 
 /// Did this launch's window die while the pin poll was waiting for it?
@@ -3283,7 +3312,7 @@ pub fn run(args: &[String]) -> i32 {
                 }
             },
         }
-        // The maximised cycle, printed as INFO and unable to change the code. Its
+        // The maximised cycle, armed by M9: drift can set 6, nothing else can. Its
         // directory comes from state_dir_for through app_state_dir, NOT from the
         // candidate search list the lane above uses: the 2026-09-13 dossier lost a
         // whole reading to the roaming profile while the portable marker had the live
@@ -3294,9 +3323,18 @@ pub fn run(args: &[String]) -> i32 {
             .map(|dir| dir.join(SESSION_FILE))
             .filter(|p| p.is_file())
         {
-            Some(path) => maximised_cycle(&geom_script, &exe, &err_file, &path),
+            Some(path) => {
+                if let Some(note) = maximised_cycle(&geom_script, &exe, &err_file, &path) {
+                    println!("SMOKE GEOMETRY FAIL: {note}");
+                    // 6 outranks 9 exactly as the lane above does, and 7 outranks 6:
+                    // a pin failure is a different and louder complaint.
+                    if code != GEOMETRY_FAILED_EXIT && code != PIN_FAILED_EXIT {
+                        code = GEOMETRY_FAILED_EXIT;
+                    }
+                }
+            }
             None => println!(
-                "smoke: maximised: INFO - not run, the app-resolved dir holds no session.json to seed"
+                "smoke: maximised: NOT JUDGED - the app-resolved dir holds no session.json to seed"
             ),
         }
     } else {
