@@ -87,7 +87,15 @@
 //!   reached the window. A capture that could not be read, and an app-resolved dir
 //!   with nothing to announce, both print NOT JUDGED (advisory) and leave the code
 //!   alone - an unverifiable step is neither a pass nor a failure, exactly as
-//!   geometry treats its own unmeasurable legs. The evidence line names the VOICE
+//!   geometry treats its own unmeasurable legs. The claim is judgeable on EVERY run,
+//!   not only on one whose owner happened to open a file today: smoke seeds exactly one
+//!   [[recents]] entry pointing at a scratch note of its own into the dir state_dir_for
+//!   resolves, then puts the profile back byte-exactly (SeedGuard - the same Drop
+//!   guarantee the session.json relocation gives, plus a sweep of notes a crashed earlier
+//!   run left). That proves the ANNOUNCE half of item 5: a non-empty list reached the live
+//!   UI. The CLICK half STAYS MANUAL - smoke never drives the mouse or the keyboard, so
+//!   "the entry was shown" is machine-proven while "choosing it opens that file" is not.
+//!   The evidence line names the VOICE
 //!   that carried the match - [rendered] is a status line the UI showed, [arrived]
 //!   is the per-arrival event line, [delivered, never rendered] is the exit drain -
 //!   and the strongest voice present is the one cited, never the first written.
@@ -830,6 +838,224 @@ pub fn count_recents_blocks(toml_text: &str) -> usize {
         .lines()
         .filter(|line| line.trim() == "[[recents]]")
         .count()
+}
+
+/// The scratch note a seeded recent points at, named through temp_path so a
+/// crashed run's leftovers stay findable by prefix (see sweep_stale_seeds).
+const SEED_STEM: &str = "seeded-recent";
+
+/// The note's text: known and non-empty, so opening it by hand is visibly
+/// different from an empty buffer.
+const SEED_TEXT: &str = "smoke seeded this note so the recent list was not empty\n";
+
+/// The settings.toml the harness writes so the startup announce HAS something to
+/// announce, pointing at one real note.
+///
+/// Two details are load-bearing and pinned by a test rather than trusted:
+///
+/// * autosave_enabled MUST be present. Settings declares it with no serde default,
+///   so a file carrying only the recents table is not "defaults plus a recent" - it
+///   is SettingsCorrupt, the app runs on factory defaults, the recents are EMPTY,
+///   and the claim silently drops back to not-judged while the log reads like a
+///   successful seed. It is written true because that is core's own factory value,
+///   so a seeded run behaves like a fresh install in every other respect.
+/// * the path is a TOML basic string with every backslash doubled, not a literal
+///   string: a profile directory holding an apostrophe would otherwise corrupt the
+///   file, and nothing would ever say so.
+pub fn seeded_settings_toml(note: &Path) -> String {
+    let escaped = note.display().to_string().replace('\\', "\\\\");
+    let display = note
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "seeded-recent.notes".to_string());
+    format!(
+        "autosave_enabled = true\n\n[[recents]]\npath = \"{escaped}\"\ndisplay = \"{display}\"\nexists = true\n"
+    )
+}
+
+/// Brings the profile's settings.toml back, byte-exactly, and removes the scratch
+/// note. The sibling of Restore for the other file in the same directory, with the
+/// same Drop guarantee: a panic, an early return or a killed probe cannot leave a
+/// seeded recent sitting in someone's profile.
+///
+/// One asymmetry, on purpose: a session.json the app rewrote is KEPT, because that
+/// file IS the persistence evidence the run exists to collect. A settings.toml the
+/// app rewrote is still replaced, because here the evidence is the printed trace
+/// line, and leaving the app's file behind would make the NEXT run's recents count
+/// come from a file whose provenance nobody can state. Every outcome prints.
+struct SeedGuard {
+    settings: PathBuf,
+    /// The bytes that were there before, or None when this run created the file.
+    prior: Option<Vec<u8>>,
+    note: PathBuf,
+    done: bool,
+    failed: bool,
+}
+
+impl SeedGuard {
+    fn finish(&mut self) {
+        if !self.done {
+            self.done = true;
+            self.restore("at the end of the run");
+        }
+    }
+
+    fn restore(&mut self, when: &str) {
+        match &self.prior {
+            Some(bytes) => {
+                let identical = fs::write(&self.settings, bytes)
+                    .and_then(|()| fs::read(&self.settings))
+                    .map(|now| now == *bytes);
+                match identical {
+                    Ok(true) => println!(
+                        "smoke: settings: {when} - the user's settings.toml came back byte-identical \
+                         (sha256 {}) at {}",
+                        crate::fixtures::sha256_hex(bytes),
+                        self.settings.display()
+                    ),
+                    Ok(false) => {
+                        self.failed = true;
+                        eprintln!(
+                            "SMOKE FAIL: settings: the user's settings.toml did NOT come back \
+                             byte-identical at {}. The original bytes exist only in this process' \
+                             memory, so say so before anything else trusts that profile.",
+                            self.settings.display()
+                        );
+                    }
+                    Err(e) => {
+                        self.failed = true;
+                        eprintln!(
+                            "SMOKE FAIL: settings: could not rewrite {} : {e}",
+                            self.settings.display()
+                        );
+                    }
+                }
+            }
+            // Nothing was there, so nothing may be left: this file is ours to remove.
+            None => match fs::remove_file(&self.settings) {
+                Ok(()) => println!(
+                    "smoke: settings: {when} - removed the settings.toml this run created at {}; the \
+                     trace line above is this run's evidence, not this file's",
+                    self.settings.display()
+                ),
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        println!(
+                            "smoke: settings: {when} - {} is already gone",
+                            self.settings.display()
+                        );
+                    } else {
+                        self.failed = true;
+                        eprintln!(
+                            "SMOKE FAIL: settings: could not remove the seeded {} : {e} - a seeded \
+                             recent is still sitting in that profile",
+                            self.settings.display()
+                        );
+                    }
+                }
+            },
+        }
+        if let Err(e) = fs::remove_file(&self.note) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                self.failed = true;
+                eprintln!(
+                    "SMOKE FAIL: settings: could not remove the scratch note {}: {e}",
+                    self.note.display()
+                );
+            }
+        }
+    }
+}
+
+impl Drop for SeedGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            self.done = true;
+            self.restore("while unwinding");
+        }
+    }
+}
+
+/// Delete scratch notes left by a CRASHED earlier run, so seeds never accumulate
+/// across runs that never reached their restore. Deliberately narrow: only this
+/// stem's notes, NEVER the session backups - those hold the user's own bytes and
+/// are the one artefact a later run must not throw away on a timer.
+///
+/// The age floor is what makes this safe beside a concurrent smoke: a run still in
+/// flight owns files minutes old, and nobody's evidence gets swept.
+fn sweep_stale_seeds(older_than: std::time::Duration) -> usize {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return 0;
+    };
+    let prefix = format!("notes-gpui-smoke-{SEED_STEM}-");
+    let mut swept = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let aged = path
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|e| e > older_than);
+        let named = path
+            .file_name()
+            .map(|s| s.to_string_lossy().starts_with(&prefix))
+            .unwrap_or(false);
+        if named && aged && fs::remove_file(&path).is_ok() {
+            swept += 1;
+        }
+    }
+    swept
+}
+
+/// Resolve the app's own state dir, then seed there. Split in two so the guard is
+/// testable against a temp directory: a test that called the resolving half would
+/// seed THIS machine's real profile, which is exactly the harm SeedGuard exists to
+/// prevent.
+fn seed_settings(exe: &Path) -> Result<(SeedGuard, PathBuf), String> {
+    let marker = exe
+        .parent()
+        .map(|d| d.join("data").is_dir())
+        .unwrap_or(false);
+    let dir = state_dir_for(exe, std::env::var_os("APPDATA").as_deref(), marker)
+        .ok_or("the app's state dir cannot be resolved from the exe path")?;
+    seed_settings_at(&dir)
+}
+
+/// Write the seed into ONE directory and hand back the guard that puts it back. The
+/// caller reads recents_at_startup AFTER this, so the count in the log is the count
+/// the seeded app will see.
+///
+/// An Err is never a verdict: the claim falls back to NOT JUDGED, exactly as it did
+/// before the seed existed, because a directory that will not take a file is the
+/// machine's story and not the app's.
+fn seed_settings_at(dir: &Path) -> Result<(SeedGuard, PathBuf), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let note = temp_path(SEED_STEM, "notes");
+    fs::write(&note, SEED_TEXT).map_err(|e| format!("cannot write {}: {e}", note.display()))?;
+    let settings = dir.join(SETTINGS_FILE);
+    let prior = match fs::read(&settings) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            let _ = fs::remove_file(&note);
+            return Err(format!("cannot read {}: {e}", settings.display()));
+        }
+    };
+    if let Err(e) = fs::write(&settings, seeded_settings_toml(&note)) {
+        let _ = fs::remove_file(&note);
+        return Err(format!("cannot seed {}: {e}", settings.display()));
+    }
+    Ok((
+        SeedGuard {
+            settings,
+            prior,
+            note: note.clone(),
+            done: false,
+            failed: false,
+        },
+        note,
+    ))
 }
 
 /// The ONE directory the app itself persists into, by the rule
@@ -2556,6 +2782,35 @@ pub fn run(args: &[String]) -> i32 {
         return DECLINED_EXIT;
     }
 
+    // Seed one recent, so the announce claim is judgeable on EVERY machine and not
+    // only on one whose owner happens to have opened a file today. Order matters
+    // twice: AFTER the Relocation::Blocked decline above, because a run about to
+    // stand down must never leave a file behind, and BEFORE the count is read below,
+    // because the number printed must be the number the app sees. The session.json
+    // relocation is a different file in the same directory, so the fresh-install case
+    // is untouched by any of this - the seed survives it by not being asked to.
+    let swept = sweep_stale_seeds(std::time::Duration::from_secs(3600));
+    if swept > 0 {
+        println!(
+            "smoke: settings: swept {swept} scratch note(s) left by an earlier run that never made it to its restore"
+        );
+    }
+    let mut seed = match seed_settings(&exe) {
+        Ok((guard, note)) => {
+            println!(
+                "smoke: settings: seeded exactly one recent, {} (the profile goes back at the end of the run)",
+                note.display()
+            );
+            Some(guard)
+        }
+        Err(e) => {
+            println!(
+                "smoke: settings: NOT SEEDED - {e}. The trace claim is as honest as it was before the seed existed, which is NOT JUDGED."
+            );
+            None
+        }
+    };
+
     // How much there WAS to announce, read before anything launches: the app
     // rewrites its own settings on the way out, so asking afterwards would be
     // asking about the run instead of about its opening state. This is the one
@@ -2768,6 +3023,18 @@ pub fn run(args: &[String]) -> i32 {
         );
     }
 
+    if let Some(seed) = seed.as_mut() {
+        seed.finish();
+        // The same severity as a botched session restore: the harness damaged a
+        // profile, which is an infrastructure failure and never an app verdict.
+        if seed.failed && code == 0 {
+            println!(
+                "smoke: DECLINED TO PASS - the seeded settings.toml did not come back clean; \
+                 the profile, not the app, is what is at risk here"
+            );
+            return STEP_FAILED_EXIT;
+        }
+    }
     if let Some(guard) = guard.as_mut() {
         // Explicit here so the verdict can see a failed restore; Drop is the
         // backstop for every path that does not reach this line.
@@ -3264,6 +3531,125 @@ mod tests {
         ));
         assert!(matches!(staleness(Some(now), None), Stale::Unknown(_)));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The seed's own shape, pinned against the two ways it can fail quietly: a
+    /// file without autosave_enabled is SettingsCorrupt (so the recents read as
+    /// EMPTY and the claim goes back to not-judged while the log says "seeded"), and
+    /// a literal TOML string breaks on a profile path holding an apostrophe.
+    #[test]
+    fn the_seeded_file_is_what_core_reads_and_what_the_counter_counts() {
+        let mut note = PathBuf::from(r"C:\Users\O'Brien");
+        note.push("a.notes");
+        let toml = seeded_settings_toml(&note);
+        assert_eq!(
+            count_recents_blocks(&toml),
+            1,
+            "exactly one entry, or the judgeability gate is wrong: {toml}"
+        );
+        assert!(
+            toml.contains("autosave_enabled = true"),
+            "the key has no serde default; without it the file is corrupt: {toml}"
+        );
+        assert!(toml.contains("exists = true"), "{toml}");
+        assert!(
+            !toml.contains("path = '"),
+            "a literal string breaks on the apostrophe in this path: {toml}"
+        );
+        let line = toml
+            .lines()
+            .find(|l| l.starts_with("path = "))
+            .expect("path line");
+        let slashes = line.chars().filter(|c| *c == '\\').count();
+        let separators = note
+            .display()
+            .to_string()
+            .chars()
+            .filter(|c| *c == '\\')
+            .count();
+        assert!(
+            separators > 0,
+            "the fixture must exercise a backslashed path"
+        );
+        assert_eq!(
+            slashes,
+            separators * 2,
+            "every separator doubled for a TOML basic string: {line}"
+        );
+        assert!(line.contains("O'Brien"), "the name survives: {line}");
+    }
+
+    /// The do-no-harm half: a profile that already had a settings.toml gets its
+    /// exact bytes back, and the scratch note leaves no trace.
+    #[test]
+    fn a_seeded_profile_comes_back_byte_identical() {
+        let dir = std::env::temp_dir().join(format!("xtask-seedback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let user = b"autosave_enabled = false\n\n[[recents]]\npath = 'C:\\Notes\\idea.notes'\ndisplay = \"idea.notes\"\nexists = true\n";
+        let settings = dir.join("settings.toml");
+        fs::write(&settings, user).expect("write the user's file");
+        let (mut guard, note) = seed_settings_at(&dir).expect("seed lands");
+        assert_eq!(
+            count_recents_blocks(&fs::read_to_string(&settings).expect("seeded")),
+            1,
+            "the app must see exactly one recent"
+        );
+        assert!(note.is_file(), "the entry points at a real note");
+        assert!(
+            fs::read_to_string(&note)
+                .expect("note text")
+                .contains("smoke seeded"),
+            "with known text"
+        );
+        guard.finish();
+        assert_eq!(fs::read(&settings).expect("back"), user, "byte-identical");
+        assert!(!note.exists(), "the scratch note is gone");
+        assert!(!guard.failed, "a clean restore is not a failure");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// And the other case: there was no settings.toml, so nothing may be left. This
+    /// is the state this machine has lived in all day - portable target/debug/data,
+    /// no settings file - and the state the claim was never judgeable in.
+    #[test]
+    fn a_seed_that_created_the_file_leaves_nothing_behind() {
+        let dir = std::env::temp_dir().join(format!("xtask-seedclean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let (mut guard, note) = seed_settings_at(&dir).expect("seed lands");
+        assert!(dir.join("settings.toml").is_file());
+        guard.finish();
+        assert!(
+            !dir.join("settings.toml").exists(),
+            "the harness created it, the harness removes it"
+        );
+        assert!(!note.exists());
+        assert!(!guard.failed);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Self-clean after a crash, and the line it must not cross: the session
+    /// backups hold the USER's bytes, so a sweep that took them would be the worst
+    /// thing this harness could do on a timer.
+    #[test]
+    fn the_sweep_takes_only_this_stems_scratch_notes() {
+        let old = std::time::Duration::from_secs(7200);
+        let stale = temp_path(SEED_STEM, "notes");
+        let fresh = temp_path(SEED_STEM, "notes");
+        let backup = temp_path("session-backup-data", "json");
+        for path in [&stale, &fresh, &backup] {
+            fs::write(path, b"content").expect("write");
+        }
+        set_mtime(&stale, std::time::SystemTime::now() - old);
+        set_mtime(&backup, std::time::SystemTime::now() - old);
+        assert!(sweep_stale_seeds(std::time::Duration::from_secs(3600)) >= 1);
+        assert!(!stale.exists(), "an old seed note is a crash leftover");
+        assert!(fresh.exists(), "a run in flight keeps its own file");
+        assert!(backup.exists(), "the user's session bytes are never swept");
+        for path in [&fresh, &backup] {
+            let _ = fs::remove_file(path);
+        }
     }
 
     /// The f61d850d incident, pinned as a rule: a test file belonging to ANOTHER
