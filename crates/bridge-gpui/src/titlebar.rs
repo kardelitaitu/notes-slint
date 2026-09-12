@@ -35,10 +35,13 @@ use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Selectable as _, Sizable as _, TitleBar};
+use gpui_kit::component::{Selectable as _, Sizable as _, TITLE_BAR_HEIGHT, TitleBar};
 use gpui_kit::{
-    AnyElement, IntoElement, ParentElement, Pixels, SharedString, Styled, div, px, rgb,
+    Action, AnyElement, App, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
+    Styled, Window, div, px, rgb,
 };
+
+use crate::menu;
 
 /// The app name: the third rung of ADR-0003's centre ladder and the word the OS title ends
 /// with. Taken from the package name so there is never a second copy to forget.
@@ -48,7 +51,10 @@ pub(crate) const APP_NAME: &str = env!("CARGO_PKG_NAME");
 /// region. The two exist together so the title is centred in the whole band rather than in
 /// what the pin button leaves over: the kit lays children out justify_between, and that reads
 /// as centring only when the two ends are the same fixed width.
-const SLOT_WIDTH: Pixels = px(30.);
+/// Two buttons now share the left slot, so the slot is two button widths and the empty
+/// right slot matches it - the centring argument in [`slot`] only holds while both ends are
+/// the same width.
+const SLOT_WIDTH: Pixels = px(60.);
 
 /// Section 4.4's two colours, on the dark background the window already paints (0x1f1f1f).
 /// Literals rather than cx.theme() lookups on purpose: a themed bar would be one more
@@ -157,6 +163,132 @@ fn dot_element(dot: Dot) -> AnyElement {
     }
 }
 
+/// A ROW OF THE HAMBURGER POPUP, as data. The whole point of naming the rows in an enum is
+/// that the popup and its tests read the SAME list, and that what a row DOES is decided by
+/// [`Row::action`] reusing the actions the native menu already dispatches (menu.rs) - one
+/// handler per command, never a second one for the click. The set is the port's vocabulary,
+/// not the ADR's drawing: there is no plain Save in `Command`, so there is no Save row
+/// (README, and `skip_words` says the same thing to the user).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Row {
+    Open,
+    SaveAs,
+    Autosave,
+    Quit,
+}
+
+/// THE ROWS, in order. `New` is absent on purpose: the port has no command that creates a
+/// document without a path (`Command::Open`/`SaveAs` are path-driven), so a New row would be
+/// a bridge-side invention - which is a design change, not a menu item.
+pub(crate) fn rows() -> [Row; 4] {
+    [Row::Open, Row::SaveAs, Row::Autosave, Row::Quit]
+}
+
+impl Row {
+    /// The label, with the auto-save row carrying the state it will TOGGLE (the wire's
+    /// `autosave`, which is the port's word - seeded from `InitialState` and kept honest by
+    /// `Saved`/`AutosaveSkipped`). A row that always said "Auto-save" would render a toggle
+    /// whose position is invisible.
+    pub(crate) fn label(self, autosave: bool) -> SharedString {
+        let words = match self {
+            Row::Open => "Open",
+            Row::SaveAs => "Save As",
+            Row::Autosave => {
+                if autosave {
+                    "Auto-save (on)"
+                } else {
+                    "Auto-save (off)"
+                }
+            }
+            Row::Quit => "Quit",
+        };
+        SharedString::from(words)
+    }
+
+    /// The chord, taken from menu.rs's own table so the popup cannot advertise a key that
+    /// is not bound. `None` for Quit: it has no chord, and an invented one is exactly the
+    /// drift the table exists to prevent.
+    pub(crate) fn chord(self) -> Option<&'static str> {
+        match self {
+            Row::Open => Some("Ctrl+O"),
+            Row::SaveAs => Some("Ctrl+S"),
+            Row::Autosave => Some("Ctrl+T"),
+            Row::Quit => None,
+        }
+    }
+
+    /// WHAT THE ROW RUNS. `Some` is an action already handled at app level (main.rs's
+    /// `cx.on_action` block), so `Window::dispatch_action` reaches the SAME code the native
+    /// menu and the chords reach. `Quit` is `None` because it is not a command: it closes
+    /// this window, which is the existing shutdown route (`on_window_closed` -> the final
+    /// flush -> `close(&gateway, &events)`), and a second quit path would be a second set of
+    /// rules about when the engine gets to write.
+    pub(crate) fn action(self) -> Option<Box<dyn Action>> {
+        match self {
+            Row::Open => Some(Box::new(menu::OpenFile) as Box<dyn Action>),
+            Row::SaveAs => Some(Box::new(menu::SaveAsFile) as Box<dyn Action>),
+            Row::Autosave => Some(Box::new(menu::ToggleAutosave) as Box<dyn Action>),
+            Row::Quit => None,
+        }
+    }
+}
+
+/// THE POPUP: an absolutely positioned column under the bar, painted as the LAST child of
+/// the window's root element so it lands above the editor without an overlay system. No
+/// `Root`, no kit `PopupMenu` - the reason is in the module header (menu.rs:1-28's
+/// second-owner-of-selection condition), and `on_mouse_down_out` is the primitive the kit
+/// itself uses for exactly this question, so click-away needs no floating window either.
+///
+/// `on_close` runs after the row's own work, so a pick dismisses; the hamburger's own
+/// toggle dismisses a second click; a click anywhere outside dismisses via
+/// `on_mouse_down_out`. Escape is NOT wired: the key is already bound to
+/// `editor::EscapeSelection` and taking it while the popup is open needs a focus context
+/// this window does not have. Named as the remaining gap rather than left silent.
+pub(crate) fn popup(autosave: bool, on_close: Rc<dyn Fn(&mut App)>) -> impl IntoElement {
+    let close = on_close;
+    div()
+        .id("title-bar-popup")
+        .absolute()
+        .top(TITLE_BAR_HEIGHT)
+        .left(px(4.))
+        .w(px(190.))
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .p(px(4.))
+        .rounded(px(6.))
+        .bg(rgb(0x2a_2a2a))
+        .text_color(rgb(0xe6_e6_e6))
+        .text_size(px(13.))
+        .on_mouse_down_out({
+            let close = Rc::clone(&close);
+            move |_, _, cx| {
+                close(cx);
+            }
+        })
+        .children(rows().into_iter().enumerate().map(|(index, row)| {
+            let close = Rc::clone(&close);
+            Button::new(format!("title-bar-menu-{index}"))
+                .label(format!(
+                    "{}{}",
+                    row.label(autosave),
+                    row.chord().map(|c| format!("  {c}")).unwrap_or_default()
+                ))
+                .ghost()
+                .small()
+                .w_full()
+                .justify_between()
+                .on_click(move |_, window: &mut Window, cx: &mut App| {
+                    if let Some(action) = row.action() {
+                        window.dispatch_action(action, cx);
+                    } else {
+                        window.remove_window();
+                    }
+                    close(cx);
+                })
+        }))
+}
+
 /// One fixed-width slot at either end of the centre region, so the kit's justify_between
 /// reads as centring rather than as a left shift. The right-hand slot is empty on purpose:
 /// the caption buttons are painted by the kit OUTSIDE the children row, and their width is
@@ -182,20 +314,44 @@ pub(crate) fn bar(
     dirty: bool,
     save_failed: bool,
     pinned: bool,
+    menu_open: bool,
     on_pin: Rc<dyn Fn(bool)>,
+    on_menu: Rc<dyn Fn(&mut App)>,
 ) -> impl IntoElement {
     // A click handler outlives this frame, so it owns its own handle on the ask.
     let toggle = on_pin;
+    // The LEFT region: ADR-0003's order, hamburger then pin. The hamburger is a plain
+    // toggle of local state - it opens a list of things the app already knows how to do, so
+    // unlike the pin it asks the port nothing and expects no answer.
+    let menu = Rc::clone(&on_menu);
+    let left = slot(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(
+                Button::new("title-bar-menu")
+                    .icon(IconName::Menu)
+                    .selected(menu_open)
+                    .small()
+                    .ghost()
+                    .text_color(rgb(if menu_open { AMBER } else { MUTED }))
+                    .on_click(move |_, _, cx| {
+                        menu(cx);
+                    }),
+            )
+            .child(
+                Button::new("title-bar-pin")
+                    .icon(pin_icon(pinned))
+                    .selected(pinned)
+                    .small()
+                    .ghost()
+                    .text_color(rgb(if pinned { AMBER } else { MUTED }))
+                    .on_click(move |_, _, _| toggle(!pinned)),
+            ),
+    );
     TitleBar::new()
-        .child(slot(
-            Button::new("title-bar-pin")
-                .icon(pin_icon(pinned))
-                .selected(pinned)
-                .small()
-                .ghost()
-                .text_color(rgb(if pinned { AMBER } else { MUTED }))
-                .on_click(move |_, _, _| toggle(!pinned)),
-        ))
+        .child(left)
         .child(
             div()
                 .flex_1()
@@ -221,6 +377,92 @@ pub(crate) fn bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE ROW LIST IS THE PORT'S VOCABULARY, not the ADR's drawing. Four rows, in order,
+    /// and the two named by the brief that do not exist - `New` (no command creates a
+    /// document without a path) and a plain `Save` (no `Command::Save`) - are absent because
+    /// the list says so, not because they were forgotten.
+    #[test]
+    fn the_rows_are_the_acts_the_port_can_actually_do() {
+        assert_eq!(
+            rows().to_vec(),
+            vec![Row::Open, Row::SaveAs, Row::Autosave, Row::Quit]
+        );
+    }
+
+    /// Every row except Quit dispatches an EXISTING app-level action, so the popup reuses
+    /// the handlers main.rs already binds instead of growing a second implementation of
+    /// Open/Save As/toggle. Quit is the one that is not a command: it closes the window, and
+    /// the close path is the only shutdown route that flushes and joins the engine.
+    #[test]
+    fn every_row_but_quit_reuses_an_existing_action() {
+        for row in [Row::Open, Row::SaveAs, Row::Autosave] {
+            let action = row.action();
+            assert!(
+                action.is_some(),
+                "{row:?} must dispatch the menu's own action"
+            );
+            let expected = match row {
+                Row::Open => std::any::TypeId::of::<menu::OpenFile>(),
+                Row::SaveAs => std::any::TypeId::of::<menu::SaveAsFile>(),
+                Row::Autosave => std::any::TypeId::of::<menu::ToggleAutosave>(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                action.unwrap().type_id(),
+                expected,
+                "the row must dispatch the action the key chord dispatches"
+            );
+        }
+        assert!(
+            Row::Quit.action().is_none(),
+            "quit is a window act, not a command"
+        );
+    }
+
+    /// THE DRIFT TEST, same shape as menu.rs's: a chord printed here must be in the table
+    /// the keymap is built from, or the popup advertises a key that does nothing.
+    #[test]
+    fn the_chords_it_prints_are_the_chords_that_work() {
+        let legend = menu::legend().to_string();
+        for row in rows() {
+            match row.chord() {
+                Some(chord) => assert!(
+                    legend.contains(chord),
+                    "{row:?} prints {chord}, which is not in the bound table: {legend}"
+                ),
+                None => assert_eq!(row, Row::Quit, "only Quit may lack a chord"),
+            }
+        }
+    }
+
+    /// The toggle row shows the state it will change, from the value it was handed - the
+    /// port's `autosave`, not a literal. Both directions, because a label that reads the
+    /// same either way is not a readback.
+    #[test]
+    fn the_autosave_row_says_which_way_it_is() {
+        assert_eq!(
+            Row::Autosave.label(true),
+            SharedString::from("Auto-save (on)")
+        );
+        assert_eq!(
+            Row::Autosave.label(false),
+            SharedString::from("Auto-save (off)")
+        );
+        // The others do not vary with it: only the toggle has a position to report.
+        assert_eq!(Row::Open.label(true), Row::Open.label(false));
+        assert_eq!(Row::Quit.label(true), Row::Quit.label(false));
+    }
+
+    /// Labels are never empty, and no row is unnamed - an empty ghost button still takes a
+    /// click and still dismisses the popup, so it would be an act with no name.
+    #[test]
+    fn every_row_is_labelled() {
+        for row in rows() {
+            let label = row.label(true);
+            assert!(!label.is_empty(), "{row:?} would render an unnamed row");
+        }
+    }
 
     #[test]
     fn a_path_the_port_announced_names_the_centre() {

@@ -408,8 +408,9 @@ const GEOMETRY_FORCE: Duration = Duration::from_millis(1000);
 /// is exactly what broke the app: a client-space number under gpui's own chrome model was
 /// winning every write into a field core documents as FRAME pixels, so each
 /// move-then-relaunch cycle shifted the window by the chrome - 16 px across, 39 px down at
-/// 100%. The role left for `rect_of` is CHANGE DETECTOR: it is diffed by `Watch`, it is
-/// what decides WHEN to send the signal, and it is never sent. A future reader must not
+/// 100%. The role left for `rect_of` is CHANGE DETECTOR: it is one HALF of what `Watch`
+/// diffs (see [`Fingerprint`] - the rect alone cannot see a maximise flip), it is what
+/// decides WHEN to send the signal, and it is never sent. A future reader must not
 /// re-attach it to the command, and that is why this paragraph is here instead of a
 /// shorter one.
 fn rect_of(window: &Window) -> Rect {
@@ -436,17 +437,53 @@ fn rect_of(window: &Window) -> Rect {
     )
 }
 
+/// WHAT THE WATCH ACTUALLY DIFFS: the rect AND the show state, because under the
+/// maximised-persistence work the two are no longer redundant. gpui's own docs say a
+/// maximised Windows window can report the SAME bounds as the display it covers
+/// (`window.rs:2279`: "On some platforms (namely Windows) this is different than the bounds
+/// being the size of the display"), so a maximise/unmaximise FLIP can leave `rect_of`
+/// byte-identical - and a rect-only diff would then never wake the engine, which is the
+/// whole runtime half of persisting `session.maximized`. `is_maximized()` is the platform's
+/// answer (gpui-pre-0.3.4 `window.rs:2281` -> `platform_window.is_maximized()`), the same
+/// call the kit's `TitleBar` uses to pick its maximise/restore glyph, so this is a read of
+/// the state, never a guess from the size.
+///
+/// A `Rect` converts to a not-maximised fingerprint, which is what keeps the synthetic-drag
+/// tests written as data; a flip is then visible as a different value, not a new rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fingerprint {
+    rect: Rect,
+    maximized: bool,
+}
+
+impl From<Rect> for Fingerprint {
+    fn from(rect: Rect) -> Self {
+        Self {
+            rect,
+            maximized: false,
+        }
+    }
+}
+
+/// Read the window the way the watch needs it: rect plus show state, one call per wake.
+fn fingerprint_of(window: &Window) -> Fingerprint {
+    Fingerprint {
+        rect: rect_of(window),
+        maximized: window.is_maximized(),
+    }
+}
+
 /// The debounce itself: no GPUI, no clock of its own. Time is passed in, so the
 /// rules are testable as data (a synthetic drag) rather than as a timing hope.
 #[derive(Debug, Default)]
 struct Watch {
-    /// The rect the port was last told about. None until the first look, which is
+    /// The state the port was last told about. None until the first look, which is
     /// the BASELINE: the port put the window there, so reporting it back is noise -
     /// and it would be the client-space number, a worse answer than the measured one
     /// the port already holds.
-    reported: Option<Rect>,
-    /// A rect that has been seen and not yet sent.
-    pending: Option<Rect>,
+    reported: Option<Fingerprint>,
+    /// A state that has been seen and not yet sent.
+    pending: Option<Fingerprint>,
     /// When the current run of motion began, and when it last changed.
     first: Option<Instant>,
     changed: Option<Instant>,
@@ -456,8 +493,9 @@ struct Watch {
 }
 
 impl Watch {
-    /// Look at the current rect; get back the rect to send, or nothing.
-    fn observe(&mut self, seen: Rect, now: Instant) -> Option<Rect> {
+    /// Look at the current state; get back the state to send, or nothing.
+    fn observe(&mut self, seen: impl Into<Fingerprint>, now: Instant) -> Option<Fingerprint> {
+        let seen = seen.into();
         let Some(reported) = self.reported else {
             self.reported = Some(seen);
             return None;
@@ -490,15 +528,15 @@ impl Watch {
         (quiet || overdue).then(|| self.commit(seen, now, overdue && !quiet))
     }
 
-    /// Take a rect as sent. A forced send keeps the drag's clock running (the next
+    /// Take a state as sent. A forced send keeps the drag's clock running (the next
     /// force is another GEOMETRY_FORCE away); a quiet send ends the episode.
-    fn commit(&mut self, rect: Rect, now: Instant, forced: bool) -> Rect {
-        self.reported = Some(rect);
+    fn commit(&mut self, seen: Fingerprint, now: Instant, forced: bool) -> Fingerprint {
+        self.reported = Some(seen);
         self.pending = None;
         self.first = forced.then_some(now);
         self.changed = forced.then_some(now);
         self.sends += 1;
-        rect
+        seen
     }
 }
 
@@ -542,6 +580,18 @@ struct Surface {
     /// The OS title this window was last given, so `set_window_title` is called when the
     /// document changed and not on every frame.
     os_title: SharedString,
+    /// IS THE HAMBURGER'S POPUP OPEN? Local view state and nothing else: the rows list acts
+    /// the app already performs, so opening it sends no command and waits on no event. A
+    /// field rather than a `use_state` hook because this is a `Render` view - the same frame
+    /// loop that repaints the status line repaints the bar.
+    menu_open: bool,
+    /// The hamburger's toggle and the popup's dismiss, both holding a WEAK handle to this
+    /// view: a click closure outlives the frame that built it, and a strong one would let a
+    /// closing window be kept alive by its own button. `Window`-level handlers only get
+    /// `&mut App`, which is why they take it - `Entity::update` is generic over
+    /// `AppContext` (gpui app/entity_map.rs), so `App` is enough to reach this view again.
+    on_menu: Rc<dyn Fn(&mut App)>,
+    dismiss_menu: Rc<dyn Fn(&mut App)>,
     /// Whether we have asked for the keyboard yet - first frame only, so that
     /// focusing the editor cannot fight something the user clicks into later.
     focus_requested: bool,
@@ -570,6 +620,28 @@ impl Surface {
         let pin_gateway = Rc::clone(&gateway);
         let on_pin: Rc<dyn Fn(bool)> =
             Rc::new(move |on: bool| send(&pin_gateway, Command::SetPinned(on)));
+        // THE POPUP'S TWO HANDLERS, from one weak handle. `dismiss` closes only when open, so
+        // the click-away listener cannot queue a repaint on every mouse-down outside a popup
+        // that is not there - which, since the popup is absent most of the app's life, is the
+        // difference between a no-op and a frame per click.
+        let view = cx.entity().downgrade();
+        let on_menu: Rc<dyn Fn(&mut App)> = {
+            let view = view.clone();
+            Rc::new(move |cx: &mut App| {
+                let _ = view.update(cx, |this, cx| {
+                    this.menu_open = !this.menu_open;
+                    cx.notify();
+                });
+            })
+        };
+        let dismiss_menu: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
+            let _ = view.update(cx, |this, cx| {
+                if this.menu_open {
+                    this.menu_open = false;
+                    cx.notify();
+                }
+            });
+        });
         let mut this = Self {
             events,
             stats,
@@ -584,6 +656,9 @@ impl Surface {
             // SEEDED with what the window was opened with, so the first frame does not pay
             // for a set that changes nothing.
             os_title: titlebar::window_title(None, false),
+            menu_open: false,
+            on_menu,
+            dismiss_menu,
             focus_requested: false,
             first_paint_stamped: false,
             signalled_once: false,
@@ -605,7 +680,9 @@ impl Surface {
                 // what GPUI already refreshed on WM_MOVE/WM_SIZE. A closed window
                 // reads as None, which the pump treats as "nothing to compare".
                 let seen = match window.borrow().as_ref() {
-                    Some(handle) => handle.update(cx, |_view, window, _cx| rect_of(window)).ok(),
+                    Some(handle) => handle
+                        .update(cx, |_view, window, _cx| fingerprint_of(window))
+                        .ok(),
                     None => None,
                 };
                 let keep_running = match this.update(cx, |this, cx| this.pump(seen, cx)) {
@@ -624,7 +701,7 @@ impl Surface {
     /// One wake: drain, look at the window, render, and ask for a repaint ONLY if
     /// there was something to show. Notifying on an idle wake would turn 125 polls a
     /// second into 125 frames a second, which is the mistake this avoids.
-    fn pump(&mut self, seen: Option<Rect>, cx: &mut Context<Self>) -> bool {
+    fn pump(&mut self, seen: Option<Fingerprint>, cx: &mut Context<Self>) -> bool {
         let started = Instant::now();
         let mut batch = Vec::new();
         let drain = {
@@ -650,7 +727,17 @@ impl Surface {
         // LAST event wins the line: `batch` is in queue order, so its final entry
         // is the newest fact the port has given us.
         for event in &batch {
-            self.status = SharedString::from(one_line(describe(event)));
+            // EVERY drained event is NAMED ONCE on the trace, before the collapse: the loop
+            // below keeps only the newest fact, so a wake that took `RecentsUpdated` then
+            // `Loaded` renders one line and the first event vanishes from stderr entirely.
+            // `status line:` keeps meaning "what the user saw rendered" and this new line
+            // means "what the port said", one per event - which is what makes a trace
+            // needle like "did RecentsUpdated arrive at all" judgeable from a real run.
+            // Ungated on purpose: the last-wins print below is deduped because a repeated
+            // RENDERED line is noise, while a repeated ARRIVAL is the fact under test.
+            let words = one_line(describe(event));
+            report(&format!("event: {words}"));
+            self.status = SharedString::from(words);
             self.apply(event, cx);
         }
         if drain.closed {
@@ -680,8 +767,8 @@ impl Surface {
         // The geometry half of the same wake. ONE read, ONE possible send per wake,
         // and only after the drag has settled - so a two-second drag cannot put 4000
         // commands on an unbounded queue. The counters are what prove that claim.
-        if let Some(rect) = seen {
-            let settled = self.watch.observe(rect, Instant::now());
+        if let Some(seen) = seen {
+            let settled = self.watch.observe(seen, Instant::now());
             // THE FIRST SETTLED READING IS ITSELF A FACT. `Watch` only reports a
             // CHANGE, which was right under the old contract (the port kept whatever rect
             // it was last told) and is wrong under the new one: a fresh install has no
@@ -694,7 +781,7 @@ impl Surface {
             let first = !self.signalled_once;
             if first || settled.is_some() {
                 self.signalled_once = true;
-                let fired = settled.unwrap_or(rect);
+                let fired = settled.unwrap_or(seen).rect;
                 // PAYLOAD-FREE (5ea2f49d): the port measures the FRAME rect itself, and
                 // only a successful measure may write session.json. The rect that fired
                 // the signal is still named in the trace, so the change stays auditable -
@@ -757,7 +844,7 @@ impl Render for Surface {
         // is only an honest expression because `Wire::adopted` now writes that flag from
         // `Loaded` and `Rebound`; while it had no production writer the name had to be
         // inferred from `path`, and the bar would have shown "Untitled" over a real file.
-        let (title, os_title, dirty, save_failed, pinned) = {
+        let (title, os_title, dirty, save_failed, pinned, autosave) = {
             let wire = self.wire.borrow();
             let announced = wire.loaded;
             (
@@ -766,6 +853,7 @@ impl Render for Surface {
                 wire.dirty(),
                 wire.save_failed,
                 wire.pin,
+                wire.autosave,
             )
         };
         if os_title != self.os_title {
@@ -777,15 +865,18 @@ impl Render for Surface {
             .flex_col()
             .bg(rgb(0x1f1f1f))
             .text_color(rgb(0xe6_e6_e6))
-            // ADR-0003's band: pin on the left, title and dirty dot in the centre, and the
-            // kit's own caption buttons plus the drag on the right - the kit draws those, so
-            // this child is the bar's LEFT and CENTRE and nothing else.
+            // ADR-0003's band: the hamburger and the pin on the left, the title and its
+            // dirty dot in the centre, and the kit's own caption buttons plus the drag on the
+            // right - the kit draws those, so this child is the LEFT and CENTRE and nothing
+            // else.
             .child(titlebar::bar(
                 title,
                 dirty,
                 save_failed,
                 pinned,
+                self.menu_open,
                 Rc::clone(&self.on_pin),
+                Rc::clone(&self.on_menu),
             ))
             // The editor above the status line, and the status line STAYS: every
             // pump diagnostic and the smoke harness read that second row, so the
@@ -809,6 +900,17 @@ impl Render for Surface {
                     .child(status)
                     .child(counters),
             )
+            // THE POPUP, LAST: paint order is gpui's only layering, so an absolutely
+            // positioned child has to come after the editor to sit above it. Mounted here
+            // rather than inside the bar's children row for the same reason - the bar is the
+            // first child of this column and would be painted under everything.
+            //
+            // No `Root`, no kit `PopupMenu`, no floating window: see the header of
+            // titlebar.rs and menu.rs:1-28 for why the second owner of window text
+            // selection is the thing this window refuses to have.
+            .when(self.menu_open, |this| {
+                this.child(titlebar::popup(autosave, Rc::clone(&self.dismiss_menu)))
+            })
     }
 }
 
@@ -1242,7 +1344,15 @@ fn skip_words(reason: SkipReason) -> &'static str {
     match reason {
         SkipReason::AutosaveDisabled => "auto-save is off",
         SkipReason::ForeignFileNotArmed => {
-            "a file this app did not create: save it once and it keeps saving"
+            // The affordance is named because it is the ONLY one: the port has no plain
+            // Save command (crates/api/src/command.rs offers Open, SaveAs, Flush,
+            // SetAutosave, SetPinned, RegisterWindow, ClearRecents, GeometryChanged, and
+            // the two file-prompt-driven ones), so "save it once" would tell the user to do
+            // a thing that does not exist. The explicit act ADR-0001 waits for is a Save As,
+            // on the keyboard Ctrl+S - and Save As is also what arms the document, because
+            // the engine answers it with `Rebound { meta }` whose `armed` this wire now
+            // stores beside the path.
+            "a file this app did not create: Save As once (Ctrl+S) and it keeps saving"
         }
         SkipReason::Clean => "nothing changed since the last write",
         // The epoch guard speaking: the debounced Flush belonged to a document the
@@ -2555,8 +2665,68 @@ mod tests {
         assert!(describe(&cases[8]).contains("a.notes (gone)"));
     }
 
-    fn rect_at(x: i32) -> Rect {
-        Rect::new(x, 200, 800, 600)
+    /// A synthetic window position, maximised NOT. Returns a `Fingerprint` because that is
+    /// what `Watch` diffs now; `observe` still takes a plain `Rect` through `Into`, which is
+    /// what keeps every drag below written as data rather than as a struct literal.
+    fn rect_at(x: i32) -> Fingerprint {
+        Fingerprint {
+            rect: Rect::new(x, 200, 800, 600),
+            maximized: false,
+        }
+    }
+
+    /// A maximised window AT the same rect. The point of the pair is that gpui documents a
+    /// Windows maximise as possibly NOT changing the bounds it reports, so these two values
+    /// can differ in exactly the one field the old watch never looked at.
+    fn maximized_at(x: i32) -> Fingerprint {
+        Fingerprint {
+            rect: rect_at(x).rect,
+            maximized: true,
+        }
+    }
+
+    /// THE FLIP IS A FACT ABOUT THE WINDOW, and a rect-only diff cannot see it. This is the
+    /// runtime half of persisting `session.maximized`: no maximise/unmaximise may be silent
+    /// just because the size came back the same, or the engine's watcher never wakes and the
+    /// bit is only ever right for a window that happened to be measured at startup.
+    #[test]
+    fn a_show_state_flip_fires_with_the_same_rect_under_it() {
+        let t0 = Instant::now();
+        let mut watch = Watch::default();
+        let rest = rect_at(500);
+        let flipped = maximized_at(500);
+        assert_eq!(rest.rect, flipped.rect, "same rect, by construction");
+        assert_ne!(rest, flipped, "and the watch sees two different windows");
+
+        assert_eq!(
+            watch.observe(rest, t0),
+            None,
+            "baseline: the port put it there"
+        );
+        assert_eq!(
+            watch.observe(rest, t0 + Duration::from_millis(1)),
+            None,
+            "an unchanged state never fires, however often it is read"
+        );
+        assert_eq!(
+            watch.observe(flipped, t0 + Duration::from_millis(1)),
+            None,
+            "the flip is MOTION first - the same debounce, not a bypass"
+        );
+        assert_eq!(
+            watch.observe(flipped, t0 + Duration::from_millis(2) + GEOMETRY_QUIET),
+            Some(flipped),
+            "then it fires, on the flip alone"
+        );
+        // Unmaximise: back to the value the port was told two reads ago, which the OLD
+        // equality would have called "where we already are" and swallowed.
+        let later = t0 + Duration::from_millis(3) + GEOMETRY_QUIET * 2;
+        assert_eq!(watch.observe(rest, later), None, "the return is motion");
+        assert_eq!(
+            watch.observe(rest, later + GEOMETRY_QUIET),
+            Some(rest),
+            "and it is reported, not deduped away"
+        );
     }
 
     /// THE DEBOUNCE, as data. A two-second drag at the MEASURED wake cadence
