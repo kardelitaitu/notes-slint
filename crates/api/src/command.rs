@@ -63,7 +63,11 @@ pub enum Command {
         revision: u64,
     },
 
-    /// A snapshot of the buffer: `Ctrl+S` and every autosave trigger.
+    /// A snapshot of the buffer: every autosave trigger, and the final flush the bridge
+    /// sends before `Shutdown`. The user's explicit act is NOT here - the port has no
+    /// plain Save, so "save this now" is [`Command::SaveAs`](crate::Command::SaveAs)
+    /// (`Ctrl+S` in the shipped chord set), which carries its own text for the same
+    /// reason this variant does.
     ///
     /// This is the whole of the bridge's text obligation. The live buffer stays
     /// in the bridge and no keystroke ever crosses the port

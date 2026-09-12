@@ -96,8 +96,9 @@ pub enum SkipReason {
     /// The global toggle is off ([`Command::SetAutosave(false)`](crate::Command::SetAutosave)).
     AutosaveDisabled,
     /// A file this app did not create, not yet saved once explicitly
-    /// (ADR-0001). The UI copy is the ADR's own explanation: press Ctrl+S once
-    /// and it keeps saving.
+    /// (ADR-0001). The UI copy is the bridge's: `Save As once (Ctrl+S) and it keeps
+    /// saving` (main.rs, the arm for this variant), because the port has no plain Save
+    /// command - naming the act must name the one command that arms.
     ForeignFileNotArmed,
     /// The buffer matches what is on disk (D11: the `Flush` revision is at or
     /// below the last saved revision), so there is nothing to write.
@@ -1004,7 +1005,8 @@ mod honesty_tests {
         assert_ne!(SkipReason::NeedsPath, SkipReason::Clean);
         assert_ne!(SkipReason::NeedsPath, SkipReason::AutosaveDisabled);
         // Distinct shapes, because one is an event the UI toasts and the other is a
-        // status-line note that the user can act on with Ctrl+S.
+        // status-line note whose own cure is a Save As (Ctrl+S) - there is no plain
+        // Save to press.
         assert_ne!(
             SaveError::NoTarget.to_string(),
             SaveError::Other(String::new()).to_string(),
