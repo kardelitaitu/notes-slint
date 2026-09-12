@@ -300,7 +300,7 @@ pub fn decide(p: &Probe, artefact: Option<&Artefact>, relocation: &Relocation) -
     if !p.flag("PROBE_DONE") {
         failures.push(format!(
             "SMOKE FAIL: the probe did not finish (keys seen: [{}]) - it hit its own deadline or died; a missing key is never a pass",
-            p.keys()
+ p.keys()
         ));
         return Verdict::Fail(failures);
     }
@@ -315,8 +315,8 @@ pub fn decide(p: &Probe, artefact: Option<&Artefact>, relocation: &Relocation) -
     if handle == 0 {
         failures.push(format!(
             "SMOKE FAIL: no top-level window handle within {WINDOW_SECS}s (MainWindowHandle stayed 0; pid={}, title={:?}) - the window was never created, so nothing downstream can be credited",
-            p.get("PID").unwrap_or("?"),
-            p.get("TITLE").unwrap_or("")
+ p.get("PID").unwrap_or("?"),
+ p.get("TITLE").unwrap_or("")
         ));
     } else if let Some(ms) = p.number("LAUNCH_MS") {
         if ms > COLD_START_BUDGET_MS {
@@ -336,7 +336,7 @@ pub fn decide(p: &Probe, artefact: Option<&Artefact>, relocation: &Relocation) -
     if forced || !p.flag("EXITED_WITHOUT_KILL") {
         failures.push(format!(
             "SMOKE FAIL: the app did NOT exit by itself within {CLOSE_SECS}s of WM_CLOSE and was force-killed (code after the kill: {:?}) - a force-kill is not a graceful shutdown and cannot PASS whatever code it ends with",
-            p.get("EXIT_CODE_AFTER_FORCE")
+ p.get("EXIT_CODE_AFTER_FORCE")
         ));
     } else {
         match p.number("EXIT_CODE") {
@@ -353,18 +353,18 @@ pub fn decide(p: &Probe, artefact: Option<&Artefact>, relocation: &Relocation) -
         Some(a) if a.read_error.is_some() && a.fresh => {
             // Own verdict, and not a pass: the app wrote something this run,
             // but it cannot be read back, so what is stored is unknown.
-            failures.push(format!(
+ failures.push(format!(
                 "SMOKE FAIL: this run created {} but it CANNOT BE READ BACK ({}) - the rect is unverified. This is a statement about the machine, not about the app; the ACL and attributes are printed above.",
-                a.path.display(),
-                a.read_error.clone().unwrap_or_default()
+ a.path.display(),
+ a.read_error.clone().unwrap_or_default()
             ));
         }
         None => failures.push(format!(
             "SMOKE FAIL: this run wrote no {SESSION_FILE} ({})",
-            match relocation {
+ match relocation {
                 Relocation::Moved { to } => format!(
                     "the user's own file was moved aside to {} first, so this was a genuine fresh-install run",
-                    to.display()
+ to.display()
                 ),
                 Relocation::Kept(what) => format!(
                     "{what} was left in place by --reuse-state, and this run wrote nothing into it"
@@ -374,8 +374,8 @@ pub fn decide(p: &Probe, artefact: Option<&Artefact>, relocation: &Relocation) -
         )),
         Some(a) if !a.fresh => failures.push(format!(
             "SMOKE FAIL: {} exists but is OLDER than this launch, so this run never wrote it and the fresh-install behaviour is not proven (rect={}) - if this file was left in place on purpose (--reuse-state), the fresh-install case cannot be judged from this run at all",
-            a.path.display(),
-            a.rect
+ a.path.display(),
+ a.rect
         )),
         Some(_) => {}
     }
@@ -702,7 +702,12 @@ pub struct TraceClaim {
 /// line reaching a real UI. This row is that showing, through the one voice the
 /// bridge has when it has no console - report()'s stderr.
 pub const TRACE_CLAIMS: &[TraceClaim] = &[TraceClaim {
-    what: "the startup recents announce reached the live UI",
+    // "the RUNNING APP", not "the live UI": what this needle can show is that the
+    // announce reached the live process' own stderr, in one of the three voices. A
+    // [delivered, never rendered] match is that fact with a smoke run that closed
+    // the window before the frame - legitimate, and the voice line keeps the log
+    // honest about the difference. The UI SHOWING it is the [rendered] voice only.
+    what: "the startup recents announce reached the running app",
     needle: "RecentsUpdated",
     proves: "M2 exit item 5 (Recents)",
 }];
@@ -715,7 +720,7 @@ pub enum TraceVerdict {
     /// citation names what the app actually printed rather than a bare green.
     Proven(Vec<String>),
     /// At least one claim matched nothing. Only reachable when the run was
-    /// judgeable at all - see the recents_at_startup gate on judge_trace.
+    /// judgeable at all - see the zero-recents gate on judge_trace.
     Broken(Vec<String>),
     /// The claim could not be tried: no capture to read, an empty capture, or a
     /// profile with nothing to announce. Advisory, and never a pass.
@@ -765,7 +770,7 @@ fn voice_rank(line: &str) -> u8 {
 ///
 /// * captured - the bytes the LIVE app wrote to its own stderr on this launch,
 ///   or None when the file could not be read.
-/// * recents_at_startup - how many recents the APP-RESOLVED state dir held before
+/// * recents_in_state_dir - how many recents the APP-RESOLVED state dir held before
 ///   the launch: the one directory the app itself opens (see recents_at_startup,
 ///   which follows core's resolution rule), never the first settings.toml some
 ///   candidate happens to hold. Zero makes the assertion UNMEASURABLE rather than
@@ -774,30 +779,30 @@ fn voice_rank(line: &str) -> u8 {
 ///   that asserted nothing.
 pub fn judge_trace(
     captured: Option<&str>,
-    recents_at_startup: usize,
+    recents_in_state_dir: usize,
     claims: &[TraceClaim],
 ) -> TraceVerdict {
     let Some(text) = captured else {
         return TraceVerdict::NotJudged(
             "the app's stderr capture could not be read, so no claim about what the live UI saw was \
-             tried"
+ tried"
                 .to_string(),
         );
     };
     if text.trim().is_empty() {
         return TraceVerdict::NotJudged(
             "the app wrote NOTHING to its own trace (0 bytes). A graceful exit always writes its exit \
-             trace, so an empty capture means the instrument failed to see the app rather than that the \
-             app said nothing - which is exactly why it is not a FAIL either"
+ trace, so an empty capture means the instrument failed to see the app rather than that the \
+ app said nothing - which is exactly why it is not a FAIL either"
                 .to_string(),
         );
     }
-    if recents_at_startup == 0 {
+    if recents_in_state_dir == 0 {
         return TraceVerdict::NotJudged(
             "the app-resolved state dir held no recents before this launch (its settings.toml is \
-             absent, unreadable, or lists none), and the engine announces only a NON-EMPTY list by \
-             design (api/src/engine.rs, THE STARTUP ANNOUNCE): there was nothing for the live UI to be \
-             shown, so the item stands unproven rather than disproven"
+ absent, unreadable, or lists none), and the engine announces only a NON-EMPTY list by \
+ design (api/src/engine.rs, THE STARTUP ANNOUNCE): there was nothing for the live UI to be \
+ shown, so the item stands unproven rather than disproven"
                 .to_string(),
         );
     }
@@ -815,8 +820,8 @@ pub fn judge_trace(
             Some(line) => proven.push(format!("{}: [{}] {line}", claim.what, trace_voice(line.trim()))),
             None => broken.push(format!(
                 "SMOKE TRACE FAIL: {} - no line of the live app's stderr contains {:?}, and {} recents \
-                 WERE in the profile to announce ({})",
-                claim.what, claim.needle, recents_at_startup, claim.proves
+                 WERE in the app-resolved state dir to announce ({})",
+ claim.what, claim.needle, recents_in_state_dir, claim.proves
             )),
         }
     }
@@ -909,7 +914,7 @@ impl SeedGuard {
                 match identical {
                     Ok(true) => println!(
                         "smoke: settings: {when} - the user's settings.toml came back byte-identical \
-                         (sha256 {}) at {}",
+ (sha256 {}) at {}",
                         crate::fixtures::sha256_hex(bytes),
                         self.settings.display()
                     ),
@@ -917,8 +922,8 @@ impl SeedGuard {
                         self.failed = true;
                         eprintln!(
                             "SMOKE FAIL: settings: the user's settings.toml did NOT come back \
-                             byte-identical at {}. The original bytes exist only in this process' \
-                             memory, so say so before anything else trusts that profile.",
+ byte-identical at {}. The original bytes exist only in this process' \
+ memory, so say so before anything else trusts that profile.",
                             self.settings.display()
                         );
                     }
@@ -935,7 +940,7 @@ impl SeedGuard {
             None => match fs::remove_file(&self.settings) {
                 Ok(()) => println!(
                     "smoke: settings: {when} - removed the settings.toml this run created at {}; the \
-                     trace line above is this run's evidence, not this file's",
+ trace line above is this run's evidence, not this file's",
                     self.settings.display()
                 ),
                 Err(e) => {
@@ -948,7 +953,7 @@ impl SeedGuard {
                         self.failed = true;
                         eprintln!(
                             "SMOKE FAIL: settings: could not remove the seeded {} : {e} - a seeded \
-                             recent is still sitting in that profile",
+ recent is still sitting in that profile",
                             self.settings.display()
                         );
                     }
@@ -1581,8 +1586,8 @@ fn report_binary(exe: &Path, root: &Path, built: bool) {
         Some(true) => "build.rs EMBEDS app.manifest at link time",
         Some(false) => {
             "build.rs does NOT embed anything, so these bytes did not come \
-                       from cargo build - they came from a post-link 'cargo xtask manifest' \
-                       run, or from the toolkit's own manifest"
+ from cargo build - they came from a post-link 'cargo xtask manifest' \
+ run, or from the toolkit's own manifest"
         }
         None => "build.rs could not be read, so the cause is unknown",
     };
@@ -1595,11 +1600,11 @@ fn report_binary(exe: &Path, root: &Path, built: bool) {
             if let crate::manifest::ReadBack::Missing(absent) = crate::manifest::read_back(&m) {
                 println!(
                     "SMOKE WARN: this exe does NOT carry our manifest - no {:?}. Since the kit \
-                     migration build.rs embeds NOTHING, so a plain cargo build is NOT compliant: the \
-                     post-link 'cargo xtask manifest' step is required and CI gates on it. Locally \
-                     this stays a warning, because a bare cargo run still gets PerMonitorV2 from the \
-                     toolkit - byte-identical DPI semantics - and a red nobody can clear without \
-                     learning a new command trains people to ignore red. --require-ours makes it 8.",
+ migration build.rs embeds NOTHING, so a plain cargo build is NOT compliant: the \
+ post-link 'cargo xtask manifest' step is required and CI gates on it. Locally \
+ this stays a warning, because a bare cargo run still gets PerMonitorV2 from the \
+ toolkit - byte-identical DPI semantics - and a red nobody can clear without \
+ learning a new command trains people to ignore red. --require-ours makes it 8.",
                     absent
                 );
             }
@@ -1620,7 +1625,8 @@ param([Parameter(Mandatory)][string]$Exe, [string]$ErrFile, [string]$Session = "
        # asserted), and how long the TOPMOST poll may wait for it. Both are
        # passed in by run_probe_script from PIN_WAIT_MS / PIN_TICK_MS below, so
        # the Rust verdict and the script cannot disagree about the budget.
-       [int]$ExpectPinned = -1, [int]$PinWaitMs = 2000, [int]$PinTickMs = 50)
+       [int]$ExpectPinned = -1, [int]$PinWaitMs = 2000, [int]$PinTickMs = 50,
+    [int]$PinConfirmMs = 200)
 $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 $wa = [System.Windows.Forms.SystemInformation]::WorkingArea
@@ -1685,22 +1691,60 @@ if ($handle -ne 0) {
     # stays a single sample. Anything else is the answer session.json demands.
     $want = [int]$ExpectPinned
     $sw = [Diagnostics.Stopwatch]::StartNew()
+    $polls = 0
+    $crashed = 0
     $style = [WIN]::GetWindowLong($handle, -20)
     $top = [int](($style -band 8) -ne 0)
     while ($want -ge 0 -and $top -ne $want -and $sw.ElapsedMilliseconds -lt $PinWaitMs) {
         Start-Sleep -Milliseconds $PinTickMs
+        $polls += 1
         # A dead window has no style to read, and polling a corpse is how a
         # timeout gets reported as a pin failure.
         $p.Refresh()
-        if ($p.HasExited) { break }
+ if ($p.HasExited) { $crashed = 1; break }
         $style = [WIN]::GetWindowLong($handle, -20)
         $top = [int](($style -band 8) -ne 0)
     }
-    "TOPMOST=$top"
-    "EXSTYLE=$style"
+    # M3: a matched 0 is an ABSENCE, and absence is the easy lie - the bit is 0
+    # before the app ever applies it, 0 on a window that is gone, and 0 for a tick
+    # when the shell re-bands. So the want=0 half used to be unable to fail: the
+    # first sample answered 0 and the loop exited. It now has to hold: after a
+    # matched 0, take a FRESH sample a confirm delay later and believe 0 only if the
+    # second one agrees. A wrongful band that lands late is caught, and when it is
+    # caught the reading becomes the band, so the outer verdict judges the current
+    # state and not the hopeful first sample. A matched 1 needs no twin: the bit
+    # being SET is a positive fact no race supplies by accident.
+    if ($want -eq 0 -and $top -eq 0 -and -not $crashed) {
+        $left = $PinWaitMs - $sw.ElapsedMilliseconds
+ if ($left -gt 0) {
+            Start-Sleep -Milliseconds ([Math]::Min($PinConfirmMs, $left))
+            $polls += 1
+            $p.Refresh()
+ if ($p.HasExited) { $crashed = 1 } else {
+                $c = [WIN]::GetWindowLong($handle, -20)
+                $style = $c
+                $top = [int](($c -band 8) -ne 0)
+            }
+        }
+    }
+    # M4: a death mid-poll must print NO reading. GetWindowLong on a dead handle
+    # answers 0, which is exactly a false pass for pinned:false - so the crash
+    # reports TOPMOST=-1 (the instrument could not look) plus the flag the geometry
+    # lane turns into NotJudged, and a crashed app is never labelled a liar.
     "TOPMOST_WANTED=$want"
     "TOPMOST_WAIT_MS=$($sw.ElapsedMilliseconds)"
-    "TOPMOST_POLLED=$([int]($sw.ElapsedMilliseconds -gt 0))"
+    # M7: did the poll actually poll - the number of times it slept, from a counter.
+    # Derived from elapsed time before, which made it decorative (a 0 ms and a 1 ms
+    # answer both said 0) and unfalsifiable.
+    "TOPMOST_POLLED=$polls"
+    if ($crashed) {
+        'PIN_POLL_CRASHED=1'
+        'TOPMOST=-1'
+    } else {
+        'PIN_POLL_CRASHED=0'
+        "TOPMOST=$top"
+        "EXSTYLE=$style"
+    }
 } else { 'TOPMOST=-1' }
 function Get-Frame($h) {
     $r = New-Object WIN+RECT
@@ -1733,8 +1777,8 @@ if ($MoveX -ge 0) {
         # tick but BEFORE the close. If this already carries the hint, the
         # measured-rect write is bypassed on every save; if only the post-exit
         # read flips, it is the shutdown path doing it.
-        if ($Session -ne "" -and (Test-Path $Session)) {
-            try {
+ if ($Session -ne "" -and (Test-Path $Session)) {
+ try {
                 $j = Get-Content -Raw -LiteralPath $Session | ConvertFrom-Json
                 $mx = [int]$j.rect.x; $my = [int]$j.rect.y
                 "MID=$($mx),$($my),$($mx + [int]$j.rect.w),$($my + [int]$j.rect.h)"
@@ -1931,7 +1975,15 @@ fn pin_wait_note(probe: &Probe) -> String {
         Some(v) => format!("{v} ms of the {PIN_WAIT_MS} ms budget"),
         None => "wait unread".to_string(),
     };
-    format!("({style}, {waited})")
+    // Wired into the reading rather than decorative: how many times the poll
+    // actually slept. Absent prints as unread, never as "0", for the same reason a
+    // missing TOPMOST does.
+    let polled = match probe.number("TOPMOST_POLLED") {
+        Some(v) if v > 0 => format!("polled {v}x"),
+        Some(_) => "first sample, never polled".to_string(),
+        None => "poll count unread".to_string(),
+    };
+    format!("({style}, {waited}, {polled})")
 }
 
 /// The harness distrusting its OWN plumbing, which is the only reading of a pin
@@ -1953,9 +2005,19 @@ pub enum PinRead {
     Mismatch { asked: bool, reported: bool },
     /// Polarity agreed; the extended style itself could not be read.
     Unreadable,
+    /// The window died while the poll was waiting. Not an app verdict about the
+    /// pin at any polarity: a dead handle answers 0 for every style, which is a
+    /// false PASS for pinned:false and would otherwise be reported as "the pin
+    /// lied" for what is really a crash.
+    Crashed,
 }
 
 pub fn read_pin(probe: &Probe, asked: bool) -> PinRead {
+    // Checked first, before any attribution: a crash explains a missing reading
+    // better than the app does, and it must never reach the exit-7 path.
+    if probe.flag("PIN_POLL_CRASHED") {
+        return PinRead::Crashed;
+    }
     // Written as two arms rather than matches!(v, 0): anything that is not exactly
     // one of those two answers is Unreported, including a script that grew a third
     // polarity the harness has not been told about.
@@ -1979,16 +2041,26 @@ pub fn read_pin(probe: &Probe, asked: bool) -> PinRead {
 fn pin_refusal(read: PinRead, which: &str) -> String {
     match read {
         PinRead::Unreported => format!(
-            "the transcript reported no polarity to wait for, so which launch {which} belongs to is              unknown and no reading of it can be trusted"
+            "the transcript reported no polarity to wait for, so which launch {which} belongs to is unknown and no reading of it can be trusted"
         ),
         PinRead::Mismatch { asked, reported } => format!(
-            "this launch was seeded {which} but the poll waited for pinned:{reported} - the harness              and the script disagree about which window is which, so this is an instrument fault, not              an app verdict (asked {asked})"
+            "this launch was seeded {which} but the poll waited for pinned:{reported} - the harness and the script disagree about which window is which, so this is an instrument fault, not an app verdict (asked {asked})"
         ),
         PinRead::Unreadable => {
             format!("{which}: the extended style could not be read on the live window")
         }
+        PinRead::Crashed => format!(
+            "{which}: the process exited by itself while the poll was waiting \
+ (EXITED_WITHOUT_KILL), so the window was gone when the style was read - \
+ this is a crash and not a pin verdict either way"
+        ),
         PinRead::Read(_) => unreachable!("a reading is not a refusal"),
     }
+}
+
+/// Did this launch's window die while the pin poll was waiting for it?
+fn poll_crashed(probe: &Probe) -> bool {
+    probe.flag("PIN_POLL_CRASHED")
 }
 
 fn topmost(probe: &Probe) -> Option<bool> {
@@ -2059,15 +2131,34 @@ pub const POLL_TICK_MS: i32 = 750;
 /// rather than trusted.
 pub const SETTLE_MS: i32 = POLL_TICK_MS * 6;
 /// How long the pin read may wait for the seeded polarity to appear on the live
-/// window, and how often it looks. 2000 ms is 4x the 512 ms the platform lane
-/// measured for the band to land, and 50 ms is far below both, so a slow-but-real
-/// apply is credited and a missing one is still caught - the budget is a wait, not
-/// a pass. Passed INTO the script, so the two halves cannot drift apart.
+/// window, and how often it looks. 2000 ms is just under 4x the 512 ms the platform
+/// lane measured for the band to land (the multiple is asserted below, not claimed
+/// in prose), and 50 ms is far below both, so a slow-but-real apply is credited and
+/// a missing one is still caught - the budget is a wait, not a pass. Passed INTO the script, so the two halves cannot drift apart.
 pub const PIN_WAIT_MS: i32 = 2_000;
 pub const PIN_TICK_MS: i32 = 50;
-// Compile-time, so a budget that stops being a wait cannot compile: four ticks is
-// the floor under which the poll could expire between two samples.
-const _: () = assert!(PIN_WAIT_MS >= 4 * PIN_TICK_MS);
+/// How long a matched "not topmost" must HOLD before it is believed: the absence
+/// of a bit is the easy lie, so absence gets confirmed against a fresh sample
+/// rather than a single reading (see the poll in GEOMETRY_PROBE).
+pub const PIN_CONFIRM_MS: i32 = 200;
+/// The slowest landing the band has ever been MEASURED taking on a live window -
+/// the platform lane's 512 ms, the same number quoted in the failure text. The
+/// invariant is about THIS, not about tick arithmetic: a budget that stops being
+/// several times the observed landing is a budget that fails a working app, and a
+/// tweak of a constant nobody measured would compile forever.
+///
+/// Encoding the invariant caught a false comment on its first run: the budget's
+/// own doc claimed "2000 ms is 4x the 512 ms", and 2000/512 is 3.9. The ceiling was
+/// set at 2000 on purpose, so the number moved the CLAIM rather than the budget: the
+/// honest multiple is 3x, and it is asserted rather than prose.
+const PIN_OBSERVED_LAND_MS: i32 = 512;
+const _: () = {
+    // (a) the wait stays >= 4x the slowest real apply ever seen, and
+    assert!(PIN_WAIT_MS >= 3 * PIN_OBSERVED_LAND_MS);
+    // (b) the budget still affords a polling run AND the double-confirm of an
+    // absence - otherwise the confirm silently never happens on a tight budget.
+    assert!(PIN_WAIT_MS >= 4 * PIN_TICK_MS + 2 * PIN_CONFIRM_MS);
+};
 pub const GEOMETRY_FAILED_EXIT: i32 = 6;
 /// The PIN specifically: WS_EX_TOPMOST did not follow what session.json claimed.
 /// Distinct from 6 because the fix usually lives in the show/pin ordering, not
@@ -2156,6 +2247,8 @@ pub fn run_probe_script(
             Some(false) => "0",
             None => "-1",
         })
+        .arg("-PinConfirmMs")
+        .arg(PIN_CONFIRM_MS.to_string())
         .arg("-PinWaitMs")
         .arg(PIN_WAIT_MS.to_string())
         .arg("-PinTickMs")
@@ -2233,6 +2326,22 @@ pub fn seed_session_with_pin(
     obj.insert("y".into(), serde_json::json!(seed.t));
     obj.insert("w".into(), serde_json::json!(seed.r - seed.l));
     obj.insert("h".into(), serde_json::json!(seed.b - seed.t));
+    // M5. This lane measures a NORMAL window: it seeds a rect and expects the
+    // frame back at that rect. session.json carries "maximized" as a sibling of
+    // "rect", and a leftover true - from a hand run, or from --reuse-state over a
+    // run that left one - makes Windows restore the maximised frame instead, which
+    // is not the seeded rect, and the lane answers exit 6 accusing the product of
+    // forgetting a geometry it was never asked to restore. So the field this lane's
+    // own premise depends on is forced, deliberately, and stated rather than
+    // inherited from whatever the profile happened to hold.
+    //
+    // A FUTURE MAXIMISED LANE WILL NEED ITS OWN SEED: it must set maximized:true,
+    // compare against the monitor work area rather than a rect, and it must not
+    // reuse this function's forcing - which is why the forcing lives here and not
+    // in the JSON seeding helper it sits beside.
+    if let Some(map) = value.as_object_mut() {
+        map.insert("maximized".to_string(), serde_json::json!(false));
+    }
     if pinned {
         obj2_pin(&mut value);
     }
@@ -2334,7 +2443,7 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
     if let (Some(f), Some(c)) = (frame, client) {
         println!(
             "smoke: geometry: measured chrome (frame -> client) = {:+}/{:+}/{:+}/{:+} px, and it is \
-             these numbers, not a model, that the tolerance is judged against",
+ these numbers, not a model, that the tolerance is judged against",
             c.l - f.l,
             c.t - f.t,
             c.r - f.r,
@@ -2354,9 +2463,9 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
         Placement::Off { deltas } => {
             notes.push(format!(
                 "RESTORE: the window is not at the seeded rect {} (frame {} client {}), deltas {deltas:?}",
-                seed.text(),
-                frame.map(|f| f.text()).unwrap_or_else(|| "-".into()),
-                client.map(|c| c.text()).unwrap_or_else(|| "-".into())
+ seed.text(),
+ frame.map(|f| f.text()).unwrap_or_else(|| "-".into()),
+ client.map(|c| c.text()).unwrap_or_else(|| "-".into())
             ));
         }
         Placement::Unreadable => notes.push("RESTORE: no window rect could be read".to_string()),
@@ -2403,25 +2512,25 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
     match &verdict {
         Persisted::Moved => println!(
             "smoke: geometry: PERSIST ok - session.json names the moved rect (window after the move: frame {} client {}, persisted {})",
-            frame_after.map(|f| f.text()).unwrap_or_else(|| "-".into()),
-            client_after.map(|c| c.text()).unwrap_or_else(|| "-".into()),
-            stored.map(|p| p.text()).unwrap_or_else(|| "-".into())
+ frame_after.map(|f| f.text()).unwrap_or_else(|| "-".into()),
+ client_after.map(|c| c.text()).unwrap_or_else(|| "-".into()),
+ stored.map(|p| p.text()).unwrap_or_else(|| "-".into())
         ),
         Persisted::StillTheSeed => notes.push(format!(
             "PERSIST: session.json still says the seeded rect {} after the window was moved to frame {} - the move never reached the state file",
-            seed.text(),
-            frame_after.map(|f| f.text()).unwrap_or_else(|| "-".into())
+ seed.text(),
+ frame_after.map(|f| f.text()).unwrap_or_else(|| "-".into())
         )),
         Persisted::Neither { got } => notes.push(format!(
             "PERSIST: session.json says {} - not the seed {}, not the window after the move (frame {} client {})",
-            got.text(),
-            seed.text(),
-            frame_after.map(|f| f.text()).unwrap_or_else(|| "-".into()),
-            client_after.map(|c| c.text()).unwrap_or_else(|| "-".into())
+ got.text(),
+ seed.text(),
+ frame_after.map(|f| f.text()).unwrap_or_else(|| "-".into()),
+ client_after.map(|c| c.text()).unwrap_or_else(|| "-".into())
         )),
         Persisted::NothingWritten => notes.push(format!(
             "PERSIST: no rect could be read back from {} after the close",
-            session.display()
+ session.display()
         )),
     }
     // 4. The pin, first polarity: the seed asked for pinned:true, so the live
@@ -2469,14 +2578,14 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
     match &relaunch {
         Placement::At { space } => println!(
             "smoke: geometry: RELAUNCH ok - the window came back at the persisted rect, read in {space} space (frame {} client {})",
-            f2.map(|f| f.text()).unwrap_or_else(|| "-".into()),
-            c2.map(|c| c.text()).unwrap_or_else(|| "-".into())
+ f2.map(|f| f.text()).unwrap_or_else(|| "-".into()),
+ c2.map(|c| c.text()).unwrap_or_else(|| "-".into())
         ),
-        other => notes.push(format!(
+ other => notes.push(format!(
             "RELAUNCH: the window came back at frame {} client {} instead of the persisted {} ({other:?})",
-            f2.map(|f| f.text()).unwrap_or_else(|| "-".into()),
-            c2.map(|c| c.text()).unwrap_or_else(|| "-".into()),
-            expect.text()
+ f2.map(|f| f.text()).unwrap_or_else(|| "-".into()),
+ c2.map(|c| c.text()).unwrap_or_else(|| "-".into()),
+ expect.text()
         )),
     }
     let pin_false = match read_pin(&second, false) {
@@ -2511,11 +2620,11 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
                 // app topmost-ing a window the file told it not to.
                 notes.push(format!(
                     "PIN: session.json said pinned:true and the window answered WS_EX_TOPMOST={t} {}, \
-                     then pinned:false answered {f} {}; the topmost bit does not follow the state file \
-                     even after waiting up to {PIN_WAIT_MS} ms for it, so this is not a first-read race \
-                     any more - check the app's own stderr for a Pinned line before blaming persistence",
-                    pin_wait_note(&first),
-                    pin_wait_note(&second)
+ then pinned:false answered {f} {}; the topmost bit does not follow the state file \
+ even after waiting up to {PIN_WAIT_MS} ms for it, so this is not a first-read race \
+ any more - check the app's own stderr for a Pinned line before blaming persistence",
+ pin_wait_note(&first),
+ pin_wait_note(&second)
                 ));
                 Pin::Contradicts {
                     wanted: true,
@@ -2524,9 +2633,14 @@ pub fn geometry_round_trip(script: &Path, exe: &Path, err_file: &Path, session: 
                 }
             }
         }
-        _ => Pin::NotJudged(
-            "one of the two launches was refused: either its extended style could not be read, or it              did not report the polarity it waited for (see the REFUSED line above)",
-        ),
+        _ => Pin::NotJudged(if poll_crashed(&first) || poll_crashed(&second) {
+            "the window exited during at least one pin poll (EXITED_WITHOUT_KILL=1), so no \
+ extended style was readable for that polarity; a dead window answers 0 for every \
+ style and that is not evidence about the pin - look at the crash, not at the band"
+        } else {
+            "one of the two launches was refused: either its extended style could not be read, \
+ or it did not report the polarity it waited for (see the REFUSED line above)"
+        }),
     };
     // 6. Never leave the seed behind in place of what the app itself wrote.
     let still_seed = fs::read_to_string(session)
@@ -2767,8 +2881,8 @@ pub fn run(args: &[String]) -> i32 {
         println!("smoke: DECLINED - {why}");
         println!(
             "smoke: this harness never creates or deletes anything under a profile; the occupant on \
-             the session path came from elsewhere, and a directory there is what an api test plants \
-             to prove a blocked write target"
+ the session path came from elsewhere, and a directory there is what an api test plants \
+ to prove a blocked write target"
         );
         println!(
             "{}",
@@ -2818,8 +2932,8 @@ pub fn run(args: &[String]) -> i32 {
     let (startup_recents, startup_settings) = recents_at_startup(&exe);
     println!(
         "smoke: recents at startup: {startup_recents} read from {} - the app's OWN resolved state \
-         dir, so a settings.toml in some other candidate dir is not counted (the trace claim below \
-         is judgeable only above 0)",
+ dir, so a settings.toml in some other candidate dir is not counted (the trace claim below \
+ is judgeable only above 0)",
         startup_settings.display()
     );
     let script = temp_path("probe", "ps1");
@@ -2961,7 +3075,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     } else {
         println!(
-            "smoke: trace: NOT RUN - the first launch did not pass, so there is no live UI whose              trace could be judged"
+            "smoke: trace: NOT RUN - the first launch did not pass, so there is no live UI whose trace could be judged"
         );
     }
 
@@ -3010,7 +3124,7 @@ pub fn run(args: &[String]) -> i32 {
                     }
                     if trace_failed {
                         println!(
-                            "smoke: note - the stderr trace claim failed too (its own code is {});                              geometry outranks it here, so read the SMOKE TRACE FAIL line above as                              part of this verdict, not as lost news",
+                            "smoke: note - the stderr trace claim failed too (its own code is {}); geometry outranks it here, so read the SMOKE TRACE FAIL line above as part of this verdict, not as lost news",
                             TRACE_FAILED_EXIT
                         );
                     }
@@ -3030,7 +3144,7 @@ pub fn run(args: &[String]) -> i32 {
         if seed.failed && code == 0 {
             println!(
                 "smoke: DECLINED TO PASS - the seeded settings.toml did not come back clean; \
-                 the profile, not the app, is what is at risk here"
+ the profile, not the app, is what is at risk here"
             );
             return STEP_FAILED_EXIT;
         }
@@ -3650,6 +3764,124 @@ mod tests {
         for path in [&fresh, &backup] {
             let _ = fs::remove_file(path);
         }
+    }
+
+    /// M4, as a rule: a window that died mid-poll must never be read as an absent
+    /// topmost bit. GetWindowLong on a dead handle answers 0, which is a false PASS
+    /// for pinned:false and a false accusation for pinned:true - so the reading is
+    /// refused before attribution, and the reason says crash rather than pin.
+    #[test]
+    fn a_window_that_died_mid_poll_is_never_a_pin_verdict() {
+        let dead = probe(&[
+            ("TOPMOST", "-1"),
+            ("TOPMOST_WANTED", "0"),
+            ("PIN_POLL_CRASHED", "1"),
+            ("TOPMOST_WAIT_MS", "700"),
+            ("TOPMOST_POLLED", "14"),
+        ]);
+        assert_eq!(read_pin(&dead, false), PinRead::Crashed);
+        assert_eq!(read_pin(&dead, true), PinRead::Crashed);
+        let why = pin_refusal(PinRead::Crashed, "pinned:false");
+        assert!(why.contains("crash"), "{why}");
+        assert!(
+            !why.to_lowercase().contains("lied"),
+            "a crash note must not accuse the pin: {why}"
+        );
+        assert!(poll_crashed(&dead));
+        // A healthy transcript does not trip it, and the bit is still read.
+        let alive = probe(&[
+            ("TOPMOST", "0"),
+            ("TOPMOST_WANTED", "0"),
+            ("PIN_POLL_CRASHED", "0"),
+        ]);
+        assert!(!poll_crashed(&alive));
+        assert_eq!(read_pin(&alive, false), PinRead::Read(false));
+    }
+
+    /// M3 and M7 live in the script, so they are pinned as text: an absence must be
+    /// confirmed against a second sample, the confirm must be budget-clamped, and
+    /// TOPMOST_POLLED must come from a counter rather than from elapsed time.
+    #[test]
+    fn the_pin_poll_confirms_an_absence_and_counts_its_own_ticks() {
+        let script = GEOMETRY_PROBE;
+        assert!(
+            script.contains("[int]$PinConfirmMs"),
+            "no confirm parameter"
+        );
+        assert!(
+            script.contains("$want -eq 0 -and $top -eq 0"),
+            "an absence is the case that needs a second sample"
+        );
+        assert!(
+            script.contains("[Math]::Min($PinConfirmMs, $left)"),
+            "the confirm must stay inside the budget, not extend it"
+        );
+        assert!(
+            script.contains("\"TOPMOST_POLLED=$polls\""),
+            "the poll count is a counter, not a timing guess"
+        );
+        assert!(
+            script.contains("'PIN_POLL_CRASHED=1'") && script.contains("'TOPMOST=-1'"),
+            "a death must print no reading"
+        );
+        assert!(
+            pin_wait_note(&probe(&[
+                ("EXSTYLE", "0x240100"),
+                ("TOPMOST_WAIT_MS", "512"),
+                ("TOPMOST_POLLED", "10"),
+            ]))
+            .contains("polled 10x"),
+            "the note cites the poll it did"
+        );
+        assert!(
+            pin_wait_note(&probe(&[
+                ("EXSTYLE", "0x240100"),
+                ("TOPMOST_WAIT_MS", "0"),
+                ("TOPMOST_POLLED", "0"),
+            ]))
+            .contains("first sample, never polled"),
+            "0 is not the same answer as 10"
+        );
+        assert!(
+            pin_wait_note(&probe(&[("EXSTYLE", "0x1")])).contains("poll count unread"),
+            "an absent key is not a zero"
+        );
+    }
+
+    /// M5: a leftover "maximized":true in the file being seeded is the one state
+    /// that makes the rect lane report a false 6 - the app restores the maximised
+    /// frame, which is not the seeded rect. The seed must overwrite the field.
+    #[test]
+    fn seeding_a_rect_clears_a_leftover_maximised_flag() {
+        let dir = std::env::temp_dir().join(format!("xtask-m5-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("session.json");
+        fs::write(
+            &path,
+            r#"{"rect":{"x":10,"y":10,"w":200,"h":200},"maximized":true,"pinned":false}"#,
+        )
+        .expect("leftover maximised state");
+        let seed = Rect {
+            l: 300,
+            t: 200,
+            r: 900,
+            b: 600,
+        };
+        seed_session_with_pin(&path, &seed, false).expect("seed");
+        let text = fs::read_to_string(&path).expect("seeded file");
+        assert!(
+            text.contains("\"maximized\": false"),
+            "the rect lane measures a normal window: {text}"
+        );
+        assert!(!text.contains("\"maximized\": true"), "{text}");
+        assert_eq!(persisted_rect(&text), Some(seed), "the rect still seeded");
+        // And the pin half still works alongside the forcing.
+        seed_session_with_pin(&path, &seed, true).expect("seed pinned");
+        let text = fs::read_to_string(&path).expect("seeded again");
+        assert!(text.contains("\"pinned\": true"), "{text}");
+        assert!(text.contains("\"maximized\": false"), "{text}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The f61d850d incident, pinned as a rule: a test file belonging to ANOTHER
@@ -4365,8 +4597,8 @@ mod tests {
     /// "RecentsUpdated - {n} in the list - {names}" with a U+00B7 separator.
     fn rendered_announce() -> String {
         "notes-gpui: startup: asking the port for C:\\Notes\\idea.notes\n\
-         notes-gpui: status line: RecentsUpdated \u{b7} 1 in the list \u{b7} untitled.notes\n\
-         notes-gpui: status line: Loaded C:\\Notes\\idea.notes \u{b7} 12 chars \u{b7} utf-8, lf\n"
+ notes-gpui: status line: RecentsUpdated \u{b7} 1 in the list \u{b7} untitled.notes\n\
+ notes-gpui: status line: Loaded C:\\Notes\\idea.notes \u{b7} 12 chars \u{b7} utf-8, lf\n"
             .to_string()
     }
 
@@ -4396,7 +4628,7 @@ mod tests {
     #[test]
     fn an_announce_named_only_in_the_exit_drain_is_still_evidence_and_says_so() {
         let trace = "notes-gpui: exit drain: 1 event(s) accounted for\n\
-                     notes-gpui: undisplayed: RecentsUpdated \u{b7} 3 in the list\n";
+ notes-gpui: undisplayed: RecentsUpdated \u{b7} 3 in the list\n";
         let verdict = judge_trace(Some(trace), 3, TRACE_CLAIMS);
         let TraceVerdict::Proven(lines) = verdict else {
             panic!("the trace names the announce: {verdict:?}");
@@ -4416,7 +4648,7 @@ mod tests {
     #[test]
     fn an_announce_that_lost_the_last_wins_collapse_is_proven_as_arrived() {
         let trace = "notes-gpui: event: RecentsUpdated with 2 entries\n\
-                     notes-gpui: status line: Loaded a file with 4 chars\n";
+ notes-gpui: status line: Loaded a file with 4 chars\n";
         let verdict = judge_trace(Some(trace), 2, TRACE_CLAIMS);
         let TraceVerdict::Proven(lines) = verdict else {
             panic!("the announce arrived, so the claim holds: {verdict:?}");
@@ -4492,7 +4724,7 @@ mod tests {
     #[test]
     fn a_trace_that_never_names_the_announce_breaks_the_claim_naming_the_needle() {
         let trace = "notes-gpui: status line: Saved C:\\Notes\\idea.notes \u{b7} revision 2\n\
-                     notes-gpui: pump: 9 wakes, 4 had work, 5 events\n";
+ notes-gpui: pump: 9 wakes, 4 had work, 5 events\n";
         let verdict = judge_trace(Some(trace), 2, TRACE_CLAIMS);
         let TraceVerdict::Broken(notes) = verdict else {
             panic!("recents to announce and no line naming them is the finding: {verdict:?}");
@@ -4623,7 +4855,7 @@ mod tests {
         fs::write(
             &path,
             r#"//! used to add /MANIFEST:EMBED plus /MANIFESTINPUT=x.manifest
-//!     rust-lld: error: duplicate resource: type MANIFEST (ID 24)
+//! rust-lld: error: duplicate resource: type MANIFEST (ID 24)
 fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
 "#,
         )
