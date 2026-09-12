@@ -1242,15 +1242,25 @@ fn main() {
             // drawn. Only the bridge can: the port has no window type at all. The
             // root view owns the pump, so the wake route starts and stops with the
             // window and there is no poller outliving the UI.
+            // ADR-0003: custom chrome. The kit's `TitleBar` is the base of this
+            // window's options, and that base IS the frameless flip - its
+            // `title_bar_options()` sets `appears_transparent`, the one flag gpui reads
+            // to extend the client area over the caption (gpui-pre-windows 0.3.4
+            // src/window.rs:460), and `app_owns_titlebar_drag` stops the OS treating
+            // that band as a system move region. The bar itself is NOT drawn yet -
+            // titlebar.rs is the next slice - so today the band is empty apart from
+            // the caption buttons.
             let options = WindowOptions {
                 window_bounds: Some(bounds_for(&initial)),
-                // The title is the cheapest proof that the running binary is this
-                // build: it carries the package version.
+                // The OS title is still set (ADR-0003): Alt+Tab, taskbar previews and
+                // accessibility tooling speak correctly even though nothing renders it
+                // visibly. It is also the cheapest proof that the running binary is
+                // this build: it carries the package version.
                 titlebar: Some(TitlebarOptions {
                     title: Some(format!("notes {}", env!("CARGO_PKG_VERSION")).into()),
-                    ..Default::default()
+                    ..gpui_kit::component::TitleBar::title_bar_options()
                 }),
-                ..Default::default()
+                ..gpui_kit::component::TitleBar::window_options()
             };
             let opened = cx.open_window(options, {
                 let events = Rc::clone(&events);
