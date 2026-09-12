@@ -442,10 +442,10 @@ fn a_settled_frame_examines_nothing_and_an_offscreen_mark_does_not_oscillate() {
     );
 }
 
-/// MEASUREMENT, not an assertion: how much the byte-scanning `TextState::line_index_at`
-/// still costs, now that the paint path does not call it. Printed so the number is on the
-/// record instead of argued about. The loose ceiling only says "a keystroke is not a
-/// second of input" - it is not the claim.
+/// MEASUREMENT, not an assertion: what `TextState::line_index_at` costs now that it is a
+/// `partition_point` over the lazy line-start cache in `editor.rs`, and the paint path does
+/// not call it. Printed so the number is on the record instead of argued about. The loose
+/// ceiling only says "a keystroke is not a second of input" - it is not the claim.
 #[test]
 fn measure_the_caret_path_that_still_scans_bytes() {
     use editor::TextState;
@@ -474,15 +474,16 @@ fn measure_the_caret_path_that_still_scans_bytes() {
         // pinned tight because this file owns it. It used to count the whole prefix AND build
         // the full line index to `nth` it - measured at 138 / 1,415 / 17,456 us per call at
         // 200 / 2,000 / 20,000 lines, i.e. one keystroke eating a whole 60 Hz frame. It now
-        // scans out to the two newlines that bound the byte and measures 0 us at every size.
+        // goes through the same line-start index as `line_index_at` - a search, not a scan -
+        // and measures 0 us at every size.
         //
-        // `line_index_at` is printed rather than pinned, because the fix is NOT this file's:
-        // another lane is giving `TextState` its own line-start cache as this is written, so
-        // the ceiling below is a tripwire against "seconds per arrow key", not a claim about
-        // a constant. Measured the day it was written: 69 / 706 / 7,228 us per call at the
-        // three sizes, reached once per Up/Down through `vertical_target`. If this starts
-        // printing 0, that cache has landed and this paragraph is stale - keep the tripwire,
-        // delete the number.
+        // `line_index_at` is printed rather than pinned: the fix was not this file's - it
+        // landed in `editor.rs`, which keeps a lazy `line_starts` cache (526d73e6), and
+        // `line_index_at` is a `partition_point` over it, O(log lines), reached once per
+        // Up/Down through `vertical_target`. The ceiling below stays a tripwire against
+        // "seconds per arrow key", not a claim about a constant: microseconds per call are
+        // wall-clock and machine-dependent, so the assert pins only the order of magnitude
+        // and the printed number keeps the measurement on the record.
         assert!(
             range < 200,
             "line_range_at must be O(line), not O(note): {range}us"
