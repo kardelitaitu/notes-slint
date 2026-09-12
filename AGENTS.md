@@ -6,21 +6,25 @@ This file is about **how** to work here. The *what* and *why* are in
 
 ## Read in this order
 
-1. [`whitepaper.md`](whitepaper.md) — §5 architecture, §8 risks, §10 open decisions.
+1. [`whitepaper.md`](whitepaper.md) — the index; the plan itself lives in `docs/`
+   (§4 features, §5 architecture, §8 risks, §10 open decisions).
 2. This file.
 3. [`.agents/skills/doc-management/SKILL.md`](.agents/skills/doc-management/SKILL.md) — before
    creating or moving **any** markdown file.
 4. [`.agents/notes/`](.agents/notes/) — especially `rejected/`, before proposing a feature.
 
-## Current phase: planning
+## Current phase: M2 in flight
 
-**There is no code in this repository.** Do not scaffold crates, write a `Cargo.toml`, or
-start implementing until the **M0 spike** has run and its answer is recorded — M0 exists to
-determine whether GPUI on Windows is viable for a standalone app at all (whitepaper §8, R1–
-R3). Its answer may reshape the UI layer completely, and code written before it is likely to
-be deleted.
+M0 ran on 2026-09-10 and came back **viable** — the results are recorded in
+[`docs/roadmap.md`](docs/roadmap.md) §12, which owns §9 and §12 of the plan. Code exists:
+M1 (the headless `core` + `api` engine), M3 (window persistence) and M4 (autosave, pin,
+recents) are built and tested; what is demonstrably working, and where it diverged from the
+plan, is recorded in [`.agents/notes/implemented/`](.agents/notes/implemented/). M2 — the
+first usable `bridge-gpui` UI — is being built slice by slice on top of that engine.
 
-The spike is deliberately done **outside** this tree. Do not add spike code here.
+The architecture invariants below are live, not aspirations: CI already runs the layering
+gate (`cargo xtask check-arch` in `.github/workflows/ci.yml`), and it fails the build when
+a boundary is crossed.
 
 ## Architecture invariants
 
@@ -35,13 +39,15 @@ crates/bridge-*   one adapter per UI toolkit. bridge-gpui is the only one built.
 ```
 
 ```sh
-cargo tree -p core -i gpui          # must be empty
-cargo tree -p core -i windows       # must be empty
-cargo tree -p core -i platform      # must be empty
-cargo tree -p api  -i gpui          # must be empty
-cargo tree -p bridge-gpui -i core   # must be empty
-cargo tree -p bridge-gpui -i platform  # must be empty
+cargo xtask check-arch   # the layering gate — exit 0 clean, 1 violation, 2 the check itself could not run
 ```
+
+One command, six probes retired: `cargo tree -i` is transitive, so correct layering made
+`bridge-gpui -i core` print a tree, and `-i windows` was ambiguous between the versions
+platform and gpui each pull. `check-arch` reads `cargo metadata --all-features` and enforces
+the diagram above per crate — by name *family* (`gpui*`, `windows*`) and, for repo crates,
+structurally, so a new member or a reach-around through a non-member wrapper is caught with
+no list to update. Rules and their stated limits: `crates/xtask/src/arch.rs`.
 
 Rules that are easy to break politely:
 
@@ -103,8 +109,10 @@ When they disagree, the code wins — edit the doc, leave the note standing.
   means `docs/dev/` holds only its README.
 - `implemented` means the code exists and works — **not** "we agreed to it".
 - `status:` in frontmatter must match the folder.
-- **Never fork the whitepaper** — no `docs/roadmap.md`, no `whitepaper-v2.md`. The validator
-  fails on `whitepaper`/`roadmap` filenames outside the root.
+- **Never fork the plan.** `whitepaper.md` is the index; the plan lives in the area docs
+  under `docs/` that it indexes (`docs/roadmap.md` owns §9 and §12). Section numbers are
+  global across the set with exactly one owner file each; the validator fails when two
+  files claim the same §, or on a `whitepaper` filename anywhere but the root.
 - `whitepaper.md` `§` numbering carries ~60 cross-references. If you insert a section,
   renumber **and** fix every inbound reference in the same edit.
 
@@ -127,12 +135,12 @@ When they disagree, the code wins — edit the doc, leave the note standing.
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
-cargo tree -p core -i gpui          # ...and the other five checks above
+cargo xtask check-arch   # the layering gate — exit 0 clean, 1 violation, 2 the check itself could not run
 pwsh .agents/skills/doc-management/scripts/check-docs.ps1
 ```
 
-Once code exists. Today, only the last one applies — documentation is the deliverable, and
-it is checkable.
+All of these apply now that code exists. A documentation-only change still owes the last
+line (the validator) before it reports done.
 
 ## Working style
 

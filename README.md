@@ -7,11 +7,13 @@ in the place you left it, and has one button to pin itself above every other win
 the window you throw your thoughts into — the bet is that the *window behaviour* is the
 product, and the editing surface can stay deliberately minimal.
 
-> **Version 0.0.1** · planning phase, no code yet
+> **Version 0.0.1** · engine built, first UI in flight
 >
-> This repository currently contains design documents only. Before any implementation work,
-> **M0 (below) must run** — it exists to find out whether GPUI on Windows is viable at all
-> for a standalone app, and its answer may change the UI layer entirely.
+> The **M0 spike ran on 2026-09-10** and answered yes — GPUI on Windows is viable for a
+> standalone app (results: [docs/roadmap.md](docs/roadmap.md) §12). M1 (headless engine),
+> M3 (window persistence) and M4 (autosave, pin, recents) are built and tested — what
+> works, and how, is recorded in [`.agents/notes/implemented/`](.agents/notes/implemented/).
+> M2, the first usable UI, is in flight.
 
 ## What it does
 
@@ -37,7 +39,7 @@ Two documentation trees, split by tense: **intent** lives in `docs/` and `whitep
 **outcomes** live in `.agents/notes/`.
 
 ```
-whitepaper.md      the founding sketch: product, architecture, risks, roadmap  <-- start here
+whitepaper.md      the index: what the plan set covers, and where each part lives  <-- start here
 AGENTS.md          conventions and invariants for anyone working on this repo
 
 docs/              planning & developer docs  (intent: what we mean to build)
@@ -49,37 +51,39 @@ docs/              planning & developer docs  (intent: what we mean to build)
   skills/          agent capabilities (doc-management, + its placement validator)
 ```
 
-Everything about *why* the project is shaped the way it is lives in
-[`whitepaper.md`](whitepaper.md). It is a single document on purpose — the placement
-validator fails the build on a second copy.
+Everything about *why* the project is shaped the way it is lives in the plan set indexed
+by [`whitepaper.md`](whitepaper.md) — one owner file per numbered section, on purpose; the
+placement validator fails the build when two files claim the same section.
 
 ## Roadmap
 
 | | |
 |---|---|
-| **M0** | **Spike.** Does a standalone GPUI app build and run on Windows, and can we set topmost, set position, and open a native file dialog? Gates everything below. |
-| M1 | Core engine, headless. Tested with no window at all. |
-| M2 | First usable UI — *you can use it as a notepad.* |
-| M3 | Window persistence. |
-| M4 | Autosave and pin. |
+| **M0** | **Spike — done 2026-09-10.** Does a standalone GPUI app build and run on Windows, and can we set topmost, set position, and open a native file dialog? Verdict: viable, every blocking question passed ([docs/roadmap.md](docs/roadmap.md) §12). |
+| M1 | **Done.** Core engine, headless. Tested with no window at all. |
+| M2 | **In flight.** First usable UI — *you can use it as a notepad.* |
+| M3 | **Done.** Window persistence. |
+| M4 | **Done.** Autosave and pin. |
 | M5 | Polish, and the Windows portable + installer builds. |
 | M6–M8 | Cross-platform seams, then mac and Linux builds. |
 
-Detail: whitepaper §9. Ship targets: `win-install`, `win-portable`, `linux-install`,
+Detail: [docs/roadmap.md](docs/roadmap.md) §9. Ship targets: `win-install`, `win-portable`, `linux-install`,
 `linux-portable`, `mac-install` (whitepaper §7).
 
 ## Questions we have not answered
 
-Tracked in whitepaper §10, and worked through one at a time in
-[`.agents/notes/proposed/`](.agents/notes/proposed/). The one that currently blocks M1
-scaffolding: [autosave behaviour on files the app did not
-create](.agents/notes/proposed/2026-09-10-autosave-foreign-files.md).
+Tracked in §10 ([docs/open-questions.md](docs/open-questions.md)), and worked through one
+at a time in [`.agents/notes/proposed/`](.agents/notes/proposed/) — which is empty right
+now. The question that used to block M1, autosave on files the app did not create, is
+settled: [ADR-0001](docs/decisions/0001-autosave-arms-on-explicit-save.md) arms autosave
+only after an explicit save on a foreign file, and M4 implements exactly that.
 
 ## Contributing
 
-Nothing to build yet. When code lands, this section will hold the build and test commands;
-until then, read [`AGENTS.md`](AGENTS.md) first — it covers the invariants that are already
-decided and the things deliberately ruled out, which is the fastest way to avoid proposing
+A Rust workspace builds here: `cargo build` from the repo root. The full pre-report gate —
+fmt, clippy, tests, the layering gate (`cargo xtask check-arch`), the docs validator — is
+in [`AGENTS.md`](AGENTS.md); read it first anyway. It covers the invariants that are
+enforced and the things deliberately ruled out, which is the fastest way to avoid proposing
 something the project has already considered.
 
 ## License
