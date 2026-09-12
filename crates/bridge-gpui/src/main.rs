@@ -8,9 +8,11 @@
 //! keystroke, and this crate imports nothing in this repo except `notes-api`.
 //!
 //! What this slice adds: one wake route from the engine thread into the GPUI loop,
-//! and an exhaustive render of every `Event` the port can say. Not in this slice,
-//! on purpose: the editor widget, the menu, the titlebar chrome, the keymap and the
-//! tray - each is its own slice.
+//! and an exhaustive render of every `Event` the port can say. Since then the editor
+//! (`editor.rs`), the menu (`menu.rs`) and the title bar's LEFT and CENTRE regions
+//! (`titlebar.rs`, ADR-0003) have landed as their own slices; what is still not here is
+//! the bar's hamburger popup and tooltip (C3c, and the reason is menu.rs:1-28's no-`Root`
+//! condition), the tray, and a keymap beyond the editor and menu chords.
 //!
 //! # The unit rule at this boundary
 //!
@@ -59,6 +61,7 @@
 // behind it, not a finished M2.
 mod editor;
 mod menu;
+mod titlebar;
 
 use editor::Editor;
 
@@ -157,10 +160,20 @@ struct Wire {
     recents: Vec<RecentEntry>,
     /// The global toggle, as last stated by the ENGINE (see `new`).
     autosave: bool,
-    /// The pin state as last CONFIRMED by the engine (`Event::Pinned`), for the
-    /// title-bar slice (C3b) to consume. Set only from the port's answer - a
-    /// check mark that follows what the UI asked for proves nothing.
+    /// The pin state as last CONFIRMED by the engine, read off the window's own style by
+    /// `apply_topmost` - the sole emitter of `Event::Pinned`, reached from the registration
+    /// restore and from a `SetPinned` on a registered window. Consumed by the title bar's
+    /// left region (`titlebar.rs`). Set only from the port's answer: a check mark that
+    /// follows what the UI asked for proves nothing, and a refusal arrives as `PinFailed`
+    /// and leaves this bit alone rather than flipping it.
     pin: bool,
+    /// HAS A SAVE FAILED AND NOTHING HAS WRITTEN THE TEXT SINCE? This is the flag §4.4's
+    /// amber dot exists for: `Event::SaveFailed` has no caller to return `Err` to (autosave
+    /// is asynchronous, AGENTS.md), so the bar's centre region can only learn it from an
+    /// event. It is CLEARED by `Loaded`/`Rebound` (a different document is now in the buffer,
+    /// the old failure is not this note's news) and by a `Saved` at or above the revision in
+    /// the debounce - i.e. the moment the text that failed is text that landed.
+    save_failed: bool,
     /// THE PORT'S LAST ANNOUNCED OPEN GENERATION (143b1c52). The bridge does
     /// not count rebinds any more - the prediction (`Wire::rebind`, bumped at
     /// every Open/SaveAs send) is DELETED - because a bump the bridge predicts
@@ -197,10 +210,18 @@ impl Wire {
             // the only visible proof that the settings reload path works. Same one-way door
             // the pin was: a check that follows what the UI asked for proves nothing.
             autosave,
-            // SEEDED FROM THE PORT like `autosave`: `InitialState::pinned` is
-            // read out of session.json, and the first `Event::Pinned` (the
-            // registration apply confirms the bit) keeps it the engine's truth.
+            // SEEDED FROM THE PORT like `autosave`: `InitialState::pinned` is read out of
+            // session.json, and the registration's apply then states what the WINDOW is -
+            // `Event::Pinned(true)` when the bit stuck, `Event::Pinned(false)` on an
+            // unpinned session's first registration. So the seed is a first frame's best
+            // answer, overwritten by the platform's real one; on a build with no platform
+            // seam nothing is announced and the seed stands, which is the honest limit.
             pin,
+            // Nothing has failed yet: the dot starts clean, and only a `SaveFailed` lights
+            // the amber. Seeding it from `InitialState` is not possible - the port stores no
+            // such bit, and it would be wrong to: a save that failed in a previous run has
+            // nothing to do with this buffer.
+            save_failed: false,
             // The engine's generation starts at 0 and so does the stored echo:
             // an untitled note has never been announced, and 0 is the honest
             // value to flush under until `Loaded` or `Rebound` says otherwise.
@@ -218,6 +239,33 @@ impl Wire {
     /// compares against the one it sent.
     fn dirty(&self) -> bool {
         self.seen_edits != self.flushed_edits
+    }
+
+    /// THE PORT HAS PUT A DOCUMENT IN THIS BUFFER: the ONLY writer of `loaded`, called from
+    /// the `Loaded` and `Rebound` arms and nowhere else, so the sentence "the port has told
+    /// us about a document" cannot be stated anywhere the port did not tell us.
+    ///
+    /// WHY A WRITER WAS NEEDED. `loaded` gates `flush_due`'s ADR-0001 clause - a loaded
+    /// document the port says is NOT armed never flushes - and until now it had no
+    /// production writer at all, only test fixtures. So that clause could not fire in a
+    /// running app, and `LoadFailed`'s disarm was inert on a buffer that had been loaded:
+    /// the next keystroke would flush the kept text onto the file the open just failed to
+    /// read. Making the guard live means a foreign file now waits for the explicit save
+    /// ADR-0001 asks for, and it ends waiting when the engine says so (`Saved` proves the
+    /// toggle is on; `armed` itself always comes from `FileMeta`), never from a guess here.
+    ///
+    /// `Rebound` calls it too, and that is the decision worth stating: a Save As is not a
+    /// load, but the event carries the port's own `FileMeta` for the new path, and ADR-0001's
+    /// rule 2 ("armed state is per document, not global") is only enforceable if a buffer
+    /// rebound to a foreign path is treated as a document the port has told us about. Its
+    /// `armed` comes from the engine and is stored as given, not reasoned about.
+    ///
+    /// The failure flag is deliberately NOT part of this: `Loaded`/`Rebound` clear
+    /// `save_failed` in their own arms, because "a new document cannot inherit the old
+    /// one's failed write" is a different claim from "this is a port-announced document".
+    fn adopted(&mut self, armed: bool) {
+        self.loaded = true;
+        self.armed = armed;
     }
 
     /// AN EDIT ENTERS THE DEBOUNCE. The one place `seen_edits` moves, and
@@ -483,6 +531,17 @@ struct Surface {
     /// local because the last `Flush` has to be issued by whoever shuts the window,
     /// and that is not this view.
     wire: Rc<RefCell<Wire>>,
+    /// THE BAR'S PIN ASK, built once rather than per frame. It holds a clone of the
+    /// gateway slot for the same reason the close path does, and it asks for a state instead
+    /// of asserting one: the reply is `Event::Pinned` (confirmed by reading the window back)
+    /// or `Event::PinFailed` (refused), and a repeat of an already-confirmed state answers
+    /// nothing at all. The bar renders `Wire::pin`, which only the first of those writes, so
+    /// a refused click leaves the glyph exactly as the port last said - the ask is not a
+    /// result, and the second click still re-applies because a refusal unconfirmed it.
+    on_pin: Rc<dyn Fn(bool)>,
+    /// The OS title this window was last given, so `set_window_title` is called when the
+    /// document changed and not on every frame.
+    os_title: SharedString,
     /// Whether we have asked for the keyboard yet - first frame only, so that
     /// focusing the editor cannot fight something the user clicks into later.
     focus_requested: bool,
@@ -505,6 +564,12 @@ impl Surface {
         wire: Rc<RefCell<Wire>>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // The bar's ask, built HERE so the closure is allocated once per window and not once
+        // per frame. `send` is the same helper every other command uses, so a title-bar click
+        // and a menu click go out the same door and are answered the same way.
+        let pin_gateway = Rc::clone(&gateway);
+        let on_pin: Rc<dyn Fn(bool)> =
+            Rc::new(move |on: bool| send(&pin_gateway, Command::SetPinned(on)));
         let mut this = Self {
             events,
             stats,
@@ -515,6 +580,10 @@ impl Surface {
             watch: Watch::default(),
             editor,
             wire,
+            on_pin,
+            // SEEDED with what the window was opened with, so the first frame does not pay
+            // for a set that changes nothing.
+            os_title: titlebar::window_title(None, false),
             focus_requested: false,
             first_paint_stamped: false,
             signalled_once: false,
@@ -681,11 +750,43 @@ impl Render for Surface {
         let status = SHUTDOWN_NOTE
             .with(|note| note.borrow().clone())
             .unwrap_or_else(|| self.status.clone());
+        // THE BAR, from the wire's own four facts. Nothing here asks the engine anything:
+        // the title is the path the port announced, `dirty` is the wire's arithmetic, and
+        // `save_failed` / `pin` are the port's last `SaveFailed` and `Pinned`. The title's
+        // second argument is `loaded` plain - the port has said a document arrived - which
+        // is only an honest expression because `Wire::adopted` now writes that flag from
+        // `Loaded` and `Rebound`; while it had no production writer the name had to be
+        // inferred from `path`, and the bar would have shown "Untitled" over a real file.
+        let (title, os_title, dirty, save_failed, pinned) = {
+            let wire = self.wire.borrow();
+            let announced = wire.loaded;
+            (
+                titlebar::title_words(wire.path.as_deref(), announced),
+                titlebar::window_title(wire.path.as_deref(), announced),
+                wire.dirty(),
+                wire.save_failed,
+                wire.pin,
+            )
+        };
+        if os_title != self.os_title {
+            self.os_title = os_title.clone();
+            window.set_window_title(os_title.as_ref());
+        }
         div()
             .size_full()
             .flex_col()
             .bg(rgb(0x1f1f1f))
             .text_color(rgb(0xe6_e6_e6))
+            // ADR-0003's band: pin on the left, title and dirty dot in the centre, and the
+            // kit's own caption buttons plus the drag on the right - the kit draws those, so
+            // this child is the bar's LEFT and CENTRE and nothing else.
+            .child(titlebar::bar(
+                title,
+                dirty,
+                save_failed,
+                pinned,
+                Rc::clone(&self.on_pin),
+            ))
             // The editor above the status line, and the status line STAYS: every
             // pump diagnostic and the smoke harness read that second row, so the
             // layout is stacked rather than replaced. flex_1 gives the editor the
@@ -729,7 +830,9 @@ impl Surface {
                 self.editor
                     .update(cx, |editor, cx| editor.load(text.clone(), cx));
                 let mut wire = self.wire.borrow_mut();
-                wire.armed = meta.armed;
+                // THE PORT HAS LOADED A DOCUMENT - the writer `loaded` never had, and the
+                // reason `flush_due`'s arming clause now applies to a real session.
+                wire.adopted(meta.armed);
                 // THE ECHO (143b1c52): the generation of the buffer this text is,
                 // as the port ANNOUNCED it. Stored, never counted: what the bridge
                 // used to PREDICT at the Open send is now TOLD about here - and a
@@ -743,6 +846,9 @@ impl Surface {
                 let edits = self.editor.read(cx).edits();
                 wire.seen_edits = edits;
                 wire.flushed_edits = edits;
+                // A NEW DOCUMENT is now in the buffer: whatever failed before belonged to a
+                // different file, so the amber dot must not follow it here.
+                wire.save_failed = false;
             }
             Event::Rebound {
                 meta,
@@ -755,7 +861,9 @@ impl Surface {
                 // is clean now, and the arming follows the new path (a file chosen by
                 // hand is armed, ADR-0001).
                 let mut wire = self.wire.borrow_mut();
-                wire.armed = meta.armed;
+                // A Save As is not a load, but the port has now said which document this is,
+                // with its own `armed` for the new path - see [`Wire::adopted`].
+                wire.adopted(meta.armed);
                 // ADOPTED FROM THE PORT: this is the rebind the menu's Save As depends on.
                 // Every later Flush goes to the document the engine rebound to, and the
                 // bridge learned that from an Event, not from its own request.
@@ -765,6 +873,9 @@ impl Surface {
                 // FAILS emits no Rebound and moves nothing - the port's promise this
                 // arm now rides on.
                 wire.epoch = *epoch;
+                // A Save As that succeeded WROTE the text, so any earlier failure is no
+                // longer this document's news and the dot goes back to the wire's arithmetic.
+                wire.save_failed = false;
                 wire.flushed_edits = wire.seen_edits;
                 if wire.in_flight.is_some_and(|sent| sent <= *revision) {
                     wire.in_flight = None;
@@ -789,6 +900,11 @@ impl Surface {
                 // a save the engine performed says the global toggle was not off. `Event` has
                 // no "autosave setting changed" variant, which is why the check mark is driven
                 // by outcomes and never by what the menu asked for.
+
+                // §4.4's amber, stored from the port's own answer. A `Saved` clears it - the
+                // text that failed has now landed - and a `SaveFailed` sets it, so the dot
+                // cannot go amber on a stale failure long after a successful save.
+                wire.save_failed = matches!(event, Event::SaveFailed { .. });
                 if matches!(event, Event::Saved { .. }) && !wire.autosave {
                     wire.autosave = true;
                     drop(wire);
@@ -821,10 +937,25 @@ impl Surface {
                 self.refresh_menus(cx);
             }
             Event::Pinned(on) => {
-                // THE PIN READBACK: the engine confirmed the pin state - a
-                // SetPinned answer, or the registration apply's verdict.
-                // Stored, never inferred from a request, so the title bar
-                // renders the port's answer and never the UI's own ask.
+                // THE PIN READBACK, and there is now exactly one thing that can send it:
+                // `apply_topmost`, on `PinOutcome::Applied` - the platform having set the
+                // extended style and read it back off the window. Two routes reach that one
+                // emitter: the `RegisterWindow` restore, and a `SetPinned` on a registered
+                // window, which is what makes a click actually topmost the live window
+                // instead of only remembering an intention. `SetPinned` no longer emits this
+                // event as an echo of its own argument.
+                //
+                // So `false` is not only an un-pin the user asked for: an unpinned session's
+                // FIRST registration confirms `false` and arrives here as `Pinned(false)`.
+                // That is why `Wire::pin` is safe to seed from `InitialState::pinned` and
+                // then let this arm own - the port states the bit either way, before the UI
+                // could ask. A repeat of an already-confirmed state stays silent; a repeat
+                // after a `PinFailed` attempts the apply again, because `pin_confirmed` was
+                // reset and there is a fact to re-establish. A refused apply is
+                // `PinFailed`, never this event, and the two never travel together.
+                //
+                // Stored, never inferred from a request, so the title bar renders the port's
+                // answer and not the UI's own ask.
                 self.wire.borrow_mut().pin = *on;
             }
             _ => {}
@@ -1034,7 +1165,9 @@ fn describe(event: &Event) -> String {
             format!("StateDirUnusable · nothing can be remembered · {}", reason)
         }
         // Arrived in the same fold that collapsed the two state-write events into
-        // one named one (D62), keeping the vocabulary at 13. The reason is
+        // one named one (D62), which is when the vocabulary stood at 13; `Pinned` came
+        // later, with the readback, and the count `describe`'s test now walks is 14. The
+        // reason is
         // platform's own sentence for the refusal and passes through; the words
         // around it are the bridge's, because a pin that failed and is rendered as
         // a success is a lie in the title bar.
@@ -1044,10 +1177,12 @@ fn describe(event: &Event) -> String {
                 reason
             )
         }
-        // The readback twin of the PinFailed arm: the state the engine
-        // CONFIRMED, as the port's own bool. `apply` stores it; this renders
-        // it, because a confirmed fact the status line never shows is a fact
-        // nobody can check. C3b (title bar) consumes the stored value.
+        // The readback twin of the PinFailed arm: the state the engine CONFIRMED off the
+        // window's own style, as the port's bool - one emitter, `apply_topmost`. `apply`
+        // stores it; this renders it, because a confirmed fact the status line never shows
+        // is a fact nobody can check. The title bar (`titlebar.rs`) consumes the stored
+        // value. "not held" is said plainly because `Pinned(false)` is a confirmation too,
+        // not an absence: it arrives on an unpinned session's first registration.
         Event::Pinned(on) => format!(
             "Pinned · the window is {} above the others",
             if *on { "held" } else { "not held" }
@@ -1195,7 +1330,25 @@ fn main() {
     // THE KIT GENERATION: `Application::new` is gone from the surface this crate is given;
     // gpui_kit::platform::application() is the constructor that picks the platform backend
     // (gpui-pre-platform-0.3.4/src/gpui_platform.rs:13).
-    gpui_kit::platform::application().run({
+    // THE ASSET SOURCE, and it is not decoration: an `IconName` is only a path
+    // ("icons/pin.svg"), and the bytes behind it come from whatever source the application
+    // was built with. `gpui_kit::platform::application()` registers none, so a bar asking
+    // for `Pin`/`PinOff` would draw an empty slot - silently.
+    //
+    // `Assets` (the default bundle) is NOT enough here: its list carries 101 names and
+    // `pin.svg` / `pin-off.svg` are not among them. `AllAssets` is the documented full
+    // catalog, so it is the one call that answers the paths this slice asks for. Cost
+    // stated rather than hidden: that catalog is 1,830 SVGs (2.8 MB of source), and the
+    // narrow alternative is `gpui_kit::assets::icon_assets!(BarIcons, [Pin, PinOff])`
+    // composed over `Assets` - ours for the two glyphs, the default bundle for everything
+    // the kit's own chrome asks for. Not done here: it is a second type and a load-order
+    // rule, which is its own slice's decision, not a title bar's. If the shipped binary's
+    // size ever becomes the argument, that is the line to revisit.
+    // Bound, not chained into the call: the same two statements written as one chain
+    // re-indents the whole 400-line closure below it, which is 400 lines of diff for one
+    // added method.
+    let app = gpui_kit::platform::application().with_assets(gpui_kit::assets::AllAssets);
+    app.run({
         let gateway = Rc::clone(&gateway);
         let events = Rc::clone(&events);
         let stats = Rc::clone(&stats);
@@ -1272,17 +1425,19 @@ fn main() {
             // `title_bar_options()` sets `appears_transparent`, the one flag gpui reads
             // to extend the client area over the caption (gpui-pre-windows 0.3.4
             // src/window.rs:460), and `app_owns_titlebar_drag` stops the OS treating
-            // that band as a system move region. The bar itself is NOT drawn yet -
-            // titlebar.rs is the next slice - so today the band is empty apart from
-            // the caption buttons.
+            // that band as a system move region. The bar IS drawn now - `titlebar.rs` is the
+            // LEFT and CENTRE regions, mounted as the first child in `Surface::render` - and
+            // the kit's own `TitleBar` paints the caption buttons and owns the drag, which is
+            // why nothing here re-implements them.
             let options = WindowOptions {
                 window_bounds: Some(bounds_for(&initial)),
                 // The OS title is still set (ADR-0003): Alt+Tab, taskbar previews and
                 // accessibility tooling speak correctly even though nothing renders it
-                // visibly. It is also the cheapest proof that the running binary is
-                // this build: it carries the package version.
+                // visibly. It starts in the ADR's `name - app` form for a note with no path,
+                // and `Surface::render` re-states it whenever the document changes, from the
+                // same helper, so the two words on screen and in the taskbar cannot drift.
                 titlebar: Some(TitlebarOptions {
-                    title: Some(format!("notes {}", env!("CARGO_PKG_VERSION")).into()),
+                    title: Some(titlebar::window_title(None, false)),
                     ..gpui_kit::component::TitleBar::title_bar_options()
                 }),
                 ..gpui_kit::component::TitleBar::window_options()
@@ -1385,17 +1540,28 @@ fn main() {
             // `restore_and_pin` -> `apply_topmost` (crates/api/src/engine.rs), which
             // calls notes-platform on the handle this bridge just registered, reading
             // the bit straight out of the session it read in step 1. So a pinned
-            // session opens pinned with no bridge help, and a duplicate
-            // `SetPinned(true)` here would only re-state a value the engine already
-            // has (its handler compares before queueing, so it would be a no-op).
-            // Removed rather than kept as insurance: storing the bit stays the
-            // bridge's job when the user clicks a pin button, and that command
-            // belongs to that slice, not to startup.
+            // session opens pinned with no bridge help - and no `SetPinned` is needed to
+            // make it so. The old sentence here claimed a duplicate `SetPinned(true)` "would
+            // be a no-op because the handler compares before queueing", and that is no
+            // longer the contract: with a window registered, `SetPinned` reaches the SAME
+            // `apply_topmost` the registration does, so a click topmosts the live window
+            // rather than only storing an intention. What stays silent is a repeat of a
+            // state the platform already read back; what re-applies is a repeat after a
+            // `PinFailed`, because nothing stands confirmed then. Sending it at startup
+            // would still be wrong - the registration's own apply is on its way, and an
+            // unregistered `SetPinned` stores the bit without announcing anything.
+            // Removed rather than kept as insurance: storing the bit is the bridge's job
+            // when the user clicks the pin, and that ask lives in `Surface::on_pin`.
             //
-            // What the pump does with the same registration is the visible half: if
-            // the restore or the topmost call is refused, the engine answers
-            // `Event::GeometryNotRestored` and the status line says so, in
-            // notes-platform's own words.
+            // What the pump does with the same registration is the visible half, and each
+            // refusal has its OWN event now: a topmost call that is refused or does not stick
+            // answers `Event::PinFailed`, a position the platform will not take answers
+            // `Event::GeometryNotRestored`, and a Z-order it did confirm answers
+            // `Event::Pinned` - including `Pinned(false)`, which is an unpinned session's
+            // first registration saying so. ORDER is contractual: on a registration the pin
+            // event comes out BEFORE the geometry warning, so a pump that keeps the last
+            // event ends on the thing about the window's position, in notes-platform's own
+            // words. Both arms render, and `PinFailed` never travels with `Pinned`.
 
             // STEP 5 - ASK FOR THE DOCUMENT THAT WAS OPEN. The session carries the path
             // and nothing in the app asked for it, which is why a relaunch came back to an
@@ -2305,10 +2471,20 @@ mod tests {
             Event::PinFailed {
                 reason: "the topmost call was refused".to_string(),
             },
+            // BOTH directions of the readback, because they are different sentences and the
+            // false one is the one a status line is tempted to skip: `Pinned(false)` is a
+            // CONFIRMATION (an unpinned session's first registration answers it), not an
+            // absence, and only a rendered line proves the arm says "not held" rather than
+            // going quiet or claiming a pin.
+            Event::Pinned(true),
+            Event::Pinned(false),
         ];
         // One name per variant, in the order above. A new variant without an arm in
         // `describe` never reaches this list, because the match is already a compile
         // error; this is the half that proves each arm says WHICH variant it rendered.
+        // The list is 16 rows for 14 variants: `StateWriteFailed` appears twice, once per
+        // `StateFile`, and `Pinned` twice, once per confirmation - the two cases the
+        // vocabulary count alone cannot see.
         let names = [
             "Loaded",
             "LoadFailed",
@@ -2324,6 +2500,8 @@ mod tests {
             "StateDirUnusable",
             "StateWriteFailed",
             "PinFailed",
+            "Pinned",
+            "Pinned",
         ];
         assert_eq!(
             names.len(),
@@ -2671,6 +2849,46 @@ mod tests {
         assert!(
             !flush_due(&wire, false, Duration::from_millis(100)),
             "and not before the idle has run out"
+        );
+    }
+
+    /// THE WRITER THE GUARD DEPENDS ON. Every assertion above SETS `loaded` by hand, which
+    /// is how the clause survived being unreachable in a real session: the tests supplied
+    /// what no event arm did. This is the seam - `adopted` is what `Loaded` and `Rebound`
+    /// call, and it is the only thing that raises the flag - so the guard now fires on what
+    /// the port announced, not on a fixture.
+    #[test]
+    fn an_announced_document_is_the_thing_the_flush_guard_waits_for() {
+        let quiet = Duration::from_millis(800);
+
+        // Before any event: the session's scratch note. No file to overwrite, so ADR-0001
+        // has nothing to withhold, and the buffer flushes on its own arithmetic.
+        let mut scratch = Wire::new(true, false);
+        assert!(!scratch.loaded, "nothing has been announced yet");
+        scratch.seen_edits = 1;
+        assert!(
+            flush_due(&scratch, false, quiet),
+            "an unannounced buffer is not an unarmed document"
+        );
+
+        // `Loaded` for a FOREIGN file: the port says `armed` false, and only the flag makes
+        // that a refusal. This is the case that could not happen while `loaded` had no
+        // production writer - the kept text would have been flushed onto the foreign file.
+        let mut foreign = Wire::new(true, false);
+        foreign.adopted(false);
+        foreign.seen_edits = 1;
+        assert!(foreign.loaded, "the arm raised the flag");
+        assert!(
+            !flush_due(&foreign, false, quiet),
+            "armed=false and loaded=true is ADR-0001 waiting for the explicit save"
+        );
+
+        // The same document once the engine says it is armed: the wait ends on the port's
+        // word, and on nothing else.
+        foreign.adopted(true);
+        assert!(
+            flush_due(&foreign, false, quiet),
+            "and the same flag lets it go when the port arms it"
         );
     }
 
