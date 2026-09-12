@@ -3,7 +3,7 @@ title: Roadmap
 type: planning
 owns: ['§9, §12']
 status: living
-updated: 2026-09-11
+updated: 2026-09-12
 ---
 
 # Roadmap
@@ -39,7 +39,8 @@ checklist.
 
 The exit criterion resolves to **seven user-visible yes/no checks**. This list is the
 milestone's definition of done — a check is PASS only when a machine proves it, not when the
-code looks finished. Status as of the current bridge slice (through `507db7f0`):
+code looks finished. Status as of the current bridge slice (through `507db7f0`, plus the
+recents and menu work now in the tree):
 
 - [x] **1. Window memory** — **PASS.** Seeded rect, real drag, `WM_CLOSE`, relaunch returns
       there; proven end to end (`74a3c90`), asserted in `crates/api/tests/geometry.rs`.
@@ -51,8 +52,22 @@ code looks finished. Status as of the current bridge slice (through `507db7f0`):
       pass; the exit check is the user-visible path, which has no assertion behind it.
 - [ ] **4. Save As** — **not proven end to end.** Path rebinding is proven headless; the
       bridge route to it is untested.
-- [ ] **5. Recents** — **not proven.** Named gap: `RecentsUpdated` is emitted only on
-      *change*, so a fresh window shows an empty list and no headless test notices.
+- [x] **5. Recents** — **machine-proven.** The named gap is closed: the port now announces
+      the persisted list *at startup*, once and before any command is handled
+      (`crates/api/src/engine.rs`, ~:382), so "nothing has changed yet" no longer reads as
+      "there is nothing". A fresh install's empty list is still silent, because empty already
+      is the bridge's default — which is why `tests/reentrancy.rs` still passes on an empty
+      state dir. Proven by `the_first_event_names_the_persisted_recents_before_any_command`
+      (`crates/api/tests/geometry.rs`, ~:569): two recents written by core's own writer, no
+      command sent, and the FIRST event off the gateway must be that list — count, order,
+      rendered labels, and `exists` as stored facts. What the list becomes on screen is proven
+      by the pure menu tests (`crates/bridge-gpui/src/menu.rs`, ~:230-295):
+      `a_recent_is_labelled_by_the_ports_own_string_at_its_own_slot`,
+      `a_missing_file_is_shown_greyed_and_never_forgotten`, and
+      `the_list_stops_where_the_slots_end` — the port's string unedited at its own numbered
+      slot, a vanished path greyed rather than forgotten, ten and never eleven. *Still owed:*
+      watching a live window draw it. The smoke harness captures the app's stderr but does not
+      yet assert a `RecentsUpdated` line there — **assertion pending**, being added.
 - [ ] **6. Autosave toggle** — **not proven.** Debounce and flush are tested
       (`crates/api/tests/debounce.rs`); the menu toggle driving them is not.
 - [ ] **7. Type and idle** — **half landed.** The scratch-note half is machine-proven: type,
@@ -60,8 +75,8 @@ code looks finished. Status as of the current bridge slice (through `507db7f0`):
       intact (`crates/api/tests/first_run.rs`, `crates/api/tests/scratch_restart.rs`). The
       idle/blur flush through a live window is still owed.
 
-**2 of 7 machine-proven** (1, and the scratch half of 7). The remaining four are exactly what
-the outstanding bridge slices are for.
+**3 of 7 machine-proven** (1, 5, and the scratch half of 7). The remaining four — 2, 3, 4, 6 —
+are exactly what the outstanding bridge slices are for.
 
 **M3 — Window persistence.**
 `platform` trait + Windows backend. Restore, validate against monitors, clamp off-screen,
