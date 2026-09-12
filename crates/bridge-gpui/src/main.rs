@@ -1405,7 +1405,17 @@ fn main() {
     // STEP 1 - query the saved session. `Gateway::start` reads session.json once,
     // on this thread; `startup_state` hands over that snapshot and is consume-once,
     // so it is read here and nowhere else.
-    let (mut gateway, events) = Gateway::start(state_dir(), Settings::default());
+    // THE RESOLVED STATE DIR, named once before anything reads it. `state_dir()` picks
+    // between a portable `<exe>\data` and `%APPDATA%\notes-gpui` on a filesystem probe, so
+    // the same binary answers differently on two machines - and a red trace claim about a
+    // session that did not persist is only judgeable once you know which directory the
+    // gateway was actually handed. This crate's `windows_subsystem` build has no console,
+    // so stderr is the one voice, and this is the earliest line it can speak.
+    // `StateDir` is a newtype over the `PathBuf` with no `Display` of its own, so `.0` is
+    // the same path the gateway receives, not a second opinion about it.
+    let dir = state_dir();
+    report(&format!("startup: state dir {}", dir.0.display()));
+    let (mut gateway, events) = Gateway::start(dir, Settings::default());
     let Some(initial) = gateway.startup_state() else {
         // Only None if the snapshot had already been consumed, which one call site
         // cannot do. If it ever can: close is the defined exit, where dropping the
