@@ -79,8 +79,9 @@ use gpui_kit::{
     div, px, rgb, size,
 };
 use notes_api::{
-    Command, Encoding, Event, EventRx, Exit, FileMeta, Gateway, InitialState, LineEnding,
-    RecentEntry, Rect, Settings, SkipReason, StateDir, WindowHandle, resolve_state_dir,
+    Command, DropGuard, Encoding, Event, EventRx, Exit, FileMeta, Gateway, InitialState,
+    LineEnding, RecentEntry, Rect, Settings, SkipReason, StateDir, WindowHandle, arm_file_drop,
+    resolve_state_dir,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -1446,6 +1447,13 @@ fn main() {
     // A one-slot cell is the smallest thing that resolves the ordering; the pump reads
     // `None` until it is filled, and `None` means "nothing to compare yet".
     let window_slot: Rc<RefCell<Option<AnyWindowHandle>>> = Rc::new(RefCell::new(None));
+    // S6: THE DROP GUARD, held in the same shape as the handle above - a one-slot cell,
+    // because the window it names appears after the loop starts. It is an
+    // `Option<DropGuard>` and not a bool: the guard IS the registration, and revoking
+    // it is the only thing dropping it can do. It is also `!Send` by the port's own
+    // design, which is why it lives in an `Rc` on this thread and could live nowhere
+    // else - the affinity rule 4 asks for is a type error here, not a convention.
+    let drop_guard: Rc<RefCell<Option<DropGuard>>> = Rc::new(RefCell::new(None));
 
     // THE KIT GENERATION: `Application::new` is gone from the surface this crate is given;
     // gpui_kit::platform::application() is the constructor that picks the platform backend
@@ -1474,6 +1482,7 @@ fn main() {
         let stats = Rc::clone(&stats);
         let subscriptions = Rc::clone(&subscriptions);
         let window_slot = Rc::clone(&window_slot);
+        let drop_guard = Rc::clone(&drop_guard);
         move |cx: &mut App| {
             // REQUIRED, not decoration: without this the app panics at first render with
             // "no state of type gpui_component::theme::Theme exists" (learned by the probe,
@@ -1644,12 +1653,23 @@ fn main() {
                 .ok()
                 .flatten()
             {
-                Some(hwnd) => send(
-                    &gateway,
-                    Command::RegisterWindow {
-                        handle: WindowHandle(hwnd),
-                    },
-                ),
+                Some(hwnd) => {
+                    send(
+                        &gateway,
+                        Command::RegisterWindow {
+                            handle: WindowHandle(hwnd),
+                        },
+                    );
+                    // THE ARM SITE, and the ONLY one in this bridge. `hwnd_of` is
+                    // called here and nowhere else, and there is no recreate path:
+                    // `on_window_closed` closes the app rather than opening a second
+                    // window, so the handle cannot change after this line. That is why
+                    // the slint bridge arms at two sites and this one arms at one. If a
+                    // recreate ever appears, THIS is where its sibling belongs, and
+                    // `arm_drop_target` already refuses a double arm instead of letting
+                    // an older guard's drop revoke a newer registration.
+                    arm_drop_target(hwnd, &drop_guard);
+                }
                 None => report("GPUI gave no Win32 window handle: RegisterWindow was not sent"),
             }
 
@@ -1723,6 +1743,7 @@ fn main() {
                 let events = Rc::clone(&events);
                 let editor_slot = Rc::clone(&editor_slot);
                 let wire = Rc::clone(&wire);
+                let drop_guard = Rc::clone(&drop_guard);
                 // THE KIT GENERATION: the callback now also receives the `WindowId` that
                 // closed - `impl FnMut(&mut App, WindowId)` (gpui-pre-0.3.4
                 // src/app.rs:2387), where 0.2.2 passed the app context alone. The id is
@@ -1737,6 +1758,14 @@ fn main() {
                     // this is the window-closed callback, the same place that already
                     // blocks on `close()` by contract.
                     final_flush(&unregistering, &editor_slot, &wire, cx);
+                    // DISARM BEFORE THE UNREGISTER, on the thread that armed. The slint
+                    // bridge states the rule - "if a later slice adds the
+                    // UnregisterWindow post, the drop belongs immediately before it" -
+                    // and this bridge HAS that post, so this is the line it was written
+                    // about. Taking the guard out here, rather than letting it die with
+                    // `main`, is what makes the revocation happen while the apartment
+                    // that registered it is alive and the HWND is still an HWND.
+                    disarm_drop_target(&drop_guard);
                     send(&unregistering, Command::UnregisterWindow);
                     close(&closing, &events);
                 }
@@ -1744,7 +1773,13 @@ fn main() {
         }
     });
 
-    // And the door that does not come through a window close.
+    // And the door that does not come through a window close: the loop ended with a
+    // window still up. Disarm here too, on the same thread, and let the report say
+    // whether there was anything left to disarm. Taking is idempotent BY DESIGN, so a
+    // run that closed its window and then fell through here prints `a guard was held:
+    // true` once and `: false` once - the true account of two doors and one
+    // registration, not a contradiction.
+    disarm_drop_target(&drop_guard);
     close(&gateway, &events);
     // The pump died with its window, so anything the engine said during its own
     // shutdown has nowhere to be rendered. It is named in the trace instead of
@@ -1872,6 +1907,128 @@ fn hwnd_of(window: &Window) -> Option<i64> {
         RawWindowHandle::Win32(win32) => Some(win32.hwnd.get() as i64),
         _ => None,
     }
+}
+
+/// S6: THE DROP TARGET, armed the only way the port allows it to be armed.
+///
+/// WHY HERE AND NOT IN THE ENGINE. `arm_file_drop` executes on the calling thread,
+/// and the contract that comes back with it is blunt: the caller must be the thread
+/// that pumps the window, because `OleInitialize` builds the COM apartment of
+/// whoever calls it and `RegisterDragDrop` binds the target to the window's owner.
+/// The engine looks like its natural home - `Command::RegisterWindow` receives this
+/// exact handle a line above - and arming there would register from a thread that
+/// pumps nothing. The callbacks would then wait for a pump inside the drag loop
+/// Windows drives for the SENDER: somebody else's Explorer frozen mid-drag, with no
+/// error returned anywhere in this process. So this bridge arms it, on the loop
+/// thread, at the moment it already holds the handle.
+///
+/// WHAT A DROP WILL MEAN. The engine turns a dropped path into `Command::Open`, so a
+/// drop is BIT-IDENTICAL to every other way this app opens a file: the same
+/// unsaved-buffer policy, the same autosave arming rules (ADR-0001), the same
+/// recents, the same epoch and generation bookkeeping. Nothing in this file decides
+/// what a path means - the port hands this signature no `Event` and no path to read,
+/// so it could not decide even by accident.
+///
+/// WHAT GETTING THE TARGET COSTS, measured against the dependency rather than
+/// assumed. gpui-pre-0.3.4 DOES register its own `IDropTarget` on every window
+/// (gpui-pre-windows-0.3.4 window.rs:1094 `#[implement(IDropTarget)]`, :1469-1471
+/// `RegisterDragDrop`), and our `arm` pre-empts it. What it was doing with it:
+/// turning the drop into `PlatformInput::FileDrop` and pushing it into gpui's own
+/// input pipeline (window.rs:1146, :1184, :1200). This bridge reads NONE of that -
+/// the only public surface about an in-flight drag is `has_active_drag` and
+/// `active_drag_cursor_style` (gpui-pre-0.3.4 app.rs:2524-2530), the `active_drag`
+/// payload itself is `pub(crate)` (app.rs:689), and neither accessor carries a path.
+/// So the takeover spends nothing this bridge could have used, which is the whole
+/// argument for doing it here at all; it is NOT true in general, and the next
+/// paragraph is what happens when it stops being true.
+///
+/// ONE VISIBLE SIDE EFFECT, so a future reader does not chase it: gpui's teardown
+/// also calls `RevokeDragDrop` (window.rs:599) and logs a failure if it errors
+/// (`.log_err()`). After a successful arm, gpui's target is already revoked, so that
+/// second revoke is the one that fails - a stray gpui log line at shutdown, from a
+/// toolkit call this bridge does not make and cannot suppress. Ours runs first and
+/// succeeds; the registration is genuinely gone either way.
+///
+/// REOPEN CONDITION - when arming must become OPT-IN, not unconditional: if this
+/// bridge ever grows a drop-to-tab / drop-on-chrome gesture of its own, or if gpui
+/// exposes the dropped paths to a window subscriber (the payload becoming public, or
+/// an `on_file_drop`-style handler), then the two targets are competing for the same
+/// gesture and the toolkit's claim wins by default. At that point this call needs a
+/// setting in front of it, and the needle below is the line that gets gated.
+///
+/// NO ENV GATE, unlike the file dialog: an `IDropTarget` nobody drags onto costs one
+/// registration and says nothing, so arming is harmless headless - and gating it
+/// would mean the code path that matters in production is not the code path any run
+/// ever exercises.
+///
+/// THE APARTMENT, HONESTLY. gpui initialises OLE on the thread that builds the
+/// platform - `OleInitialize(None)` at gpui-pre-windows-0.3.4 platform.rs:112, inside
+/// `WindowsPlatform::new`, which is the loop thread, so the apartment this call joins
+/// is the toolkit's own. That is read from the dependency's SOURCE, and it is the
+/// same call our own `arm` makes, so a pre-existing apartment is the expected case
+/// rather than a surprise. What has NOT been measured is this bridge at runtime:
+/// there is no live gpui drop run behind this line yet. If it ever prints ARM FAILED,
+/// that needle carries the platform's own sentence untranslated, and the two things
+/// to read off it are the hwnd it names and whether the words say OLE refused the
+/// window or the thread - which is the difference between a degraded window and this
+/// comment being wrong.
+fn arm_drop_target(hwnd: i64, holder: &Rc<RefCell<Option<DropGuard>>>) {
+    if holder.borrow().is_some() {
+        // A second arm while the first guard is still held would install a new guard
+        // and leave the old one to drop later - and the old guard's drop calls
+        // disarm on the SAME hwnd, revoking the target the second arm just
+        // registered. One arm site today, so this is unreachable rather than merely
+        // unlikely; it stays because a recreate path would make it live, and a report
+        // beats an unwind in the middle of a window setup.
+        report(&format!(
+            "drop: already armed (hwnd {hwnd:#x} was named twice; a second arm would have disarmed the first)"
+        ));
+        return;
+    }
+    match arm_file_drop(WindowHandle(hwnd)) {
+        Ok(guard) => {
+            // Read the takeover off the live guard BEFORE it moves into the holder.
+            // On this bridge the honest expectation is `true`: gpui registered first
+            // (window.rs:1469-1471), so the pre-emptive revoke found something. The
+            // wording below still holds under `false` - nothing registered at all -
+            // because the bridge does not interpret the bool, it reports it.
+            let took_over = guard.took_over();
+            *holder.borrow_mut() = Some(guard);
+            let whose = if took_over {
+                "took gpui's own drop target; its FileDropEvent had no subscriber here, so nothing was given up"
+            } else {
+                "quiet - nothing was registered"
+            };
+            report(&format!(
+                "drop: armed hwnd={hwnd:#x} ({whose}) - a file dragged onto this window now arrives as Command::Open, exactly like a menu Open"
+            ));
+        }
+        Err(e) => {
+            // Rendered honestly, never silence. A window that cannot receive drops is
+            // one missing convenience, not a broken app, so the answer is a line the
+            // reader can act on - and the guard stays None, which is what makes the
+            // exit needle below say `a guard was held: false`.
+            report(&format!(
+                "drop: ARM FAILED - {e}, dragging files onto the window will do nothing"
+            ));
+        }
+    }
+}
+
+/// S6: put the registration down, on the thread that picked it up. Both exits call
+/// this - the window-close handler immediately before `Command::UnregisterWindow`,
+/// and the fall-out-of-the-loop path - and it is idempotent, so the pair reports
+/// truthfully about one registration instead of double-revoking it.
+fn disarm_drop_target(holder: &Rc<RefCell<Option<DropGuard>>>) {
+    let disarmed = holder.borrow_mut().take();
+    report(&format!(
+        "drop: disarmed on exit (a guard was held: {})",
+        disarmed.is_some()
+    ));
+    // The drop is what calls the platform's `disarm`, and doing it HERE rather than
+    // at the end of `main` keeps the revocation inside the apartment that registered
+    // it, while the HWND still names a window.
+    drop(disarmed);
 }
 
 fn send(gateway: &Rc<RefCell<Option<Gateway>>>, command: Command) {
