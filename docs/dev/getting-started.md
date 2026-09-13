@@ -31,8 +31,9 @@ cargo build
 
 The first build compiles the whole dependency graph — ~440 crates, the GPUI toolkit
 among them, so expect a few minutes. Warm rebuilds are seconds. A default build links
-three exes into `target\debug\`: `notes-gpui.exe`, and `notes-slint.exe` plus
-`notes-slint-probe.exe` from `crates/bridge-slint`. In every case the *bin* is the product
+three **app** exes into `target\debug\` — `notes-gpui.exe`, and `notes-slint.exe` plus
+`notes-slint-probe.exe` from `crates/bridge-slint` — beside the `xtask.exe` tool itself.
+In every app case the *bin* is the product
 name and the *package* names the adapter — `notes-gpui` from `notes-bridge-gpui`, both
 Slint bins from `notes-bridge-slint` — because one package can ship more than one thing.
 They are not three copies of the same app; [Run](#run) says which to start.
@@ -65,8 +66,8 @@ cargo run -p notes-bridge-slint --bin notes-slint-probe   # the instrument
 
 **Run `notes-slint` to use the app.** It is the shipping artifact — the one CI links (the
 `slint-build` row of `cargo xtask check`), the one `cargo xtask smoke --binary=slint`
-judges, and the name the icon, the application manifest and the `%APPDATA%` identity fence
-against. It runs no scheduled acts and hides itself for no harness's benefit, so it stays
+judges, and the name every downstream owner fences against — which is why it is declared
+first in `crates/bridge-slint/Cargo.toml`. It runs no scheduled acts and hides itself for no harness's benefit, so it stays
 open until you close it; the stderr it does write is its own startup report — which is
 exactly what the product leg reads.
 
