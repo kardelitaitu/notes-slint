@@ -1,0 +1,142 @@
+// S1 design TOKENS for the slint bridge: the palette, the type scale and the
+// title-bar slot, named once instead of repeating per label.
+//
+// Every default below is HARVESTED, not chosen. Each one is the literal
+// `ui/main.slint` carries today, and the line is cited where it sits, so the
+// wiring can be checked hex-for-hex. That file belongs to another lane: it is
+// read here and NOT edited, and nothing in this file mounts into it. Importing
+// `Theme` and replacing a literal is one line at a time, in that lane's diff.
+//
+// Why a token table instead of `Palette` lookups everywhere:
+// `.agents/skills/slint/reference/polish.md` - "Scattered hex literals break dark
+// mode and drift out of sync". Why the tokens are `in` rather than all `out`:
+// an `in` property is what lets the host (or tomorrow's settings key) re-skin the
+// bar without a markup edit; a value derived only from `Palette` cannot be
+// overridden from Rust, and this app's whole pin story is that the PORT tells the
+// UI what is true, so the UI's colors should be settable from outside too.
+
+// `ColorScheme` is a slint BUILTIN enum, not a std-widgets export - naming it in
+// this import is a hard error ("No exported type called 'ColorScheme'").
+import { Palette } from "std-widgets.slint";
+
+/// Which scheme the derived tokens follow: the OS one, unless the host says
+/// otherwise. `system` is the default because the spike has no settings key yet.
+export enum ThemePreference {
+    system,
+    light,
+    dark,
+}
+
+/// The one place a color or a size is written down.
+export global Theme {
+    // ---- scheme -------------------------------------------------------
+
+    in property <ThemePreference> preference: ThemePreference.system;
+
+    /// Resolved once, so no component has to repeat the three-way choice.
+    out property <bool> dark:
+        preference == ThemePreference.dark ? true
+        : preference == ThemePreference.light ? false
+        : Palette.color-scheme == ColorScheme.dark;
+
+    // ---- palette ------------------------------------------------------
+    // Six colors, all of them already on screen today.
+
+    /// The title strip while the port has NOT confirmed always-on-top.
+    /// `ui/main.slint:58`, the unpinned branch of `background`.
+    in property <color> bar-bg: #2b2b2b;
+
+    /// The title strip while it HAS: the only state the strip can be in, and the
+    /// reason it is a token rather than a ternary in the markup.
+    /// `ui/main.slint:58`, the pinned branch.
+    in property <color> bar-bg-pinned: #445566;
+
+    /// The strip's own label: the strongest voice on the bar.
+    /// `ui/main.slint:72`.
+    in property <color> text-primary: #eeeeee;
+
+    /// What the port last said. One step down from primary, one up from muted -
+    /// that ladder is the whole argument for naming these.
+    /// `ui/main.slint:90`.
+    in property <color> text-secondary: #bbbbbb;
+
+    /// A recents row, i.e. text the user may act on but that is not a status.
+    /// `ui/main.slint:104`.
+    in property <color> text-row: #d0d0d0;
+
+    /// Text the UI decided about itself (the tap counter) - deliberately the
+    /// weakest, because it reports the click, not the world.
+    /// `ui/main.slint:80`.
+    in property <color> text-muted: #999999;
+
+    /// Derived, not picked, per polish.md ("Derive secondary text from the
+    /// palette instead of picking a gray"). The ONE token here that is not a
+    /// harvested hex, and the one that follows `preference` for free: on a light
+    /// scheme it comes back as a faded dark, with no second table of grays.
+    out property <brush> text-faded: Palette.foreground.transparentize(0.4);
+
+    /// A hairline that belongs to whichever scheme is showing, for the day the
+    /// strip gains an edge rather than a hard color change.
+    out property <brush> bar-edge: Palette.border;
+
+    // ---- type scale, in rem -------------------------------------------
+    // The scale is RATIOS of `1rem`, applied at the label as:
+    //
+    //     font-size: 1rem * Theme.font-scale-body;
+    //
+    // `rem` in slint is the window's DEFAULT FONT SIZE, not a fixed 16px, so the
+    // ladder follows the platform's own body text instead of freezing pixels - and
+    // the px the spike ships today is written beside each ratio so the two can be
+    // compared in a screenshot before anyone adopts one of them.
+    //
+    // Why the ratio and not the length: a `1rem` LITERAL cannot live in a global.
+    // Measured with slint-viewer 1.17.1 --check on the obvious form
+    // (`in property <length> font-body: 1rem;`), and the same for a function body:
+    //   error: Cannot convert between rem and logical length in a global component,
+    //          because the default font size is not known
+    // A global belongs to no window, so only the window can pay for the conversion.
+    // The ratio is what travels; the `1rem` is written where a window exists.
+
+    /// The document text - `ui/main.slint:119` ships 14px.
+    in property <float> font-scale-body: 1.0;
+
+    /// A strip label, the app's heading role - `ui/main.slint:73` ships 12px.
+    in property <float> font-scale-heading: 1.15;
+
+    /// Status line and recents rows - `ui/main.slint:81,91,105` ship 11px.
+    in property <float> font-scale-secondary: 0.85;
+
+    /// Subordinate to that, for a timestamp or a count. No literal to harvest yet:
+    /// the one ratio here that is a choice rather than a measurement.
+    in property <float> font-scale-caption: 0.75;
+
+    // ---- spacing and slots --------------------------------------------
+
+    /// The fixed button slot at either end of the title band. Two buttons share
+    /// the left one, and the empty right one has to match it or the kit's
+    /// justify-between reads as a left shift instead of as centring.
+    ///
+    /// It is 60px here because that is what the FIRST bridge measures for the same
+    /// shape (`crates/bridge-gpui/src/titlebar.rs:58`, `SLOT_WIDTH = px(60.)`), and
+    /// the number surviving a toolkit swap is the claim this workspace makes.
+    in property <length> slot-width: 60px;
+
+    /// The strip's height: `ui/main.slint:57`.
+    in property <length> bar-height: 28px;
+
+    /// One icon cell inside the slot. `ui/icons/*.svg` are authored on a 24x24
+    /// grid, so this and the viewBox are the same number by construction.
+    in property <length> icon-size: 24px;
+
+    /// The strip's left inset, the value the spike repeats (`ui/main.slint:69,87`).
+    in property <length> gap: 8px;
+
+    /// The tight step down, per polish.md's "multiples of 8, halving to 4":
+    /// `ui/main.slint:88` uses 2px once; 4 is the scale's floor, and a token for a
+    /// single-use 2px would be a coin flip dressed as a system.
+    in property <length> gap-tight: 4px;
+
+    /// Deliberately NOT lifted: the 6px row inset at `ui/main.slint:101`. It is the
+    /// one spacing the spike never repeats, so it stays a literal until a second
+    /// use says which scale value it was meant to be.
+}

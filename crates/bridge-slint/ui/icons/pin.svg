@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    pin.svg - the PINNED glyph, authored for this repo (MIT, no third-party asset
+    and no download: see unpin.svg's header for the pair and the sizing notes).
+    Monochrome on purpose: slint's Image.colorize repaints the whole glyph from the
+    theme, so one file serves both schemes. Grid 24x24 = Theme.icon-size.
+    Geometry is paths + polygons only - no mask, filter, transform or gradient -
+    because slint renders SVG through its own parser, and those are what survive it.
+  -->
+  <!-- cap: the flat head you press -->
+  <path fill="#000000" d="M6 2h12v5H6z"/>
+  <!-- body: cap down to the needle, tapering -->
+  <path fill="#000000" d="M8 7h8l-2.5 6h-3z"/>
+  <!-- needle: driven into the board, i.e. the window is held above the rest -->
+  <path fill="#000000" d="M11 13h2v9h-2z"/>
+</svg>

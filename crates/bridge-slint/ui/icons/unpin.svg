@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    unpin.svg - the UNPINNED glyph, the same pin with a strike across it: the two
+    states read as one object changing, which is what a toggle needs. Both files in
+    this pair are authored for this repo (MIT; nothing downloaded), share the pin's
+    exact geometry, and are monochrome so Image.colorize can repaint them for either
+    scheme. 24x24 = Theme.icon-size. Paths and polygons only, for slint's parser.
+  -->
+  <!-- cap -->
+  <path fill="#000000" d="M6 2h12v5H6z"/>
+  <!-- body -->
+  <path fill="#000000" d="M8 7h8l-2.5 6h-3z"/>
+  <!-- needle -->
+  <path fill="#000000" d="M11 13h2v9h-2z"/>
+  <!-- the strike: 2.1px band from lower-left to upper-right, clearing the cap -->
+  <path fill="#000000" d="M1.4 20.4L20.4 1.4 22.6 3.6 3.6 22.6z"/>
+</svg>
