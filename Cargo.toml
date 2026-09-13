@@ -34,6 +34,20 @@ tempfile = "3"
 # name the bridge imported disappeared.
 gpui-kit = "=0.6.1"
 raw-window-handle = "0.6"
+# S9: the file picker. ONE declaration, per the features lesson - a member that repeats the
+# version drifts the moment the root bumps it, and two copies of rfd in one lockfile is how a
+# bridge ends up with two dialogs.
+#
+# default-features = false is the part worth the comment, and it is the lesson applied rather
+# than re-learned: rfd's DEFAULTS are xdg-portal + wayland + async-std, i.e. a Linux story
+# (ashpd, pollster, urlencoding) that a Windows-first spike does not need and that widens the
+# offline resolve for nothing. On Windows the native IFileDialog backend is cfg-gated, not
+# feature-gated, so it builds with NO features at all. Revisit when M8 lands Linux: the
+# portal path is then a feature to ADD here, in one line, by name and with a reason - not a
+# silent default inherited from a crate whose author was thinking about a different OS.
+# common-controls-v6 is the legacy fallback picker behind a feature; the modern backend is
+# what this app gets, so the feature stays off and the closure stays small.
+rfd = { version = "0.16", default-features = false }
 # Granted by FCR at S1 (bridge editor). Needed for grapheme-cluster boundaries in the caret-to-point mapping
 # (slice S4) and for a caret that does not split a combining sequence. Verified present in the offline
 # registry cache (1.12.0 and 1.13.3) so it resolves with --offline, which CI depends on.

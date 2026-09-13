@@ -273,6 +273,125 @@ const CHORD_TAIL_AT: Duration = Duration::from_millis(21600);
 /// comment that says it should.
 const CHORD_EVERY: Duration = Duration::from_millis(500);
 
+// ==== S9: THE NATIVE DIALOG, AND THE ONE RULE IT MAY NOT BREAK ====
+//
+// The rule: never block the Slint event loop. rfd's pick_file/save_file are SYNCHRONOUS and
+// modal, so calling one from a handler freezes pump, autosave, drain and every tick needle for
+// as long as the user takes - the same class of failure as "never block on a channel inside a
+// frame", with a person instead of a deadlock. So the dialog lives on a thread of its own and
+// answers over a channel whose Receiver is polled by try_recv in the per-tick drain: no await,
+// no new timer, no callback the toolkit has to be alive to deliver.
+//
+// THE PARENT, and this is the finding the brief predicted. rfd 0.16 offers exactly one way to
+// own a dialog to a window - FileDialog::set_parent(&W) where W: HasWindowHandle +
+// HasDisplayHandle (file_dialog.rs:96); there is no set_parent_handle and DialogHandle is not
+// public. The only handle this bridge can reach is slint::Window::window_handle(), whose
+// return type BORROWS the window (hwnd_of at the top of this file lives inside one statement
+// for exactly that reason), so it cannot be moved into a spawned thread: the compiler says
+// "closure may outlive the current function, but it borrows". Consequence, and it is a real
+// one, not cosmetic: THE DIALOG OPENS UNPARENTED - it is not modal to our window, it can be
+// left behind by an alt-tab, and it is not the child that would move with the window. A shipped
+// bridge fixes this at the platform layer (notes-platform owns the HWND and could take it as a
+// raw isize and call the Win32 API itself), which is an ADR conversation, not a line here. So:
+// unparented, said here, said in the needle, and rfd still gets the starting directory and the
+// suggested name, which is most of what a dialog being owned buys the user.
+//
+// WHAT THE COMPILER SAID, since the attempt is gone and its words are the evidence: spawning
+// rejected slint::WindowHandle three times over - Rc of dyn WindowAdapter cannot be sent between
+// threads safely, dyn HasWindowHandle cannot be SHARED between threads safely, and the type is
+// not Send either (i-slint-core api.rs:414 WindowHandleInner, :429 WindowHandle), required by
+// this bound in spawn. Not a borrow-lifetime complaint but an auto-trait verdict: the handle is
+// deliberately not thread-safe, because a window adapter is single-threaded by design.
+//
+// THE WAY ROUND, named so nobody rediscovers it as a clever idea: carry a plain isize HWND into
+// the thread and implement the two traits on a local newtype, which is what rfd actually wants
+// (it reads the raw handle at call time, file_dialog.rs:100). That takes a NonNull over a pointer
+// nobody here owns - unsafe - and AGENTS.md puts unsafe in notes-platform, not in a bridge. Right
+// rule, and it names where the fix belongs: notes-platform already holds the HWND it was given by
+// Command::RegisterWindow, so a Send-able owned-handle answer is a port-and-platform conversation,
+// not a line in this file. Until then: unparented, on purpose, out loud.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DialogKind {
+    Open,
+    SaveAs,
+}
+
+impl DialogKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::SaveAs => "save as",
+        }
+    }
+}
+
+/// What the picker thread sends back: a path, or the absence of one. The absence IS the
+/// cancel - rfd returns None for it, and the rule below is that it must never be silence.
+struct DialogReply {
+    kind: DialogKind,
+    path: Option<PathBuf>,
+}
+
+/// The headless defence, same shape as SYNTHETIC_CLOSE_ACTS, with one difference that had to be
+/// said out loud: a const cannot be set by an environment, and this gate exists precisely so a
+/// CI/smoke/probe run can stand the modal down without an edit. So the const is the shipped
+/// DEFAULT (a real bridge does show a dialog) and SLINT_NO_DIALOG=1 is the per-run gate. Every
+/// probe run in this slice's evidence was made with the gate ON.
+const DIALOG_ALLOWED_BY_DEFAULT: bool = true;
+
+fn dialog_allowed() -> bool {
+    DIALOG_ALLOWED_BY_DEFAULT && std::env::var_os("SLINT_NO_DIALOG").is_none()
+}
+
+/// Where the picker starts. The current file's directory first - the port's recents list is
+/// ordered most-recent-first, so recents[0] IS the file in the window, and after a Clear it is
+/// the next best thing - then nothing, which leaves rfd on its own default.
+fn dialog_starting_dir(current: Option<&PathBuf>, recents: &[PathBuf]) -> Option<PathBuf> {
+    let from = current.or_else(|| recents.first());
+    let dir = from.and_then(|path| path.parent())?;
+    (!dir.as_os_str().is_empty()).then(|| dir.to_path_buf())
+}
+
+/// The name the save dialog offers. The bridge already computes the title's words for the OS
+/// title and the strip, so the dialog asks for the same thing the user can already read rather
+/// than inventing a third name; an extension is added only when the word has none, because
+/// rfd's suggestion is a whole file name on Windows.
+fn suggested_name(title_words: &str) -> String {
+    let trimmed = title_words.trim();
+    let base = if trimmed.is_empty() {
+        "Untitled".to_string()
+    } else {
+        // The path type knows both separators on Windows; a hand-rolled split by one of them
+        // is the kind of bug that only shows up on the other machine. A full path in, a bare
+        // file name out, and words that are not a path come back as they were.
+        std::path::Path::new(trimmed)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| trimmed.to_string())
+    };
+    if base.contains(".") {
+        base.to_string()
+    } else {
+        format!("{base}.notes")
+    }
+}
+
+/// The one place the wording of a dialog answer lives, so the status line and the log cannot
+/// disagree about whether the user picked or cancelled.
+fn dialog_words(kind: DialogKind, path: &Option<PathBuf>) -> String {
+    match path {
+        Some(chosen) => format!(
+            "{}: {}",
+            kind.label(),
+            chosen
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| chosen.display().to_string())
+        ),
+        None => format!("{}: cancelled", kind.label()),
+    }
+}
+
 /// Which table rows to drive, by index into SHORTCUTS: Open, Alt+2, Auto-save, Save As,
 /// Clear recents. The order is a constraint, not a preference, and it cost a run to learn:
 ///  * Alt+2 before Clear - clearing first empties the list the recents act reads, so the Alt
@@ -610,6 +729,12 @@ fn main() {
     let dir = Rc::new(dir);
     let tick = Timer::default();
     let third_dir = Rc::clone(&dir);
+    // S9: the dialog answer lane, created before the tick that reads it, because the tick
+    // is the only thing in this binary allowed to notice that a person has finished
+    // choosing. One try_recv per tick, never an await, never a timer of its own.
+    let (dialog_tx, dialog_rx) = std::sync::mpsc::channel::<DialogReply>();
+    let dialog_rx = Rc::new(RefCell::new(dialog_rx));
+    let dialog_tx = Rc::new(dialog_tx);
     let third_gw = Rc::clone(&gateway);
     let third_events = Rc::clone(&events);
     let third_pump = Rc::clone(&pump);
@@ -661,6 +786,15 @@ fn main() {
             // S4, THE ONE-LINER: the pump now runs on EVERY tick, so event latency
             // is the 8 ms tick and not "whenever the next hand-written poll happens".
             drain(&third_events, &third_pump, &ui.as_weak());
+            // S9: the picker answer, if one has come in. try_recv is a question with a
+            // one-word answer; when it is not yet, the tick goes on to pump, autosave and
+            // drain exactly as it did while the modal was up. That IS the rule, tested.
+            {
+                let rx = dialog_rx.borrow();
+                while let Ok(reply) = rx.try_recv() {
+                    answer_dialog(reply, &third_gw, &third_pump, &ui);
+                }
+            }
             // RISK 3, second half: DOES the handle appear once the loop has actually
             // spun? If it does, this is the registration point and the delay is the
             // finding - a bridge cannot place what it cannot name.
@@ -1132,58 +1266,26 @@ fn main() {
     // implements none of it again - that is the whole reason the rows forward instead of
     // answering in markup. Chrome dismisses its own popup; Rust runs the command.
     {
-        let gw = Rc::clone(&gateway);
-        let pump = Rc::clone(&pump);
+        let dialog_tx = Rc::clone(&dialog_tx);
+        let dialog_pump = Rc::clone(&pump);
+        let dialog_weak = ui.as_weak();
         ui.on_open_asked(move || {
-            // The real command is Command::Open { path }. A shipped bridge gets the path
-            // from a file dialog; this spike has no dialog surface, so it opens the file
-            // the probe already owns and SAYS so. Command, answer and buffer adoption are
-            // the production ones - only the picker is stood in for, in the log line.
-            let found = pump.borrow().seed.clone();
-            match found {
-                Some(path) => {
-                    report(&format!(
-                        "menu: Open row -> Command::Open {} (no dialog surface in this spike)",
-                        path.display()
-                    ));
-                    send(&gw, Command::Open { path });
-                }
-                None => report("menu: Open row asked, but no path exists to open - nothing sent"),
-            }
+            // S9: the row, the Ctrl+O chord and any future native menu land on this one
+            // handler, and the handler now means ask a person. What comes back goes out
+            // through Command::Open - the SAME door the recents rows use, which is the only
+            // reason a picked file keeps the epoch, the buffer adoption and the title working.
+            ask_dialog(DialogKind::Open, &dialog_weak, &dialog_pump, &dialog_tx);
         });
     }
     {
-        let gw = Rc::clone(&gateway);
-        let pump = Rc::clone(&pump);
-        let weak = ui.as_weak();
+        let dialog_tx = Rc::clone(&dialog_tx);
+        let dialog_pump = Rc::clone(&pump);
+        let dialog_weak = ui.as_weak();
         ui.on_save_as_asked(move || {
-            let found = pump.borrow().loop_path.clone();
-            let Some(ui) = weak.upgrade() else { return };
-            match found {
-                Some(path) => {
-                    let text = lf(&ui.get_buffer());
-                    let revision = {
-                        let mut p = pump.borrow_mut();
-                        p.edits += 1;
-                        p.last_sent = text.clone();
-                        p.edits
-                    };
-                    report(&format!(
-                        "menu: Save As row -> Command::SaveAs {} ({} bytes, revision={revision})",
-                        path.display(),
-                        text.len()
-                    ));
-                    send(
-                        &gw,
-                        Command::SaveAs {
-                            path,
-                            text,
-                            revision,
-                        },
-                    );
-                }
-                None => report("menu: Save As row asked before any path existed - nothing sent"),
-            }
+            // The same ask with a different verb, answering through the door that already
+            // exists: Command::SaveAs, with the buffer read when the ANSWER arrives rather
+            // than when the user was asked - see answer_dialog.
+            ask_dialog(DialogKind::SaveAs, &dialog_weak, &dialog_pump, &dialog_tx);
         });
     }
     {
@@ -1717,6 +1819,123 @@ fn fire(ui: &Spike, route: Route, display: &str, what: &str) {
 /// Which asset the maximize cell shows. The markup carries the same ternary; this exists so a
 /// test can hold the two together. The risk is not that the condition is wrong, it is that
 /// someone renames a file or flips one branch and the button starts lying about the state.
+/// Show the dialog OFF THE LOOP. Grabbed on the calling thread: the starting directory, the
+/// suggested name and the gate decision, all of which need the component or the pump, then the
+/// block happens somewhere else and the answer comes back over the channel.
+fn ask_dialog(
+    kind: DialogKind,
+    weak: &slint::Weak<Spike>,
+    pump: &Rc<RefCell<Pump>>,
+    tx: &std::sync::mpsc::Sender<DialogReply>,
+) {
+    let Some(ui) = weak.upgrade() else { return };
+    let (starting, suggested, stand_in) = {
+        let p = pump.borrow();
+        (
+            dialog_starting_dir(p.seed.as_ref(), &p.recent_paths),
+            suggested_name(&ui.get_title_words()),
+            match kind {
+                DialogKind::Open => p.seed.clone(),
+                DialogKind::SaveAs => p.loop_path.clone(),
+            },
+        )
+    };
+    drop(ui);
+
+    if !dialog_allowed() {
+        report(&format!(
+            "dialog[skipped]: SLINT_NO_DIALOG - no modal to click, so the probe's own path answers through the SAME channel ({} -> {})",
+            kind.label(),
+            stand_in
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+        ));
+        let _ = tx.send(DialogReply {
+            kind,
+            path: stand_in,
+        });
+        return;
+    }
+
+    report(&format!(
+        "dialog: spawning the {label} picker on its own thread (UNPARENTED - see the finding; the loop keeps pumping)",
+        label = kind.label()
+    ));
+    let tx = tx.clone();
+    // THE PARENT IS NOT CARRIED, and the compiler is the witness for it: rfd's set_parent takes
+    // a &impl HasWindowHandle (file_dialog.rs:96) and reads the raw handle out of it at call
+    // time (file_dialog.rs:100), so the call has to happen on THIS thread for the dialog to be
+    // owned - and this thread is not allowed to block. Owned dialog or responsive loop: the
+    // rule picks the loop. The full wording of the rejection is in the finding above.
+    std::thread::spawn(move || {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = starting {
+            dialog = dialog.set_directory(dir);
+        }
+        if kind == DialogKind::SaveAs {
+            dialog = dialog.set_file_name(suggested);
+        }
+        // The blocking call, on a thread nobody is waiting on.
+        let chosen = match kind {
+            DialogKind::Open => dialog.pick_file(),
+            DialogKind::SaveAs => dialog.save_file(),
+        };
+        let _ = tx.send(DialogReply { kind, path: chosen });
+    });
+}
+
+/// The far end, run from the tick: try_recv, no await, and the SAME doors the rows and the
+/// chords already use. Nothing here owns a path or a revision; it hands them to the port.
+fn answer_dialog(
+    reply: DialogReply,
+    gw: &Rc<RefCell<Option<Gateway>>>,
+    pump: &Rc<RefCell<Pump>>,
+    ui: &Spike,
+) {
+    let words = dialog_words(reply.kind, &reply.path);
+    ui.set_status(words.clone().into());
+    match (reply.kind, reply.path) {
+        (_, None) => report(&format!(
+            "dialog: {words} (nothing sent; cancel is not silence)"
+        )),
+        (DialogKind::Open, Some(path)) => {
+            report(&format!(
+                "dialog: {words} -> Command::Open, the recents door"
+            ));
+            send(gw, Command::Open { path });
+        }
+        (DialogKind::SaveAs, Some(path)) => {
+            // The buffer is read HERE, at the moment the answer arrives, not when the user was
+            // asked. gpui snapshots before opening the dialog (main.rs:2160) and pays for it:
+            // anything typed while the dialog is up is saved under a name for text that is
+            // already gone. Here the pump kept running the whole time, so the freshest text and
+            // the revision that describes it are read together, in one pair of statements, and
+            // a stale pairing is not reachable.
+            let text = lf(&ui.get_buffer());
+            let revision = {
+                let mut p = pump.borrow_mut();
+                p.edits += 1;
+                p.last_sent = text.clone();
+                p.edits
+            };
+            report(&format!(
+                "dialog: {words} -> Command::SaveAs {} ({} bytes, revision={revision})",
+                path.display(),
+                text.len()
+            ));
+            send(
+                gw,
+                Command::SaveAs {
+                    path,
+                    text,
+                    revision,
+                },
+            );
+        }
+    }
+}
+
 fn caption_glyph(maximized: bool) -> &'static str {
     if maximized {
         "icons/restore.svg"
@@ -2336,6 +2555,66 @@ mod chords {
             MARKUP.contains("visible: chrome.menu-open")
                 && MARKUP.contains("enabled: chrome.menu-open"),
             "a closed popup must leave every pixel to the editor"
+        );
+    }
+
+    #[test]
+    fn the_suggested_name_is_the_title_the_user_can_already_read() {
+        // The strip says "s9-seed.notes", so the dialog asks for "s9-seed.notes" - a third
+        // name for the same document (Untitled.notes while the title says something else) is
+        // the kind of small inconsistency that makes a dialog feel like another app.
+        assert_eq!(suggested_name("s9-seed.notes"), "s9-seed.notes");
+        assert_eq!(suggested_name("scratch"), "scratch.notes");
+        assert_eq!(suggested_name(""), "Untitled.notes");
+        assert_eq!(suggested_name("   "), "Untitled.notes");
+        // A path in, a file name out, on both separators, because the title can carry the
+        // file name and a user can paste a path into a name field.
+        assert_eq!(suggested_name(r"C:\dev\notes\a.notes"), "a.notes");
+        assert_eq!(suggested_name("/tmp/thing"), "thing.notes");
+        // An extension already there is left alone - no ".notes.notes" on a second ask.
+        assert_eq!(suggested_name("report.md"), "report.md");
+    }
+
+    #[test]
+    fn a_cancel_is_a_word_and_never_silence() {
+        assert_eq!(dialog_words(DialogKind::Open, &None), "open: cancelled");
+        assert_eq!(
+            dialog_words(DialogKind::SaveAs, &None),
+            "save as: cancelled"
+        );
+        assert_eq!(
+            dialog_words(
+                DialogKind::Open,
+                &Some(PathBuf::from(r"C:\dev\x\keep.notes"))
+            ),
+            "open: keep.notes"
+        );
+        // The label is the verb the user pressed, so the status line and the log cannot name
+        // two different acts for one reply.
+        assert_eq!(DialogKind::Open.label(), "open");
+        assert_eq!(DialogKind::SaveAs.label(), "save as");
+    }
+
+    #[test]
+    fn the_picker_starts_where_the_document_lives() {
+        let here = PathBuf::from(r"C:\dev\notes\a.notes");
+        let there = PathBuf::from(r"D:\other\b.notes");
+        assert_eq!(
+            dialog_starting_dir(Some(&here), std::slice::from_ref(&there)),
+            Some(PathBuf::from(r"C:\dev\notes"))
+        );
+        // No current file: the first recent is the next best guess, which after a
+        // Clear recents is nothing at all and rfd keeps its own default.
+        assert_eq!(
+            dialog_starting_dir(None, &[here.clone(), there.clone()]),
+            Some(PathBuf::from(r"C:\dev\notes"))
+        );
+        assert_eq!(dialog_starting_dir(None, &[]), None);
+        // A bare relative name has no directory to offer; an empty path must not be handed
+        // to a dialog as the working directory of everything.
+        assert_eq!(
+            dialog_starting_dir(Some(&PathBuf::from("bare.notes")), &[]),
+            None
         );
     }
 

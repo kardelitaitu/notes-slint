@@ -46,3 +46,6 @@ notes-api = { workspace = true }
 slint = { workspace = true }
 # The trait objects `window_handle()` hands back; the same pin bridge-gpui uses.
 raw-window-handle = { workspace = true }
+# S9: the native picker, ON THE THREAD. Declared once at the root with the reason;
+# here it is only used.
+rfd = { workspace = true }
