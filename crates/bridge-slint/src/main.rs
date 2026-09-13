@@ -177,6 +177,35 @@ const SETTLE: Duration = Duration::from_millis(300);
 // the registration answer can miss the whole loop - so the ask waits for that answer
 // but never waits forever.
 const LATE_ASK: Duration = Duration::from_millis(4000);
+
+/// S4c: the save-failure cycle. Three acts inside the 25 s lifetime: take the path away
+/// (READ_ONLY_AT), type (KEY2_AT) so the debounce has something to send and the port must
+/// fail, then put it back (WRITE_BACK_AT) so the next save lands and the latch clears.
+/// The middle act is deliberately NOT a read-only attribute: an autosave writes by
+/// renaming a temp file OVER its target, and Windows lets a rename replace a read-only
+/// file - the attribute would prove nothing. What reliably fails is a DIRECTORY sitting
+/// on the target path, a lesson this repo already paid for (crates/xtask/src/smoke.rs:
+/// "Access is denied (os error 5) ... exactly what renaming a file onto a directory
+/// does"). Same error, staged on purpose, in the one place it can be undone.
+const READ_ONLY_AT: Duration = Duration::from_millis(12000);
+const KEY2_AT: Duration = Duration::from_millis(13500);
+const WRITE_BACK_AT: Duration = Duration::from_millis(17000);
+
+/// S4c: THE MENU, WITH NO HANDS. A row's click cannot be synthesised from outside the
+/// window, so the tick invokes the ROOT callback each forwarded row reaches - which is
+/// precisely the wire a click drives: Chrome -> root.open-asked() -> the Rust handler ->
+/// the Command. What this does NOT prove is the one markup line per row (Chrome's own
+/// callback reaching root's), and that is proven by the component compiling and the popup
+/// drawing. One act per tick slot, in the order a user would try them.
+const MENU_OPEN_AT: Duration = Duration::from_millis(18500);
+const MENU_SAVEAS_AT: Duration = Duration::from_millis(19300);
+const MENU_AUTOSAVE_AT: Duration = Duration::from_millis(20000);
+const MENU_QUIT_AT: Duration = Duration::from_millis(20600);
+
+/// S4b: when the one in-run keystroke lands. After the pin experiment has finished
+/// (PIN_AT + HOLD + SETTLE) and after the seed Open has adopted a buffer, so the tick
+/// count, the dot and the flush are all measured against a settled baseline.
+const LATE_KEY: Duration = Duration::from_millis(9000);
 /// Print one tick needle per this-many milliseconds, from inside the Timer callback.
 const TICK_MS: u64 = 2000;
 
@@ -313,6 +342,11 @@ fn main() {
         report("autosave: SetAutosave(true) sent - spike override, after registration");
     }
     let pump = Rc::new(RefCell::new(Pump::default()));
+    // The autosave bit the port holds now: InitialState's answer, or ON because the
+    // spike override just above sent SetAutosave(true). Stated as the sequence of
+    // commands this bridge sent, because no event confirms it (see Pump::autosave).
+    pump.borrow_mut().autosave = true;
+    note_dot(&pump, &ui.as_weak(), false, "start");
     text_probe(&ui);
 
     // (a) THE SAVE PATH, so the loop can actually close. File-less, nothing can land
@@ -329,6 +363,7 @@ fn main() {
         let place = exe_dir.join("slint-probe");
         if std::fs::create_dir_all(&place).is_ok() {
             let path = place.join("s4-loop.notes");
+            pump.borrow_mut().loop_path = Some(path.clone());
             let text = lf(&ui.get_buffer());
             let revision = pump.borrow().edits;
             report(&format!(
@@ -543,6 +578,105 @@ fn main() {
             }
             // ---- S4: the text loop, on the bridge's own cadence ----
             text_pump(&ui, &third_gw, &third_pump);
+            // S4b: ONE keystroke from inside the loop, so 'buffer changed -> dot reddens
+            // -> debounce -> flush' is proven on the tick rather than inferred from the
+            // exit path. Deliberately after text_pump: the NEXT tick is the one that must
+            // see it dirty, which is the ordering the user actually experiences.
+            {
+                let mut p = third_pump.borrow_mut();
+                if !p.late_key && now >= LATE_KEY {
+                    p.late_key = true;
+                    let base = p.last_sent.clone();
+                    drop(p);
+                    report(&format!(
+                        "keystroke-in-run: t+{now:?} appending 6 bytes, expecting dirty then flush"
+                    ));
+                    ui.set_buffer(format!("{base}+typed").into());
+                }
+            }
+            // ---- S4c: stage the failure, type, then clear the way ----
+            {
+                let mut p = third_pump.borrow_mut();
+                if !p.ro_done && now >= READ_ONLY_AT {
+                    p.ro_done = true;
+                    let found = p.loop_path.clone();
+                    drop(p);
+                    match found {
+                        Some(file) => {
+                            let away = file.with_extension("notes.bak");
+                            // Rename the real file aside, put a DIRECTORY on its path,
+                            // and roll back if the second step fails - staged, checked,
+                            // and reversible in one straight line each.
+                            // Rename the real file aside, put a DIRECTORY on its path,
+                            // and roll both back if either step fails: staged, checked,
+                            // reversible - and no map_err/inspect_err to fight the lint with.
+                            let attempt = std::fs::rename(&file, &away)
+                                .and_then(|_| std::fs::create_dir(&file));
+                            let staged = match &attempt {
+                                Ok(()) => format!(
+                                    "path is now a DIRECTORY, so the rename-over-target must fail: {}",
+                                    file.display()
+                                ),
+                                Err(err) => {
+                                    let _ = std::fs::remove_dir(&file);
+                                    let _ = std::fs::rename(&away, &file);
+                                    format!("STAGING FAILED: {err}")
+                                }
+                            };
+                            report(&format!("save-fail: staged at t+{now:?} - {staged}"));
+                        }
+                        None => report("save-fail: no loop path was recorded, nothing to stage"),
+                    }
+                } else if !p.key2_done && now >= KEY2_AT {
+                    p.key2_done = true;
+                    let base = p.last_sent.clone();
+                    drop(p);
+                    report("save-fail: typed 6 bytes, expecting SaveFailed then dot=amber");
+                    ui.set_buffer(format!("{base}+fail1").into());
+                } else if !p.wb_done && now >= WRITE_BACK_AT {
+                    p.wb_done = true;
+                    let found = p.loop_path.clone();
+                    drop(p);
+                    if let Some(file) = found {
+                        let away = file.with_extension("notes.bak");
+                        let _ = std::fs::remove_dir(&file);
+                        let _ = std::fs::rename(&away, &file);
+                        let base = lf(&ui.get_buffer());
+                        report("save-fail: path restored, typed 6 bytes, expecting Saved then dot clears");
+                        ui.set_buffer(format!("{base}+back1").into());
+                    }
+                }
+            }
+            // ---- S4c: fire the menu rows through the same callbacks a click uses ----
+            let fired: Option<(u64, &str)> = {
+                let mut p = third_pump.borrow_mut();
+                if p.menu_act == 0 && now >= MENU_OPEN_AT {
+                    p.menu_act = 1;
+                    Some((1, "Open"))
+                } else if p.menu_act == 1 && now >= MENU_SAVEAS_AT {
+                    p.menu_act = 2;
+                    Some((2, "Save As"))
+                } else if p.menu_act == 2 && now >= MENU_AUTOSAVE_AT {
+                    p.menu_act = 3;
+                    Some((3, "Auto-save"))
+                } else if p.menu_act == 3 && now >= MENU_QUIT_AT {
+                    p.menu_act = 4;
+                    Some((4, "Quit"))
+                } else {
+                    None
+                }
+            };
+            if let Some((step, name)) = fired {
+                report(&format!(
+                    "menu: firing the {name} row\'s callback at t+{now:?} (row {step} of 4)"
+                ));
+                match step {
+                    1 => ui.invoke_open_asked(),
+                    2 => ui.invoke_save_as_asked(),
+                    3 => ui.invoke_autosave_asked(),
+                    _ => ui.invoke_quit_asked(),
+                }
+            }
             // (2) THE SYNTHETIC CLICK. Aim at the first row that is NOT the file this
             // probe seeded, so what lands is a RECENT file the port listed.
             {
@@ -632,19 +766,124 @@ fn main() {
     {
         let pump = Rc::clone(&pump);
         ui.window().on_close_requested(move || {
-            let n = {
+            let (n, asked_to_quit) = {
                 let mut p = pump.borrow_mut();
                 p.closes += 1;
-                p.closes
+                (p.closes, p.quit_requested)
             };
-            report(&format!("close: requested (#{n})"));
-            if n == 1 {
+            report(&format!(
+                "close: requested (#{n}) quit-asked={asked_to_quit}"
+            ));
+            if n == 1 && !asked_to_quit {
                 report("close: declined, held (KeepWindowShown)");
                 slint::CloseRequestResponse::KeepWindowShown
             } else {
                 report("close: second, exiting (HideWindow)");
                 slint::CloseRequestResponse::HideWindow
             }
+        });
+    }
+    // ---- S4c: THE MENU ROWS. Every handler reuses an act that already exists and
+    // implements none of it again - that is the whole reason the rows forward instead of
+    // answering in markup. Chrome dismisses its own popup; Rust runs the command.
+    {
+        let gw = Rc::clone(&gateway);
+        let pump = Rc::clone(&pump);
+        ui.on_open_asked(move || {
+            // The real command is Command::Open { path }. A shipped bridge gets the path
+            // from a file dialog; this spike has no dialog surface, so it opens the file
+            // the probe already owns and SAYS so. Command, answer and buffer adoption are
+            // the production ones - only the picker is stood in for, in the log line.
+            let found = pump.borrow().seed.clone();
+            match found {
+                Some(path) => {
+                    report(&format!(
+                        "menu: Open row -> Command::Open {} (no dialog surface in this spike)",
+                        path.display()
+                    ));
+                    send(&gw, Command::Open { path });
+                }
+                None => report("menu: Open row asked, but no path exists to open - nothing sent"),
+            }
+        });
+    }
+    {
+        let gw = Rc::clone(&gateway);
+        let pump = Rc::clone(&pump);
+        let weak = ui.as_weak();
+        ui.on_save_as_asked(move || {
+            let found = pump.borrow().loop_path.clone();
+            let Some(ui) = weak.upgrade() else { return };
+            match found {
+                Some(path) => {
+                    let text = lf(&ui.get_buffer());
+                    let revision = {
+                        let mut p = pump.borrow_mut();
+                        p.edits += 1;
+                        p.last_sent = text.clone();
+                        p.edits
+                    };
+                    report(&format!(
+                        "menu: Save As row -> Command::SaveAs {} ({} bytes, revision={revision})",
+                        path.display(),
+                        text.len()
+                    ));
+                    send(
+                        &gw,
+                        Command::SaveAs {
+                            path,
+                            text,
+                            revision,
+                        },
+                    );
+                }
+                None => report("menu: Save As row asked before any path existed - nothing sent"),
+            }
+        });
+    }
+    {
+        let gw = Rc::clone(&gateway);
+        let pump = Rc::clone(&pump);
+        let weak = ui.as_weak();
+        ui.on_autosave_asked(move || {
+            let (was, asks) = {
+                let mut p = pump.borrow_mut();
+                let was = p.autosave;
+                p.autosave = !was;
+                p.autosave_asks += 1;
+                (was, p.autosave_asks)
+            };
+            report(&format!(
+                "menu: autosave-row toggled {was}->{} (ask #{asks}) - MIRROR, not a report: the port echoes no autosave event",
+                !was
+            ));
+            send(&gw, Command::SetAutosave(!was));
+            let dirty = pump.borrow().dirty;
+            note_dot(&pump, &weak, dirty, "autosave-row");
+        });
+    }
+    {
+        let pump = Rc::clone(&pump);
+        let weak = ui.as_weak();
+        ui.on_quit_asked(move || {
+            // THE SINGLE DOOR. Quit hides nothing and calls no gateway: it bumps
+            // close-arm, which runs Window::close() in markup, which lands on the same
+            // on_close_requested an OS close reaches - where the final flush and the
+            // joined shutdown already live. quit_requested is the one extra fact: a user
+            // asking to leave is never the rehearsal case the first request declines.
+            let Some(ui) = weak.upgrade() else { return };
+            let arm = {
+                let mut p = pump.borrow_mut();
+                p.quit_requested = true;
+                p.closes + 1
+            };
+            report(&format!("menu: Quit row -> close-arm {arm} (single door)"));
+            ui.set_close_arm(arm as i32);
+            report(&format!(
+                "menu: after the door: close-allowed={} visible={}",
+                ui.get_close_allowed(),
+                ui.window().is_visible()
+            ));
         });
     }
     // R1: the strip's double-click, the promise the README makes about a frameless
@@ -710,6 +949,14 @@ fn main() {
     }
     let accounted = pump.borrow().seen - seen_before;
     report(&format!("exit drain: {accounted} event(s) accounted for"));
+    // S4b: the counter that settles the block-scoping question with a number instead of
+    // a reading of braces. ~2500 over a 21s run at 8ms is "every tick"; 1 is "one-shot".
+    report(&format!(
+        "text_pump: invocations={} dirty-at-exit={} last-needle=[{}]",
+        pump.borrow().invocations,
+        pump.borrow().dirty,
+        pump.borrow().dot_words
+    ));
     report(&format!("exit {}", measured(&dir, started.elapsed())));
 }
 
@@ -798,6 +1045,16 @@ fn text_probe(ui: &Spike) {
 /// The revision counts those observed changes; the epoch is echoed, never invented.
 fn text_pump(ui: &Spike, gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>) {
     let text = lf(&ui.get_buffer());
+    // The dot's dirty input, by the same comparison the guard below makes - one source
+    // of truth for "unsaved", so the dot and the Flush can never disagree.
+    // A let, not an inline call: the temporary borrow would still be alive inside
+    // note_dot's own borrow_mut and the RefCell would panic (measured on a live run).
+    let dirty_now = {
+        let p = pump.borrow();
+        text != p.last_sent
+    };
+    note_dot(pump, &ui.as_weak(), dirty_now, "buffer");
+    pump.borrow_mut().invocations += 1;
     let mut pump = pump.borrow_mut();
     if text == pump.last_sent {
         pump.pending_at = None;
@@ -950,6 +1207,100 @@ struct Pump {
     last_sent: String,
     /// When this change first entered the debounce; the stamp a Flush reports.
     pending_at: Option<Instant>,
+    // ---- S4b: the three signals Chrome draws (dirty dot, failed dot, menu check).
+    // Each is a port FACT or this bridge's own last ask; none of them is a guess.
+    /// dirty means "the buffer differs from what was last sent" - the SAME comparison
+    /// the Flush guard makes in text_pump, so the dot cannot disagree with the bytes
+    /// that are about to go out.
+    dirty: bool,
+    /// Latched by Event::SaveFailed, cleared by the next Event::Saved. The failure stays
+    /// until the bytes actually land: a dot that blinks off on the next keystroke tells
+    /// the user nothing changed, which is the opposite of section 4.4.
+    save_failed: bool,
+    /// The port has NO event that echoes autosave - engine.rs:601-602 assigns the bool
+    /// and says nothing back - so this is InitialState's answer XORed by every
+    /// Command::SetAutosave this bridge sends. The bridge's own last ask, named as such
+    /// rather than passed off as a report.
+    autosave: bool,
+    /// The last needle printed, so a signal that did not move stays quiet.
+    dot_words: String,
+    /// S4b: how many ticks actually reached text_pump. Printed at exit because the
+    /// question this answers is arithmetic, not opinion: if the text loop sat inside the
+    /// one-shot SAMPLED block, this number would be ~1 and the mid-run flush needle
+    /// would be dead. Measured: it is every tick (the block closes at the 't+SAMPLE'
+    /// report), and the number below is the proof.
+    invocations: u64,
+    /// The one in-run keystroke, fired once so the dirty->flush->clean chain is proven on
+    /// the bridge's own cadence instead of being inherited from a pre-run probe write.
+    late_key: bool,
+    // ---- S4c: the save-failure cycle, and the menu ----
+    /// The file SaveAs landed on. Autosave rewrites THIS name, so it is where the failure
+    /// has to be staged; kept because the tick cannot re-derive it.
+    loop_path: Option<PathBuf>,
+    /// The three acts, each once.
+    ro_done: bool,
+    key2_done: bool,
+    wb_done: bool,
+    /// Which menu row has been fired: 0 none, then Open, Save As, Auto-save, Quit.
+    menu_act: u64,
+    /// How many autosave toggles this bridge has sent. The port echoes NO autosave event,
+    /// so the menu check can only follow the ask - printed as 'menu: ...' so the
+    /// convention is visible instead of pretending to be a report.
+    autosave_asks: u64,
+    /// A Quit from the menu is the user's own request, so the close contract must not
+    /// decline it the way it declines the FIRST synthetic request to prove declining
+    /// works. One door (Window::close), one extra fact in front of it.
+    quit_requested: bool,
+}
+
+/// The dot's word for the pair, in section 4.4's precedence: a failed save outranks
+/// plain dirt, and neither paints at all on a clean buffer.
+fn dot_word(save_failed: bool, dirty: bool) -> &'static str {
+    if save_failed {
+        "amber(save-failed)"
+    } else if dirty {
+        "red(dirty)"
+    } else {
+        "none(clean)"
+    }
+}
+
+/// ONE NEEDLE PER SIGNAL CHANGE: the exact triple Chrome renders, printed, so a run is
+/// gradable on transitions instead of on a screenshot. 'via' says which input moved
+/// (start / buffer / saved / save-failed), and a transition that prints nothing is a
+/// signal that is not wired.
+fn note_dot(pump: &RefCell<Pump>, weak: &slint::Weak<Spike>, dirty: bool, via: &str) {
+    let (words, save_failed, autosave) = {
+        let mut p = pump.borrow_mut();
+        p.dirty = dirty;
+        (
+            format!(
+                "dot={} save-failed={} dirty={} autosave={}",
+                dot_word(p.save_failed, dirty),
+                p.save_failed,
+                dirty,
+                p.autosave
+            ),
+            p.save_failed,
+            p.autosave,
+        )
+    };
+    // PUBLISH, not just print: the triple Chrome draws is the same three facts, and one
+    // writer for both. Set unconditionally - Chrome's dot precedence and its menu check
+    // are bindings, so an unchanged value costs nothing and a changed one cannot be lost
+    // to a printed-diff heuristic that runs before the property lands.
+    if let Some(ui) = weak.upgrade() {
+        ui.set_dirty(dirty);
+        ui.set_save_failed(save_failed);
+        ui.set_autosave(autosave);
+    }
+    let previous = {
+        let mut p = pump.borrow_mut();
+        std::mem::replace(&mut p.dot_words, words.clone())
+    };
+    if previous != words {
+        report(&format!("chrome: {via}: {words} (was: {previous})"));
+    }
 }
 
 fn send(gateway: &Rc<RefCell<Option<Gateway>>>, command: Command) {
@@ -1093,7 +1444,10 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                     changed
                 };
                 if changed {
-                    report(&format!("recents: rendered {rows} rows"));
+                    report(&format!(
+                        "recents: rendered {rows} row{}",
+                        if rows == 1 { "" } else { "s" }
+                    ));
                 }
             }
             Event::Saved { path, revision } => {
@@ -1102,6 +1456,11 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                     p.saves += 1;
                     p.saves
                 };
+                // The bytes landed, so the failure is over - cleared here and nowhere
+                // else: "latched until the next successful Saved", in one line.
+                pump.borrow_mut().save_failed = false;
+                let dirty = pump.borrow().dirty;
+                note_dot(pump, weak, dirty, "saved");
                 if which == 1 {
                     report(&format!("saved: rev={revision} {}", path.display()));
                 } else {
@@ -1110,10 +1469,17 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                     // autosave path proving itself - the loop the gpui bridge owns on
                     // its side of the seam.
                     report(&format!(
-                        "autosave: saved rev={revision} ({}th Saved, no SaveAs between)",
-                        which
+                        "autosave: saved rev={revision} (Saved #{which}, no SaveAs between)"
                     ));
                     report(&format!("autosave: file {}", path.display()));
+                }
+            }
+            Event::SaveFailed { reason, .. } => {
+                pump.borrow_mut().save_failed = true;
+                let dirty = pump.borrow().dirty;
+                note_dot(pump, weak, dirty, "save-failed");
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_status(format!("save failed: {reason:?}").into());
                 }
             }
             other => {

@@ -51,6 +51,14 @@ export component Spike inherits Window {
     in property <bool> pinned: false;
     in property <string> status: "starting";
 
+    // S4b: THE THREE SIGNALS, now fed by the port through Rust instead of a constant.
+    // Same rule as pinned above: each is a RENDER of an answer (or, for autosave, of the
+    // last Command::SetAutosave this bridge sent, because the port echoes no event for
+    // it), and markup computes nothing - dirty is buffer!=last_sent in main.rs, not here.
+    in property <bool> dirty: false;
+    in property <bool> save-failed: false;
+    in property <bool> autosave: false;
+
     // The only thing the strip may decide by itself. `in-out`, per finding 3.
     in-out property <int> taps: 0;
 
@@ -69,6 +77,18 @@ export component Spike inherits Window {
     // place of the OS caption button. The handler lives in Rust (set_maximized is a
     // window call), and the markup only names the event.
     callback toggle-max();
+
+    // S4c: THE MENU ROWS, forwarded - not answered. Chrome owns the look and the row's
+    // identity, and it dismisses itself on a pick (its own in-out menu-open); what a row
+    // DOES is decided in Rust, on the SAME path the chords and the native menu use, so a
+    // click cannot grow a second set of rules about when the engine gets to write. The
+    // names match Chrome's one-for-one for the same reason: a mapping, not a translation.
+    callback open-asked();
+    callback save-as-asked();
+    callback autosave-asked();
+    /// Quit is not a command: it closes the window, which is the only shutdown route
+    /// that flushes and joins the engine (see the close contract in main.rs).
+    callback quit-asked();
 
     // ---- S5: recents, as delivered ----
     // `Event::RecentsUpdated(Vec<RecentEntry>)` has been arriving, unused, since S4.
@@ -95,11 +115,9 @@ export component Spike inherits Window {
         height: 28px;
         title: root.title-words;
         pinned: root.pinned;
-        // Not derived from anything this spike owns yet: the port has no dirty /
-        // save-failed surface reaching Rust here, so idle beats a lie.
-        dirty: false;
-        save-failed: false;
-        autosave: false;
+        dirty: root.dirty;
+        save-failed: root.save-failed;
+        autosave: root.autosave;
         // C1: Chrome carries a pin STATE, never a window level - nothing in this file
         // names always-on-top or a level, and notes-platform stays the one
         // WS_EX_TOPMOST writer. The bool Chrome hands back is the WIDGET'S GUESS at
@@ -109,6 +127,25 @@ export component Spike inherits Window {
             root.taps += 1;
             root.asked-guess = asked;
             root.toggled-pin();
+        }
+        // S4b: the title band's double-click. Chrome emits the ASK and owns no geometry
+        // (set_maximized is a window call, so it lives in Rust); this forwards it to the
+        // existing toggle-max() callback, which main.rs already binds to the SAME
+        // toggle_max() the synthetic driver calls - one implementation, two triggers.
+        toggle-max-requested => {
+            root.toggle-max();
+        }
+        open-asked => {
+            root.open-asked();
+        }
+        save-as-asked => {
+            root.save-as-asked();
+        }
+        autosave-asked => {
+            root.autosave-asked();
+        }
+        quit-asked => {
+            root.quit-asked();
         }
     }
 

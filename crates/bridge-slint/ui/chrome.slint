@@ -78,6 +78,14 @@ export component Chrome inherits Rectangle {
     /// cannot mistake it for a fifth command.
     callback quit-asked();
 
+    /// THE DOUBLE-CLICK ASK. Chrome EMITS this and decides nothing about geometry:
+    /// whether a maximised window comes back maximised, which rect gets stored, and the
+    /// GeometryChanged the port then writes are Rust's and the port's business (AGENTS.md:
+    /// geometry RESTORE is bridge work, geometry STORAGE is core work). main.rs binds this
+    /// to the same toggle_max() the synthetic timer drives, so one implementation has two
+    /// triggers - which is exactly why it is a callback and not a window call in here.
+    callback toggle-max-requested();
+
     // ---- the dot ----------------------------------------------------------------
     // failed outranks dirty: dirty already says "you have unsaved text" and the amber exists
     // to add "and the app could not write it". A failed save over a clean buffer is the
@@ -230,6 +238,23 @@ export component Chrome inherits Rectangle {
             // (titlebar.rs:16-27), and it is owed here: eliding without it is the honest
             // interim, and the full path still reaches the user via the status line and the
             // OS title.
+        }
+    }
+
+    // ---- THE TITLE BAND: double-click asks for a maximise ----------------------
+    // Exactly the CENTRE band and nothing else: it starts one slot-width in and stops
+    // one slot-width short, so the hamburger and the pin keep their own clicks. The band
+    // is the only thing on a frameless window that reads as a title bar, and this is the
+    // frame contract's one act (ui/main.slint:24-30 turns no-frame on, so there is no OS
+    // caption to double-click). Declared after the title Text, which is not interactive,
+    // so it steals nothing; a single click on it does nothing at all by design.
+    max-band := TouchArea {
+        x: Theme.slot-width;
+        y: 0px;
+        width: root.width - Theme.slot-width * 2;
+        height: parent.height;
+        double-clicked => {
+            root.toggle-max-requested();
         }
     }
 
