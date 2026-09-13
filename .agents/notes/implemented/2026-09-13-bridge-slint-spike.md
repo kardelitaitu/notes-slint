@@ -1,9 +1,9 @@
 ---
 title: Slint bridge adoption in flight - what we are measuring as we build
-status: proposed
+status: implemented
 id: 2026-09-13-bridge-slint-spike
 created: 2026-09-13
-updated: 2026-09-13
+updated: 2026-09-14
 relates: [whitepaper §4.1, whitepaper §4.3, whitepaper §4.4, whitepaper §4.5, whitepaper §5.5, whitepaper §8, whitepaper §10.2, whitepaper §12.2]
 decision: null
 ---
@@ -15,6 +15,17 @@ decision: null
 > four risks to engineer *through*, and the licensing consequence that has to be decided before
 > anything ships. `status:` stays `proposed` because no working Slint bridge
 > exists yet - `implemented` would be a lie (§5.6).
+>
+> **AMENDED 2026-09-14 — that last sentence stopped being true, and it is left standing because it
+> was true when written.** A working Slint bridge now exists: the strip program separated the
+> instrument from the product, and `notes-slint.exe` builds from its own root (`src/product.rs`),
+> judged by its own machine leg. So the note moved `proposed/` -> `implemented/` with its `status:`
+> matching, which is what the `doc-management` lifecycle asks for: the note's own test — does a
+> working bridge exist — is what unlocked the move, not a change of ambition. Two things did NOT
+> become true: no CI has ever run for it (`git remote -v` is empty), and the licensing consequence
+> named above is now paid — `AboutSlint` is the 6th hamburger row. Both, with their numbers and
+> their limits, are in [`2026-09-14-strip-program`](2026-09-14-strip-program.md). Everything
+> measured below is the spike's record, unchanged.
 
 ## Question
 
