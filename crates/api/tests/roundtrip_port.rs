@@ -1050,6 +1050,127 @@ fn the_empty_and_bom_only_notes_survive_the_flush_leg() -> Result<(), Box<dyn Er
     Ok(())
 }
 
+/// THE WRITE-BACK HALF, through the port: a bridge's buffer is LF-only (gpui
+/// keeps LF internally, Enter inserts LF, paste CRLF→LF-replaces), so the text
+/// that comes back in `Command::Flush` is NOT the bytes `Event::Loaded` was
+/// built from. The format a foreign file was born with lives only in `FileMeta`
+/// and in the engine's own `Detected`; if the save path never applies them, a
+/// CRLF file edited once comes home as LF and the port reports `Event::Saved`
+/// anyway. This is the byte-level form of that claim, on the corpus files whose
+/// line endings are CRLF, judged by re-reading the disk.
+///
+/// Each case: copy the fixture, `Open` it, prove the refusal (`ForeignFileNotArmed`),
+/// arm it with the one explicit `SaveAs` at its own path, then `Flush` an
+/// LF-normalised edited buffer and hash the bytes that landed.
+#[test]
+fn an_edited_lf_normalised_buffer_comes_home_in_the_files_own_shape() -> Result<(), Box<dyn Error>>
+{
+    let manifest = load_manifest()?;
+    let crlf = manifest
+        .entries
+        .iter()
+        .filter(|e| e.line_ending == "crlf")
+        .collect::<Vec<_>>();
+    assert!(
+        !crlf.is_empty(),
+        "the corpus has no CRLF fixture, so this gate proves nothing"
+    );
+
+    let mut drift: Vec<String> = Vec::new();
+    for entry in crlf {
+        let source = fixtures_dir().join(&entry.file);
+        let original =
+            fs::read(&source).unwrap_or_else(|e| panic!("cannot read fixture {source:?}: {e}"));
+
+        let mut port = Port::start(manifest.ansi_codepage);
+        let copy = port.copy_of(&entry.file, &original);
+        let (text, meta) = port.loaded(&copy);
+        assert_eq!(
+            meta.line_ending,
+            LineEnding::CrLf,
+            "{}: the port must report the file's own ending before anything is written",
+            entry.file
+        );
+
+        // Arm it the way ADR-0001 says, with the buffer exactly as Loaded gave it.
+        assert_eq!(
+            port.flushed(&copy, &text, 1),
+            Err(SkipReason::ForeignFileNotArmed),
+            "{}: a fresh foreign file must refuse before the explicit save",
+            entry.file
+        );
+        port.saved_as(&copy, &text, 2);
+
+        // THE EDIT: what the bridge holds after one Enter/paste - LF-only line
+        // breaks and a typed character on a final line the file never had.
+        let edited = text.replace("\r\n", "\n").replace('\r', "\n") + "X";
+        assert!(
+            !edited.contains('\r'),
+            "{}: the edited buffer is not LF-only, so this case tests nothing",
+            entry.file
+        );
+        let revision = port.flushed(&copy, &edited, 3).unwrap_or_else(|reason| {
+            panic!(
+                "{}: the armed autosave leg skipped with {reason:?}",
+                entry.file
+            )
+        });
+        assert_eq!(
+            revision, 3,
+            "{}: Saved reports the flush revision",
+            entry.file
+        );
+        let written = port.bytes_of(&copy);
+        port.close();
+
+        // Count line breaks in the WRITTEN units, not in the buffer: an escaped
+        // CR is invisible to a String comparison, which is how the defect hid.
+        let cr = |bytes: &[u8]| bytes.iter().filter(|&&b| b == 0x0D).count();
+        let lf = |bytes: &[u8]| bytes.iter().filter(|&&b| b == 0x0A).count();
+        // Every file in this half of the corpus is UTF-8/UTF-16 with CRLF pairs;
+        // UTF-16 carries each CR and LF in one unit, so the CR count is the pair
+        // count either way, and a lost CR shows up as cr < lf.
+        if cr(&written) != lf(&written) {
+            drift.push(format!(
+                "{}: an LF-normalised edit wrote {} CR bytes against {} LF bytes - the file's CRLF pairs were not restored",
+                entry.file,
+                cr(&written),
+                lf(&written)
+            ));
+        }
+        // The final-newline fact, read back out of the bytes: a `__nonl__`
+        // fixture must not have gained one and a `__nl__` fixture must not have
+        // lost it. UTF-16 spells the LF as 0A 00, hence both spellings.
+        let ends_with_newline = written.ends_with(&[0x0A]) || written.ends_with(&[0x0A, 0x00]);
+        if ends_with_newline != entry.trailing_newline {
+            drift.push(format!(
+                "{}: the saved file ends with a final newline = {ends_with_newline}, the file's own fact is {}",
+                entry.file, entry.trailing_newline
+            ));
+        }
+        // Both shape assertions above are satisfiable by writing the fixture's
+        // OWN bytes back and saving nothing, so the edit has to be visible too.
+        assert!(
+            written != original,
+            "{}: the flush wrote the fixture's bytes back unchanged - the edit never reached the disk",
+            entry.file
+        );
+        assert!(
+            fs::read(&source).is_ok_and(|again| again == original),
+            "{}: this gate wrote into the generator-owned fixture",
+            entry.file
+        );
+    }
+
+    assert!(
+        drift.is_empty(),
+        "{} CRLF fixture(s) lost their shape to an edited buffer through the port:\n{}",
+        drift.len(),
+        drift.join("\n")
+    );
+    Ok(())
+}
+
 /// The EOL leg, on the corpus files whose newlines are not uniform - plus the
 /// CJK/emoji UTF-8 file, the IME commit string's own bytes. The two `.notes`
 /// among them are armed on open, so their FIRST flush is the write.

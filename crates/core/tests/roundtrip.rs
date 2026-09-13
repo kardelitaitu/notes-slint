@@ -285,6 +285,115 @@ fn lone_cr_fixture_gains_no_lf() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// THE OTHER HALF OF THE RULE, and the half nothing but a save path can prove.
+/// Every case above flushes the text `decode` produced, which is a buffer that
+/// still carries the file's own line endings — so encode can be a pure verbatim
+/// copy and every one of those cases stays green. The buffer a bridge actually
+/// hands `save_document` is not that: gpui keeps LF internally, Enter inserts
+/// LF, and its paste path runs the clipboard through a CRLF→LF replace
+/// (`bridge-gpui/src/editor.rs`), so after ONE edit the text is LF-only while
+/// `Detected` still says the FILE is CRLF. If the write path never applies the
+/// detection, a CRLF file edited once saves as LF and reports `Event::Saved`
+/// — which is what the slint bridge's save audit caught by hashing the bytes.
+///
+/// The edit simulated here is the smallest real one: fold every CRLF and lone
+/// CR to LF, then type `X` at the end of the last line, keeping the file's own
+/// final-newline fact (that is what `Detected::trailing_newline` states, and
+/// the fixture shape decides it — inventing or eating one here would be the
+/// write path rewriting the fact rather than applying it). Both facts are then
+/// re-read OUT of the bytes, by `detect`, never from the buffer.
+#[test]
+fn every_fixture_survives_an_edited_lf_normalised_buffer() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (manifest, codepage) = load_manifest()?;
+    let mut drift: Vec<String> = Vec::new();
+    let mut edited_cases = 0usize;
+
+    for entry in &manifest.files {
+        let bytes = read_fixture(entry)?;
+        let expected = expected_detected(entry)?;
+        let text = decode(&bytes, expected)?;
+
+        // What the bridge holds after one Enter/paste: LF-only line breaks, and
+        // the typed character sitting on a final line the file never had. This
+        // is the shape that DROPS a trailing newline if the save path applies
+        // nothing, and the shape that must not INVENT one on a file that never
+        // ended with a newline — `Detected` decides, both ways.
+        let edited = text.replace("\r\n", "\n").replace('\r', "\n") + "X";
+
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("edited-copy");
+        save_document(&target, &edited, expected)?;
+        let saved = fs::read(&target)?;
+        let seen = detect(&saved, Some(codepage));
+        edited_cases += 1;
+
+        // The edit itself has to be on disk, or a write of the old bytes would
+        // satisfy the two shape assertions below by doing nothing at all. Checked
+        // on the trimmed tail so a lost or gained FINAL newline cannot hide the
+        // typed character, and vice versa: each fact reports on its own line.
+        let back = decode(&saved, seen)?;
+        if !back.trim_end_matches(['\r', '\n']).ends_with('X') {
+            drift.push(format!(
+                "{}: the typed text never reached the disk ({:?})",
+                entry.file,
+                tail(&back)
+            ));
+            continue;
+        }
+        if seen.line_ending != expected.line_ending {
+            drift.push(format!(
+                "{}: an edited buffer saved as {:?}, the file is {:?}",
+                entry.file, seen.line_ending, expected.line_ending
+            ));
+        }
+        if seen.trailing_newline != expected.trailing_newline {
+            drift.push(format!(
+                "{}: an edited buffer ended the file {} newline, it was {}",
+                entry.file,
+                if seen.trailing_newline {
+                    "with a"
+                } else {
+                    "without a"
+                },
+                expected.trailing_newline
+            ));
+        }
+    }
+
+    assert_eq!(
+        edited_cases,
+        manifest.files.len(),
+        "the edited-buffer gate ran on fewer fixtures than the manifest lists"
+    );
+    // One list, not a fail-fast panic: WHICH fixtures drift is the evidence this
+    // gate exists to produce.
+    assert!(
+        drift.is_empty(),
+        "{} fixture(s) lost their shape to an edited buffer:\n{}",
+        drift.len(),
+        drift.join("\n")
+    );
+    Ok(())
+}
+
+/// The last three characters of a decoded buffer, escaped: a lost CR is exactly
+/// the thing a tail printed raw cannot show.
+fn tail(text: &str) -> String {
+    text.chars()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|c| match c {
+            '\r' => "\\r".to_owned(),
+            '\n' => "\\n".to_owned(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
 /// The frontmatter fixture is a .notes file with a '---' block; it must
 /// survive detection, the pure round trip and the full save path.
 #[test]

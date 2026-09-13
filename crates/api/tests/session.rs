@@ -452,10 +452,15 @@ fn a_foreign_file_reports_its_format_refuses_to_autosave_and_arms_on_one_save() 
         1,
         "Save As writes the snapshot it was given"
     );
+    // kept.notes did not exist, so the format this write was given is
+    // `new_file_detected()`: UTF-8, LF, trailing_newline TRUE - the very meta
+    // the `Event::Rebound` below reports back. A brand-new file therefore gains
+    // its final terminator, and the buffer's own CRLF rides through untouched
+    // because an LF decision means verbatim bytes, never a restyle.
     assert_eq!(
         app.bytes(&target),
-        b"line one\r\nline two edited",
-        "the bytes are the buffer's, in the buffer's own line endings"
+        b"line one\r\nline two edited\n",
+        "the buffer's own bytes, in the buffer's own line endings, plus the final newline the new-file meta says"
     );
     assert_eq!(
         app.bytes(&md),
@@ -467,8 +472,8 @@ fn a_foreign_file_reports_its_format_refuses_to_autosave_and_arms_on_one_save() 
     assert_eq!(app.flush(&target, "edit again", 2), 2);
     assert_eq!(
         app.bytes(&target),
-        b"edit again",
-        "autosave wrote it, in the same detected format"
+        b"edit again\n",
+        "autosave wrote it, in the same detected format, final terminator included"
     );
     assert_eq!(
         app.bytes(&md),
@@ -659,8 +664,8 @@ fn save_as_writes_the_text_it_was_given_not_a_last_flush_snapshot() {
     );
     assert_eq!(
         app.bytes(&target),
-        b"typed first\nand then a lot more",
-        "the NEW text is on disk, not the snapshot the last flush left behind"
+        b"typed first\nand then a lot more\n",
+        "the NEW text is on disk, not the snapshot the last flush left behind - and a new file gains its final newline"
     );
 }
 

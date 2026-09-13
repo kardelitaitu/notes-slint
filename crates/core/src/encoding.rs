@@ -3,9 +3,18 @@
 //! This module is the heart of the do-no-harm rule (AGENTS.md, features §4.5):
 //! loading then saving a foreign file must be BYTE-IDENTICAL — preserve the
 //! encoding, the BOM, the line endings and the trailing newline. The theorem
-//! this module maintains: decode(encode(text, d), d) == text, and
-//! encode(decode(bytes, detect(bytes, cp)), detect(bytes, cp)) == bytes — or
-//! a typed error; never a silent rewrite, never a panic on hostile bytes.
+//! this module maintains for text decode() produced: decode(encode(text, d),
+//! d) == text, and encode(decode(bytes, detect(bytes, cp)), detect(bytes, cp))
+//! == bytes — a typed error, never a silent rewrite or a panic on hostile bytes.
+//!
+//! ALL FOUR facts are applied on the way out, not two. detect() reads the line
+//! ending and the trailing newline out of the bytes and encode() puts them
+//! back: `layout` runs on the text first, and only then does the text become
+//! bytes in the detected encoding. That order is what makes the theorem above
+//! mean something for a buffer the FILE never contained — a bridge hands the
+//! save path LF-only text after one Enter or one paste (gpui keeps LF
+//! internally), and with no layout step a one-edit save of a CRLF file
+//! restyles it silently while still reporting Event::Saved.
 //!
 //! Pure std only: no windows crate, no OS calls. The one OS-specific fact
 //! core needs — the active ANSI code page — arrives as a PARAMETER
@@ -36,12 +45,18 @@
 //!    it, which is precisely the harm this module exists to prevent.
 //!
 //! Line endings: CRLF is dominant only when CRLFs exist and no lone LF does;
-//! lone CRs (classic Mac) count as Lf for the write-back decision but are
-//! preserved byte-exactly by decode/encode like every other byte.
+//! lone CRs (classic Mac) count as Lf for the write-back decision. Under an Lf
+//! decision the text is written exactly as decode() produced it, so every 0x0D
+//! byte survives; under a CrLf decision layout() re-emits every break, and a
+//! lone CR is a break, so it leaves as CRLF with the rest. The trailing
+//! newline is honoured the same way: a file that ended with one still ends
+//! with one, a file that never did is not given one.
 //!
 //! Size guard (D9): MAX_TEXT_BYTES / is_oversize — at or above the limit the
 //! CALLER opens the file read-only; decode/encode never refuse on size, they
 //! are pure transforms.
+
+use std::borrow::Cow;
 
 /// The documented size guard (D9): files at or above this many bytes are
 /// opened read-only by the caller. Never a refusal inside this module.
@@ -160,7 +175,14 @@ pub fn decode(bytes: &[u8], d: Detected) -> Result<String, DecodeError> {
 /// Encodes text per the detection result. A character with no byte in the
 /// target code page is refused exactly (Unencodable) — never written as
 /// '?' or a box glyph.
+///
+/// The text goes through [`layout`] first, so `d`'s line ending and trailing
+/// newline are applied as well as its encoding and BOM. `layout` borrows when
+/// the buffer is already in the file's own shape, which is every unedited
+/// save; an edit that arrived as LF in a CRLF file costs one allocation.
 pub fn encode(text: &str, d: Detected) -> Result<Vec<u8>, EncodeError> {
+    let text = layout(text, d);
+    let text = text.as_ref();
     let mut out = Vec::with_capacity(text.len() + 4);
     match d.encoding {
         TextEncoding::Utf8 | TextEncoding::Utf8Bom => {
@@ -465,6 +487,92 @@ fn cp1252_str(bytes: &[u8]) -> Result<String, DecodeError> {
 }
 
 // --- encode internals ---
+
+/// The detected LAYOUT of the file, applied to the text before it becomes
+/// bytes: the line ending, and the trailing newline on the final line.
+///
+/// Why this exists as its own step: detect() states four facts about the bytes
+/// and only two of them (encoding, BOM) survive a byte-mapping pass. The other
+/// two describe the SHAPE of the text, so they have to be applied to the text.
+/// Without this, `FileMeta.line_ending` and `FileMeta.trailing_newline` are
+/// facts the UI is shown and the writer ignores, and the first edit in a
+/// LF-only buffer (which is what gpui's Enter and paste produce) rewrites a
+/// CRLF file while `Event::Saved` reports success — whitepaper §4.5 broken by
+/// a keystroke, with no error to see.
+///
+/// The two rules, and why they are not symmetric:
+///
+/// * `CrLf`: every line break becomes CRLF. A CRLF stays one, an LF becomes
+///   one, and a lone CR (classic Mac, or an editor that folded only the pairs)
+///   becomes one. detect() only reports CrLf when no lone LF exists, so a file
+///   that is already CRLF re-emits byte-for-byte and do-no-harm is untouched.
+/// * `Lf`: the text is verbatim. Lf is the honest answer for a mixed-EOL or
+///   classic-Mac file (a lone LF beats CRLF in the decision) precisely so the
+///   writer cannot "tidy" a lone CR into an LF; `edge__lone-cr` and
+///   `edge__mixed-eol` in the fixture corpus are the proof of that.
+///
+/// The trailing newline is honoured on the FINAL line only, and only in the
+/// direction that cannot eat a keystroke: if the file ended with a newline, so
+/// does the saved one, even when the edited buffer's last line is unterminated
+/// (typing at the end of a terminated file produces exactly that buffer, and
+/// the file's shape must survive it). If the file did NOT end with a newline,
+/// nothing is added — and a final newline the user typed is left alone rather
+/// than stripped, because deleting a visible Enter is a worse harm than a file
+/// whose final-line fact quietly changed.
+fn layout(text: &str, d: Detected) -> Cow<'_, str> {
+    let mut laid: Cow<'_, str> = match d.line_ending {
+        // Lf is the verbatim answer, and verbatim means verbatim: a lone CR
+        // or a mixed file keeps every byte it has.
+        LineEnding::Lf => Cow::Borrowed(text),
+        LineEnding::CrLf => reemit_crlf(text),
+    };
+    // The trailing newline, on the final line only. An empty buffer has no
+    // final line to terminate: a 0-byte file stays 0 bytes and an emptied note
+    // stays empty (AGENTS.md: never "normalise" someone's file tidy).
+    if d.trailing_newline && !laid.is_empty() && !laid.ends_with(['\n', '\r']) {
+        laid.to_mut().push_str(match d.line_ending {
+            LineEnding::CrLf => "\r\n",
+            LineEnding::Lf => "\n",
+        });
+    }
+    laid
+}
+
+/// The CrLf half of [`layout`]: fold every kind of line break — CRLF, lone CR,
+/// lone LF — and re-emit CRLF. Idempotent on text that already uses CRLF,
+/// which is every file detect() ever called CrLf, so the byte-exact round trip
+/// is unaffected; an LF-normalised edit is the case that changes, and it
+/// changes back.
+fn reemit_crlf(text: &str) -> Cow<'_, str> {
+    let Some(first) = text.find(['\r', '\n']) else {
+        // No line break of any kind: the layout has nothing to say.
+        return Cow::Borrowed(text);
+    };
+    let mut out = String::with_capacity(text.len() + text.len() / 8 + 2);
+    out.push_str(&text[..first]);
+    let mut rest = &text[first..];
+    while let Some(ch) = rest.chars().next() {
+        match ch {
+            '\r' => {
+                out.push_str("\r\n");
+                rest = &rest[1..];
+                if rest.starts_with('\n') {
+                    // The LF of a CRLF pair: already emitted with its CR.
+                    rest = &rest[1..];
+                }
+            }
+            '\n' => {
+                out.push_str("\r\n");
+                rest = &rest[1..];
+            }
+            other => {
+                out.push(other);
+                rest = &rest[other.len_utf8()..];
+            }
+        }
+    }
+    Cow::Owned(out)
+}
 
 fn push_unit(out: &mut Vec<u8>, unit: u16, be: bool) {
     let [lo, hi] = unit.to_le_bytes();
@@ -798,6 +906,70 @@ mod tests {
             };
             assert_eq!(e, DecodeError::UnsupportedCodepage(1252));
         }
+    }
+
+    #[test]
+    fn layout_restores_the_detected_shape_to_an_edited_buffer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The save-side half of the do-no-harm rule, in one unit: `Detected`
+        // carries TWO facts about the SHAPE of the text, and encode() applies
+        // both — which it must, because a bridge's buffer after one Enter or
+        // one paste is LF-only (gpui: editor.rs's paste replace) whatever the
+        // file on disk was. Verbatim byte-mapping loses the shape there.
+        let crlf = |nl: bool| Detected {
+            encoding: TextEncoding::Utf8,
+            bom_present: false,
+            line_ending: LineEnding::CrLf,
+            trailing_newline: nl,
+        };
+        let lf = |nl: bool| Detected {
+            encoding: TextEncoding::Utf8,
+            bom_present: false,
+            line_ending: LineEnding::Lf,
+            trailing_newline: nl,
+        };
+
+        // An LF-only buffer in a CRLF file comes home as CRLF, terminator and
+        // all; the typed final line keeps its place above it.
+        assert_eq!(encode("a\nbX", crlf(true))?, b"a\r\nbX\r\n");
+        // ... and a file that never ended with a newline is not given one.
+        assert_eq!(encode("a\nbX", crlf(false))?, b"a\r\nbX");
+        // A lone CR is a line break, so a CRLF file's classic-Mac remnant is
+        // re-emitted as a pair rather than left as a stray byte.
+        assert_eq!(encode("a\rb\n", crlf(true))?, b"a\r\nb\r\n");
+        // Already-CRLF text is untouched: the same bytes in, the same out.
+        assert_eq!(encode("a\r\nb\r\n", crlf(true))?, b"a\r\nb\r\n");
+
+        // Under an Lf decision NOTHING is rewritten: a lone CR is not an
+        // ending we may restyle, and mixed endings stay mixed — that is what
+        // detect() reported them as, and the fixture corpus proves it.
+        assert_eq!(encode("a\rb\nc", lf(false))?, b"a\rb\nc");
+        assert_eq!(encode("a\rb\nc", lf(true))?, b"a\rb\nc\n");
+        // A final newline the user typed is not eaten to match a false fact.
+        assert_eq!(encode("a\n", lf(false))?, b"a\n");
+
+        // An empty buffer has no final line to terminate, so the flag cannot
+        // conjure bytes: an emptied note saves as 0 bytes, as it loaded.
+        assert_eq!(encode("", crlf(true))?, Vec::<u8>::new());
+        assert_eq!(encode("", lf(true))?, Vec::<u8>::new());
+
+        // The layout runs BEFORE the byte mapping, so it holds for every
+        // encoding: UTF-16LE spells the restored pair as two units.
+        let utf16_crlf = Detected {
+            encoding: TextEncoding::Utf16Le,
+            bom_present: false,
+            line_ending: LineEnding::CrLf,
+            trailing_newline: true,
+        };
+        let written = encode("a\nb", utf16_crlf)?;
+        assert_eq!(
+            written,
+            vec![
+                0x61, 0x00, 0x0D, 0x00, 0x0A, 0x00, 0x62, 0x00, 0x0D, 0x00, 0x0A, 0x00
+            ]
+        );
+        assert_eq!(decode(&written, utf16_crlf)?, "a\r\nb\r\n");
+        Ok(())
     }
 
     #[test]
