@@ -63,7 +63,7 @@ the difficulty of the code.
   sections below. This is the commit that made the app usable across a relaunch.
 - **CI - `67d1d682`, mid-wave:** the product gets judged off this machine too. Why that row is not yet
   evidence is owed item 4.
-- **Hygiene - `6dd19637`, and its tests at `76a36433` (HEAD).** Three fixes, below.
+- **Hygiene - `6dd19637`, and its tests at `76a36433` (HEAD when this note was written).** Three fixes, below.
 
 ## The draft store, and the C1 bug that reads like a missing feature
 
@@ -123,7 +123,7 @@ The stale dated allow on `wire_callbacks` died in this commit; the two surface f
   AutosaveSkipped / SaveFailed: `surface.rs:686`, bumped at :1099, :1141, :1172) and the wait now exits
   on either counter moving, with the answer named in the verdict line (`product.rs:511-544`).
 
-`76a36433` pins two of the three down as unit tests at HEAD -
+`76a36433` pins two of the three down as unit tests -
 `the_register_latch_closes_on_success_and_on_the_second_same_refusal` and
 `an_answered_flush_ends_the_close_wait_even_when_nothing_saved` - so the next reader inherits verdicts,
 not prose.
@@ -147,17 +147,23 @@ not prose.
   re-runnable check - unlike the smoke legs, which anyone can run. And the run **did make a click** to
   aim the pointer, while every chord lives on the markup's outermost `FocusScope`
   (`crates/bridge-slint/ui/main.slint:188-195`, whose own comment also forbids an imperative `focus()`
-  on the caret's account). That combination is precisely why owed item 1 is open rather than closed.
+  on the caret's account). That combination is why owed item 1 could not be closed on **that** run's
+  authority; it closed later, on a keyboard-only control run with no click at all (item 1, `a12d58b3`).
 
 ## What is still owed - the honest list
 
-1. **Focus at startup.** Whether the first keys after an OS launch are dead until a pointer press lands
-   inside the window, or whether that was a driver artifact. Fix **in flight and uncommitted as of this
-   note**: a product.rs-only lane, whose working-tree edit borrows the toolkit's own door
-   (`WindowInner::from_pub(..).set_focus_item(..)` with `FocusReason::Programmatic` - the same path
-   Slint's generated `.focus()` compiles to, because 1.17's public `slint::Window` exposes no focus
-   API) under a 250-wake ceiling; the ceiling is there on purpose, since the commit before it retired a
-   retry that ran ~125 times a second forever. Nothing in this note depends on that landing.
+1. **Focus at startup - CLOSED, shipped in `a12d58b3`.** The question this row carried - first keys
+   dead until a pointer press lands, or driver artifact? - is answered by a control run, not by
+   argument: the same keyboard-only `AttachThreadInput` driver, no click anywhere, **PASSes** on the
+   fixed build (`focus: taken before the loop`, then a real Ctrl+T flips auto-save) and **FAILS** with
+   zero chord lines on the pre-fix `76a36433` build. So the dead first keys were real, and they are
+   gone. The mechanism is `claim_focus` (`product.rs:240-257`): ask the outermost scope once and
+   accept only a **visible** focus item, via `WindowInner::from_pub(..).set_focus_item(..)` with
+   `FocusReason::Programmatic` - the door Slint's generated `.focus()` itself compiles to, borrowed
+   because 1.17's public `slint::Window` has no focus API at all. **The caveat, stated plainly:** the
+   250-wake give-up path (`FOCUS_TRIES`, ~2 s) has never been exercised - the fast path lands on every
+   run observed, including under `cargo xtask smoke --binary=slint` - so the retry arm and its failure
+   line are vouched for by reading, not by watching.
 2. **The per-field `Pump` allows.** `product.rs:1-14` is now the honest version of an allow: it names
    what is left (`asked`, `hold_reported`, `ticks`, `last_bucket`, `strokes`, `quarantine_reported` and
    the act-machine counters after `surface.rs:700`) and says plainly that replacing the blanket
@@ -185,14 +191,18 @@ now have latch functions with unit tests instead of comments.
 
 Harder, and worth naming: the chord surface is now *live* in a product, so a chord that routes to nothing
 is a user-visible dead key rather than a probe curiosity - which is what the `SHORTCUTS` and `route_of`
-guards at `surface.rs:110-177` are for. And `docs/roadmap.md` §9 still counts M2 exit items on gpui's
-proofs: nothing here promotes a row there on its own authority, because §9's own rule is that the CI
-evidence trail has to exist first.
+guards at `surface.rs:110-177` are for. The shipped focus claim carries its own risk in one `use` line:
+`slint::private_unstable_api::re_exports` (`product.rs:72`) is not public surface, so **any Slint version
+bump is the tripwire** - re-read `claim_focus` against the new `i-slint-core` and re-run the keyboard-only
+control before trusting the first keystroke of a post-bump build. And `docs/roadmap.md` §9 still counts
+M2 exit items on gpui's proofs: nothing here promotes a row there on its own authority, because §9's own
+rule is that the CI evidence trail has to exist first.
 
 ## Reopening conditions
 
-- If the focus fix lands and a run with **no** click still loses the first keys, this is not a bridge bug
-  and the question moves up to the markup's focus model - reopen as a proposal, not a patch.
+- THIS ONE HAS A DATE AND A RESULT: the focus fix landed (`a12d58b3`) and a run with **no** click kept
+  its first keys, so the question stayed a bridge bug and did not move up to the markup's focus model.
+  Reopen it there if a future no-click run loses the first keys anyway.
 - If a third bridge lands, "one wiring home in `surface`" stops being enough and the shared module wants
   its own crate; do not answer that by copying `wire_callbacks`.
 - If the per-field allow in item 2 is ever satisfied by *deleting* the measurement half of `Pump` rather
