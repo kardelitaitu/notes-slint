@@ -216,9 +216,24 @@ fn arm_drop_target(hwnd: i64, holder: &Rc<RefCell<Option<DropGuard>>>) {
     }
     match arm_file_drop(WindowHandle(hwnd)) {
         Ok(guard) => {
+            // S4 (bridge side): WHOSE TARGET IT TOOK, read off the live guard before it moves
+            // into the holder. The bool is the platform's answer, and the bridge does not
+            // interpret it: `false` covers two different worlds - nothing was registered at all,
+            // and we displaced our own target on a re-arm (file_drop.rs:321 says so, and calls
+            // that stealing rather than taking over) - so the word below is the port's wording,
+            // chosen to stay true under either reading rather than to claim a cause we cannot
+            // see. `true` is the interesting case for THIS bridge: winit registers its own
+            // OLE target first, so taking it over means our copy of the cursor rules from here
+            // on, and a drag that once did nothing now arrives as Command::Open.
+            let took_over = guard.took_over();
             *holder.borrow_mut() = Some(guard);
+            let whose = if took_over {
+                "took the toolkit drop target; our copy cursor is the law now"
+            } else {
+                "quiet - nothing was registered"
+            };
             report(&format!(
-                "drop: armed hwnd={hwnd:#x} (a file dragged onto this window now arrives as Command::Open, exactly like a menu Open)"
+                "drop: armed hwnd={hwnd:#x} ({whose}) - a file dragged onto this window now arrives as Command::Open, exactly like a menu Open"
             ));
         }
         Err(e) => {
@@ -230,6 +245,45 @@ fn arm_drop_target(hwnd: i64, holder: &Rc<RefCell<Option<DropGuard>>>) {
             ));
         }
     }
+}
+
+/// S4d: the LOCKED fixture - small, and read-only on disk - and the story of why the lever
+/// changed twice. The 9 MiB version this replaces could never have worked: D9 is a REFUSAL, not a
+/// verdict attached to a load. `Engine::open` stats the bytes and answers
+/// `Event::LoadFailed { reason: TooLarge }` (event.rs:241-248), so no `Loaded` and no FileMeta
+/// ever arrive for an oversized file - which is exactly why the old act printed silence where it
+/// expected a lock, and why it was waiting on an adoption the port had already decided not to
+/// send. The `oversize` arm of `lock_verdict` is kept (if the port ever starts carrying it, the
+/// bridge is one call from honouring it) and is UNREACHABLE today: all four FileMeta construction
+/// sites in engine.rs (995, 1073, 1156, 1318) hard-code `oversize: false`.
+///
+/// The attribute is therefore the only lever that reaches `FileMeta::read_only`, and std cannot
+/// set it on a stable toolchain (`PermissionsExt::set_readonly` is the unstable
+/// `windows_permissions_ext`, rust#152956) while the `windows` crate is precisely what the
+/// layering rule forbids a bridge to import. So the bridge asks the OS's own utility through a
+/// process: `attrib +R`. No dependency, no FFI, no rule bent - and the child's stderr is
+/// reported, because a silent failure here would be indistinguishable from a port that never
+/// answers, which is the exact mistake this act is replacing.
+fn write_lock_fixture(path: &Path) -> std::io::Result<u64> {
+    let body = "locked by the disk, not by size\n";
+    std::fs::write(path, body.as_bytes())?;
+    Ok(body.len() as u64)
+}
+
+fn run_attrib(path: &Path, flag: &str) -> std::io::Result<()> {
+    let made = std::process::Command::new("attrib")
+        .arg(flag)
+        .arg(path)
+        .output()?;
+    if made.status.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "attrib {flag} {} exited {}: {}",
+        path.display(),
+        made.status,
+        String::from_utf8_lossy(&made.stderr).trim()
+    )))
 }
 
 /// Rect plus show state - the same two halves the gpui bridge diffs, because a
@@ -556,6 +610,18 @@ const DRAG_AT: Duration = Duration::from_millis(7000);
 /// maximised frame origin. When the frame act stands down, this is just another move.
 const DRAG2_AT: Duration = Duration::from_millis(16000);
 
+/// S4e: THE LOCK, MOVED - after the chord walk (CHORD_TAIL_AT 21.6 s plus its 500 ms steps) and
+/// before the caption machine (CAPTION_AT 23.7 s), which is the one seam nothing else owns. The 4d
+/// run showed what the startup placement cost: an early Open puts the fixture IN the recents list,
+/// the Alt+1..0 walk then re-opens it, and every stretch with a locked document current is a
+/// stretch the pump correctly refuses to save - so the flush chain dropped from 4 to 1 and this one
+/// act silently rewrote another slice's evidence. Movement, not mechanics: the act now runs last,
+/// restores the seed as the open document, and the run closes unlocked with the cleanup at exit.
+const LOCK_AT: Duration = Duration::from_millis(23000);
+/// The answer measured 10.7 ms, and the old 2 s bound was pre-loop sleep that ate the run's tick
+/// budget (invocations 3056 -> 1105). Tight now, and the report still says plainly when it expires.
+const LOCK_WAIT: Duration = Duration::from_millis(250);
+
 const END: Duration = Duration::from_millis(28000);
 
 fn main() {
@@ -788,6 +854,13 @@ fn main() {
                     fnv1a(raw.as_bytes()),
                     seed.display()
                 ));
+                // S4e: the LOCKED ACT USED TO BE HERE, at startup. It moved - see LOCK_AT for why,
+                // and the reason is a schedule fact, not a code one: opening the fixture early put
+                // it in the recents list, and the Alt+1..0 chord walk re-opened it, so the run spent
+                // parts of itself on a document the pump rightly refuses to save and someone
+                // else's flush evidence went 4 -> 1.
+                // The seed LAST, so the run ends up on the document every later needle assumes,
+                // and `locked` falls back to false before the loop starts.
                 report(&format!("open: asked {} via Command::Open", seed.display()));
                 send(&gateway, Command::Open { path: seed });
                 drain(&events, &pump, &ui.as_weak());
@@ -829,6 +902,12 @@ fn main() {
         move || {
             let Some(ui) = weak.upgrade() else { return };
             let now = started.elapsed();
+            // S4c: no witness is set here any more, and this note exists so a later reader does
+            // not re-add one. S10c asked "has the loop ticked?" - first of `invocations`, a pump
+            // counter an act can bump, then of `loop_ticked`, which no act can touch but which
+            // still only ever answered WHEN the event arrived. The hazard is not about when, it is
+            // about WHICH document, so note_adoption compares Pump::adopted_path and the question
+            // stops being answerable by accident. `third_pump` is still borrowed below, as before.
             let seen = fingerprint_of(ui.window());
             // S8: NOTHING to feed here, and that is the finding. Window's own 'maximized'
             // builtin (builtins.slint:1524) is what Chrome's caption cell binds to, so the
@@ -882,9 +961,13 @@ fn main() {
                 }
             }
             // S10b: the arming of the quarantine, reported ONCE, at the moment the generation
-            // first leaves zero - which, since S10c, means the FIRST REAL SWITCH: the startup
-            // adoptions arrive before the pump has ever run, so note_adoption leaves the counter
-            // at zero and undo stays native on the document the app reopened. The per-keystroke
+            // first leaves zero - which, since S4c, means the FIRST REAL SWITCH by construction:
+            // note_adoption steps on document IDENTITY, so the startup pair (Rebound then Loaded,
+            // both naming the same path) leaves the counter at zero however late the answer
+            // arrives, and undo stays native on the document the app reopened. Before S4c this
+            // claim was TEMPORAL - "the adoptions arrive before the pump has ever run" - and one
+            // 9 MiB open that pushed an answer past the first tick made it false in a live run.
+            // The per-keystroke
             // swallow needle can only come from a real hand (1.17 has no key-injection API,
             // established in S6), so this is what a headless run can honestly show: the switch
             // happened, the capture branch is armed, and the cost is being paid from here on.
@@ -1205,6 +1288,79 @@ fn main() {
                 }
             }
             // ---- S8: the caption buttons, driven through the doors the markup uses ----
+            // S4e: THE LOCK, MET - relocated here from startup; see LOCK_AT for the schedule
+            // reason. One tick, whole: prepare the fixture, ask for it, wait BOUNDED for the answer,
+            // let the pump meet the lock, then put the seed back so nothing after this point runs on
+            // a document the port will not save.
+            {
+                let due = {
+                    let mut p = third_pump.borrow_mut();
+                    if p.lock_acted || now < LOCK_AT {
+                        false
+                    } else {
+                        p.lock_acted = true;
+                        true
+                    }
+                };
+                if due {
+                    let fixture = third_dir.0.join("s8-locked.notes");
+                    match write_lock_fixture(&fixture)
+                        .and_then(|bytes| run_attrib(&fixture, "+R").map(|()| bytes))
+                    {
+                        Ok(bytes) => {
+                            third_pump.borrow_mut().lock_fixture = Some(fixture.clone());
+                            report(&format!(
+                                "lock-act: wrote {bytes} bytes to {}, set +R through attrib, asking Command::Open",
+                                fixture.display()
+                            ));
+                            // The answer comes from the engine thread, so poll `drain` - it takes
+                            // what is already queued and never blocks on a channel - until EITHER
+                            // kind of answer lands or the bound expires, and report which. The first
+                            // version drained once, microseconds after sending, and its silence read
+                            // like a dead lever.
+                            let before = third_pump.borrow().load_answers;
+                            let sent = Instant::now();
+                            send(&third_gw, Command::Open { path: fixture });
+                            while third_pump.borrow().load_answers == before
+                                && sent.elapsed() < LOCK_WAIT
+                            {
+                                std::thread::sleep(Duration::from_millis(2));
+                                drain(&third_events, &third_pump, &ui.as_weak());
+                            }
+                            let answers = third_pump.borrow().load_answers;
+                            report(&format!(
+                                "lock-act: the port {} after {:?} (load_answers {} -> {})",
+                                if answers == before {
+                                    "STAYED SILENT past the bound - the lever did not reach it"
+                                } else {
+                                    "answered"
+                                },
+                                sent.elapsed(),
+                                before,
+                                answers
+                            ));
+                            // The refusal, then proof it is once-per-lock: two calls to the same fn
+                            // the tick calls, and only one line may appear.
+                            text_pump(&ui, &third_gw, &third_pump);
+                            text_pump(&ui, &third_gw, &third_pump);
+                            // RESTORE, so the caption tail and the honest shutdown both run on the
+                            // document they were written for.
+                            let seed = third_pump.borrow().seed.clone();
+                            if let Some(seed) = seed {
+                                report(&format!(
+                                    "lock-act: restoring the seed {} so the run closes unlocked",
+                                    seed.display()
+                                ));
+                                send(&third_gw, Command::Open { path: seed });
+                                drain(&third_events, &third_pump, &ui.as_weak());
+                            } else {
+                                report("lock-act: no seed path stored - the run stays on the fixture");
+                            }
+                        }
+                        Err(e) => report(&format!("lock-act: fixture refused to be prepared: {e}")),
+                    }
+                }
+            }
             let cstep = third_pump.borrow().caption_step;
             if driven == total && cstep < 9 && now >= CAPTION_AT + CAPTION_EVERY * (cstep as u32) {
                 third_pump.borrow_mut().caption_step = cstep + 1;
@@ -1531,6 +1687,36 @@ fn main() {
             disarmed.is_some()
         ));
         drop(disarmed);
+    }
+    // S4d: the run's own mess, cleared here rather than by the next run's surprise. The
+    // attribute goes FIRST and that is not ceremony: a read-only file left in the probe directory
+    // makes the NEXT startup write of that path fail, and a probe that makes the next probe lie is
+    // worse than no probe. Both steps report, and the failure paths print the reason, because
+    // "cleanup failed" without a cause is not evidence.
+    {
+        let fixture = pump.borrow().lock_fixture.clone();
+        match fixture {
+            Some(path) => {
+                let cleared = run_attrib(&path, "-R");
+                let removed = std::fs::remove_file(&path);
+                report(&format!(
+                    "lock-act: cleanup {} (attrib -R ok: {}, removed: {})",
+                    path.display(),
+                    cleared.is_ok(),
+                    removed.is_ok()
+                ));
+                if let Err(e) = &cleared {
+                    report(&format!("lock-act: the attribute did not clear: {e}"));
+                }
+                if let Err(e) = &removed {
+                    report(&format!(
+                        "lock-act: CLEANUP FAILED for {}: {e} - delete it by hand before trusting the next run's recents",
+                        path.display()
+                    ));
+                }
+            }
+            None => report("lock-act: no fixture to clean (the act did not create one)"),
+        }
     }
     // R2b: THE HONEST SHUTDOWN, in the order that cannot lose text. The close that
     // granted is what lands here - and by then the debounce has NOT run, so any byte
@@ -2210,16 +2396,45 @@ fn answer_dialog(
 /// the S10b run printed `rebind: epoch=1 gen=1` and `load: epoch=2 gen=2` BEFORE
 /// `hwnd = 0x… APPEARED at t+84ms, after the loop spun`, so the quarantine armed at
 /// generation=2 with ZERO document switches and killed undo on the first keystroke of the first
-/// file - the exact opposite of what the capture branch promises. `invocations > 0` is the
-/// loop's own witness: the text pump runs once per tick, so a non-zero count means the window is
-/// up and anything arriving now is a switch a person caused.
-fn note_adoption(pump: &RefCell<Pump>) -> i32 {
+/// file - the exact opposite of what the capture branch promises.
+///
+/// S4b, and the second half of that lesson: the witness used to be `invocations > 0`, which is a
+/// PUMP counter, not a loop fact. The locked act calls text_pump twice from startup (to make the
+/// refusal speak before the seed re-opens), which bumped that counter, faked a tick, and armed the
+/// quarantine on the startup open - the S10c bug, re-introduced through the witness itself. So the
+/// S4c, and the end of that lesson: the witness is now the FACT itself. The first adoption of a run
+/// is the app coming back to its own file, and the second one is the same fact twice (the engine
+/// answers startup with a Rebound and then a Loaded, both naming the SAME path), so neither is a
+/// switch - and comparing document identity cannot be fooled by timing, which is what defeated both
+/// earlier witnesses. The general rule, written where it will be read: a boolean that PROXIES a
+/// fact drifts out of sync the moment anyone exercises the proxy; ask for the fact.
+///
+/// What the rule keeps, on purpose: re-opening the SAME path does NOT step, because the undo stack
+/// still holds that file's own edits and native undo is genuinely safe there. Save As DOES step,
+/// which is conservative - the text did not change, so nothing is stale - and the price is undo in
+/// a case where the user has just performed a document-identity act anyway. Stated rather than
+/// hidden, because it is a behaviour a person could notice.
+fn note_adoption(pump: &RefCell<Pump>, path: &Path) -> i32 {
     let mut p = pump.borrow_mut();
     p.edited_flag = false;
     p.pending_at = None;
-    if p.invocations > 0 {
+    // The FIRST adoption of a run is the baseline, not a switch: there is no previous document
+    // whose bytes could be sitting in the undo stack. Two consequences written down because they
+    // are limits, not details: (1) a step needs a path to differ FROM, so `is_some_and`, not a
+    // bare inequality - the first draft used `!= Some(path)` and stepped immediately, which the
+    // test caught as `left: 1, right: 0`; and (2) this assumes every run BEGINS with an adoption,
+    // which is this bridge's behaviour today (every log shows `rebind: epoch=1` then
+    // `load: epoch=2` before the user does anything). If a later `New document` act lets a person
+    // type into a never-adopted buffer and then Open, that first adoption is a real switch and
+    // would not step - the way to see that break is the first assertion below.
+    let switching = p
+        .adopted_path
+        .as_deref()
+        .is_some_and(|previous| previous != path);
+    if switching {
         p.generation = next_generation(p.generation);
     }
+    p.adopted_path = Some(path.to_path_buf());
     p.generation
 }
 
@@ -2371,6 +2586,31 @@ struct Pump {
     lock_word: String,
     /// The refusal speaks once per lock, not once per tick.
     lock_needled: bool,
+    /// S4c: THE FACT, not a proxy for it. The undo hazard depends on exactly one thing - whether
+    /// the document in the buffer changed - so the policy now compares document IDENTITY.
+    ///
+    /// Both earlier witnesses were temporal, and timing defeated each in turn: `invocations > 0`
+    /// (a pump counter) was faked by the locked act calling text_pump from startup, and the
+    /// replacement `loop_ticked` was defeated WITHOUT any trick - the 9 MiB fixture open delayed
+    /// the startup Loaded past the first tick, so the 4b run printed `load: epoch=2 gen=1` and
+    /// `ARMED at generation=1` with zero document switches. That is also why this is not a probe
+    /// problem to schedule around: a slow first open - a big file, a network share, OneDrive, a
+    /// spinning disk, all normal for this app - would arm the quarantine on a real user's first
+    /// document and silently kill undo. A same-path pair cannot arm under ANY timing now, which is
+    /// the property the other two lacked.
+    adopted_path: Option<PathBuf>,
+    /// S4d: every ANSWER to an open - `Loaded` or `LoadFailed`, either way the engine has
+    /// replied. The locked act polls this instead of draining once and hoping: the old version
+    /// drained microseconds after sending, saw nothing, and printed silence that read like a dead
+    /// lever. A count, not a bool, because a run opens several files.
+    load_answers: u64,
+    /// S4e: the locked act is a once-per-run event, and the one-shot lives with the rest of the
+    /// act machine's memory rather than in a captured bool.
+    lock_acted: bool,
+    /// S4: the read-only fixture this run created, remembered so the exit path can clear the
+    /// attribute and delete the file. A probe that leaves a read-only file in its own state dir
+    /// makes the NEXT run's write fail, which is a probe lying about the run after it.
+    lock_fixture: Option<PathBuf>,
     // ---- S5 ----
     /// The paths behind the rendered recent rows, in the order the port sent them,
     /// so a row index maps back to the file it names.
@@ -2630,6 +2870,7 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                 let mut p = pump.borrow_mut();
                 p.epoch = *epoch;
                 p.last_sent = adopted.clone();
+                p.load_answers += 1; // S4d: an answer arrived - what the locked act waits for
                 // S8b: THE VERDICT, read at last. This pattern used to end in `..`, which dropped
                 // the whole FileMeta - the disk flag, D9's size verdict, ADR-0001's arming bit -
                 // on the floor. That is how this bridge came to let a person type into a file the
@@ -2643,7 +2884,7 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                 drop(p);
                 // An adoption is not a user edit, and the startup one is not a switch either -
                 // both facts are decided in one place, note_adoption.
-                let generation = note_adoption(pump);
+                let generation = note_adoption(pump, path);
                 if let Some(ui) = weak.upgrade() {
                     ui.set_buffer(adopted.clone().into());
                     ui.set_doc_generation(generation);
@@ -2663,7 +2904,8 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                     publish_title(&ui, Some(path), true, "loaded");
                 }
                 report(&format!(
-                    "load: epoch={epoch} gen={generation} meta(read_only={} oversize={} armed={}) locked={locked} announced, buffer adopted ({} bytes, CR-normalised)",
+                    "load: path={} epoch={epoch} gen={generation} meta(read_only={} oversize={} armed={}) locked={locked} announced, buffer adopted ({} bytes, CR-normalised)",
+                    path.display(),
                     meta.read_only,
                     meta.oversize,
                     meta.armed,
@@ -2694,7 +2936,7 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                 p.lock_needled = false;
                 let (locked, word) = (p.locked, p.lock_word.clone());
                 drop(p);
-                let generation = note_adoption(pump);
+                let generation = note_adoption(pump, path);
                 if let Some(ui) = weak.upgrade() {
                     ui.set_doc_generation(generation);
                     ui.set_locked(locked);
@@ -2707,8 +2949,32 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                     publish_title(&ui, Some(path), true, "rebound");
                 }
                 report(&format!(
-                    "rebind: epoch={epoch} gen={generation} meta(read_only={} oversize={} armed={}) locked={locked}; the next Flush echoes it",
-                    meta.read_only, meta.oversize, meta.armed
+                    "rebind: path={} epoch={epoch} gen={generation} meta(read_only={} oversize={} armed={}) locked={locked}; the next Flush echoes it",
+                    path.display(),
+                    meta.read_only,
+                    meta.oversize,
+                    meta.armed
+                ));
+            }
+            // S4d: EVENT::LOADFAILED, ARMED AT LAST. This event used to fall through the catch-all,
+            // which threw away both the path and the reason on the ONE event whose entire job is to
+            // say why nothing happened - and "nothing happened" is the load half of the do-no-harm
+            // promise, so it is exactly the fact a probe must print. The wording is the PORT's:
+            // LoadError is a thiserror enum whose sentences are already human (TooLarge -> "file is
+            // too large to open"), so spelling them again here would be a second copy of a verdict
+            // the port owns, the same rule PinFailed follows.
+            //
+            // A REFUSED LOAD IS NOT AN ADOPTION, which is why nothing below touches state: no text
+            // crossed the port, so the buffer, the generation, the epoch and the lock all stay as
+            // the previous document left them. The engine guarantees the survivor - the session doc
+            // is only rewritten from an actual adoption (session.rs:806-835) - and the gpui bridge
+            // makes the same decision for the same reason (bridge-gpui/src/main.rs:986-994: keep
+            // the text, disarm, and never flush onto a path the open just failed to read).
+            Event::LoadFailed { path, reason } => {
+                pump.borrow_mut().load_answers += 1;
+                let where_ = path.display().to_string();
+                report(&format!(
+                    "load[refused]: {where_} - {reason} (nothing adopted: the previous document, its buffer, its generation and its lock are untouched)"
                 ));
             }
             Event::RecentsUpdated(list) => {
@@ -3218,39 +3484,115 @@ mod chords {
     }
 
     #[test]
+    fn a_refused_load_adopts_nothing_and_says_why() {
+        // S4d, structural: the arm exists, it speaks the port's own reason, and above all it
+        // touches NOTHING - a refusal that adopted state would be the data-loss bug this event
+        // exists to prevent. Cut at `mod tests` for the reason the S8b test learned: this file
+        // greps ITSELF, so the counting lines are inside it.
+        let whole = include_str!("../src/main.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        assert!(
+            src.contains("Event::LoadFailed { path, reason } =>"),
+            "the event must have a real arm, not the catch-all"
+        );
+        let arm = &src[src
+            .find("Event::LoadFailed { path, reason } =>")
+            .expect("the arm")..];
+        let arm = &arm[..arm.find("Event::RecentsUpdated").expect("the next arm")];
+        assert!(
+            arm.contains("load[refused]:"),
+            "the needle must name itself"
+        );
+        assert!(
+            arm.contains("{reason}"),
+            "the port's own sentence, not a bridge paraphrase"
+        );
+        for untouched in [
+            "note_adoption(",
+            "set_locked",
+            "p.locked",
+            "set_buffer",
+            "Generation",
+        ] {
+            assert!(
+                !arm.contains(untouched),
+                "a refused load must not touch {untouched}"
+            );
+        }
+        // The gpui parity claim, checked rather than asserted: it keeps the buffer and says so.
+        assert!(
+            src.contains("nothing adopted"),
+            "the needle must state the survivor"
+        );
+        // S4d item 3: both adoption needles name the path, because a claim about WHICH adoption
+        // was which was previously uncheckable and turned out to be wrong.
+        assert!(
+            src.contains("\"load: path={} epoch={epoch}"),
+            "Loaded must print its path"
+        );
+        assert!(
+            src.contains("\"rebind: path={} epoch={epoch}"),
+            "Rebound must print its path"
+        );
+    }
+
+    #[test]
     fn the_startup_adoption_is_not_a_switch() {
-        // S10c, and the S10b run is why it exists. This drives the POLICY - note_adoption - not
-        // the predicate: undo_quarantined(gen, ..) was correct all along and could not fail, but
-        // the gen it was handed came from a policy that stepped on the app's own startup open.
-        // A test that takes the number as an argument cannot catch the code that produces it.
+        // S4c: the policy is driven here, not the predicate - undo_quarantined(gen, ..) was right
+        // from the start and could not fail, because the gen it was handed came from a policy that
+        // stepped on the app's own startup open. A test that takes the number as an argument
+        // cannot catch the code that produces it, and (the 4b lesson, one level up) a test that
+        // MANUFACTURES the witness cannot audit it either: this one used to set `loop_ticked` by
+        // hand and still passed while the live run armed the quarantine at startup.
+        let a = PathBuf::from("C:/probe/same.notes");
+        let b = PathBuf::from("C:/probe/other.notes");
         let pump = RefCell::new(Pump::default());
+        // The startup pair: the engine answers the initial query with a Rebound and then a Loaded,
+        // both naming the SAME path. That pair armed the quarantine under both temporal witnesses
+        // as soon as an answer arrived late - i.e. whenever the disk was slow.
         assert_eq!(
-            note_adoption(&pump),
+            note_adoption(&pump, &a),
             0,
-            "the rebind that answers the startup open is not a switch"
+            "the rebind that answers startup is not a switch"
         );
         assert_eq!(
-            note_adoption(&pump),
+            note_adoption(&pump, &a),
             0,
-            "nor is the Loaded that brings the text back: the first document keeps native undo"
+            "nor is the Loaded that follows it for the same path"
         );
-        pump.borrow_mut().invocations = 1; // the loop has ticked: the window is up
+        // The pump counter stays decoupled on purpose: the locked act calls text_pump from
+        // startup, so invocations is non-zero before the loop has ever run.
+        pump.borrow_mut().invocations = 9;
         assert_eq!(
-            note_adoption(&pump),
+            note_adoption(&pump, &a),
+            0,
+            "the same path never steps, pump calls or not"
+        );
+        // A DIFFERENT document is a switch, and it is now the only thing that can arm.
+        assert_eq!(
+            note_adoption(&pump, &b),
             1,
-            "the first switch arms the quarantine"
+            "a different path is the switch"
         );
         assert_eq!(
-            note_adoption(&pump),
+            note_adoption(&pump, &a),
             2,
-            "and every switch after it steps once"
+            "and switching back is another one"
         );
         assert_eq!(pump.borrow().generation, 2);
-        // The witness clearing lives here too, which is the point of one function instead of two
-        // copies: an adoption must never look like an edit, on either path.
+        // The timing-proof claim, restated: with the counter zeroed and the same path still
+        // current, nothing steps. There is no longer a moment in a run where it can.
+        pump.borrow_mut().invocations = 0;
+        assert_eq!(
+            note_adoption(&pump, &a),
+            2,
+            "idempotent for the current document"
+        );
+        // The witness clearing lives in the same function, which is why both sites call it: an
+        // adoption must never look like an edit, on either path.
         pump.borrow_mut().edited_flag = true;
         pump.borrow_mut().pending_at = Some(Instant::now());
-        assert_eq!(note_adoption(&pump), 3);
+        assert_eq!(note_adoption(&pump, &b), 3);
         assert!(
             !pump.borrow().edited_flag,
             "an adoption never counts as an edit"
