@@ -1704,6 +1704,41 @@ fn text_probe(ui: &Spike) {
 /// edited and then edited back to identical must not produce a save, and only the bytes can
 /// say so.
 fn text_pump(ui: &Spike, gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>) {
+    // S8b: THE REFUSAL, deliberately ABOVE the witness dispatch so neither path can escape it.
+    // A locked document is one the port has already decided it will not save - the disk flag or
+    // D9's 8 MiB verdict - so sending is not merely useless: the log would print a flush for a
+    // save whose only possible answer is `SaveError::ReadOnly`, which is a record of an attempt
+    // the engine refuses to make. `last_sent` is kept IN SYNC and the edited witness and debounce
+    // clock cleared, so no phantom dirty survives the refusal; the buffer is remembered as what
+    // the pump WOULD have sent, and the dot is forced clean once, because LOCK beats DIRTY - a
+    // file that can never be saved has no unsaved state to advertise. Printed once per lock, not
+    // 125 times a second, because noise is how a finding stops being read. The honest cost: this
+    // branch reads the buffer every tick while locked, which is exactly the per-tick cost S10
+    // removed. Rare by definition, and it buys the no-phantom-dirty property the refusal needs;
+    // a locked document that later unlocks must not come back 300 edits behind.
+    let locked = {
+        let p = pump.borrow();
+        p.locked
+    };
+    if locked {
+        let first = {
+            let mut p = pump.borrow_mut();
+            let first = !p.lock_needled;
+            p.lock_needled = true;
+            p.last_sent = lf(&ui.get_buffer());
+            p.edited_flag = false;
+            p.pending_at = None;
+            first
+        };
+        if first {
+            note_dot(pump, &ui.as_weak(), false, "locked");
+            let word = pump.borrow().lock_word.clone();
+            report(&format!(
+                "flush[refused]: {word} - the port will not save this document; the buffer is tracked as sent, the dot is clean, and autosave never fires while it is locked"
+            ));
+        }
+        return;
+    }
     if !EDITED_IS_DIRTY_WITNESS {
         // The fallback is a const flip, not a redesign: the old path is still in this file,
         // byte for byte, as text_pump_by_compare.
@@ -2188,7 +2223,20 @@ fn note_adoption(pump: &RefCell<Pump>) -> i32 {
     p.generation
 }
 
-/// S10: the generation, one step. Plus one, not a toggle: the port epochs move one at a time and
+/// S8b: the port's verdict, put into a word. Empty means not locked. The two causes stay
+/// distinct because they explain differently to a person: `read_only` is the disk, which the user
+/// set (or a file server did), while `oversize` is D9 - the 8 MiB guard opens a big file READ-ONLY
+/// instead of refusing it, because a refused open is a lost document. Returning the word rather
+/// than a bool is deliberate: the UI must not re-derive a reason the port already gave, and a bare
+/// bool invites a status line that says "read-only" about a file that is merely huge.
+fn lock_verdict(read_only: bool, oversize: bool) -> &'static str {
+    match (read_only, oversize) {
+        (false, false) => "",
+        (true, false) => "read-only on disk",
+        (false, true) => "read-only: too big to edit safely (8 MiB guard)",
+        (true, true) => "read-only on disk, and too big to edit safely (8 MiB guard)",
+    }
+}
 /// a toggle would collide after two adoptions. The PARITY is what a conditional recreation would
 /// key on, so this makes the parity a fact a test can hold rather than an expression written
 /// twice in two languages.
@@ -2313,6 +2361,16 @@ struct Pump {
     /// S10b: the arming of the undo quarantine is reported once, when the generation first
     /// leaves zero - the run's own proof that the swallow is live from here on.
     quarantine_reported: bool,
+    // ---- S8b ----
+    /// The port's lock, mirrored from FileMeta so the pump can refuse without reaching back into
+    /// the event that set it. `true` means the engine has already decided it will not save this
+    /// document; a bridge that kept flushing anyway was the bug this field exists to close.
+    locked: bool,
+    /// The word the status line shows and the refusal needle quotes, straight from lock_verdict,
+    /// so the two causes (disk vs size) cannot be conflated downstream.
+    lock_word: String,
+    /// The refusal speaks once per lock, not once per tick.
+    lock_needled: bool,
     // ---- S5 ----
     /// The paths behind the rendered recent rows, in the order the port sent them,
     /// so a row index maps back to the file it names.
@@ -2563,12 +2621,25 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
             // deliberately does not - a save does not change the generation, so a
             // bridge that read epoch from it would be one bump out of step.
             Event::Loaded {
-                epoch, text, path, ..
+                epoch,
+                text,
+                path,
+                meta,
             } => {
                 let adopted = lf(text);
                 let mut p = pump.borrow_mut();
                 p.epoch = *epoch;
                 p.last_sent = adopted.clone();
+                // S8b: THE VERDICT, read at last. This pattern used to end in `..`, which dropped
+                // the whole FileMeta - the disk flag, D9's size verdict, ADR-0001's arming bit -
+                // on the floor. That is how this bridge came to let a person type into a file the
+                // engine had already decided it would never save.
+                let word = lock_verdict(meta.read_only, meta.oversize);
+                p.locked = !word.is_empty();
+                p.lock_word = word.to_string();
+                // A new document, a new lock: the refusal gets to speak once about THIS file.
+                p.lock_needled = false;
+                let (locked, word) = (p.locked, p.lock_word.clone());
                 drop(p);
                 // An adoption is not a user edit, and the startup one is not a switch either -
                 // both facts are decided in one place, note_adoption.
@@ -2576,10 +2647,26 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                 if let Some(ui) = weak.upgrade() {
                     ui.set_buffer(adopted.clone().into());
                     ui.set_doc_generation(generation);
+                    // THE WIDGET'S HALF: one property, and 1.17 stops the caret itself
+                    // (textedit-base gates its interaction areas on read-only).
+                    ui.set_locked(locked);
+                    if locked {
+                        // The visible word, from the port's own reason - see lock_verdict. The
+                        // dot stays clean by the pump's guard, which is the precedence S8b
+                        // chose: a document that can never be saved has no unsaved state to
+                        // advertise, so LOCK beats DIRTY rather than competing with it.
+                        ui.set_status(
+                            format!("{word} - typing is off; the engine will not save this file")
+                                .into(),
+                        );
+                    }
                     publish_title(&ui, Some(path), true, "loaded");
                 }
                 report(&format!(
-                    "load: epoch={epoch} gen={generation} announced, buffer adopted ({} bytes, CR-normalised)",
+                    "load: epoch={epoch} gen={generation} meta(read_only={} oversize={} armed={}) locked={locked} announced, buffer adopted ({} bytes, CR-normalised)",
+                    meta.read_only,
+                    meta.oversize,
+                    meta.armed,
                     adopted.len()
                 ));
                 // The open half of the rule: reading a foreign file must not change it.
@@ -2591,20 +2678,37 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                     do_no_harm(pump, "loaded");
                 }
             }
-            Event::Rebound { epoch, path, .. } => {
+            Event::Rebound {
+                epoch, path, meta, ..
+            } => {
                 // The other half of the same door: a Save As rebinds the document identity, so
                 // the generation moves here too - through the SAME policy function, which is what
-                // stops a key that must move on both paths from moving on only one.
+                // stops a key that must move on both paths from moving on only one. And it reads
+                // meta for the same reason Loaded does now: a Save As CAN land on a read-only
+                // path, and the bridge may not assume the answer.
                 let mut p = pump.borrow_mut();
                 p.epoch = *epoch;
+                let word = lock_verdict(meta.read_only, meta.oversize);
+                p.locked = !word.is_empty();
+                p.lock_word = word.to_string();
+                p.lock_needled = false;
+                let (locked, word) = (p.locked, p.lock_word.clone());
                 drop(p);
                 let generation = note_adoption(pump);
                 if let Some(ui) = weak.upgrade() {
                     ui.set_doc_generation(generation);
+                    ui.set_locked(locked);
+                    if locked {
+                        ui.set_status(
+                            format!("{word} - typing is off; the engine will not save this file")
+                                .into(),
+                        );
+                    }
                     publish_title(&ui, Some(path), true, "rebound");
                 }
                 report(&format!(
-                    "rebind: epoch={epoch} gen={generation} announced; the next Flush echoes it"
+                    "rebind: epoch={epoch} gen={generation} meta(read_only={} oversize={} armed={}) locked={locked}; the next Flush echoes it",
+                    meta.read_only, meta.oversize, meta.armed
                 ));
             }
             Event::RecentsUpdated(list) => {
@@ -3039,6 +3143,78 @@ mod chords {
                 .any(|row| row.2.contains("undo") || row.2.contains("redo")),
             "no port Command exists for undo; the legend may not claim one"
         );
+    }
+
+    #[test]
+    fn the_lock_verdict_names_the_cause_and_only_the_cause() {
+        // Four facts, because the port ships two independent bits and the UI must not blur them.
+        // An unlocked file gets the EMPTY word, which is what makes `locked = !word.is_empty()`
+        // safe: there is no third state where a reason exists without a lock.
+        assert_eq!(lock_verdict(false, false), "");
+        assert_eq!(lock_verdict(true, false), "read-only on disk");
+        assert_eq!(
+            lock_verdict(false, true),
+            "read-only: too big to edit safely (8 MiB guard)"
+        );
+        let both = lock_verdict(true, true);
+        assert!(both.contains("on disk") && both.contains("8 MiB"), "{both}");
+        assert_ne!(lock_verdict(true, false), lock_verdict(false, true));
+    }
+
+    #[test]
+    fn a_locked_document_is_never_flushed() {
+        // The structural half of S8b: the verdict is READ at both adoption sites, the WIDGET is
+        // told, and the pump refuses ABOVE the dispatch so neither witness path escapes it. This
+        // is grep-grade proof on purpose - the behavioural half needs a file the engine really
+        // refuses, see the run's meta(...) needle and the manual list.
+        // Cut at the tests module: this file includes ITSELF, so every literal counted below
+        // would otherwise match the counting line too - the trap this test walked into on its
+        // first run, reporting 3 for 2 real sites. Self-referential greps must say what they
+        // exclude.
+        let whole = include_str!("../src/main.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        assert_eq!(
+            src.matches("lock_verdict(meta.read_only, meta.oversize)")
+                .count(),
+            2,
+            "Loaded and Rebound must both read the verdict; one is the bug class again"
+        );
+        assert_eq!(
+            src.matches("ui.set_locked(locked)").count(),
+            2,
+            "both sites must tell the widget, or a switch can unlock a document the port locked"
+        );
+        assert_eq!(
+            src.matches("armed={}").count(),
+            2,
+            "armed is printed at both sites: dropping the field is the bug, even unread"
+        );
+        let guard = &src[src.find("S8b: THE REFUSAL").expect("the guard")..];
+        let guard = &guard[..guard
+            .find("if !EDITED_IS_DIRTY_WITNESS")
+            .expect("the dispatch")];
+        assert!(
+            guard.contains("return;"),
+            "the refusal must return before any send"
+        );
+        assert!(
+            !guard.contains("Command::Flush"),
+            "no flush may be reachable from the locked branch"
+        );
+        assert!(
+            guard.contains("p.last_sent = lf(&ui.get_buffer());"),
+            "the refusal keeps last_sent in sync, or the unlock resurrects a phantom dirty"
+        );
+        assert!(
+            guard.contains("p.edited_flag = false;") && guard.contains("p.pending_at = None;"),
+            "the witness and the debounce clock are cleared too"
+        );
+        assert!(
+            guard.contains("note_dot(pump, &ui.as_weak(), false, \"locked\")"),
+            "LOCK beats DIRTY"
+        );
+        assert!(MARKUP.contains("in-out property <bool> locked"));
+        assert!(MARKUP.contains("read-only: root.locked;"));
     }
 
     #[test]

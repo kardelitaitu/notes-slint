@@ -123,6 +123,15 @@ export component Spike inherits Window {
     /// for why that half is not shipped yet.
     in-out property <int> doc-generation: 0;
 
+    /// S8b: THE LOCK, as the port said it. `Event::Loaded` and `Event::Rebound` carry a
+    /// FileMeta whose `read_only` bit is the disk and whose `oversize` bit is D9's verdict - the
+    /// 8 MiB guard opens a big file READ-ONLY rather than refusing it, because a refused open is
+    /// a lost document. Before this property the bridge dropped `meta` on the floor at both
+    /// adoption sites, so the user could type into a file the engine had already decided it
+    /// would never save. One bit, because the two causes differ in the WORD shown, not in what
+    /// the widget does: both mean the caret must stop.
+    in-out property <bool> locked: false;
+
     /// S8: the caption minimize ask, carried up so Rust can answer it. Every other caption
     /// cell reused a door that already existed; this is the one that had to be added.
     callback minimize-requested();
@@ -298,6 +307,12 @@ export component Spike inherits Window {
         // the toolkit's prettier default is a behavioural difference between two bridges that
         // are supposed to be the same app. Long lines scroll; they do not fold.
         wrap: TextWrap.no-wrap;
+        // S8b: the port's verdict, bound. 1.17's own textedit-base gates the caret and the
+        // interaction areas on this (`enabled: !root.read-only && root.enabled`), which is why
+        // the bind is the whole of the widget's half - and why a programmatic `set_buffer` is
+        // NOT stopped by it: the property refuses input, not writes. The pump refuses to send
+        // for a locked document; that guard, not this line, is what the headless run can prove.
+        read-only: root.locked;
         // Two-way binding: `set_buffer` repaints the widget, typing refills the
         // property, and the pump reads only the property.
         text <=> root.buffer;
