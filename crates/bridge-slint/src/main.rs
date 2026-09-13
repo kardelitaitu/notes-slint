@@ -31,7 +31,8 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use notes_api::{
-    Command, Event, Exit, Gateway, Rect, Settings, StateDir, WindowHandle, resolve_state_dir,
+    Command, DropGuard, Event, Exit, Gateway, Rect, Settings, StateDir, WindowHandle,
+    arm_file_drop, resolve_state_dir,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, LogicalPosition, LogicalSize, Timer, TimerMode};
@@ -174,6 +175,60 @@ fn hwnd_of(window: &slint::Window) -> Option<i64> {
     match handle.as_raw() {
         RawWindowHandle::Win32(win32) => Some(win32.hwnd.get() as i64),
         _ => None,
+    }
+}
+
+/// S6b: THE DROP TARGET, armed the only way the port allows it to be armed.
+///
+/// WHY HERE AND NOT IN THE ENGINE. `arm_file_drop` executes on the calling thread, and the
+/// contract that comes back with it is blunt: the caller must be the thread that pumps the
+/// window, because `OleInitialize` builds the COM apartment of whoever calls it and
+/// `RegisterDragDrop` binds the target to the window's owner. The engine looks like its natural
+/// home - `Command::RegisterWindow` already receives this exact handle - and arming there would
+/// register from a thread that pumps nothing. The callbacks would then wait for a pump inside the
+/// drag loop Windows drives for the SENDER: somebody else's Explorer frozen mid-drag, with no
+/// error returned anywhere in this process. A wrong thread here is not a degraded window, so the
+/// bridge arms it, on the thread that owns the window, at the moment it already holds the handle.
+///
+/// WHAT A DROP WILL MEAN, the semantics this call buys. The engine turns a dropped path into
+/// `Command::Open`, so a drop is BIT-IDENTICAL to every other way this app opens a file: the same
+/// unsaved-buffer policy, the same autosave arming rules (ADR-0001 - a drop does not arm
+/// autosave on a foreign file any more than Ctrl+O does), the same recents, the same epoch and
+/// generation bookkeeping, the same undo quarantine. That is consistency, not an oversight:
+/// §4.4 promised a drop opens a note, and an open that behaved differently depending on which
+/// door it came in through is the bug a user would call us for. Nothing in this file decides what
+/// a path means - the port deliberately has no Event and no PathBuf in this signature, so it
+/// could not decide even by accident.
+///
+/// NO ENV GATE, unlike the dialog: an `IDropTarget` nobody drags onto costs one registration and
+/// says nothing, so arming is harmless headless - and gating it would mean the code path that
+/// matters in production is not the code path any run ever exercises.
+fn arm_drop_target(hwnd: i64, holder: &Rc<RefCell<Option<DropGuard>>>) {
+    if holder.borrow().is_some() {
+        // Both registration sites can fire in one run (first-visible, then appeared-in-the-loop).
+        // A second arm would install a new guard while the old one is still held, and the old
+        // guard's drop calls the platform's disarm on the SAME hwnd - revoking the target the
+        // second arm had just registered. So the second site reports instead of unwinding.
+        report(&format!(
+            "drop: already armed (hwnd {hwnd:#x} was named twice; a second arm would have disarmed the first)"
+        ));
+        return;
+    }
+    match arm_file_drop(WindowHandle(hwnd)) {
+        Ok(guard) => {
+            *holder.borrow_mut() = Some(guard);
+            report(&format!(
+                "drop: armed hwnd={hwnd:#x} (a file dragged onto this window now arrives as Command::Open, exactly like a menu Open)"
+            ));
+        }
+        Err(e) => {
+            // Rendered honestly, never silence. A window that cannot receive drops is one missing
+            // convenience, not a broken app, so the answer is a line the reader can act on - and
+            // the guard stays None, which is what makes the exit needle say so too.
+            report(&format!(
+                "drop: ARM FAILED - {e}, dragging files onto the window will do nothing"
+            ));
+        }
     }
 }
 
@@ -607,6 +662,12 @@ fn main() {
         shown.rect.x - session.rect.x,
         shown.rect.y - session.rect.y
     ));
+    // S6b: the drop target's lease, declared BEFORE the first registration site so it outlives
+    // both of them, and dropped explicitly on the exit path. BESIDE Pump rather than inside it,
+    // on purpose: Pump is the state the unit tests build with `Pump::default()`, and a DropGuard
+    // in it would make that struct thread-owned and un-constructible off the window thread. The
+    // guard is a resource, not a measurement.
+    let drop_guard: Rc<RefCell<Option<DropGuard>>> = Rc::new(RefCell::new(None));
     let started = Instant::now();
     let hwnd = hwnd_of(window);
     match hwnd {
@@ -626,6 +687,13 @@ fn main() {
                     handle: WindowHandle(hwnd),
                 },
             );
+            // S6b: arm on the success path - and note what "success" can mean here. `send` is a
+            // post, not a call: RegisterWindow answers with no Event, and the one failure it can
+            // report ("the engine had already exited") is already printed by send itself. There
+            // is no acknowledgement to wait for, so the moment the handle is named is the moment
+            // the arm is right - and an arm that landed after the engine left is a guard nobody
+            // drags onto, disarmed on exit like everything else.
+            arm_drop_target(hwnd, &drop_guard);
             if initial.pinned {
                 send(&gateway, Command::SetPinned(true));
             }
@@ -753,6 +821,9 @@ fn main() {
     let third_gw = Rc::clone(&gateway);
     let third_events = Rc::clone(&events);
     let third_pump = Rc::clone(&pump);
+    // S6b: the tick's own handle on the lease, for the registration site that actually fires in
+    // a normal run (the HWND appears only after the loop spins).
+    let third_drops = Rc::clone(&drop_guard);
     tick.start(TimerMode::Repeated, Duration::from_millis(8), {
         let state = Rc::clone(&state);
         move || {
@@ -846,6 +917,10 @@ fn main() {
                             handle: WindowHandle(hwnd),
                         },
                     );
+                    // S6b: THE site that fires in practice - the handle exists only once the loop
+                    // has spun, so this tick callback is the thread that pumps the window, which
+                    // is the whole of the arm_file_drop contract. Same fn, same thread, same run.
+                    arm_drop_target(hwnd, &third_drops);
                     drain(&third_events, &third_pump, &ui.as_weak());
                 }
             }
@@ -1436,6 +1511,27 @@ fn main() {
         ui.on_drag_ended(move || drag_release(&gw, "title-band"));
     }
     ui.run().ok();
+    // S6b: DISARM FIRST, on the thread that armed - this one, the main thread, the only thread
+    // that ever pumped this window. Dropping the guard calls the platform's `disarm`, which
+    // revokes the IDropTarget; taking it here instead of letting the destructor run at process
+    // exit means the revocation happens while the apartment that registered it is still alive.
+    // The save worker thread never sees this Rc, so there is no other thread it could be.
+    //
+    // NOTED, because the brief expected a Command::UnregisterWindow here: this bridge never sends
+    // it. The port has the command and the engine clears the stored handle on it, but the spike's
+    // exit is a granted close (HideWindow) and a return from run(), so the port's window identity
+    // dies with the process rather than with a message. This drop is therefore the FIRST teardown
+    // that names the window going away - and if a later slice does add the UnregisterWindow post,
+    // the drop belongs immediately before it, which is stated so nobody has to guess which side
+    // of the post is safe.
+    {
+        let disarmed = drop_guard.borrow_mut().take();
+        report(&format!(
+            "drop: disarmed on exit (a guard was held: {})",
+            disarmed.is_some()
+        ));
+        drop(disarmed);
+    }
     // R2b: THE HONEST SHUTDOWN, in the order that cannot lose text. The close that
     // granted is what lands here - and by then the debounce has NOT run, so any byte
     // typed after the last tick is still only in this bridge's buffer.
