@@ -93,8 +93,16 @@ Consequences that need designing, not assuming:
 - **Session restores the file too.** "Always remembers" should mean the same *note* is
   there on relaunch, not just the same window size. Store the last path in `session.json`
   and reopen it. If it's gone, say so once, quietly.
-- **Drag-and-drop a file onto the window to open it.** Nearly free to implement, and the
-  fastest path for this kind of app.
+- **Drag-and-drop a file onto the window to open it.** The fastest path for this kind of app —
+  and, contra the first version of this bullet, which priced it as "nearly free", **not free on
+  either toolkit**: gpui-pre rewrites the shell drop into an internal `active_drag` a bridge
+  cannot reach, and Slint's winit backend has no arm for the event at all, so it falls into
+  `_ => {}`. What ships instead is a drop target owned in `platform`, armed through one
+  synchronous, thread-affine call at the port (ADR-0004) and polled by the engine into the **same
+  `Command::Open` the menu uses** — so a drop is an open, arms no new autosave rule (ADR-0001
+  unchanged), and adds no `Command` and no `Event`. Built and shipping on the Slint bridge;
+  `bridge-gpui` does not arm it (the S7 slice was not run).
+  Chain: [2026-09-13-file-drop-chain](../.agents/notes/implemented/2026-09-13-file-drop-chain.md).
 - **Title display.** The title bar's centre shows, in order: the open file's real name with
   its real extension (§10.1 changes the default, not this rule), else `Untitled` for a new
   unsaved document, else the app name. A dirty document carries a dot that turns amber on

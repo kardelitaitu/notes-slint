@@ -74,8 +74,8 @@ Detail: [docs/roadmap.md](docs/roadmap.md) §9. Ship targets: `win-install`, `wi
 
 Tracked in §10 ([docs/open-questions.md](docs/open-questions.md)), and worked through one
 at a time in [`.agents/notes/proposed/`](.agents/notes/proposed/), which currently holds
-two open notes: how autosave arms on a foreign file when the port has no plain Save
-command, and the title-bar `Root` overlay. Coming back maximised is settled and shipped
+four open notes: how autosave arms on a foreign file when the port has no plain Save
+command, the title-bar `Root` overlay, a `New document` command, and the Slint bridge swap. Coming back maximised is settled and shipped
 ([`2026-09-12-maximized-persistence`](.agents/notes/implemented/2026-09-12-maximized-persistence.md)).
 
 The rule that used to block M1 — autosave on files the app did not create — is settled:
