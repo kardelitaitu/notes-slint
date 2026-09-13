@@ -1192,7 +1192,44 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
 ///    mistaken for the design.
 /// 3. `autosave_asks` is not bumped. The counter exists so a run can name which ask #N it watched,
 ///    nothing renders it, and the bit the menu binds to is `autosave`, which this handler does write.
-#[allow(dead_code)] // product wiring lands in step B, 2026-09-14 - delete this allow then
+///
+/// C1 (STRIP-5, 2026-09-15): THE DOCUMENT THAT WAS OPEN, ASKED FOR ONCE.
+///
+/// gpui found this the hard way and says so at its own STEP 5 (bridge-gpui/src/main.rs:1706-1720):
+/// the session carries the path of what was open, NOTHING in the bridge asked for it, and a
+/// relaunch came back to an empty editor while the bytes sat on disk. The slint product had the
+/// identical hole: it cloned the session for the rect and read every field of it except `path`.
+///
+/// The fix is one command of EXISTING vocabulary and no new machinery: its answer is the
+/// `Event::Loaded` arm in `drain` (the buffer adoption, the epoch, the title, the lock verdict),
+/// which already existed. So this is a send, not a subsystem - and per the root law it lives
+/// HERE, because product.rs owns no `send()` of its own.
+///
+/// ORDER: the engine queues a command posted before the window is registered, and gpui sends its
+/// STEP 5 pre-loop too, so either side of RegisterWindow is correct. What is NOT optional is the
+/// ask: no path means no ask, and a first launch or a draft that was never written comes back
+/// empty - which is the truth about it.
+#[allow(dead_code)] // dead in the PROBE root only: notes-slint calls this from product.rs
+pub(crate) fn restore_from_session(gw: &Rc<RefCell<Option<Gateway>>>, path: &Path) {
+    report(&format!(
+        "startup: asking the port for {} (the path the session was restored with)",
+        path.display()
+    ));
+    send(
+        gw,
+        Command::Open {
+            path: path.to_path_buf(),
+        },
+    );
+}
+
+/// C2 (STRIP-5, 2026-09-15): the caption's remaining asks - pin, clear-recents, max/restore and
+/// minimize - are hooked in `wire_callbacks` below, each one a verbatim move of the probe body it
+/// mirrors (probe.rs:1316-1320, :1410, :1448, :1453, with :1693-1703 and :1825-1833 behind them),
+/// minus the probe's measurement witnesses. Nothing here decides anything the port has not been
+/// asked to decide: pin is `Command::SetPinned`, clear is `Command::ClearRecents`, and the two
+/// frame acts are `ui.window()` calls, which are the bridge's per the geometry law.
+#[allow(dead_code)] // dead in the PROBE root only: probe.rs wires its own handlers
 pub(crate) fn wire_callbacks(
     ui: &Spike,
     gw: &Rc<RefCell<Option<Gateway>>>,
@@ -1270,6 +1307,62 @@ pub(crate) fn wire_callbacks(
             };
             report(&format!("menu: Quit -> close-arm {arm} (single door)"));
             ui.set_close_arm(arm as i32);
+        });
+    }
+    // C2 (1) THE PIN, from the title strip and the ^ menu row. probe.rs:1316-1320 is the body this
+    // mirrors: ONE command out, nothing rendered locally, and the state asked for comes from the
+    // port's last fact (`confirmed`, written by the Pinned / PinFailed arms in `drain`) rather than
+    // from a counter of its own. The widget's guess is dropped on purpose - see main.slint:393-398.
+    {
+        let gw = Rc::clone(gw);
+        let pump = Rc::clone(pump);
+        ui.on_toggled_pin(move || {
+            let next = !pump.borrow().confirmed.unwrap_or(false);
+            report(&format!("pinned: strip click -> SetPinned({next})"));
+            send(&gw, Command::SetPinned(next));
+        });
+    }
+    // C2 (2) Clear recents: an ask, one command, and the list redraws from the event that answers
+    // it - never from the click. probe.rs:1410 -> clear_recents (probe.rs:1793-1796).
+    {
+        let gw = Rc::clone(gw);
+        ui.on_clear_recents_asked(move || {
+            report("recents: menu row -> Command::ClearRecents");
+            send(&gw, Command::ClearRecents);
+        });
+    }
+    // C2 (3) Max / restore: the band's double-click and the caption button are the SAME door
+    // (main.slint:405), and the body is probe.rs:1693-1703 minus its readback act. The glyph is
+    // printed because the window's own bit is the only input to which caption asset it now shows.
+    {
+        let gw = Rc::clone(gw);
+        let weak = ui.as_weak();
+        ui.on_toggle_max(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let window = ui.window();
+            let want = !window.is_maximized();
+            window.set_maximized(want);
+            report(&format!(
+                "frame: toggle-max -> maximised={} glyph={}",
+                window.is_maximized(),
+                caption_glyph(window.is_maximized())
+            ));
+            send(&gw, Command::GeometryChanged);
+        });
+    }
+    // C2 (4) Minimize: the caption button's ask, probe.rs:1825-1833. It sends NO command - a
+    // minimise is not a resting place the port should store, which is why the hook above sends and
+    // this one does not.
+    {
+        let weak = ui.as_weak();
+        ui.on_minimize_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let window = ui.window();
+            window.set_minimized(true);
+            report(&format!(
+                "caption: minimize -> is_minimized={}",
+                window.is_minimized()
+            ));
         });
     }
 }

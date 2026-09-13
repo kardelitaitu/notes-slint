@@ -1,12 +1,16 @@
 // STILL NEEDED AFTER STEP B, and now it names exactly what: the callback wiring landed, so the
 // dialog mailbox, ask_dialog/answer_dialog and the whole of wire_callbacks are LIVE here — they are
 // no longer part of the reason this allow exists. What is left is items that live in surface.rs and
-// belong to the probe only: `caption_glyph` (surface.rs:419, the max/restore asset word — nothing in
-// the product asks for it) and the probe's measurement fields on `Pump` (`asked`, `hold_reported`,
-// `ticks` and their neighbours, surface.rs:657-671). Deleting them would break the other root;
-// calling them from here would be writing acts into the product, which is STRIP-4's opposite. So the
-// allow stays at this root, where the lie is smallest, and the two names above are what must go (or
-// move behind a per-item allow in surface.rs, outside this fence) before it can.
+// belong to the probe only. STRIP-5 (2026-09-15) shrank that list by two entries: `wire_callbacks`
+// and its dialog mailbox are live (the C2 hooks), `caption_glyph` now has a REAL product caller — the
+// toggle-max hook in surface.rs names the asset in its report line — and the two surface fns that
+// are dead in the PROBE root (the probe wires its own handlers) carry their own per-item allow THERE,
+// which is the honest direction for an allow. What is left, and the only reason this line still
+// exists, is the measurement half of `Pump`: `asked`, `hold_reported`, `ticks`, `last_bucket`,
+// `strokes`, `quarantine_reported` and the act-machine counters after surface.rs:700. Deleting those
+// fields would break the other root; reading them from here would be writing acts into the product,
+// which is STRIP-4's opposite. A per-field allow on ~25 lines is the remaining step, and it is OWED,
+// not done — this box spent itself on the two features.
 #![allow(dead_code)]
 #![windows_subsystem = "windows"]
 
@@ -66,7 +70,10 @@ mod title_contract;
 mod ui_gen;
 
 use plumbing::{arm_drop_target, fingerprint_of, hwnd_of, note_dot, publish_title, report, send};
-use surface::{DialogReply, Pump, answer_dialog, drain, legend, text_pump, wire_callbacks};
+use surface::{
+    DialogReply, Pump, answer_dialog, drain, legend, restore_from_session, text_pump,
+    wire_callbacks,
+};
 use ui_gen::Spike;
 
 /// THE PORT RULE AND NOTHING ELSE. The probe overrides its state dir with a directory beside its
@@ -252,6 +259,18 @@ fn main() {
             }
         }
         None => report("startup: NO HWND after show: the window contract fails here"),
+    }
+
+    // C1, STRIP-5 (2026-09-15): ASK FOR THE DOCUMENT THE SESSION WAS HOLDING. The session was read
+    // for its rect, its scale, its maximised bit and its pin - and never for its `path`, which is why
+    // a relaunch showed an empty editor while the draft's bytes sat in <state>/notes/untitled.notes.
+    // One command, from the surface fn that owns the send (the root-law rule in this file's header:
+    // no `send()` here); the answer is the `Loaded` arm in drain that already exists. An ask before
+    // RegisterWindow is fine - the engine queues, and gpui sends its own STEP 5 pre-loop.
+    if let Some(path) = session.path.clone() {
+        restore_from_session(&gateway, &path);
+    } else {
+        report("startup: the session named no document, so nothing is asked for");
     }
 
     let pump = Rc::new(RefCell::new(Pump::default()));
