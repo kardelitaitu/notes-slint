@@ -1720,6 +1720,13 @@ public static class WIN {
   [DllImport("user32.dll", EntryPoint="GetWindowLongW")] public static extern int GetWindowLong(IntPtr h, int i);
   [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hh, bool rep);
   [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+  // M9: window memory is about the RESTORED position - rcNormalPosition - which
+  // GetWindowRect can never produce while the window is maximised (that answer is
+  // the zoomed frame with its overhang). So the probe asks the OS that actually
+  // stores it. Struct layout is the documented WINDOWPLACEMENT: 4+4+4, two POINTs,
+  // two RECTs.
+  [StructLayout(LayoutKind.Sequential)] public struct WINDOWPLACEMENT { public int length; public int flags; public int showCmd; public POINT ptMinPosition; public POINT ptMaxPosition; public RECT rcNormalPosition; public RECT rcReserved; }
+  [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
 }
 '@
 if (-not (Add-Type -TypeDefinition $code -PassThru)) { 'WIN32=0'; 'PROBE_DONE=1'; exit 0 }
@@ -1833,6 +1840,16 @@ function Get-Frame($h) {
     if ([WIN]::GetWindowRect($h, [ref]$r)) { return "$($r.Left),$($r.Top),$($r.Right),$($r.Bottom)" }
     return ''
 }
+function Get-Placement($h) {
+    $wp = New-Object WIN+WINDOWPLACEMENT
+    $wp.length = [Runtime.InteropServices.Marshal]::SizeOf($wp)
+    if (-not [WIN]::GetWindowPlacement($h, [ref]$wp)) { return '' }
+    $r = $wp.rcNormalPosition
+    # showCmd rides along in the same string so the stability test below covers the
+    # show state too - a rect that has stopped moving while the state is still
+    # flipping is not settled.
+    return "$($r.Left),$($r.Top),$($r.Right),$($r.Bottom)|$($wp.showCmd)"
+}
 function Get-Client($h) {
     $r = New-Object WIN+RECT
     $pt = New-Object WIN+POINT
@@ -1842,6 +1859,40 @@ function Get-Client($h) {
 }
 "FRAME=$(Get-Frame $handle)"
 "CLIENT=$(Get-Client $handle)"
+# M9, THE NORMAL POSITION, SETTLED. Two things this replaces: a FRAME-vs-FRAME
+# comparison taken on the handle-sighting tick with zero settle (which compared the
+# zoomed overhang against itself and called 0,0 VACUOUSLY green, and read a cold
+# exe's pre-zoom 382,274 as RED), and any single sample at all. The rule is now:
+# poll GetWindowPlacement every 100 ms until the SAME value appears in two
+# consecutive samples, with $SettleMs as the ceiling, print every sighting that
+# changed, and report NORMAL_STABLE so a value that never stopped moving becomes a
+# finding rather than the quietest number on the page.
+$norm = ''
+$stable = 0
+$pcmd = -1
+if ($handle -ne 0) {
+    $prev = Get-Placement $handle
+    $sw2 = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw2.ElapsedMilliseconds -lt $SettleMs) {
+        Start-Sleep -Milliseconds 100
+        $next = Get-Placement $handle
+        if ($next -eq '') { break }
+        if ($next -ne $prev) {
+            "NORMAL_SEEN=$($next.Split('|')[0]) SHOWCMD=$($next.Split('|')[1])"
+            $prev = $next
+        } else { $stable = 1; break }
+    }
+    $norm = $prev
+}
+if ($norm -ne '') {
+    $parts = $norm.Split('|')
+    "NORMAL=$($parts[0])"
+    "NORMAL_SHOWCMD=$($parts[1])"
+} else {
+    'NORMAL='
+    'NORMAL_SHOWCMD=-1'
+}
+"NORMAL_STABLE=$stable"
 if ($MoveX -ge 0) {
     $f = Get-Frame $handle
     if ($f -ne '') {
@@ -2171,8 +2222,23 @@ pub fn rect_drift(before: Option<Rect>, after: Option<Rect>) -> Option<(i32, i32
     ))
 }
 
-/// The maximised cycle, INFO ONLY: seed the file to say maximized:true, launch it,
-/// close it clean, relaunch, and print what the restore did to the rect.
+/// The maximised cycle: seed the file to say maximized:true, launch it, close it
+/// clean, relaunch, and measure what the restore did to the STORED position.
+///
+/// WHAT IT COMPARES, and this is the honesty fix. The promise is about
+/// `rcNormalPosition` - where the window comes back - so both sides of the drift are
+/// NORMAL readings from `GetWindowPlacement`, and the baseline is specifically the
+/// rect launch 1 wrote into session.json. It used to compare two live `GetWindowRect`
+/// FRAME samples taken on the handle-sighting tick with NO settle at all, which was
+/// wrong twice over: a maximised window's frame is the same zoomed overhang in both
+/// samples, so the drift was 0,0 VACUOUSLY green, and the same leg went RED when a
+/// cold exe simply had not applied the zoom yet on launch 1 (a pre-zoom 382,274 read
+/// against a post-zoom relaunch). Neither of those was a fact about the product.
+///
+/// It is also cold-cache safe now: the reading is taken after the probe has polled
+/// `GetWindowPlacement` until two consecutive 100 ms samples agree, so a slow first
+/// link does not move the baseline; a launch whose position NEVER agrees is reported
+/// as a failure of the promise, not judged on a moving number.
 ///
 /// Why this exists as a leg of its own rather than as another case inside
 /// geometry_round_trip: it needed its OWN seeds (maximised on purpose, per the M5
@@ -2211,7 +2277,9 @@ fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) -
         }
     };
     // Launch one: the file says maximised, so ZOOM at creation is the READ half of
-    // the promise and FRAME is the rect that will be persisted on the way out.
+    // the promise, and the SETTLED normal position is the rect that gets persisted on
+    // the way out. That is why the comparison below never starts from a live FRAME
+    // sample (see the leg's doc comment).
     let first = match run_probe_script(script, exe, err_file, Some(session), None, None, 12) {
         Ok(p) => p,
         Err(e) => {
@@ -2228,10 +2296,40 @@ fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) -
         restore_session(session, before.as_deref());
         return None;
     }
-    let rect_before = probe_rect(&first, "FRAME");
+    let rect_before = probe_rect(&first, "NORMAL");
+    if !first.flag("NORMAL_STABLE") {
+        restore_session(session, before.as_deref());
+        return Some(
+            "MAXIMISED: launch 1's normal position never settled inside the settle ceiling \
+             (NORMAL_STABLE=0) - the window the promise has to remember was still moving \
+             when the run ended"
+                .to_string(),
+        );
+    }
+    // THE BASELINE IS WHAT LAUNCH 1 STORED, not a second live sample of the same
+    // window. A ratchet walks the persisted normal position, so the pair to diff is
+    // (the rect launch 1 wrote to session.json) -> (the normal position launch 2
+    // comes back at). Two live FRAME samples of a maximised window agree with each
+    // other for the wrong reason - the zoomed overhang is the same overhang twice -
+    // which is how a 0,0,0,0 drift could be reported VACUOUSLY while a cold exe read
+    // of the pre-zoom 382,274 made the same leg go red for an unrelated reason.
+    let persisted_first = fs::read_to_string(session)
+        .ok()
+        .and_then(|t| persisted_rect(&t));
+    let base = match (persisted_first, rect_before) {
+        (Some(r), _) => Some(r),
+        (None, q) => q,
+    };
+    println!(
+        "smoke: maximised: INFO - launch 1 stored {} (NORMAL at sighting {}, stable={}, showCmd {})",
+        base.map(|r| r.text()).unwrap_or_else(|| "-".into()),
+        rect_before.map(|r| r.text()).unwrap_or_else(|| "-".into()),
+        first.flag("NORMAL_STABLE"),
+        first.number("NORMAL_SHOWCMD").unwrap_or(-1)
+    );
     // Launch two: the same file, relaunched, is where a frame/client double-count
     // becomes visible, because the persisted rect is applied as bounds and measured
-    // back as a frame again.
+    // back as a normal position again.
     let second = match run_probe_script(script, exe, err_file, Some(session), None, None, 12) {
         Ok(p) => p,
         Err(e) => {
@@ -2240,7 +2338,7 @@ fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) -
             return None;
         }
     };
-    let rect_after = probe_rect(&second, "FRAME");
+    let rect_after = probe_rect(&second, "NORMAL");
     let persisted = fs::read_to_string(session).ok().and_then(|t| {
         let r = persisted_rect(&t);
         let m = t.contains("\"maximized\": true");
@@ -2262,10 +2360,36 @@ fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) -
         rect_after.map(|r| r.text()).unwrap_or_else(|| "-".into()),
         zoom(&second)
     );
-    let drift = rect_drift(rect_before, rect_after);
+    // A value that never stopped moving is not a reading. Both launches must settle
+    // inside the ceiling the probe was handed; the probe reports that itself, and a
+    // NO here is the promise failing rather than a measurement problem - the restored
+    // position is supposed to BE stable.
+    if !second.flag("NORMAL_STABLE") {
+        restore_session(session, before.as_deref());
+        return Some(
+            "MAXIMISED: the relaunch's normal position never settled inside the settle \
+             ceiling (NORMAL_STABLE=0) - a window still moving at the end of the run has \
+             no fixed point to assert"
+                .to_string(),
+        );
+    }
+    // Fallback, stated where it is used: if this launch's GetWindowPlacement failed,
+    // the rect the app STORED while maximised is by definition the normal position it
+    // would restore to, so comparing against that loses only the certainty that the
+    // OS said it and not the app.
+    let after = match (rect_after, persisted) {
+        (Some(r), _) => Some(r),
+        (None, q) => q,
+    };
+    if rect_after.is_none() {
+        println!(
+            "smoke: maximised: INFO - launch 2's GetWindowPlacement gave nothing; comparing the persisted rect"
+        );
+    }
+    let drift = rect_drift(base, after);
     println!(
         "smoke: maximised: INFO - drift across one cycle (dx, dy, dw, dh) = {drift:?}; the rect launch 1 persisted was {}, and the chrome measured this run is (+8, +0, -8, -8) - a non-zero quadruple matching that border is the frame/client double-count, not a race",
-        persisted.map(|r| r.text()).unwrap_or_else(|| "-".into())
+        base.map(|r| r.text()).unwrap_or_else(|| "-".into())
     );
     // M9, ARMED - the exact flip promised in part 1, and the budget is zero. The fix
     // is 5c2516e8's ratchet; the fixed point was measured live as Some((0, 0, 0, 0))
@@ -2282,8 +2406,10 @@ fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) -
     // 0 there - part 1 printed "NOT zoomed at creation" for a window whose frame was
     // the entire 3448x1400 work area, while a SetWindow-driven probe reading the same
     // window says True. Asserting that would measure when the harness looked, not what
-    // the product did; arming it needs the probe re-ordered to re-read after a settle,
-    // which is a part-3 question with its own evidence.
+    // the product did. The settle the DRIFT now relies on is a GetWindowPlacement
+    // poll; ZOOM itself is still one sample taken at the sighting tick, so arming it
+    // stays a part-3 question. The drift is honest now; the zoom line still reports
+    // when the harness looked, not what the product did.
     let verdict = match drift {
         None => {
             println!(
@@ -2299,8 +2425,8 @@ fn maximised_cycle(script: &Path, exe: &Path, err_file: &Path, session: &Path) -
             "MAXIMISED: one maximise-close-relaunch cycle moved the restore rect by (dx, dy, dw, dh) = {d:?} \
              (launch 1 {r1}, launch 2 {r2}); the rect persisted while maximised is not the rect the next \
              launch came back at, which is the frame/client ratchet walking the window by its own chrome",
-            r1 = rect_before.map(|r| r.text()).unwrap_or_else(|| "-".into()),
-            r2 = rect_after.map(|r| r.text()).unwrap_or_else(|| "-".into())
+            r1 = base.map(|r| r.text()).unwrap_or_else(|| "-".into()),
+            r2 = after.map(|r| r.text()).unwrap_or_else(|| "-".into())
         )),
     };
     restore_session(session, before.as_deref());
@@ -4195,6 +4321,59 @@ mod tests {
         );
         assert_eq!(rect_drift(None, Some(at(0, 0, 10, 10))), None);
         assert_eq!(rect_drift(Some(at(0, 0, 10, 10)), None), None);
+    }
+
+    /// THE SABOTAGE, as a unit fact: a cycle that really does walk the STORED normal
+    /// position must not read as a fixed point. The live leg cannot be made to
+    /// produce that honestly without breaking the product's window memory on
+    /// purpose, so the mutated-normal case is proven here, over the same pure math
+    /// the leg arms on - and the numbers are the chrome this machine measures.
+    #[test]
+    fn a_ratcheted_normal_position_is_not_a_fixed_point() {
+        let stored = Rect {
+            l: 320,
+            t: 240,
+            r: 920,
+            b: 640,
+        };
+        // The chrome this machine measures: the stored position gained the
+        // non-client border on every side it should not have - 8 left, 4 top,
+        // 8 right, 4 bottom.
+        let walked = Rect {
+            l: 312,
+            t: 236,
+            r: 928,
+            b: 644,
+        };
+        assert_eq!(
+            rect_drift(Some(stored), Some(walked)),
+            Some((-8, -4, 16, 8)),
+            "the double-count walking the stored position must be visible as drift"
+        );
+        assert_ne!(rect_drift(Some(stored), Some(walked)), Some((0, 0, 0, 0)));
+    }
+
+    /// The leg's whole fix, pinned in the script text: the normal position is
+    /// ASKED FOR (GetWindowPlacement), printed (NORMAL=), and WAITED FOR
+    /// (NORMAL_STABLE), with an empty answer for a failed call rather than a zero.
+    #[test]
+    fn the_probe_asks_placement_not_just_the_frame() {
+        assert!(
+            GEOMETRY_PROBE.contains("public static extern bool GetWindowPlacement"),
+            "the script must be able to ask the OS that stores rcNormalPosition"
+        );
+        assert!(
+            GEOMETRY_PROBE.contains("\"NORMAL=$($parts[0])\""),
+            "and answer with it"
+        );
+        assert!(
+            GEOMETRY_PROBE.contains("\"NORMAL_STABLE=$stable\""),
+            "and say whether it ever stopped moving"
+        );
+        assert!(
+            GEOMETRY_PROBE.contains("'NORMAL='"),
+            "a failed call is an absent answer, never a zero-sized rect"
+        );
     }
 
     /// A seed must be able to SAY maximised, not merely fail to clear it: the cycle leg
