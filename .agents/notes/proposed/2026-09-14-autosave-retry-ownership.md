@@ -19,7 +19,7 @@ running.
 ## The disagreement, as the code holds it
 
 **`bridge-slint` retries forever.** `79af7b32` (STRIP-4b row 1, decided 2026-09-13) made the
-`Event::SaveFailed` arm in `crates/bridge-slint/src/surface.rs:1121-1146` restore the send
+`Event::SaveFailed` arm in `crates/bridge-slint/src/surface.rs:1119-1146` restore the send
 witness — `last_sent.clear()`, `edited_flag = true` — so the next quiet tick re-sends a
 `Flush`. There is no cap and no back-off: a permanent failure is retried **every
 `AUTOSAVE_IDLE` (750 ms), indefinitely**, each attempt printing a `retry: … (retry #N)`

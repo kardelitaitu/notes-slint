@@ -96,7 +96,7 @@ default is `gpui`, which is what CI and `cargo xtask check` run (`crates/xtask/s
 |---|---|---|
 | `gpui` | `target\debug\notes-gpui.exe` | judged — the needle schedule (`Leg::GpuiSchedule`) |
 | `slint` | `target\debug\notes-slint.exe` | judged — the product contract (`Leg::Product`) |
-| `slint-probe` | `target\debug\notes-slint-probe.exe` | resolved, built, **not judged** (`Leg::NotWired`) |
+| `slint-probe` | `target\debug\notes-slint-probe.exe` | path named, then declined — **not built, not launched, not judged** (`Leg::NotWired`) |
 
 An unlisted value is refused, naming the legal list, before anything is built.
 
@@ -120,9 +120,11 @@ read a rect or poll a pin.
 
 ### `slint-probe` declines, out loud
 
-The instrumented build is resolved and built but never judged, and the harness prints why
-instead of leaving a blank to be read as a pass. The reason lives in one function,
-`not_wired_reason`, and is printed verbatim:
+The instrumented build is never judged, and the harness prints why instead of leaving a
+blank to be read as a pass. The decline is asked **before** the build step — after the exe
+path is named, before anything is compiled, launched or measured — so the run costs nothing
+and claims nothing. The reason lives in one function, `not_wired_reason`, and is printed
+verbatim:
 
 > `the only schedule this harness speaks is the gpui one, and pointing it at the
 > instrumented probe bytes is a port, not a flag: its needles are the same lines
