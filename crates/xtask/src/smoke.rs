@@ -239,7 +239,11 @@ const GPUI_TARGET: ArtifactTarget = ArtifactTarget {
 /// rather than a doc link on purpose: the test lives in `mod tests`, which `cargo doc`
 /// does not build, so a link here would be an unresolved-link warning - the noise this
 /// comment used to be.
-#[allow(dead_code)] // described, not driven: no smoke leg runs this exe on this branch
+/// NO LONGER `#[allow(dead_code)]`: `--binary slint` selects this row, so it has a
+/// non-test consumer from the commit it landed in - which is the condition its old
+/// marker named ("described, not driven: no smoke leg runs this exe"). The DRIVE is
+/// still missing, and [Leg::NotWired] is where that says so at runtime rather than
+/// letting the row look judged.
 const SLINT_TARGET: ArtifactTarget = ArtifactTarget {
     pkg: "notes-bridge-slint",
     bin: "notes-slint",
@@ -264,19 +268,141 @@ const SLINT_TARGET: ArtifactTarget = ArtifactTarget {
     ],
 };
 
-const BIN_REL: &str = GPUI_TARGET.exe_rel_debug;
-/// THE FILE NAME SMOKE LAUNCHES, derived from the row rather than written again.
+/// THE INSTRUMENTED SLINT BUILD, and the reason this row is a row and not a field on
+/// the row above: as of STRIP-2b the crate ships TWO bins from one package -
+/// `notes-slint` (the product: no self-hide, the real state dir, nothing a harness
+/// can peek at) and `notes-slint-probe` (the same bytes with the needle plumbing
+/// still in). Same package, same sources, same freshness roots, DIFFERENT contract -
+/// which is exactly why a target is not a package name. The `-probe` row is what a
+/// needle-schedule leg could be pointed at; the product is not, and never will be,
+/// because its whole point is that it stops saying those lines.
+const SLINT_PROBE_TARGET: ArtifactTarget = ArtifactTarget {
+    bin: "notes-slint-probe",
+    exe_rel_debug: "target/debug/notes-slint-probe.exe",
+    ..SLINT_TARGET
+};
+
+/// THE THREE THINGS `--binary` ACCEPTS, in the order the refusal prints them.
+pub const BINARY_NAMES: &[&str] = &["gpui", "slint", "slint-probe"];
+
+/// The row `--binary` names, or None for a name that is not one of [BINARY_NAMES].
+/// Total and pure: the flag's whole job is picking which artifact the harness
+/// resolves, builds and staleness-checks, so the mapping is a lookup this crate can
+/// test without touching a disk.
+/// The `'static spelling of a legal `--binary` value, or None.
 ///
-/// This used to be `pub const EXE_NAME: &str = "notes-gpui.exe"` - a third copy of
-/// the bin name that a rename could leave standing, guarded only by a test comparing
-/// it to [GPUI_TARGET::bin]. Once [ArtifactTarget::bin_file] existed the literal had
-/// no job: the `CARGO_TARGET_DIR` branch of [resolve_exe] takes the derived name,
-/// and the only place that still needs the spelled-out string is the test that pins
-/// what `notes-gpui` means to CI and to [crate::manifest]. Deleting a guarded
-/// duplicate beats guarding a duplicate.
-pub fn exe_name() -> String {
-    GPUI_TARGET.bin_file()
+/// The parser stores THIS and not the caller's bytes, for two reasons that are one
+/// reason: a value that is not in [BINARY_NAMES] must be refused (an unlisted string
+/// reaching the selection would be a name nobody validated), and a stored reference
+/// into the argument vector is a lifetime the invocation struct does not own. So
+/// `Invocation.binary` is always a `&'static str` drawn from one list, and
+/// [select_target] is the lookup that list indexes.
+fn legal_name(v: &str) -> Option<&'static str> {
+    BINARY_NAMES.iter().copied().find(|n| *n == v)
 }
+
+pub fn select_target(name: &str) -> Option<&'static ArtifactTarget> {
+    match name {
+        "gpui" => Some(&GPUI_TARGET),
+        "slint" => Some(&SLINT_TARGET),
+        "slint-probe" => Some(&SLINT_PROBE_TARGET),
+        _ => None,
+    }
+}
+
+/// Which CONTRACT a run judges, given the artifact it selected. This is the honest
+/// half of the wiring: resolving and building an exe is not the same as being able to
+/// judge it, and a harness that runs gpui's needle schedule against a binary that
+/// never emits those needles produces a verdict about the wrong product.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Leg {
+    /// The full needle schedule: self-hide, the window/close/session triple, the
+    /// geometry and recents probes. Only the gpui artifact speaks it today.
+    GpuiSchedule,
+    /// Resolved, buildable, and NOT judged - with the reason, so `--binary slint`
+    /// cannot read as a pass, nor as a product failure.
+    NotWired(&'static str),
+}
+
+pub fn leg_for(target: &ArtifactTarget) -> Leg {
+    // Compared by bin, not by pointer: two rows sharing a bin name could only be an
+    // accident, and an accident should surface as a wrong verdict loudly.
+    if target.bin == GPUI_TARGET.bin {
+        Leg::GpuiSchedule
+    } else {
+        Leg::NotWired(target.bin)
+    }
+}
+
+/// One parsed invocation: everything `run()` decides before it touches a disk.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Invocation {
+    pub reuse: bool,
+    pub no_build: bool,
+    pub require_ours: bool,
+    /// The selected artifact, spelled as [BINARY_NAMES]. Defaults to gpui, which is
+    /// what every existing CI step and developer run means today.
+    pub binary: &'static str,
+}
+
+/// Parse smoke's arguments. `--binary` takes both shapes (`--binary=slint` and
+/// `--binary slint`): the two-token form is what a person types, the value form is
+/// what a CI line can quote without ambiguity. A bad value refuses WITH the legal
+/// names - a usage line that omits them is a refusal that does not help.
+pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
+    let mut inv = Invocation {
+        binary: "gpui",
+        ..Invocation::default()
+    };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--binary=") {
+            // legal_name, not select_target's argument: the parser stores the
+            // 'static spelling from BINARY_NAMES, never a borrow of argv.
+            inv.binary = legal_name(v).ok_or_else(|| unknown_binary(v))?;
+            continue;
+        }
+        match a.as_str() {
+            "--reuse-state" => inv.reuse = true,
+            "--no-build" => inv.no_build = true,
+            "--require-ours" => inv.require_ours = true,
+            "--binary" => {
+                let v = it.next().ok_or_else(|| {
+                    format!(
+                        "--binary needs a value: one of {} (--binary alone is not a default)",
+                        BINARY_NAMES.join(", ")
+                    )
+                })?;
+                inv.binary = legal_name(v).ok_or_else(|| unknown_binary(v))?;
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument '{other}'; usage: cargo xtask smoke [--reuse-state] [--no-build] [--require-ours] [--binary={}]",
+                    BINARY_NAMES.join("|")
+                ));
+            }
+        }
+    }
+    Ok(inv)
+}
+
+fn unknown_binary(v: &str) -> String {
+    format!(
+        "unknown --binary value '{v}'; this harness can point at {} - {} is the product, {} is the same bytes with the needle plumbing, and only the gpui artifact has a leg wired today",
+        BINARY_NAMES.join(", "),
+        BINARY_NAMES[1],
+        BINARY_NAMES[2],
+    )
+}
+
+const BIN_REL: &str = GPUI_TARGET.exe_rel_debug;
+// EXE_NAME is gone entirely, with no wrapper left behind. It was a third copy of the
+// bin name, guarded only by a test comparing it to GPUI_TARGET.bin; once
+// ArtifactTarget::bin_file existed the copy had no job, because every path through
+// resolve_exe takes the derived name from the SELECTED row. What still earns its keep
+// is the literal "notes-gpui.exe" in the test that pins what CI artifact paths and
+// xtask manifest assume by hand. Deleting a guarded duplicate beats guarding one;
+// deleting a duplicate's alias beats both.
 const BUILD_HINT: &str = "cargo build -p notes-bridge-gpui --bin notes-gpui";
 const SESSION_FILE: &str = "session.json";
 /// The other file in the same directory, and the one the RECENTS live in (core's
@@ -351,6 +477,14 @@ impl ArtifactTarget {
     /// steps all use by hand - so the derivation is checked, not assumed.
     pub fn bin_file(&self) -> String {
         format!("{}.exe", self.bin)
+    }
+
+    /// The five tokens that build THIS artifact. Derived rather than stored because
+    /// the pair (package, bin) has to agree with [ArtifactTarget::exe_rel]: if
+    /// `cargo build -p A --bin B`$ does not emit `target/debug/B.exe`$, one of the two is
+    /// wrong, and a single source cannot be half wrong.
+    pub const fn build_args(&self) -> [&'static str; 5] {
+        ["build", "-p", self.pkg, "--bin", self.bin]
     }
 }
 
@@ -1517,7 +1651,15 @@ fn summary(verdict: &Verdict, p: &Probe, elapsed: Duration, relocation: &Relocat
 /// is built first, a compile failure is a hard verdict with its own exit code,
 /// and the exe's mtime is then compared against the newest source that
 /// produces it. Freshness is proven, never trusted.
-const BUILD_ARGS: &[&str] = &["build", "-p", GPUI_TARGET.pkg, "--bin", GPUI_TARGET.bin];
+/// BUILD_ARGS is gone, and it died the way [EXE_NAME] did: it was already derived
+/// from [GPUI_TARGET], but as a `const` it could only ever name ONE row, so the moment
+/// `--binary` existed the build step and the launch step would disagree about which
+/// crate they meant - a compile failure in crate A judged on crate B's stale exe.
+/// [ArtifactTarget::build_args] is the same five tokens, per row.
+///
+/// No `--locked` here, deliberately, unlike CI's bridge steps: smoke runs on a dirty
+/// working tree by design, and --locked would refuse the run for a manifest the
+/// developer is mid-edit on. Locking the graph is CI's gate's business (see check.rs).
 /// The crates whose SOURCE DIRECTORIES end up inside that binary, named as
 /// "<crate>/src" rather than "<crate>" on purpose. Cargo's own fingerprint remains
 /// the authority on what rebuilds what; this list is only the guard that exists
@@ -1534,12 +1676,21 @@ const BUILD_ARGS: &[&str] = &["build", "-p", GPUI_TARGET.pkg, "--bin", GPUI_TARG
 /// The scope is strict, not loose. The exe's own crate's sources stay in it, so a
 /// crates/bridge-gpui/src edit newer than the exe is still a loud 5. What left the
 /// scope is a non-input, not a granted exception.
+/// The gpui row's roots and files, as consts.
+///
+/// TEST-ONLY, and that is the point: the runtime path takes the roots from the
+/// SELECTED row (see [newest_source]), so a const here that names one bridge would be
+/// a second opinion nobody asked for - exactly the drift the long story below
+/// documents. What these two are for is the tests that walk the list, and the story
+/// that explains why the list is what it is.
+#[cfg(test)]
 const SOURCE_ROOTS: &[&str] = GPUI_TARGET.freshness_roots;
 /// Inputs that live OUTSIDE a src dir, named one by one because a scan that walked
 /// whole crate dirs would walk their tests with them: the workspace manifest and the
 /// lock (the lock decides the entire external graph), one manifest per crate above (a
 /// feature or dependency line there changes the binary), and the bridge's build.rs (it
 /// decides the embedded manifest, so a stale build script is a stale exe).
+#[cfg(test)]
 const SOURCE_FILES: &[&str] = GPUI_TARGET.freshness_files;
 /// The target did not compile: its own verdict, not a decline (the desktop is
 /// fine) and not a step failure (nothing was launched).
@@ -1610,8 +1761,15 @@ fn mtime_of(path: &Path) -> Option<std::time::SystemTime> {
 /// implementation - "is this artefact older than its sources" is one rule that
 /// smoke and the tool's own self-check both apply, and two copies of it is how
 /// one of them drifts.
-pub fn newest_source(root: &Path) -> Option<(std::time::SystemTime, PathBuf)> {
-    crate::identity::newest_mtime(root, SOURCE_ROOTS, SOURCE_FILES)
+pub fn newest_source(
+    root: &Path,
+    target: &ArtifactTarget,
+) -> Option<(std::time::SystemTime, PathBuf)> {
+    // THE ROOTS FOLLOW THE SELECTION. This is the false-5 half of the wiring: a
+    // slint exe judged against gpui's source list is "stale" the moment anybody
+    // touches crates/bridge-gpui, and "fresh" when crates/bridge-slint changes -
+    // both wrong, one of them silently.
+    crate::identity::newest_mtime(root, target.freshness_roots, target.freshness_files)
 }
 
 /// smoke's own verdict type: a stale GUI binary is a HARD failure (exit 5),
@@ -1632,9 +1790,9 @@ fn first_error(text: &str) -> Option<String> {
 
 /// Build the target. Err carries the first real error line and how many there
 /// were; cargo's own output is echoed (bounded) so nobody has to re-run it.
-pub fn build_target(root: &Path) -> Result<(), (String, usize)> {
+pub fn build_target(root: &Path, target: &ArtifactTarget) -> Result<(), (String, usize)> {
     let out = std::process::Command::new("cargo")
-        .args(BUILD_ARGS)
+        .args(target.build_args())
         .current_dir(root)
         .output()
         .map_err(|e| (format!("could not run cargo build: {e}"), 1))?;
@@ -3131,18 +3289,10 @@ fn restore_session(path: &Path, bytes: Option<&[u8]>) {
     }
 }
 
-/// The exe under test, honouring CARGO_TARGET_DIR.
-///
-/// Every lane is now told to build into a private target directory, and smoke
-/// used to resolve <root>/target/debug anyway: it then judged a binary nobody had
-/// built, failed its OWN freshness guard, and left the intended exe sitting
-/// unused. A harness that cannot be pointed at a build is not a harness. The
-/// resolution is pure and returned with the reason it chose, because the path is
-/// the thing a reader needs to trust the verdict.
 /// THE PROFILE EVERY LEG RUNS AT TODAY, expressed as a guard rather than a habit.
 ///
-/// gpui's leg is Debug for a concrete reason, not a default: [BUILD_ARGS] builds a
-/// debug bin, [crate::manifest] rewrites and reads back
+/// gpui's leg is Debug for a concrete reason, not a default: [ArtifactTarget::build_args]
+/// builds a debug bin, [crate::manifest] rewrites and reads back
 /// `target/debug/notes-gpui.exe`, and CI's artifact chain names that same path -
 /// so a Release exe would have smoke judge a file nothing in this repo produces.
 /// When `--binary` grows a profile argument, THIS is the function that stops
@@ -3158,12 +3308,24 @@ const fn driven_profile(target: &ArtifactTarget) -> Profile {
 /// Debug for the target smoke actually runs, this does not build.
 const _: () = assert!(matches!(driven_profile(&GPUI_TARGET), Profile::Debug));
 
-pub fn resolve_exe(root: &Path, target_dir: Option<&str>) -> (PathBuf, &'static str) {
-    let profile = driven_profile(&GPUI_TARGET);
+/// The exe under test, honouring CARGO_TARGET_DIR.
+///
+/// Every lane is now told to build into a private target directory, and smoke
+/// used to resolve <root>/target/debug anyway: it then judged a binary nobody had
+/// built, failed its OWN freshness guard, and left the intended exe sitting
+/// unused. A harness that cannot be pointed at a build is not a harness. The
+/// resolution is pure and returned with the reason it chose, because the path is
+/// the thing a reader needs to trust the verdict.
+pub fn resolve_exe(
+    root: &Path,
+    target_dir: Option<&str>,
+    target: &ArtifactTarget,
+) -> (PathBuf, &'static str) {
+    let profile = driven_profile(target);
     let trimmed = target_dir.unwrap_or_default().trim();
     if trimmed.is_empty() {
         return (
-            root.join(GPUI_TARGET.exe_rel(profile)),
+            root.join(target.exe_rel(profile)),
             "no CARGO_TARGET_DIR in the environment, so the workspace default",
         );
     }
@@ -3178,7 +3340,7 @@ pub fn resolve_exe(root: &Path, target_dir: Option<&str>) -> (PathBuf, &'static 
     (
         // Same helper the non-redirected branch's path is built from, so a
         // redirected lane's exe is named by exactly one expression in this crate.
-        base.join(profile.dir()).join(exe_name()),
+        base.join(profile.dir()).join(target.bin_file()),
         "CARGO_TARGET_DIR, honoured as asked",
     )
 }
@@ -3222,22 +3384,26 @@ pub fn manifest_of(root: &Path, exe: &Path) -> Result<crate::manifest::Markers, 
     let bytes = fs::read(exe).map_err(|e| format!("cannot read the exe: {e}"))?;
     Ok(crate::manifest::read_markers(&bytes, &identity, &wanted))
 }
-/// Entry point for "cargo xtask smoke [--reuse-state] [--no-build] [--require-ours]".
+/// Entry point for `cargo xtask smoke [--reuse-state] [--no-build] [--require-ours] [--binary=gpui|slint|slint-probe]`".
 pub fn run(args: &[String]) -> i32 {
     // The contract first, before anything can fail: a log that shows a verdict
     // also shows the code table that verdict came out of.
     println!("{}", contract_line());
-    let unknown: Vec<&str> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| *a != "--reuse-state" && *a != "--no-build" && *a != "--require-ours")
-        .collect();
-    if !unknown.is_empty() {
-        eprintln!("smoke: unknown argument(s): {}", unknown.join(" "));
-        eprintln!("smoke: usage: cargo xtask smoke [--reuse-state] [--no-build] [--require-ours]");
-        return HARNESS_EXIT;
-    }
-    let reuse = args.iter().any(|a| a == "--reuse-state");
+    let inv = match parse_args(args) {
+        Ok(inv) => inv,
+        Err(why) => {
+            eprintln!("smoke: {why}");
+            return HARNESS_EXIT;
+        }
+    };
+    // parse_args only ever stores a name select_target accepts, so the unwrap is the
+    // parser's own invariant, restated rather than trusted: if the two ever disagree
+    // this says which one lied.
+    let target = select_target(inv.binary).unwrap_or_else(|| {
+        eprintln!("smoke: INTERNAL - parse_args accepted '{0}' and select_target rejects it; the flag's two lists disagree", inv.binary);
+        std::process::exit(HARNESS_EXIT);
+    });
+    let reuse = inv.reuse;
 
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
@@ -3253,25 +3419,74 @@ pub fn run(args: &[String]) -> i32 {
             return HARNESS_EXIT;
         }
     };
-    let (exe, resolved_from) =
-        resolve_exe(&root, std::env::var("CARGO_TARGET_DIR").ok().as_deref());
+    let (exe, resolved_from) = resolve_exe(
+        &root,
+        std::env::var("CARGO_TARGET_DIR").ok().as_deref(),
+        target,
+    );
     println!(
         "smoke: exe path {} | resolved from {resolved_from}",
         exe.display()
     );
+    // THE LEG QUESTION, asked here - after the path is named, before anything is
+    // built, launched or judged.
+    //
+    // Selecting an artifact and being able to JUDGE it are different abilities. The
+    // needle schedule this harness IS (self-hide, the window/close/session triple, the
+    // geometry and recents probes) is gpui's contract; running it against
+    // notes-slint.exe - which as of STRIP-2b deliberately stops hiding itself, stops
+    // using the probe state dir and stops saying the lines the schedule reads - would
+    // print a confident verdict about a binary that was never meant to answer them.
+    // Green there is a lie, red there is a false accusation against the product, so
+    // neither is allowed to happen, and the only honest answer left is "not judged".
+    //
+    // Exit 2 (HARNESS_EXIT), deliberately NOT 3: 3 claims "this MACHINE cannot host the
+    // check", which is a statement about the runner this decline is not entitled to
+    // make - a box with a perfect window station answers the same 2. 2 says the harness
+    // itself stopped before judging anything, which is exactly what happened here: the
+    // missing leg is ours, not the desktop's.
+    if let Leg::NotWired(bin) = leg_for(target) {
+        println!(
+            "smoke: NOT JUDGED - '{bin}' resolves to {} ({}) but no leg speaks its contract yet.",
+            exe.display(),
+            if exe.is_file() {
+                "an exe that EXISTS on disk"
+            } else {
+                "no exe on disk"
+            }
+        );
+        println!(
+            "smoke:   legs wired today: [{}]",
+            BINARY_NAMES
+                .iter()
+                .filter(|n| {
+                    matches!(
+                        leg_for(select_target(n).unwrap_or(&GPUI_TARGET)),
+                        Leg::GpuiSchedule
+                    )
+                })
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!(
+            "smoke:   the product leg (alive at 45s, the startup lines on piped stderr, a clean taskkill drain - and NOT the shutdown-honesty needles, which are not shipped yet) and the probe leg (today's schedule against notes-slint-probe.exe) are the next slice's work. This run launched nothing: there is NO verdict about {bin} in either direction."
+        );
+        return HARNESS_EXIT;
+    }
     // BUILD FIRST. A harness that launches whatever exe happens to be lying
     // around proves a cached binary, and a green line on a stale exe is the
     // most dangerous output this repo can produce: it says the app works when
     // what worked was three commits old. A compile failure is therefore its own
     // hard verdict (4), never a decline and never a silent fallback to the old
     // exe on disk.
-    let built = if args.iter().any(|a| a == "--no-build") {
+    let built = if inv.no_build {
         println!(
             "smoke: NOT building (--no-build): this run can only prove the exe already on disk"
         );
         false
     } else {
-        match build_target(&root) {
+        match build_target(&root, target) {
             Ok(()) => true,
             Err((first, count)) => {
                 println!(
@@ -3290,7 +3505,7 @@ pub fn run(args: &[String]) -> i32 {
     // ran the post-link step yet, and a rule that makes every local run red is
     // a rule that gets --no-build-ed past. An UNREADABLE manifest is not judged
     // here either: absence of evidence is not evidence of a violation.
-    if args.iter().any(|a| a == "--require-ours") {
+    if inv.require_ours {
         match manifest_of(&root, &exe) {
             Ok(m) => {
                 if let crate::manifest::ReadBack::Missing(absent) = crate::manifest::read_back(&m) {
@@ -3313,7 +3528,7 @@ pub fn run(args: &[String]) -> i32 {
         println!("smoke: window=MISSING close=NOBIN session=NOBIN 0.0s");
         return STEP_FAILED_EXIT;
     }
-    match staleness(mtime_of(&exe), newest_source(&root)) {
+    match staleness(mtime_of(&exe), newest_source(&root, &GPUI_TARGET)) {
         Stale::OlderThan {
             source,
             delta_secs,
@@ -4108,7 +4323,7 @@ mod tests {
         let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         set_mtime(&exe, past);
 
-        let newest = newest_source(&dir).expect("a readable source mtime");
+        let newest = newest_source(&dir, &GPUI_TARGET).expect("a readable source mtime");
         assert_eq!(
             newest.1, source,
             "the newest source must be the one just written"
@@ -4535,7 +4750,7 @@ mod tests {
         fs::write(&foreign_test, "// a test of another crate\n").expect("test file");
         set_mtime(&foreign_test, std::time::SystemTime::now());
         assert_eq!(
-            staleness(mtime_of(&exe), newest_source(&dir)),
+            staleness(mtime_of(&exe), newest_source(&dir, &GPUI_TARGET)),
             Stale::Fresh,
             "a newer tests/ file of another crate must not abort the run it built"
         );
@@ -4545,7 +4760,7 @@ mod tests {
             &src,
             std::time::SystemTime::now() + std::time::Duration::from_secs(60),
         );
-        match staleness(mtime_of(&exe), newest_source(&dir)) {
+        match staleness(mtime_of(&exe), newest_source(&dir, &GPUI_TARGET)) {
             Stale::OlderThan { source, .. } => assert_eq!(source, src),
             other => panic!("a newer bridge source is real staleness: {other:?}"),
         }
@@ -4571,7 +4786,7 @@ mod tests {
             // Stepping the stamp each round matters: the scan keeps the FIRST file at
             // a tie, so identical stamps would test the loop order, not the scope.
             set_mtime(&path, future + std::time::Duration::from_secs(n as u64 + 1));
-            let newest = newest_source(&dir).expect("a source");
+            let newest = newest_source(&dir, &GPUI_TARGET).expect("a source");
             assert_eq!(
                 newest.1, path,
                 "{f} must be in scope: newest came back as {:?}",
@@ -4604,7 +4819,7 @@ mod tests {
                 set_mtime(&file, future);
             }
         }
-        let newest = newest_source(&dir).expect("a source");
+        let newest = newest_source(&dir, &GPUI_TARGET).expect("a source");
         assert!(
             newest.0 > std::time::SystemTime::now(),
             "the last crate's future mtime must win the scan: {newest:?}"
@@ -4619,7 +4834,7 @@ mod tests {
         fs::write(&lock, "# bumped\n").expect("lock");
         set_mtime(&lock, future + std::time::Duration::from_secs(60));
         assert_eq!(
-            newest_source(&dir).map(|(m, p)| (m > future, p)),
+            newest_source(&dir, &GPUI_TARGET).map(|(m, p)| (m > future, p)),
             Some((true, lock))
         );
         let _ = fs::remove_dir_all(&dir);
@@ -4919,24 +5134,24 @@ mod tests {
     #[test]
     fn the_target_dir_we_are_told_is_the_target_dir_we_use() {
         let root = PathBuf::from(r"C:\dev\notes-gpui");
-        let (path, why) = resolve_exe(&root, None);
+        let (path, why) = resolve_exe(&root, None, &GPUI_TARGET);
         assert_eq!(
             path,
             PathBuf::from(r"C:\dev\notes-gpui\target\debug\notes-gpui.exe")
         );
         assert!(why.contains("default"), "{why}");
-        let (path, why) = resolve_exe(&root, Some(""));
+        let (path, why) = resolve_exe(&root, Some(""), &GPUI_TARGET);
         assert!(
             path.starts_with(r"C:\dev\notes-gpui\target"),
             "an empty value is no value: {path:?}"
         );
         assert!(why.contains("default"), "{why}");
-        let (path, why) = resolve_exe(&root, Some("   "));
+        let (path, why) = resolve_exe(&root, Some("   "), &GPUI_TARGET);
         assert!(
             why.contains("default"),
             "whitespace is not a directory: {why}"
         );
-        let (private, why) = resolve_exe(&root, Some(r"D:\builds\lane-4"));
+        let (private, why) = resolve_exe(&root, Some(r"D:\builds\lane-4"), &GPUI_TARGET);
         assert_eq!(
             private,
             PathBuf::from(r"D:\builds\lane-4\debug\notes-gpui.exe"),
@@ -4950,7 +5165,7 @@ mod tests {
         );
         // A relative value is resolved against the root, which is what cargo does
         // against the invoking directory - and the reason string says so.
-        let (rel, _) = resolve_exe(&root, Some("out/scratch"));
+        let (rel, _) = resolve_exe(&root, Some("out/scratch"), &GPUI_TARGET);
         assert_eq!(
             rel,
             PathBuf::from(r"C:\dev\notes-gpui\out\scratch\debug\notes-gpui.exe"),
@@ -5616,7 +5831,7 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
     #[test]
     fn exe_name_is_the_bin_target_plus_the_windows_extension() {
         assert_eq!(
-            exe_name(),
+            GPUI_TARGET.bin_file(),
             format!("{}.exe", GPUI_TARGET.bin),
             "the launched name must stay bin + the Windows extension, or smoke launches nothing"
         );
@@ -5625,7 +5840,7 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
         // default target, the smoke step's needles - and none of them can be reached
         // from here. So the derived name is pinned against the literal they assume.
         assert_eq!(
-            exe_name(),
+            GPUI_TARGET.bin_file(),
             "notes-gpui.exe".to_string(),
             "the launched exe changed: rename it in ci.yml's artifact paths and in              xtask manifest's default target in the SAME commit, or smoke judges a file              nothing builds"
         );
@@ -5643,16 +5858,116 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
         // literal above are three spellings of one fact.
         assert_eq!(
             GPUI_TARGET.bin_file(),
-            exe_name(),
+            GPUI_TARGET.bin_file(),
             "the gpui row and the launched name disagree"
         );
         // The two agree by construction, not by coincidence of the same literal:
         // a redirected build still has to be named the same file.
-        let (exe, _) = resolve_exe(Path::new("wherever"), Some("C:/builds/lane-4"));
+        let (exe, _) = resolve_exe(
+            Path::new("wherever"),
+            Some("C:/builds/lane-4"),
+            &GPUI_TARGET,
+        );
         assert_eq!(
             exe.file_name().and_then(|n| n.to_str()),
             Some("notes-gpui.exe"),
             "the CARGO_TARGET_DIR branch resolves to the same file name: {exe:?}"
         );
+    }
+
+    /// `--binary` parses in both shapes, defaults to the artifact every existing CI
+    /// step and developer run means, and refuses a name that is not one of the three
+    /// without losing the flag's value. The cases below are the whole surface of the
+    /// flag; the judgement it selects is the next test's business.
+    #[test]
+    fn the_binary_flag_parses_both_shapes_and_defaults_to_gpui() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        assert_eq!(parse_args(&s(&[])).unwrap().binary, "gpui");
+        assert_eq!(parse_args(&s(&["--binary=slint"])).unwrap().binary, "slint");
+        assert_eq!(
+            parse_args(&s(&["--binary", "slint-probe"])).unwrap().binary,
+            "slint-probe"
+        );
+        // The other flags still work, and the value form does not eat its neighbour.
+        let mixed = parse_args(&s(&["--no-build", "--binary=slint", "--reuse-state"])).unwrap();
+        assert!(mixed.no_build && mixed.reuse && !mixed.require_ours);
+        assert_eq!(mixed.binary, "slint");
+        assert!(!parse_args(&s(&["--require-ours"])).unwrap().no_build);
+    }
+
+    /// A refusal has to be USEFUL: name what was rejected, and name the three that
+    /// were legal, and never accept a bare `--binary` as an implicit default - that is
+    /// how a typo in a CI line turns into a green run of the wrong artifact.
+    #[test]
+    fn an_unusable_binary_value_refuses_naming_every_legal_one() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        for bad in [
+            s(&["--binary=gpuii"]),
+            s(&["--binary", "slint_probe"]),
+            s(&["--binary", "notes-slint"]),
+            s(&["--binary"]),
+        ] {
+            let why = parse_args(&bad).expect_err("this value must not parse");
+            assert!(
+                BINARY_NAMES.iter().all(|n| why.contains(n)),
+                "the refusal does not list all three legal names: {why}"
+            );
+        }
+        // A value that happens to be the PACKAGE name is not the artifact name.
+        assert!(parse_args(&s(&["--binary=notes-bridge-slint"])).is_err());
+        // And an unknown FLAG is still refused, with a usage line that now names --binary.
+        let why = parse_args(&s(&["--frobnicate"])).expect_err("no such flag");
+        assert!(
+            why.contains("--frobnicate") && why.contains("--binary"),
+            "{why}"
+        );
+    }
+
+    /// Selection and leg are two different questions, and this pins that the second is
+    /// answered honestly: all three names resolve to a row with its own exe path and
+    /// its own build tokens, and exactly ONE of them has a leg. When a future commit
+    /// wires the slint legs, the assert below is the one that goes red and demands the
+    /// count be re-read - the discipline `every_row_that_resolves_a_graph_carries_the_lock`
+    /// already enforces on the gate roster.
+    #[test]
+    fn each_selectable_artifact_resolves_its_own_paths_and_exactly_one_has_a_leg() {
+        let rows: Vec<(&str, &'static ArtifactTarget)> = BINARY_NAMES
+            .iter()
+            .map(|n| (*n, select_target(n).expect("every listed name resolves")))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        let mut bins: Vec<&str> = rows.iter().map(|(_, t)| t.bin).collect();
+        bins.sort();
+        bins.dedup();
+        assert_eq!(bins.len(), 3, "two rows share a bin name: {bins:?}");
+        for (name, t) in &rows {
+            assert_eq!(
+                t.exe_rel(Profile::Debug),
+                t.exe_rel_debug,
+                "the {name} row's Debug projection drifted from its own seam"
+            );
+            assert_eq!(
+                t.build_args().join(" "),
+                format!("build -p {} --bin {}", t.pkg, t.bin),
+                "the {name} row would build something other than the exe it launches"
+            );
+        }
+        // The two slint rows are the same PACKAGE and different BINS - which is the
+        // whole reason a target cannot just carry a package name.
+        assert_eq!(SLINT_TARGET.pkg, SLINT_PROBE_TARGET.pkg);
+        assert_ne!(SLINT_TARGET.bin, SLINT_PROBE_TARGET.bin);
+        assert_eq!(
+            leg_for(select_target("gpui").unwrap()),
+            Leg::GpuiSchedule,
+            "the gpui leg is the one thing that must stay wired"
+        );
+        for name in ["slint", "slint-probe"] {
+            let t = select_target(name).unwrap();
+            assert_eq!(
+                leg_for(t),
+                Leg::NotWired(t.bin),
+                "a slint leg was wired without this file's decline path being retired -                  and the exit-2 CONTRACT text says the harness stops before judging, so                  update both or neither"
+            );
+        }
     }
 }
