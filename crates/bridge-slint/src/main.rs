@@ -30,7 +30,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use notes_api::{
-    Command, Event, Gateway, Rect, Settings, StateDir, WindowHandle, resolve_state_dir,
+    Command, Event, Exit, Gateway, Rect, Settings, StateDir, WindowHandle, resolve_state_dir,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, LogicalPosition, LogicalSize, Timer, TimerMode};
@@ -187,6 +187,13 @@ const AUTOSAVE_IDLE: Duration = Duration::from_millis(750);
 /// When the probe drives a recent row by itself: after the seed's open, so the list
 /// holds more than one file and the click has something to aim at.
 const CLICK_AT: Duration = Duration::from_millis(3000);
+
+// R1/R2 act times. The frame act goes first so the maximise is in the state the
+// close act then has to carry out of the window, and the two closes are far enough
+// apart to see whether the declined one really left the window on screen.
+const MAX_AT: Duration = Duration::from_millis(14000);
+const CLOSE_AT: Duration = Duration::from_millis(18000);
+const CLOSE2_AT: Duration = Duration::from_millis(21000);
 const END: Duration = Duration::from_millis(25000);
 
 fn main() {
@@ -553,6 +560,40 @@ fn main() {
                     }
                 }
             }
+            // R1 then R2, driven from the loop so the run needs no hands.
+            {
+                let mut p = third_pump.borrow_mut();
+                if !p.max_toggled && now >= MAX_AT {
+                    p.max_toggled = true;
+                    drop(p);
+                    toggle_max(&ui.as_weak(), &third_gw, "synthetic");
+                } else if now >= CLOSE_AT && p.closes == 0 {
+                    drop(p);
+                    ui.set_close_arm(1);
+                    let allowed = ui.get_close_allowed();
+                    report(&format!(
+                        "close: request_close #1 returned {allowed} (false = the decline held), visible={}",
+                        ui.window().is_visible()
+                    ));
+                } else if now >= CLOSE2_AT && p.closes == 1 {
+                    drop(p);
+                    // THE QUIT RACE, made real: type, then close on the same tick. The
+                    // 750 ms debounce can never fire between these two, so the only
+                    // thing that can save these bytes is the shutdown path below.
+                    let dirty = format!("{}Z", lf(&ui.get_buffer()));
+                    ui.set_buffer(dirty.into());
+                    report("exit: buffer dirtied immediately before the granted close");
+                    ui.set_close_arm(2);
+                    let allowed = ui.get_close_allowed();
+                    report(&format!(
+                        "close: request_close #2 returned {allowed}, visible-before-hide={}",
+                        ui.window().is_visible()
+                    ));
+                    if allowed {
+                        ui.window().hide().ok();
+                    }
+                }
+            }
             if now >= END {
                 do_no_harm(&third_pump);
                 report(&format!("probe over {}", measured(&third_dir, now)));
@@ -581,8 +622,90 @@ fn main() {
             open_recent(&gw, &pump, index as usize, "touch");
         });
     }
+    // R2: THE CLOSE CONTRACT. This is the handler an OS close would land on, and it
+    // declines the FIRST request and grants the SECOND, which is the whole shape of
+    // act 1 and act 2 in one run.
+    {
+        let pump = Rc::clone(&pump);
+        ui.window().on_close_requested(move || {
+            let n = {
+                let mut p = pump.borrow_mut();
+                p.closes += 1;
+                p.closes
+            };
+            report(&format!("close: requested (#{n})"));
+            if n == 1 {
+                report("close: declined, held (KeepWindowShown)");
+                slint::CloseRequestResponse::KeepWindowShown
+            } else {
+                report("close: second, exiting (HideWindow)");
+                slint::CloseRequestResponse::HideWindow
+            }
+        });
+    }
+    // R1: the strip's double-click, the promise the README makes about a frameless
+    // title bar. Bound to the same fn the synthetic driver calls.
+    {
+        let gw = Rc::clone(&gateway);
+        let weak = ui.as_weak();
+        ui.on_toggle_max(move || toggle_max(&weak, &gw, "double-click"));
+    }
     ui.run().ok();
-    drain(&events, &pump, &ui.as_weak());
+    // R2b: THE HONEST SHUTDOWN, in the order that cannot lose text. The close that
+    // granted is what lands here - and by then the debounce has NOT run, so any byte
+    // typed after the last tick is still only in this bridge's buffer.
+    let seen_before = pump.borrow().seen;
+    let text = lf(&ui.get_buffer());
+    let dirty = text != pump.borrow().last_sent;
+    if dirty {
+        let (revision, epoch) = {
+            let mut p = pump.borrow_mut();
+            p.edits += 1;
+            p.last_sent = text.clone();
+            (p.edits, p.epoch)
+        };
+        report(&format!(
+            "exit: final flush sent ({} bytes rev={revision} epoch={epoch})",
+            text.len()
+        ));
+        send(
+            &gateway,
+            Command::Flush {
+                text,
+                revision,
+                epoch,
+            },
+        );
+    } else {
+        report("exit: final flush skipped (buffer matches what was last sent)");
+    }
+    // THE SHUTDOWN, and which arm of `Exit` came back is the whole story: Ok is the
+    // only one that promises the engine finished its own drain, and the api's doc is
+    // blunt that QueueClosed means no such promise and Panicked means characters lost.
+    // First bridge in this repo to match all three arms rather than the happy path.
+    let owned = gateway.borrow_mut().take();
+    match owned {
+        Some(gateway) => match gateway.close() {
+            Ok(()) => report("exit: Shutdown accepted, engine joined"),
+            Err(Exit::QueueClosed) => report(
+                "exit: ENGINE ALREADY GONE (QueueClosed) - shutdown never accepted, no promise of a final save",
+            ),
+            Err(Exit::Abandoned(waited)) => report(&format!(
+                "exit: ABANDONED after {waited:?} - engine healthy but still running; its own exit drain owes the flush"
+            )),
+            Err(Exit::Panicked) => report(
+                "exit: PANICKED - nothing after it ran: no drain, no final save, no session write",
+            ),
+        },
+        None => report("exit: no gateway to shut down"),
+    }
+    // The answers the engine may still be sending while it unwinds its own exit.
+    for _ in 0..20 {
+        drain(&events, &pump, &ui.as_weak());
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let accounted = pump.borrow().seen - seen_before;
+    report(&format!("exit drain: {accounted} event(s) accounted for"));
     report(&format!("exit {}", measured(&dir, started.elapsed())));
 }
 
@@ -708,6 +831,25 @@ fn do_no_harm(pump: &RefCell<Pump>) {
     ));
 }
 
+/// R1: the double-click act, shared by the markup's `double-clicked` handler and by
+/// the synthetic driver, so an unattended run exercises the same code a strip
+/// double-click would. The pair this prints is the one the README promise rests on:
+/// Slint's OWN `is_maximized()` bool, and - marked, not guessed - `os-showCmd`, which
+/// a bridge CANNOT read: `GetWindowPlacement` lives in the `windows` family and a
+/// bridge may not import it (check-arch's rule), so the field is printed as
+/// UNREACHABLE unless the port itself states it. See the slice report.
+fn toggle_max(weak: &slint::Weak<Spike>, gw: &Rc<RefCell<Option<Gateway>>>, via: &str) {
+    let Some(ui) = weak.upgrade() else { return };
+    let window = ui.window();
+    let want = !window.is_maximized();
+    window.set_maximized(want);
+    report(&format!(
+        "frame: {via} toggled to {want} -> slint-max={} os-showCmd=UNREACHABLE-bridge-side",
+        window.is_maximized()
+    ));
+    send(gw, Command::GeometryChanged);
+}
+
 /// One recent row, one `Command::Open`. THE SHARED PATH: the TouchArea's generated
 /// callback calls this, and so does the synthetic click in the timer, which is what
 /// lets an unattended run exercise the same code a click would.
@@ -768,6 +910,11 @@ struct Pump {
     /// The synthetic click: fired once, and its answer is matched by path.
     click_done: bool,
     click_pending: Option<PathBuf>,
+    /// How many times the close-requested callback has run. Act 1 declines the first,
+    /// Act 2 lets the second through - the count IS the act selector.
+    closes: u32,
+    /// Has the frame act run yet?
+    max_toggled: bool,
     /// Times the pump has run. `drains` climbing while `seen` stays 0 is the proof
     /// that the callback and its 8ms poll are live and the port is simply silent.
     drains: u64,

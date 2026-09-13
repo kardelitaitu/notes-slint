@@ -15,7 +15,28 @@ export component Spike inherits Window {
     // carry the path); the bridge never invents it, so it is one-way Event -> UI.
     in property <string> file-name: "no document";
     title: "notes-slint S5 - " + root.file-name;
-    no-frame: false;
+    // R1 THE FRAME CONTRACT, flipped for real: no OS frame, so the strip below is the
+    // only title bar and the only drag handle, and `resize-border-width` is what
+    // leaves Slint a border to grab. The risk this is here to measure is that an
+    // undecorated winit window loses WS_MAXIMIZEBOX, in which case the OS refuses
+    // Win+Up and the port's restore has nothing to restore INTO.
+    no-frame: true;
+    resize-border-width: 8px;
+
+    // R2: the close act, driven through the ONLY close door this build exposes.
+    // `slint::Window` has no request_close(), so Rust cannot fire the request; the
+    // Window builtin `close() -> bool` can be fired from markup, and a `changed`
+    // callback is how Rust reaches it. Bumping `close-arm` runs close(), which runs
+    // the close_requested handler registered in Rust (the same handler an OS close
+    // reaches), and the bool it answered with lands in `close-allowed` for Rust to
+    // read back. Declining is real: the window must still be visible afterwards.
+    in property <int> close-arm: 0;
+    out property <bool> close-allowed: false;
+    changed close-arm => {
+        // 1.17: inside a changed handler the Window builtins need a receiver - bare
+        // close() is an unknown unqualified identifier, self.close() is the door.
+        root.close-allowed = self.close();
+    }
 
     // C1, and this line is the whole point: Slint's OWN always-on-top property is
     // never mentioned here and stays at its default. notes-platform, through the
@@ -33,6 +54,11 @@ export component Spike inherits Window {
     // the editor, api never sees a keystroke).
     in-out property <string> buffer;
     callback toggled-pin();
+
+    // R1: the strip's double-click, which is what a frameless window has to offer in
+    // place of the OS caption button. The handler lives in Rust (set_maximized is a
+    // window call), and the markup only names the event.
+    callback toggle-max();
 
     // ---- S5: recents, as delivered ----
     // `Event::RecentsUpdated(Vec<RecentEntry>)` has been arriving, unused, since S4.
@@ -58,6 +84,9 @@ export component Spike inherits Window {
         background: pinned ? #445566 : #2b2b2b;
 
         pin-toggle := TouchArea {
+            double-clicked => {
+                root.toggle-max();
+            }
             clicked => {
                 root.taps += 1;
                 // No local flip of `pinned`: the click asks, the port answers.
