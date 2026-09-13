@@ -27,15 +27,18 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use notes_api::{
-    Command, DropGuard, Event, Exit, Gateway, Rect, Settings, StateDir, WindowHandle,
-    arm_file_drop, resolve_state_dir,
+    Command, DropGuard, Exit, Gateway, Rect, Settings, StateDir, WindowHandle, arm_file_drop,
+    resolve_state_dir,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, LogicalPosition, LogicalSize, Timer, TimerMode};
+mod plumbing;
+pub(crate) use plumbing::{
+    Fingerprint, do_no_harm, fnv1a, lf, note_dot, publish_title, report, send,
+};
 mod surface;
 mod title_contract;
 #[cfg(test)]
@@ -51,20 +54,9 @@ pub(crate) use surface::{
     route_of, suggested_name,
 };
 
-// The UI lives in ui/main.slint, imported rather than inlined: that file is one of
-// xtask smoke's freshness roots, so editing the markup behind a built binary makes the
-// binary stale in the guard's eyes instead of invisible to it. 1.17 finding 4: the
-// `export` line takes NO trailing semicolon, and relying on an implicit re-export of
-// the last import is deprecated - so it is spelled.
-slint::slint! {
-    import { Spike } from "../ui/main.slint";
-    export { Spike }
-}
-
-/// The same voice as the gpui bridge - see the header for why the name stays.
-fn report(why: &str) {
-    eprintln!("notes-gpui: {why}");
-}
+mod ui_gen;
+// The generated component, re-exported at the root so the crate's shape does not change with it.
+use ui_gen::Spike;
 
 /// PER-INSTANCE ISOLATION IS A BRIDGE CHOICE, NOT A PORT GAP - and this is the
 /// correction to what this file claimed last slice. `Gateway::start` takes the
@@ -315,25 +307,6 @@ fn run_attrib(path: &Path, flag: &str) -> std::io::Result<()> {
     )))
 }
 
-/// Rect plus show state - the same two halves the gpui bridge diffs, because a
-/// maximise can leave the rect alone. Both reads are already PHYSICAL here
-/// (`position() -> PhysicalPosition`, `size() -> PhysicalSize`, i-slint-core
-/// api.rs:562 / :576), so unlike the restore path there is no scale to apply.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Fingerprint {
-    rect: Rect,
-    maximized: bool,
-    /// S8: the third thing a window can be doing to itself, measured not assumed: minimizing
-    /// moves the rect to Windows' parking place (-32000,-32000) AND shrinks the reported size
-    /// to 160x28, so a minimized window is visible in the rect after all - but as an OS
-    /// convention nobody documented to us, one that a restore-later or a different DPI could
-    /// change. The bit is explicit, free, and the thing the caption button needs to be provable
-    /// from the log, which is this spike's only eye. 1.17 has both calls (i-slint-core
-    /// api.rs:608 is_minimized, :613 set_minimized): no winit workaround, no window-handle FFI,
-    /// one call each way.
-    minimized: bool,
-}
-
 fn fingerprint_of(window: &slint::Window) -> Fingerprint {
     let position = window.position();
     let size = window.size();
@@ -425,17 +398,6 @@ const CHORD_TAIL_AT: Duration = Duration::from_millis(21600);
 /// silently disappeared again - which is how a needle that never prints is worth more than a
 /// comment that says it should.
 const CHORD_EVERY: Duration = Duration::from_millis(500);
-
-/// The headless defence, same shape as SYNTHETIC_CLOSE_ACTS, with one difference that had to be
-/// said out loud: a const cannot be set by an environment, and this gate exists precisely so a
-/// CI/smoke/probe run can stand the modal down without an edit. So the const is the shipped
-/// DEFAULT (a real bridge does show a dialog) and SLINT_NO_DIALOG=1 is the per-run gate. Every
-/// probe run in this slice's evidence was made with the gate ON.
-const DIALOG_ALLOWED_BY_DEFAULT: bool = true;
-
-fn dialog_allowed() -> bool {
-    DIALOG_ALLOWED_BY_DEFAULT && std::env::var_os("SLINT_NO_DIALOG").is_none()
-}
 
 /// Which table rows to drive, by index into SHORTCUTS: Open, Alt+2, Auto-save, Save As,
 /// Clear recents. The order is a constraint, not a preference, and it cost a run to learn:
@@ -1778,40 +1740,6 @@ struct Poll {
     sampled: bool,
 }
 
-/// THE TITLE, from the port's fact and nowhere else. `title_words` is what the strip
-/// centre shows; `window_title` is what Alt+Tab, the taskbar preview and a screen
-/// reader speak. Both come from `title_contract`, the same two pure functions
-/// bridge-gpui calls (its main.rs:851-861), so the wording cannot drift between
-/// bridges - and both are PRINTED, because that print is the only honest measurement
-/// of this mount a headless run can make: no screenshot was taken.
-fn publish_title(ui: &Spike, path: Option<&Path>, loaded: bool, via: &str) {
-    let words = title_contract::title_words(path, loaded);
-    let title = title_contract::window_title(path, loaded);
-    ui.set_title_words(words.clone().into());
-    ui.set_os_title(title.clone().into());
-    report(&format!("title: {via} words={words:?} os-title={title:?}"));
-}
-
-/// FNV-1a over the file's own bytes. A checksum rather than a hash crate on purpose:
-/// this bridge may not add a dependency to prove a byte-for-byte claim, and the
-/// question is only ever "did anything change at all".
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// LF-normalise an incoming buffer, byte-for-byte the rule `bridge-gpui` states at
-/// editor.rs:2026 - CRLF collapses to LF AND a lone CR becomes LF, because core keeps
-/// LF internally and the do-no-harm rule restores the file's own ending at the save
-/// layer. The bridge never adds a `\r`, and now never leaks one into a Flush.
-fn lf(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
-}
-
 /// C4/C5 measurements, taken before the loop so the numbers describe the toolkit and
 /// not this probe's own scheduling. Textures of the buffer only: no file, no api call.
 fn text_probe(ui: &Spike) {
@@ -2003,35 +1931,6 @@ fn text_pump_by_compare(ui: &Spike, gw: &Rc<RefCell<Option<Gateway>>>, pump: &Re
     );
 }
 
-/// The other half of the seam: read the seeded file again and say whether a single
-/// byte moved. Print the flush counter too, because "no spurious Flush" is the
-/// mechanism by which it should not have moved.
-///
-/// S9 follow-up: this used to run ONLY at the END deadline, which made it invisible to
-/// how the run is closed - a granted Quit ends the loop before 25 s and the needle simply
-/// never printed, so the do-no-harm rule went unwitnessed in exactly the runs that quit
-/// early. It is now called on the SAVE CYCLE instead: after the seed's `Event::Loaded`
-/// adoption (the open must not have touched it) and after every `Event::Saved` whose path
-/// IS the seed (a save of a CRLF foreign file is the moment the rule can actually break).
-/// `via` names the moment, because three identical needles would be ambiguous.
-fn do_no_harm(pump: &RefCell<Pump>, via: &str) {
-    let p = pump.borrow();
-    let Some(seed) = p.seed.clone() else {
-        report("do-no-harm: no seed file was written, nothing to compare");
-        return;
-    };
-    let bytes = std::fs::read(&seed).unwrap_or_default();
-    let after = fnv1a(&bytes);
-    report(&format!(
-        "do-no-harm[{via}]: {} bytes fnv={after:#x} (seeded {} bytes fnv={:#x}) hash-equal={} flush-since-open={}",
-        bytes.len(),
-        p.hash_len,
-        p.hash_before,
-        u8::from(after == p.hash_before && bytes.len() == p.hash_len),
-        p.edits - p.flushes_at_open
-    ));
-}
-
 /// R1: the double-click act, shared by the markup's `double-clicked` handler and by
 /// the synthetic driver, so an unattended run exercises the same code a strip
 /// double-click would. The pair this prints is the one the README promise rests on:
@@ -2212,86 +2111,6 @@ fn open_recent(gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>, index: u
             send(gw, Command::Open { path });
         }
         None => report(&format!("recents: {via} row {index} names no path")),
-    }
-}
-
-/// The dot's word for the pair, in section 4.4's precedence: a failed save outranks
-/// plain dirt, and neither paints at all on a clean buffer.
-fn dot_word(save_failed: bool, dirty: bool) -> &'static str {
-    if save_failed {
-        "amber(save-failed)"
-    } else if dirty {
-        "red(dirty)"
-    } else {
-        "none(clean)"
-    }
-}
-
-/// ONE NEEDLE PER SIGNAL CHANGE: the exact triple Chrome renders, printed, so a run is
-/// gradable on transitions instead of on a screenshot. 'via' says which input moved
-/// (start / buffer / saved / save-failed), and a transition that prints nothing is a
-/// signal that is not wired.
-fn note_dot(pump: &RefCell<Pump>, weak: &slint::Weak<Spike>, dirty: bool, via: &str) {
-    let (words, save_failed, autosave) = {
-        let mut p = pump.borrow_mut();
-        p.dirty = dirty;
-        (
-            format!(
-                "dot={} save-failed={} dirty={} autosave={}",
-                dot_word(p.save_failed, dirty),
-                p.save_failed,
-                dirty,
-                p.autosave
-            ),
-            p.save_failed,
-            p.autosave,
-        )
-    };
-    // PUBLISH, not just print: the triple Chrome draws is the same three facts, and one
-    // writer for both. Set unconditionally - Chrome's dot precedence and its menu check
-    // are bindings, so an unchanged value costs nothing and a changed one cannot be lost
-    // to a printed-diff heuristic that runs before the property lands.
-    if let Some(ui) = weak.upgrade() {
-        ui.set_dirty(dirty);
-        ui.set_save_failed(save_failed);
-        ui.set_autosave(autosave);
-    }
-    let previous = {
-        let mut p = pump.borrow_mut();
-        std::mem::replace(&mut p.dot_words, words.clone())
-    };
-    if previous != words {
-        report(&format!("chrome: {via}: {words} (was: {previous})"));
-    }
-}
-
-fn send(gateway: &Rc<RefCell<Option<Gateway>>>, command: Command) {
-    let borrowed = gateway.borrow();
-    let Some(gateway) = borrowed.as_ref() else {
-        return;
-    };
-    if gateway.send(command).is_err() {
-        report("the engine had already exited: a command came back undelivered");
-    }
-}
-
-/// The event's name, plus its rect when it has one.
-fn describe(event: &Event) -> String {
-    match event {
-        Event::GeometryNotRestored { rect, .. } => {
-            format!(
-                "GeometryNotRestored {}x{} at {},{}",
-                rect.w, rect.h, rect.x, rect.y
-            )
-        }
-        Event::AutosaveSkipped { reason } => {
-            format!("AutosaveSkipped reason={reason:?}")
-        }
-        other => format!("{other:?}")
-            .split(['(', ' ', ':'])
-            .next()
-            .unwrap_or("unknown")
-            .to_string(),
     }
 }
 

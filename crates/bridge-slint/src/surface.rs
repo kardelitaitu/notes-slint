@@ -27,7 +27,18 @@ use std::path::PathBuf;
 // on it deliberately instead of pub(crate)-ing a dozen printing helpers the product will own again
 // later - the boundary this strip is drawing is between DECISIONS and INSTRUMENTATION, and an
 // import list that reaches up to the root makes the reach visible in one line.
-use crate::*;
+use std::cell::RefCell;
+use std::path::Path;
+use std::rc::Rc;
+use std::sync::mpsc::Receiver;
+use std::time::Instant;
+
+use notes_api::{Command, Event, Gateway};
+
+use crate::Spike;
+use crate::plumbing::{
+    describe, dialog_allowed, do_no_harm, lf, note_dot, publish_title, report, send,
+};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DialogKind {
     Open,
