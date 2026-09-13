@@ -12,9 +12,9 @@ decision: null
 
 A save failed and the user has stopped typing. Does the app try again — and if so, how
 often, and who decides? The two shipped bridges answer differently, so this is no longer
-hypothetical: the retry rule is today a per-toolkit habit, and §4.4's promise (the newest
-edit is never silently lost) is only as strong as whichever bridge the user happens to be
-running.
+hypothetical: the retry rule is today a per-toolkit habit, and §4.4's line — "Silent
+autosave failure is the worst possible outcome — the user believes they are saved and are
+not" — is only as strong as whichever bridge the user happens to be running.
 
 ## The disagreement, as the code holds it
 
@@ -32,7 +32,8 @@ clears**, without asking the user to type another character to trigger a save.
 `seen_edits != flushed_edits` (`main.rs:241-242`) — a counter only an edit moves. So after a
 failure the gpui bridge goes quiet, and a user who fixes the cause (closes the locking
 program, frees the disk) and then walks away has lost the newest edit until they type
-again. Same port, same event, two behaviours.
+again. Same port, same event, two behaviours — and it is the gpui reading that §4.4 calls
+the worst possible outcome.
 
 **Three copies of 750 ms.** The cadence is duplicated rather than shared, because the
 port's constant is private: `api` holds `AUTOSAVE_IDLE` at `crates/api/src/engine.rs:64`

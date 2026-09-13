@@ -104,6 +104,7 @@ M2 therefore stays **in flight**. What is left is the CI evidence trail after a 
 human eye-pass list no harness reaches: the popup, caption and About glyphs on a real screen, a real
 Explorer drag rather than a synthesised one, the over-8 MiB refusal as a user sees it, and the
 read-only caret.
+
 **M3 — Window persistence.**
 `platform` trait + Windows backend. Restore, validate against monitors, clamp off-screen,
 handle maximised + DPI. Test on 100/150/200% scaling and with a monitor unplugged.
