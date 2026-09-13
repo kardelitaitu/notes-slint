@@ -1,8 +1,9 @@
 //! SLINT SPIKE, slice 1 - THE WINDOW CONTRACT, and nothing else.
 //!
 //! One question, with a printed number as its answer: can a Slint window be (a)
-//! placed at the rect `session.json` holds BEFORE it is ever visible, (b) shown
-//! maximised when the file says so, and (c) yield an HWND to the port without a
+//! placed at the rect the PORT REPORTS (its `InitialState`, never the file itself)
+//! BEFORE it is ever visible, (b) shown maximised when that snapshot says so, and (c)
+//! yield an HWND to the port without a
 //! visible correction jump afterwards? That is deal-breaker 1 of the spike. No
 //! editor, no menu, no text widget: anything that is not the question is not in
 //! this file.
@@ -100,9 +101,42 @@ fn json_int(src: &str, key: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
+/// A JSON bool, read from its OWN value and nothing else.
+///
+/// RC2 - the one that mattered. This used to slice 40 bytes from the key and ask whether
+/// that window contained "true". On a pretty-printed session the 40 bytes after the
+/// `"maximized"` key are `: false,` + newline + `"pinned"` - so a file holding
+/// maximized:false, pinned:true answered TRUE. Every `maximized=` needle this spike
+/// printed through `measured()` was therefore a PIN INDICATOR wearing a maximise label,
+/// including the ones that fed the phantom maximise story. Two bugs in three lines: the
+/// window is key-order dependent, and `at + 40` panics outright on a short file. Reading
+/// the value up to its own terminator has neither problem.
 fn json_flag(src: &str, key: &str) -> Option<bool> {
     let at = src.find(&format!("\"{key}\""))?;
-    Some(src[at..at + 40].contains("true"))
+    let value = src[at..].split_once(':')?.1;
+    // Stop at the end of THIS value - comma, newline, closing brace - not at an arbitrary
+    // number of bytes after the key name.
+    let value = value
+        .trim_start()
+        .split([',', '\n', '}', ' '])
+        .next()?
+        .trim();
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// What the PORT said the window was, straight out of `InitialState`: one string, so the
+/// startup print and the first-visible print cannot disagree with each other, and neither
+/// one reaches into a state directory the bridge does not own. `measured()` stays where its
+/// question is genuinely "what did the port WRITE to disk" - the persistence probes.
+fn port_said(rect: &Rect, scale: f32, maximized: bool, pinned: bool) -> String {
+    format!(
+        "port says {}x{} at {},{} scale {scale} maximized={maximized} pinned={pinned}",
+        rect.w, rect.h, rect.x, rect.y
+    )
 }
 
 /// The frame rect as the PORT last measured and wrote it - this spike's GetWindowRect.
@@ -118,8 +152,12 @@ fn measured(dir: &StateDir, at: Duration) -> String {
                 (Some(x), Some(y), Some(w), Some(h)) => format!("{}x{} at {},{}", w, h, x, y),
                 _ => "UNPARSEABLE".to_string(),
             };
+            // Both bits, each from its own value: this is the line that has to AGREE with
+            // the bytes on disk, and it did not until RC2 (see json_flag). Printing the
+            // pin beside the maximise is what makes a swap visible instead of plausible.
             let zoom = json_flag(&src, "maximized").unwrap_or(false);
-            format!("frame rect (port-measured) t+{at:?}: {rect} maximized={zoom}")
+            let pin = json_flag(&src, "pinned").unwrap_or(false);
+            format!("frame rect (port-measured) t+{at:?}: {rect} maximized={zoom} pinned={pin}")
         }
         Err(err) => format!("frame rect t+{at:?}: no session.json yet ({err})"),
     }
@@ -198,9 +236,16 @@ const WRITE_BACK_AT: Duration = Duration::from_millis(17000);
 /// callback reaching root's), and that is proven by the component compiling and the popup
 /// drawing. One act per tick slot, in the order a user would try them.
 const MENU_OPEN_AT: Duration = Duration::from_millis(18500);
-const MENU_SAVEAS_AT: Duration = Duration::from_millis(19300);
-const MENU_AUTOSAVE_AT: Duration = Duration::from_millis(20000);
-const MENU_QUIT_AT: Duration = Duration::from_millis(20600);
+const MENU_SAVEAS_AT: Duration = Duration::from_millis(20600);
+const MENU_AUTOSAVE_AT: Duration = Duration::from_millis(21000);
+const MENU_QUIT_AT: Duration = Duration::from_millis(21500);
+
+/// S9 follow-up: one keystroke AFTER the Open row made the seed the current document, so
+/// an autosave lands ON THE SEED and the do-no-harm rule is tested where it can actually
+/// break - on the write, not just on the read. The engine saves to whatever path is
+/// current, so this has to sit between the Open row and the Save As row; the 750 ms
+/// debounce then puts the Saved at ~19.95 s, still 1.5 s clear of the Quit.
+const SEED_KEY_AT: Duration = Duration::from_millis(19200);
 
 /// S4b: when the one in-run keystroke lands. After the pin experiment has finished
 /// (PIN_AT + HOLD + SETTLE) and after the seed Open has adopted a buffer, so the tick
@@ -224,6 +269,18 @@ const CLICK_AT: Duration = Duration::from_millis(3000);
 const MAX_AT: Duration = Duration::from_millis(14000);
 const CLOSE_AT: Duration = Duration::from_millis(18000);
 const CLOSE2_AT: Duration = Duration::from_millis(21000);
+
+/// S9: THE SYNTHETIC CLOSE PAIR STANDS DOWN FOR THIS RUN, on purpose.
+///
+/// The pair proves the decline holds and that a typed-then-closed race is carried by the
+/// shutdown path - both real, both already witnessed in earlier runs. But it also made
+/// the menu Quit row untestable: by the time Quit fired, closes was already 1, so the
+/// pre-existing "grant anything that is not the first request" branch answered it and the
+/// run proved nothing about the QUIT PRECEDENCE. With the pair off, the FIRST close
+/// request this app ever sees is the Quit row's, and only quit_requested can grant it.
+/// Flip to true to bring both acts back; their evidence and this one cannot share a run,
+/// because a granted close ends it.
+const SYNTHETIC_CLOSE_ACTS: bool = false;
 const END: Duration = Duration::from_millis(25000);
 
 fn main() {
@@ -245,15 +302,21 @@ fn main() {
         return;
     };
     let session = initial.session.clone();
-    report(&format!(
-        "startup: session.json says {}x{} at {},{} scale {} maximized={} pinned={}",
-        session.rect.w,
-        session.rect.h,
-        session.rect.x,
-        session.rect.y,
+    // S9: the file read is GONE from the startup path. The numbers below were already
+    // InitialState's - only the wording admitted the habit. The snapshot carries rect,
+    // monitor, scale, the maximise bit, the pin bit and the open path, so nothing about
+    // PLACING this window needs a second opinion from a file the bridge does not own, and
+    // nothing had to be added to the port to drop it. The gate is the startup_state()
+    // match above: the snapshot is handed out exactly once, synchronously, before the
+    // window exists - it does not arrive on the channel, so there is no arrival to wait
+    // for. And no fact needed here is missing from it, so this is not an add-the-event
+    // case; the one thing the file still answers is "what did the port persist", which
+    // is what measured() is now left for.
+    report(&port_said(
+        &session.rect,
         session.scale_factor,
         session.maximized,
-        session.pinned
+        session.pinned,
     ));
 
     let Ok(ui) = Spike::new() else {
@@ -310,8 +373,13 @@ fn main() {
     match hwnd {
         Some(hwnd) => {
             report(&format!(
-                "hwnd = {hwnd:#x} FIRST VISIBLE {}",
-                measured(&dir, started.elapsed())
+                "hwnd = {hwnd:#x} FIRST VISIBLE, {}",
+                port_said(
+                    &session.rect,
+                    session.scale_factor,
+                    session.maximized,
+                    session.pinned
+                )
             ));
             send(
                 &gateway,
@@ -633,6 +701,12 @@ fn main() {
                     drop(p);
                     report("save-fail: typed 6 bytes, expecting SaveFailed then dot=amber");
                     ui.set_buffer(format!("{base}+fail1").into());
+                } else if !p.seed_key_done && now >= SEED_KEY_AT {
+                    p.seed_key_done = true;
+                    let base = p.last_sent.clone();
+                    drop(p);
+                    report("do-no-harm: typed 6 bytes INTO THE SEED document, expecting Saved then a hash print");
+                    ui.set_buffer(format!("{base}+seed1").into());
                 } else if !p.wb_done && now >= WRITE_BACK_AT {
                     p.wb_done = true;
                     let found = p.loop_path.clone();
@@ -705,7 +779,7 @@ fn main() {
                     p.max_toggled = true;
                     drop(p);
                     toggle_max(&ui.as_weak(), &third_gw, "synthetic");
-                } else if now >= CLOSE_AT && p.closes == 0 {
+                } else if SYNTHETIC_CLOSE_ACTS && now >= CLOSE_AT && p.closes == 0 {
                     drop(p);
                     ui.set_close_arm(1);
                     let allowed = ui.get_close_allowed();
@@ -713,7 +787,7 @@ fn main() {
                         "close: request_close #1 returned {allowed} (false = the decline held), visible={}",
                         ui.window().is_visible()
                     ));
-                } else if now >= CLOSE2_AT && p.closes == 1 {
+                } else if SYNTHETIC_CLOSE_ACTS && now >= CLOSE2_AT && p.closes == 1 {
                     drop(p);
                     // THE QUIT RACE, made real: type, then close on the same tick. The
                     // 750 ms debounce can never fire between these two, so the only
@@ -733,7 +807,7 @@ fn main() {
                 }
             }
             if now >= END {
-                do_no_harm(&third_pump);
+                do_no_harm(&third_pump, "exit");
                 report(&format!("probe over {}", measured(&third_dir, now)));
                 ui.window().hide().ok();
             }
@@ -760,9 +834,11 @@ fn main() {
             open_recent(&gw, &pump, index as usize, "touch");
         });
     }
-    // R2: THE CLOSE CONTRACT. This is the handler an OS close would land on, and it
-    // declines the FIRST request and grants the SECOND, which is the whole shape of
-    // act 1 and act 2 in one run.
+    // R2: THE CLOSE CONTRACT. This is the handler an OS close would land on. It declines
+    // the first request that arrives on its own - the rehearsal case that proves a decline
+    // can hold - and grants any later one, UNLESS the user asked to leave: a Quit from the
+    // menu is never the rehearsal case. With SYNTHETIC_CLOSE_ACTS off, this run exercises
+    // exactly that clause on request #1.
     {
         let pump = Rc::clone(&pump);
         ui.window().on_close_requested(move || {
@@ -778,7 +854,12 @@ fn main() {
                 report("close: declined, held (KeepWindowShown)");
                 slint::CloseRequestResponse::KeepWindowShown
             } else {
-                report("close: second, exiting (HideWindow)");
+                // NOT "second, exiting": with the pair standing down this IS request #1,
+                // and the only thing that granted it is quit_requested. Print the count and
+                // the reason so neither run has to be interpreted after the fact.
+                report(&format!(
+                    "close: GRANTED, exiting (HideWindow) on request #{n} quit-asked={asked_to_quit}"
+                ));
                 slint::CloseRequestResponse::HideWindow
             }
         });
@@ -1088,7 +1169,15 @@ fn text_pump(ui: &Spike, gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>
 /// The other half of the seam: read the seeded file again and say whether a single
 /// byte moved. Print the flush counter too, because "no spurious Flush" is the
 /// mechanism by which it should not have moved.
-fn do_no_harm(pump: &RefCell<Pump>) {
+///
+/// S9 follow-up: this used to run ONLY at the END deadline, which made it invisible to
+/// how the run is closed - a granted Quit ends the loop before 25 s and the needle simply
+/// never printed, so the do-no-harm rule went unwitnessed in exactly the runs that quit
+/// early. It is now called on the SAVE CYCLE instead: after the seed's `Event::Loaded`
+/// adoption (the open must not have touched it) and after every `Event::Saved` whose path
+/// IS the seed (a save of a CRLF foreign file is the moment the rule can actually break).
+/// `via` names the moment, because three identical needles would be ambiguous.
+fn do_no_harm(pump: &RefCell<Pump>, via: &str) {
     let p = pump.borrow();
     let Some(seed) = p.seed.clone() else {
         report("do-no-harm: no seed file was written, nothing to compare");
@@ -1097,7 +1186,7 @@ fn do_no_harm(pump: &RefCell<Pump>) {
     let bytes = std::fs::read(&seed).unwrap_or_default();
     let after = fnv1a(&bytes);
     report(&format!(
-        "do-no-harm: {} bytes fnv={after:#x} (seeded {} bytes fnv={:#x}) hash-equal={} flush-since-open={}",
+        "do-no-harm[{via}]: {} bytes fnv={after:#x} (seeded {} bytes fnv={:#x}) hash-equal={} flush-since-open={}",
         bytes.len(),
         p.hash_len,
         p.hash_before,
@@ -1243,6 +1332,8 @@ struct Pump {
     wb_done: bool,
     /// Which menu row has been fired: 0 none, then Open, Save As, Auto-save, Quit.
     menu_act: u64,
+    /// The one keystroke aimed at the seed document.
+    seed_key_done: bool,
     /// How many autosave toggles this bridge has sent. The port echoes NO autosave event,
     /// so the menu check can only follow the ask - printed as 'menu: ...' so the
     /// convention is visible instead of pretending to be a report.
@@ -1409,6 +1500,14 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                     "load: epoch={epoch} announced, buffer adopted ({} bytes, CR-normalised)",
                     adopted.len()
                 ));
+                // The open half of the rule: reading a foreign file must not change it.
+                let is_seed = {
+                    let p = pump.borrow();
+                    p.seed.as_deref() == Some(path.as_path())
+                };
+                if is_seed {
+                    do_no_harm(pump, "loaded");
+                }
             }
             Event::Rebound { epoch, path, .. } => {
                 pump.borrow_mut().epoch = *epoch;
@@ -1472,6 +1571,17 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                         "autosave: saved rev={revision} (Saved #{which}, no SaveAs between)"
                     ));
                     report(&format!("autosave: file {}", path.display()));
+                }
+                // The save half, and the one that matters: core is supposed to restore
+                // this file's own CRLF endings on the way out. If it ever writes LF, the
+                // hash moves HERE, in the run that did it - not 4 s later at a deadline
+                // the run may never reach.
+                let is_seed = {
+                    let p = pump.borrow();
+                    p.seed.as_deref() == Some(path.as_path())
+                };
+                if is_seed {
+                    do_no_harm(pump, "saved");
                 }
             }
             Event::SaveFailed { reason, .. } => {
