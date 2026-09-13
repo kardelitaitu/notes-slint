@@ -51,7 +51,7 @@
 //!     invisible (bridge-gpui/src/main.rs:1396);
 //! (4) the recents exists-mark, the legend keys in a real bar, and the pin check mark's round trip.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -63,6 +63,13 @@ use notes_api::{
 use slint::{
     CloseRequestResponse, ComponentHandle, LogicalPosition, LogicalSize, Timer, TimerMode,
 };
+// FOCUS-AT-STARTUP (the fn below is the reason): 1.17's PUBLIC slint::Window has no focus door at
+// all - api.rs lists show / hide / place / resize / dispatch_event and stops. These two names are the
+// SAME path the macro's own generated .focus() compiles to (i-slint-compiler generator/rust.rs:3635
+// emits WindowInner::from_pub(..).set_focus_item(.., FocusReason::Programmatic)), so the root borrows
+// the toolkit's door rather than inventing one - the only alternative is an imperative focus() in the
+// markup, which main.slint:178 rules out on purpose.
+use slint::private_unstable_api::re_exports::{FocusReason, WindowInner};
 
 mod plumbing;
 mod surface;
@@ -107,6 +114,12 @@ const GEOMETRY_FORCE: Duration = Duration::from_millis(1000);
 /// not answered by then is not going to answer before a person gives up.
 const SAVE_WAIT: Duration = Duration::from_millis(2000);
 const EXIT_REWAIT: Duration = Duration::from_secs(10);
+/// FOCUS-AT-STARTUP: how many 8 ms wakes this root keeps asking for a focus item before it prints the
+/// failure instead. 250 is ~2 s, and the window is mapped and laid out inside the first few pumps, so
+/// a window still unfocused after that is not a race to win but a fact to print. The ceiling is the
+/// point: the commit before this one retired a REGISTRATION retry that ran ~125 times a second forever
+/// (see `Register`), and an uncapped focus retry is the same storm in a different name.
+const FOCUS_TRIES: u16 = 250;
 
 /// HYGIENE (P1b fix 1): the LATE-REGISTRATION LATCH. The guard this replaced was
 /// "is the drop lease still empty", and plumbing.rs:255-262 deliberately leaves that lease empty
@@ -194,6 +207,53 @@ fn panic_note(what: &str, where_: Option<&str>) -> String {
         Some(at) => format!("panic: {what} at {at}"),
         None => format!("panic: {what}"),
     }
+}
+
+/// FOCUS-AT-STARTUP, and the measured fact that makes it necessary: launched by the OS rather than by
+/// a click, this product's chords are DEAD until a pointer press lands inside the window. Not a
+/// theory about the harness - the mechanism is readable in 1.17 and both halves of it are true:
+///   * every chord this app answers lives in `capture-key-pressed` on the markup's OUTERMOST
+///     FocusScope (ui/main.slint:191), and Slint runs that capture pass only along the path from the
+///     window to its CURRENT focus item (i-slint-core window.rs:1074, then the `capture_key_event`
+///     loop at :1098). No focus item, no path, no chord - the keystroke is swallowed and the status
+///     line never moves;
+///   * the thing that installs a focus item is a pointer press (i-slint-backend-winit accesskit.rs:810
+///     calls set_focus_item with FocusReason::PointerClick), which is exactly why the one click the
+///     E2E run made unlocked every key for the rest of the session. `forward-focus: editor` names WHO
+///     to focus once the scope is asked; nothing in the markup or in this root ever did the asking.
+///
+/// So the root does the asking, from the head of the chain - the same call the generated .focus()
+/// makes, with FocusReason::Programmatic, which is the reason the walk is allowed to start at the
+/// WindowItem and land on the first item that accepts.
+///
+/// VISIBLE is the condition, not a nicety, and it is why this returns a verdict instead of a shrug:
+/// the key dispatcher itself drops a focus item whose item is not visible (window.rs:1076-1081, "Reset
+/// the focus... not great, but better than keeping it"), and the tree has no geometry until winit has
+/// pumped once - so focus landed on an item that is not visible is WORSE than none at all, because the
+/// user's first keystroke eats it and still finds no chord. A `false` here therefore means "ask again
+/// on the next wake" (the caller's budget, `FOCUS_TRIES`), and `true` means STOP ASKING FOR GOOD:
+/// set_focus_item redirects to the open popup's window when one exists (window.rs:1232-1239), so a
+/// root that kept re-asserting focus could park it in somebody's menu. It lands once, then it keeps
+/// its hands off - which is also why this does not contradict main.slint:178's "no imperative
+/// focus()": that rule is about stealing focus to ROUTE a key, and this takes the focus exactly once,
+/// before any key has been routed or any caret existed to lose.
+fn claim_focus(window: &slint::Window) -> bool {
+    let inner = WindowInner::from_pub(window);
+    let held = || {
+        inner
+            .focus_item
+            .borrow()
+            .upgrade()
+            .is_some_and(|item| item.is_visible())
+    };
+    if held() {
+        return true;
+    }
+    let Some(root) = inner.window_item_rc() else {
+        return false;
+    };
+    inner.set_focus_item(&root, true, FocusReason::Programmatic);
+    held()
 }
 
 fn main() {
@@ -320,6 +380,22 @@ fn main() {
         None => report("startup: NO HWND after show: the window contract fails here"),
     }
 
+    // FOCUS-AT-STARTUP, the first ask (what it is for: see `claim_focus`). It usually MISSES here -
+    // there is no geometry before winit's first pump, so there is no visible item to land on - and
+    // lands on a wake a few milliseconds later. What must not happen is the window coming up holding
+    // no focus item at all, because that is the user's first keystroke going into a void. The Cell is
+    // the budget, and zero means it already landed: the wake stops asking on that same zero, so this
+    // root never re-asserts a focus the person (or a menu) has since moved somewhere else.
+    let focus_budget = Rc::new(Cell::new(FOCUS_TRIES));
+    if claim_focus(window) {
+        focus_budget.set(0);
+        report("focus: taken before the loop - a chord is live from the first keystroke");
+    } else {
+        report(&format!(
+            "focus: no focus item yet, the wakes will keep asking ({FOCUS_TRIES} tries)"
+        ));
+    }
+
     // C1, STRIP-5 (2026-09-15): ASK FOR THE DOCUMENT THE SESSION WAS HOLDING. The session was read
     // for its rect, its scale, its maximised bit and its pin - and never for its `path`, which is why
     // a relaunch showed an empty editor while the draft's bytes sat in <state>/notes/untitled.notes.
@@ -369,6 +445,7 @@ fn main() {
     let tick_drops = Rc::clone(&drop_guard);
     let tick_register = Rc::new(RefCell::new(Register::default()));
     let tick_dialog_rx = Rc::clone(&dialog_rx);
+    let tick_focus = Rc::clone(&focus_budget);
     let tick_settle = Rc::new(RefCell::new(Settle::default()));
     let weak = ui.as_weak();
     let tick = Timer::default();
@@ -412,6 +489,24 @@ fn main() {
                     report(&format!(
                         "hwnd: registration refused for {hwnd:#x} {} times - NOT asking again this run; no drag lands and no pin applies until a handle does take the arm",
                         next.tries
+                    ));
+                }
+            }
+        }
+        // FOCUS-AT-STARTUP, the retry, on the same wakes that carry the late HWND: while the budget
+        // is unspent, ask once more; the moment the claim lands, spend it for good. The ceiling is the
+        // difference between this and the registration storm the last commit retired - a wake that
+        // cannot claim costs ONE comparison, and after ~2 s it costs that not even a print.
+        if tick_focus.get() > 0 {
+            if claim_focus(ui.window()) {
+                tick_focus.set(0);
+                report("focus: the chord scope holds a VISIBLE focus item - keys are live without a click");
+            } else {
+                let left = tick_focus.get().saturating_sub(1);
+                tick_focus.set(left);
+                if left == 0 {
+                    report(&format!(
+                        "focus: STILL no visible focus item after {FOCUS_TRIES} wakes - every chord is dead until something focuses the window"
                     ));
                 }
             }
