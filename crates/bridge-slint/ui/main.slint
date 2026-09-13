@@ -107,6 +107,22 @@ export component Spike inherits Window {
     callback backdrop-asked();
     callback escape-asked();
 
+    /// S10: TextEdit's own edited signal, forwarded unchanged. It carries NO text: the pump
+    /// reads the buffer when it acts, not on every keystroke, which is the point of the event.
+    callback text-edited();
+
+    /// S10b: the quarantine's own signal - raised when a replay key is swallowed, so a run can
+    /// SHOW the swallow instead of inferring it from an absence. It asks nothing: the key is
+    /// already accepted by the time this fires, and the port is never told.
+    callback undo-swallowed();
+
+    /// S10: which document the editor is showing, in the bridge's own counting. Bumped at every
+    /// adoption (Loaded and Rebound) and nothing else. It exists because 1.17 cannot clear a
+    /// TextEdit's undo history (no such API exists - verified across the whole toolkit) and the
+    /// only other answer is to destroy and recreate the widget; see the finding in src/main.rs
+    /// for why that half is not shipped yet.
+    in-out property <int> doc-generation: 0;
+
     /// S8: the caption minimize ask, carried up so Rust can answer it. Every other caption
     /// cell reused a door that already existed; this is the one that had to be added.
     callback minimize-requested();
@@ -142,10 +158,12 @@ export component Spike inherits Window {
     // S6: THE CHORD SCOPE. The nesting IS the mechanism: capture-key-pressed on the
     // OUTERMOST scope runs before the focused child's key handler (events-and-overlays), so
     // this sees Ctrl+O first, and every key it returns Ignore for keeps travelling to
-    // TextEdit - which is why nothing below mentions Ctrl+A/C/V/X/Z: an editor chord that is
-    // not in this table reaches the caret untouched. No imperative focus() anywhere, which is
-    // the other half of the same rule (a bridge that steals focus to route a key loses the
-    // caret).
+    // TextEdit - which is why nothing below mentions Ctrl+A/C/V: an editor chord that is not in
+    // this table reaches the caret untouched. No imperative focus() anywhere, which is the other
+    // half of the same rule (a bridge that steals focus to route a key loses the caret). ONE
+    // exception, and this sentence is the reason S10b had to edit it: Ctrl+Z and Ctrl+Y ARE named
+    // below - not as commands, but as a quarantine that arms only after the first document
+    // switch. See undo_quarantined() in src/main.rs for why, and for what it costs.
     //
     // THE DIFF SHAPE, on purpose: the children below are NOT re-indented, so the body reads
     // as if it were still one level. Slint does not care and a 90-line re-indent would bury
@@ -172,6 +190,32 @@ export component Spike inherits Window {
             // dismissal is not a command and does not belong in a legend of commands.
             if (event.text == Key.Escape && chrome.menu-open) {
                 chrome.escape-asked();
+                return EventResult.accept;
+            }
+            // S10b: THE UNDO QUARANTINE, and it is a state rule, not a chord.
+            // 1.17 cannot clear a TextEdit's undo stack (verified in S10), and the stack
+            // survives a document switch because the widget is never destroyed - the
+            // conditional-recreation answer needs a focus path 1.17 does not have (the finding is
+            // written out in src/main.rs). So from the first switch onward Ctrl+Z holds the
+            // PREVIOUS document's bytes, and replaying them writes them into the NEW one under a
+            // legal new epoch: the engine's own guard cannot see it, and the hazard is unbounded
+            // in time. Swallowing the two replay keys is the only mitigation that ships today,
+            // and it is gated on generation > 0 so that before any switch the stack is honest and
+            // the keys reach the editor untouched through the reject path below. THE COST, for
+            // the commit message: after the first document switch, undo and redo are DEAD for the
+            // session - a quiet loss of the editor's most-used keys, taken because the alternative
+            // is corrupting a file the user never typed into. The un-kill is upstream: clear-undo
+            // on TextEdit, or a way to focus a conditionally created editor so the recreation can
+            // ship. This branch is the seam they replace. SHIFT IS DELIBERATELY ALLOWED: the
+            // usual redo chord is Ctrl+Shift+Z, so a rule that excluded shift would have left the
+            // same stale bytes reachable through the key that redoes - which is how this branch
+            // was first written, and corrected before it shipped.
+            if (root.doc-generation > 0
+                    && event.modifiers.control
+                    && !event.modifiers.alt
+                    && (event.text.to_lowercase() == "z"
+                        || event.text.to_lowercase() == "y")) {
+                root.undo-swallowed();
                 return EventResult.accept;
             }
             if (event.modifiers.control && event.modifiers.shift
@@ -249,9 +293,21 @@ export component Spike inherits Window {
         width: parent.width;
         height: parent.height - status-line.y - 18px - root.stack-h;
         font-size: 14px;
+        // S10, PARITY: no wrapping. Not a style choice - the whole project never wrapped
+        // (editor.rs:883 puts word wrap out of scope) and the first bridge never had it, so
+        // the toolkit's prettier default is a behavioural difference between two bridges that
+        // are supposed to be the same app. Long lines scroll; they do not fold.
+        wrap: TextWrap.no-wrap;
         // Two-way binding: `set_buffer` repaints the widget, typing refills the
         // property, and the pump reads only the property.
         text <=> root.buffer;
+        // S10: the dirty witness, event-driven. Every keystroke arrives here, so the pump no
+        // longer has to read and compare the whole buffer 125 times a second to learn that
+        // something changed. See text_pump for how the flag replaced the comparison, and for
+        // what the comparison is still doing here.
+        edited => {
+            root.text-edited();
+        }
     }
     // S7, THE BACKDROP: the click-away the first bridge got from the kit's window-level
     // on_mouse_down_out and that a TouchArea cannot express from inside a component. It covers

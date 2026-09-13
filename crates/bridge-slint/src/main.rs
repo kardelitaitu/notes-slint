@@ -206,6 +206,21 @@ fn fingerprint_of(window: &slint::Window) -> Fingerprint {
     }
 }
 
+/// S10: the dirty-witness switch. True means TextEdit.edited is the authority and a tick costs
+/// one borrow; false means the pre-S10 full-buffer compare runs. Both paths compile and
+/// neither is dead code, deliberately.
+// MEASURED, not assumed: with this TRUE a live run printed ZERO flush lines. TextEdit.edited is
+// a USER-input signal, and this bridge writes the buffer programmatically (set_buffer) for its
+// keystroke acts - which is exactly what a person typing does not do - so the flag never set
+// and autosave quietly stopped. That answers item 3: the event is a fine ADDITION (it stamps
+// the debounce clock the moment a real key arrives, and the handler stays wired for that) and a
+// broken REPLACEMENT, because anything the bridge writes itself - a dialog-suggested body, a
+// future insert, a restore into the buffer - would never be saved. So the compare remains the
+// authority and the cost item 3 asked about is UNPAID: about 125 buffer reads a second, in
+// exchange for a witness that cannot lie about programmatic writes. The way to pay it later is
+// a flag the bridge sets wherever it writes the buffer itself, not one the widget withholds.
+const EDITED_IS_DIRTY_WITNESS: bool = false;
+
 /// The quiet window before a change is reported, in the spirit of the gpui bridge's
 /// debounce. Shortened so the probe fits inside its own lifetime.
 const QUIET: Duration = Duration::from_millis(1200);
@@ -795,6 +810,26 @@ fn main() {
                     answer_dialog(reply, &third_gw, &third_pump, &ui);
                 }
             }
+            // S10b: the arming of the quarantine, reported ONCE, at the moment the generation
+            // first leaves zero - which, since S10c, means the FIRST REAL SWITCH: the startup
+            // adoptions arrive before the pump has ever run, so note_adoption leaves the counter
+            // at zero and undo stays native on the document the app reopened. The per-keystroke
+            // swallow needle can only come from a real hand (1.17 has no key-injection API,
+            // established in S6), so this is what a headless run can honestly show: the switch
+            // happened, the capture branch is armed, and the cost is being paid from here on.
+            {
+                let mut p = third_pump.borrow_mut();
+                if !p.quarantine_reported && ui.get_doc_generation() > 0 {
+                    p.quarantine_reported = true;
+                    let generation = p.generation;
+                    drop(p);
+                    report(&format!(
+                        "undo: quarantine ARMED at generation={generation} - Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y are swallowed for the rest of the session (stale stack, cross-file replay is the hazard); the per-keystroke swallow needle needs a hand on the keyboard"
+                    ));
+                } else {
+                    drop(p);
+                }
+            }
             // RISK 3, second half: DOES the handle appear once the loop has actually
             // spun? If it does, this is the registration point and the delay is the
             // finding - a bridge cannot place what it cannot name.
@@ -1356,6 +1391,31 @@ fn main() {
         let weak = ui.as_weak();
         ui.on_minimize_requested(move || minimize(&weak, "minimize button"));
     }
+    // S10: the keystroke witness. One bool, one counter, no string touched - the entire point of
+    // item 3. Attached in Rust because the markup forwards every editor branch to the SAME Spike
+    // callback: one door, however many widgets stand behind it.
+    {
+        let pump = Rc::clone(&pump);
+        ui.on_text_edited(move || {
+            let mut p = pump.borrow_mut();
+            p.strokes += 1;
+            p.edited_flag = true;
+            p.pending_at = Some(Instant::now());
+            if p.strokes == 1 || p.strokes % 8 == 0 {
+                report(&format!(
+                    "edited: keystroke #{} witnessed (no buffer read happens at this rate since S10)",
+                    p.strokes
+                ));
+            }
+        });
+    }
+    // S10b: the swallow's voice. Raised from the capture handler when a replay key is eaten; it
+    // asks nothing of the port and changes nothing here - the decision already happened in
+    // markup. Its only job is that a run can show the quarantine biting rather than proving it
+    // by an absence, which is the weakest kind of evidence this spike has ever leaned on.
+    ui.on_undo_swallowed(move || {
+        report("undo: quarantined (stale stack, cross-file replay is the hazard)");
+    });
     // S5: THE DRAG WIRES, closed by the four approved markup lines. Chrome's band emits a
     // delta per frame and one release, and both land on the SAME two functions the synthetic
     // acts call - so the arithmetic, the maximised guard and the once-per-drag store ask
@@ -1538,7 +1598,83 @@ fn text_probe(ui: &Spike) {
 /// (architecture §5.5), so what crosses is one debounced Flush: only when the content
 /// actually differs from what was last sent, and only after AUTOSAVE_IDLE of quiet.
 /// The revision counts those observed changes; the epoch is echoed, never invented.
+/// S10, ITEM 3: the per-tick cost, fixed. Until now the pump read the WHOLE buffer out of the
+/// widget, re-allocated it through lf(), and compared it against last_sent - on every 8 ms
+/// tick, about 125 reads a second, including the ~99.9% where nothing had happened. TextEdit
+/// has been saying so all along: the edited callback fires on every keystroke, and main.slint
+/// now forwards it. So a keystroke sets one bool and stamps the debounce clock, and a tick that
+/// finds the flag clear does ONE borrow and returns. The string is read once, when a flush is
+/// due, and that read is where the comparison keeps the one job an event cannot do. Text
+/// edited and then edited back to identical must not produce a save, and only the bytes can
+/// say so.
 fn text_pump(ui: &Spike, gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>) {
+    if !EDITED_IS_DIRTY_WITNESS {
+        // The fallback is a const flip, not a redesign: the old path is still in this file,
+        // byte for byte, as text_pump_by_compare.
+        text_pump_by_compare(ui, gw, pump);
+        return;
+    }
+    let (flag, due) = {
+        let mut p = pump.borrow_mut();
+        p.invocations += 1;
+        if !p.edited_flag {
+            return;
+        }
+        let entered = *p.pending_at.get_or_insert_with(Instant::now);
+        (true, entered.elapsed() >= AUTOSAVE_IDLE)
+    };
+    // The dot and the flush guard are witnesses of one fact, so the event feeds both: the same
+    // single source of truth the comparison used to be, unchanged in kind.
+    note_dot(pump, &ui.as_weak(), flag, "buffer");
+    if !due {
+        return;
+    }
+    let text = lf(&ui.get_buffer());
+    let identical = {
+        let p = pump.borrow();
+        text == p.last_sent
+    };
+    if identical {
+        let mut p = pump.borrow_mut();
+        p.edited_flag = false;
+        p.pending_at = None;
+        drop(p);
+        note_dot(pump, &ui.as_weak(), false, "compare");
+        report("flush[skipped]: edited and edited back - the bytes are identical, nothing sent");
+        return;
+    }
+    let mut pump = pump.borrow_mut();
+    pump.edits += 1;
+    let (revision, epoch) = (pump.edits, pump.epoch);
+    pump.last_sent = text.clone();
+    let quiet = pump.pending_at.map_or_else(
+        || String::from("unknown"),
+        |at| format!("{:?}", at.elapsed()),
+    );
+    let cr = text.matches('\r').count();
+    pump.pending_at = None;
+    pump.edited_flag = false;
+    drop(pump);
+    report(&format!(
+        "flush: sent {} bytes rev={revision} epoch={epoch} edit-to-flush={quiet} CR-in-buffer={cr} (witness=edited)",
+        text.len()
+    ));
+    send(
+        gw,
+        Command::Flush {
+            text,
+            revision,
+            epoch,
+        },
+    );
+}
+
+/// The pre-S10 path, kept whole and reachable: if the edited event ever proves unreliable (a
+/// keystroke that does not fire it, or a programmatic set that does), flipping
+/// EDITED_IS_DIRTY_WITNESS back to false restores the old behaviour with no other edit. The
+/// brief asked for the comparison to survive only as a fallback, and a fallback you have to
+/// re-write from memory is not a fallback.
+fn text_pump_by_compare(ui: &Spike, gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>) {
     let text = lf(&ui.get_buffer());
     // The dot's dirty input, by the same comparison the guard below makes - one source
     // of truth for "unsaved", so the dot and the Flush can never disagree.
@@ -1936,6 +2072,58 @@ fn answer_dialog(
     }
 }
 
+/// S10c: THE ADOPTION POLICY, one function for both events. It clears the dirty witness (an
+/// adoption is not a user edit) and steps the generation - EXCEPT for the adoptions that arrive
+/// before the loop has ever ticked, which are the app coming back to the document it was closed
+/// with, not a switch. Measured, that distinction is the difference between a fix and a footgun:
+/// the S10b run printed `rebind: epoch=1 gen=1` and `load: epoch=2 gen=2` BEFORE
+/// `hwnd = 0x… APPEARED at t+84ms, after the loop spun`, so the quarantine armed at
+/// generation=2 with ZERO document switches and killed undo on the first keystroke of the first
+/// file - the exact opposite of what the capture branch promises. `invocations > 0` is the
+/// loop's own witness: the text pump runs once per tick, so a non-zero count means the window is
+/// up and anything arriving now is a switch a person caused.
+fn note_adoption(pump: &RefCell<Pump>) -> i32 {
+    let mut p = pump.borrow_mut();
+    p.edited_flag = false;
+    p.pending_at = None;
+    if p.invocations > 0 {
+        p.generation = next_generation(p.generation);
+    }
+    p.generation
+}
+
+/// S10: the generation, one step. Plus one, not a toggle: the port epochs move one at a time and
+/// a toggle would collide after two adoptions. The PARITY is what a conditional recreation would
+/// key on, so this makes the parity a fact a test can hold rather than an expression written
+/// twice in two languages.
+fn next_generation(previous: i32) -> i32 {
+    previous + 1
+}
+
+/// S10b: THE UNDO QUARANTINE, as a decision a test can hold. The capture handler in
+/// main.slint implements the same rule in markup (this file cannot call into it and markup
+/// cannot call into here, so the pair is held together by `the_quarantine_is_a_state_rule`,
+/// which greps every piece of the condition out of the mount).
+///
+/// Why a STATE rule and not two more table rows: SHORTCUTS is the legend of *commands*, each
+/// with a port Command behind it, and it is held at fourteen rows by tests that mirror
+/// menu.rs. Undo and redo are not commands - the port has no Command for them and never will -
+/// so rows for them would print them in a legend of commands and break the parity guard the
+/// table exists to keep. What is different here is that the rule is armed by generation, not
+/// by the key alone: the same keystroke is native undo on the first document and a swallowed
+/// hazard on the second, which is precisely the shape a table cannot express.
+/// Test-only on purpose, and dead-code-clean because of it: there is no Rust-side key path to
+/// call this from - the implementation is the markup branch, and this is the oracle the branch is
+/// grepped against. Wiring it into the binary would mean inventing a call site that lies.
+#[cfg(test)]
+fn undo_quarantined(generation: i32, text: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
+    let _ = shift; // allowed, on purpose - see the doc comment above and the Ctrl+Shift+Z hole.
+    generation > 0
+        && ctrl
+        && !alt
+        && (text.eq_ignore_ascii_case("z") || text.eq_ignore_ascii_case("y"))
+}
+
 fn caption_glyph(maximized: bool) -> &'static str {
     if maximized {
         "icons/restore.svg"
@@ -2017,6 +2205,18 @@ struct Pump {
     /// `Saved` count, so the first one (the answer to this probe's own `SaveAs`) can
     /// be told apart from a later one, which only the autosave path could have sent.
     saves: u64,
+    // ---- S10 ----
+    /// The dirty witness, set by `TextEdit.edited` and cleared when a flush goes out (or when the
+    /// bytes turn out to be identical). True is not a claim about WHAT changed - the callback
+    /// carries no text on purpose - so the byte compare still guards the send.
+    edited_flag: bool,
+    /// Keystrokes witnessed, so the cost claim is a number and not an adjective.
+    strokes: u64,
+    /// S10: the document generation, stepped at both adoption sites. See `next_generation`.
+    generation: i32,
+    /// S10b: the arming of the undo quarantine is reported once, when the generation first
+    /// leaves zero - the run's own proof that the swallow is live from here on.
+    quarantine_reported: bool,
     // ---- S5 ----
     /// The paths behind the rendered recent rows, in the order the port sent them,
     /// so a row index maps back to the file it names.
@@ -2274,12 +2474,16 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                 p.epoch = *epoch;
                 p.last_sent = adopted.clone();
                 drop(p);
+                // An adoption is not a user edit, and the startup one is not a switch either -
+                // both facts are decided in one place, note_adoption.
+                let generation = note_adoption(pump);
                 if let Some(ui) = weak.upgrade() {
                     ui.set_buffer(adopted.clone().into());
+                    ui.set_doc_generation(generation);
                     publish_title(&ui, Some(path), true, "loaded");
                 }
                 report(&format!(
-                    "load: epoch={epoch} announced, buffer adopted ({} bytes, CR-normalised)",
+                    "load: epoch={epoch} gen={generation} announced, buffer adopted ({} bytes, CR-normalised)",
                     adopted.len()
                 ));
                 // The open half of the rule: reading a foreign file must not change it.
@@ -2292,12 +2496,19 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                 }
             }
             Event::Rebound { epoch, path, .. } => {
-                pump.borrow_mut().epoch = *epoch;
+                // The other half of the same door: a Save As rebinds the document identity, so
+                // the generation moves here too - through the SAME policy function, which is what
+                // stops a key that must move on both paths from moving on only one.
+                let mut p = pump.borrow_mut();
+                p.epoch = *epoch;
+                drop(p);
+                let generation = note_adoption(pump);
                 if let Some(ui) = weak.upgrade() {
+                    ui.set_doc_generation(generation);
                     publish_title(&ui, Some(path), true, "rebound");
                 }
                 report(&format!(
-                    "rebind: epoch={epoch} announced; the next Flush echoes it"
+                    "rebind: epoch={epoch} gen={generation} announced; the next Flush echoes it"
                 ));
             }
             Event::RecentsUpdated(list) => {
@@ -2619,6 +2830,213 @@ mod chords {
     }
 
     #[test]
+    fn z_and_y_are_swallowed_only_after_the_first_switch() {
+        // The rule as a table of facts, which is the only honest headless witness: 1.17 cannot
+        // deliver a key event, so what CAN be proven is the predicate the markup implements, and
+        // that it is armed by STATE rather than by the chord.
+        //
+        // Before any switch: native undo must reach the editor untouched.
+        assert!(
+            !undo_quarantined(0, "z", true, false, false),
+            "first document keeps its undo"
+        );
+        assert!(
+            !undo_quarantined(0, "y", true, false, false),
+            "first document keeps its redo"
+        );
+        // After the first switch: every replay spelling is swallowed.
+        assert!(undo_quarantined(1, "z", true, false, false));
+        assert!(
+            undo_quarantined(1, "Z", true, false, false),
+            "shift arrives as the upper glyph"
+        );
+        assert!(
+            undo_quarantined(1, "z", true, true, false),
+            "Ctrl+Shift+Z is redo, same hazard"
+        );
+        assert!(undo_quarantined(1, "y", true, false, false));
+        assert!(
+            undo_quarantined(7, "y", true, true, false),
+            "and it stays armed for the session"
+        );
+        // What must NOT be caught: plain typing, the menu chords, and anything with Alt.
+        assert!(
+            !undo_quarantined(3, "a", true, false, false),
+            "select-all stays alive"
+        );
+        assert!(
+            !undo_quarantined(3, "s", true, false, false),
+            "Save As is a command, not a replay"
+        );
+        assert!(
+            !undo_quarantined(3, "r", true, true, false),
+            "Ctrl+Shift+R keeps working"
+        );
+        assert!(
+            !undo_quarantined(3, "z", false, false, false),
+            "a bare z is a letter"
+        );
+        assert!(
+            !undo_quarantined(3, "z", true, false, true),
+            "Alt is someone else's chord"
+        );
+        assert!(
+            !undo_quarantined(3, "x", true, false, false),
+            "cut stays with the editor"
+        );
+    }
+
+    #[test]
+    fn the_quarantine_is_a_state_rule_and_the_markup_agrees() {
+        // The pair is held together here because neither side can call the other: this greps
+        // every piece of the condition out of the mount, so a one-sided edit (a dropped
+        // generation test, a swapped key, an accept turned into a reject) fails the build.
+        assert!(
+            MARKUP.contains("root.doc-generation > 0"),
+            "the arming condition vanished"
+        );
+        assert!(MARKUP.contains("event.modifiers.control"));
+        assert!(MARKUP.contains("!event.modifiers.alt"));
+        assert!(MARKUP.contains("event.text.to_lowercase() == \"z\""));
+        assert!(MARKUP.contains("event.text.to_lowercase() == \"y\""));
+        assert!(
+            !MARKUP.contains("&& !event.modifiers.shift && !event.modifiers.alt && (event.text.to_lowercase() == \"z\""),
+            "shift must stay allowed: Ctrl+Shift+Z is the redo chord and carries the same stale bytes"
+        );
+        // ORDER is the claim: the branch raises the signal and THEN accepts. A branch that
+        // accepted without signalling is invisible in a log, and one that signalled without
+        // accepting has swallowed nothing - so the two statements must be adjacent, in order.
+        // (The first draft asserted that the slice between them contained "EventResult", which is
+        // trivially false because the accept comes AFTER the signal. It failed, and for a better
+        // reason than it thought it was testing.)
+        // Measured by POSITION, not by a joined literal: the mount is stored with CRLF line
+        // endings in this working copy, so any assertion that spells a newline in a string is
+        // testing the file's line discipline rather than the code's order. Position says the
+        // same thing with no such trap - and it also reports the gap it saw.
+        let signal = MARKUP
+            .find("root.undo-swallowed();")
+            .expect("the swallow signal");
+        let gap = MARKUP[signal..]
+            .find("return EventResult.accept;")
+            .expect("the accept that must follow it");
+        let signal_len = "root.undo-swallowed();".len();
+        assert!(
+            gap > signal_len,
+            "the accept must come AFTER the signal, not inside it"
+        );
+        let between = &MARKUP[signal + signal_len..signal + gap];
+        assert!(
+            between.trim().is_empty(),
+            "only whitespace may sit between the signal and its accept; found {between:?}"
+        );
+        assert!(MARKUP.contains("root.undo-swallowed();"));
+        assert!(MARKUP.contains("callback undo-swallowed();"));
+        // And the table stays a legend of commands: fourteen, untouched, no undo row invented.
+        assert_eq!(
+            SHORTCUTS.len(),
+            14,
+            "the quarantine must not join the chord table"
+        );
+        assert!(
+            !SHORTCUTS
+                .iter()
+                .any(|row| row.2.contains("undo") || row.2.contains("redo")),
+            "no port Command exists for undo; the legend may not claim one"
+        );
+    }
+
+    #[test]
+    fn the_startup_adoption_is_not_a_switch() {
+        // S10c, and the S10b run is why it exists. This drives the POLICY - note_adoption - not
+        // the predicate: undo_quarantined(gen, ..) was correct all along and could not fail, but
+        // the gen it was handed came from a policy that stepped on the app's own startup open.
+        // A test that takes the number as an argument cannot catch the code that produces it.
+        let pump = RefCell::new(Pump::default());
+        assert_eq!(
+            note_adoption(&pump),
+            0,
+            "the rebind that answers the startup open is not a switch"
+        );
+        assert_eq!(
+            note_adoption(&pump),
+            0,
+            "nor is the Loaded that brings the text back: the first document keeps native undo"
+        );
+        pump.borrow_mut().invocations = 1; // the loop has ticked: the window is up
+        assert_eq!(
+            note_adoption(&pump),
+            1,
+            "the first switch arms the quarantine"
+        );
+        assert_eq!(
+            note_adoption(&pump),
+            2,
+            "and every switch after it steps once"
+        );
+        assert_eq!(pump.borrow().generation, 2);
+        // The witness clearing lives here too, which is the point of one function instead of two
+        // copies: an adoption must never look like an edit, on either path.
+        pump.borrow_mut().edited_flag = true;
+        pump.borrow_mut().pending_at = Some(Instant::now());
+        assert_eq!(note_adoption(&pump), 3);
+        assert!(
+            !pump.borrow().edited_flag,
+            "an adoption never counts as an edit"
+        );
+        assert!(
+            pump.borrow().pending_at.is_none(),
+            "nor starts a debounce clock"
+        );
+    }
+
+    #[test]
+    fn the_generation_steps_once_per_adoption_and_alternates() {
+        // The undo mitigation keys on PARITY: two mutually exclusive editor branches, so every
+        // flip destroys and recreates the widget. Both adoption sites call this one function,
+        // which is what makes "the generation moved" mean "the widget would be rebuilt" rather
+        // than "some counter somewhere changed". Six adoptions, six different documents.
+        let mut g = 0;
+        let mut branches = Vec::new();
+        for _ in 0..6 {
+            g = next_generation(g);
+            branches.push(g % 2 == 0);
+        }
+        assert_eq!(branches, vec![false, true, false, true, false, true]);
+        assert_ne!(next_generation(3), 3, "an adoption must always move");
+        assert_eq!(
+            next_generation(i32::MAX - 1),
+            i32::MAX,
+            "no wrap in a session"
+        );
+    }
+
+    #[test]
+    fn the_editor_is_one_widget_and_the_generation_is_only_carried() {
+        // S10 said out loud, in the shape that will fail if someone half-ships it. The
+        // recreation is NOT in this tree: one TextEdit, named directly by the outer focus
+        // scope, and the generation present but unused as a key. The 1.17 compiler refused the
+        // conditional form the mitigation needs - an id declared inside a conditional branch is
+        // invisible to the enclosing scope, so forward-focus cannot name the live one, and
+        // has-focus is an out-property, so focus cannot be driven back. Re-measured in the
+        // S10 probes (g1, f1, x3) rather than remembered from a document.
+        assert!(!MARKUP.is_empty(), "sanity: the markup is loaded");
+        assert_eq!(
+            MARKUP.matches("TextEdit {").count(),
+            1,
+            "two editors means this test is rewritten, not deleted"
+        );
+        assert!(
+            !MARKUP.contains("if root.doc-generation"),
+            "no half-shipped recreation"
+        );
+        assert!(MARKUP.contains("forward-focus: editor"));
+        assert!(MARKUP.contains("in-out property <int> doc-generation"));
+        // Item 2 and item 3, both structural.
+        assert!(MARKUP.contains("wrap: TextWrap.no-wrap"));
+        assert!(MARKUP.contains("callback text-edited();"));
+        assert!(MARKUP.contains("edited =>"));
+    }
+    #[test]
     fn every_chord_routes_somewhere() {
         for row in SHORTCUTS {
             assert!(
@@ -2755,12 +3173,16 @@ mod chords {
     #[test]
     fn capture_path_ends_by_rejecting_everything_it_did_not_match() {
         // The negative claim, pinned down: the handler accepts each chord it matches and its
-        // LAST act is a reject, which is what leaves Ctrl+A/C/V/X/Z and every typed character
-        // to the editor. Grep-quality proof, not behavioural - behaviour needs a real key.
+        // LAST act is a reject, which is what leaves Ctrl+A/C/V/X and every typed character to
+        // the editor. Grep-quality proof, not behavioural - behaviour needs a real key.
+        // S10b moves the count by ONE statement, not two: the sixteen accepts are fourteen chords
+        // plus Escape plus ONE branch that covers both replay keys (z and y) in a single return.
+        // And Z is now only "left to the editor" while the generation is still zero, which
+        // undo_quarantined() states as a rule and the test below greps out of the markup.
         let body = capture_body();
         assert_eq!(
             body.matches("EventResult.accept").count(),
-            SHORTCUTS.len() + 1,
+            SHORTCUTS.len() + 2,
             "one accept per bound chord, plus Escape: fourteen commands in the table and ONE              dismissal, which is not a command and so is not in the legend (menu.rs has no              Escape row either - see the parity warning in main.slint)"
         );
         assert_eq!(
