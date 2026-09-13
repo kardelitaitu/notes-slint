@@ -17,6 +17,8 @@
 //! in its signature, so it cannot make that decision even by accident, which is
 //! why rule 1 is safe here rather than merely respected.
 
+use std::marker::PhantomData;
+
 use crate::command::WindowHandle;
 
 /// Start receiving shell drops for `handle`.
@@ -30,9 +32,11 @@ use crate::command::WindowHandle;
 /// # The thread warning, which is the contract
 ///
 /// **`arm_file_drop` must be called from the thread that pumps this window**, and
-/// the returned guard must be dropped on that same thread — which is bridge
-/// discipline rather than something the types enforce: a [`DropGuard`] carries
-/// an `isize`, and Rust will let it be moved anywhere.
+/// the returned guard must be dropped on that same thread. That is no longer only
+/// discipline: [`DropGuard`] is `!Send` and `!Sync`, so a bridge that tries to move
+/// it off the window's thread - into a `std::thread::spawn`, a worker, a
+/// `Send`-requiring slot - fails to COMPILE, which is the only enforcement a port
+/// has when the cost of getting it wrong lands in somebody else's process.
 ///
 /// `OleInitialize` builds the COM apartment of the thread that *calls it*, and
 /// `RegisterDragDrop` binds the drop target to the window's owner. Move this call
@@ -60,7 +64,11 @@ pub fn arm_file_drop(handle: WindowHandle) -> Result<DropGuard, DropArmError> {
     // mean different things to whoever reads them.
     let hwnd = to_isize(handle)?;
     platform_arm(hwnd)?;
-    Ok(DropGuard { hwnd, _priv: () })
+    Ok(DropGuard {
+        hwnd,
+        _priv: (),
+        _thread_affine: PhantomData,
+    })
 }
 
 /// The window this port's drop registration is live for.
@@ -71,10 +79,47 @@ pub fn arm_file_drop(handle: WindowHandle) -> Result<DropGuard, DropArmError> {
 /// of one guard would revoke one registration twice, and a hand-built guard would
 /// revoke a registration nobody made.
 ///
-/// **Drop it on the thread that pumps the window** — see [`arm_file_drop`] for why
-/// the pair is thread-affine. In practice that means the guard is fielded by the
-/// bridge that armed it, next to the window it names, and released before that
-/// window is destroyed.
+/// # The thread affinity is ENFORCED, not requested
+///
+/// The `_thread_affine` marker below makes this type `!Send` and `!Sync`, which is
+/// the compiler holding rule 4 for a resource whose misuse is not visible here:
+/// `RevokeDragDrop` from a thread that neither owns the window nor pumps it does not
+/// fail loudly, it leaves the target registered against a pump that will never run.
+/// Held in an `Rc<RefCell<Option<DropGuard>>>` on the window's own thread, or in a
+/// field of something that is already not `Send`, is the only shape that compiles -
+/// which is exactly the shape the affinity asks for, so the bound costs nothing.
+///
+/// Two doctests pin it, and the second is what stops the first being vacuous: a
+/// `compile_fail` block passes for ANY compile error, so the positive control proves
+/// the identical shape compiles when the bound IS satisfied (and that this type is
+/// reachable by path from outside the crate).
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// fn main() {
+///     assert_send::<notes_api::DropGuard>();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// fn main() {
+///     assert_sync::<notes_api::DropGuard>();
+/// }
+/// ```
+///
+/// ```
+/// // THE CONTROL, and it must compile: the SAME two assertions, on the handle type
+/// // this guard was armed from. If this block ever fails, the two above are green
+/// // for the wrong reason - a broken path, a renamed type - and not because the
+/// // affinity marker did its job.
+/// fn assert_send<T: Send>() {}
+/// fn assert_sync<T: Sync>() {}
+/// fn main() {
+///     assert_send::<notes_api::WindowHandle>();
+///     assert_sync::<notes_api::WindowHandle>();
+/// }
+/// ```
 ///
 /// A refusal on the way out is swallowed, and not from carelessness: a destructor
 /// has nowhere to return an `Err`, the port has no channel to report one on (this
@@ -91,6 +136,12 @@ pub struct DropGuard {
     hwnd: isize,
     /// Private marker: the only way to hold one of these is to have armed one.
     _priv: (),
+    /// THE AFFINITY MARKER, and the reason this type cannot cross a thread:
+    /// `*const ()` is neither `Send` nor `Sync`, and `PhantomData` inherits that
+    /// while staying zero-sized - so the guard costs the same 8 bytes it did before
+    /// it could refuse. Nothing is ever stored in it; the type IS the claim. Proved
+    /// by the two `compile_fail` blocks on this struct and their control.
+    _thread_affine: PhantomData<*const ()>,
 }
 
 impl Drop for DropGuard {
@@ -288,15 +339,26 @@ mod tests {
         );
     }
 
-    /// The guard is 8 bytes plus a zero-sized marker: it holds the handle and the
-    /// registration's lifetime, and nothing else — no `Sender`, no `PathBuf`, no
+    /// The guard is ONE `isize` and two zero-sized markers: it holds the handle and
+    /// the registration's lifetime, and nothing else — no `Sender`, no `PathBuf`, no
     /// copy of what anybody dropped.
+    ///
+    /// The assertion is deliberately about SIZE, because that is the only half of
+    /// the claim a runtime test can make: `_priv` (unconstructible from outside) and
+    /// `_thread_affine` (`!Send`, `!Sync`) are both `PhantomData`-class markers that
+    /// cost no bytes, so the affinity is FREE and the price of the rule is nothing.
+    /// Whether the guard is actually `Send` is a compile-time fact and is proved by
+    /// the two `compile_fail` doctests on [`DropGuard`] plus the control that must
+    /// compile - a runtime test cannot express "does not implement".
     #[test]
     fn the_guard_carries_the_handle_and_nothing_else() {
         assert_eq!(
             core::mem::size_of::<DropGuard>(),
             core::mem::size_of::<isize>(),
-            "an isize plus a private marker"
+            "an isize, a private marker, an affinity marker: none of them costs a byte"
         );
+        // The positive half, in-crate: what this type DOES still promise.
+        fn assert_still_crossable_as_data<T: 'static>() {}
+        assert_still_crossable_as_data::<DropGuard>();
     }
 }

@@ -602,7 +602,9 @@ impl Engine {
     }
 
     /// THE DROP DOOR: ask the host what has been dropped since the last ask, and
-    /// hand every path to the same [`Self::handle`] the loop's own Ok arm uses.
+    /// hand the FIRST path to the same [`Self::handle`] the loop's own Ok arm uses.
+    /// One wake opens one file; what happens to the rest of a multi-file drop, and
+    /// why that is not "all of them", is stated at the end of this method.
     ///
     /// The `Open` is not sent anywhere. It is not queued, no `Sender` is touched,
     /// nothing is waited on, and the thread does not change: this is a direct call
@@ -663,7 +665,36 @@ impl Engine {
             Some(backend) => backend.take_dropped_paths(),
             None => return,
         };
-        for path in paths {
+        // ONE WAKE, ONE OPEN: the FIRST path is opened and the rest are discarded.
+        //
+        // REVIEWER FINDING (FIX-B, MINOR). This used to be `for path in paths`, and
+        // the shape of what that meant was wrong even though every individual Open
+        // was right: a multi-file drop is one gesture - Explorer hands over the whole
+        // set in one `IDropTarget::Drop` - and N chained Opens in one wake produce
+        // ONE surviving document (the last), because each Open rebinds the buffer the
+        // next one replaces. So the user dropped four files, saw one, and got FOUR
+        // recents entries and four session writes for documents they never looked at,
+        // in an order Explorer does not promise. Chaining was not "opens them all";
+        // it was "opens them all and hides all but the last".
+        //
+        // WHY DISCARD RATHER THAN QUEUE, WHICH IS THE PART THAT OWES A POLICY. Every
+        // alternative costs a decision this crate is forbidden to make: showing a
+        // second document means either a tab/instance model this app has ruled out
+        // (AGENTS.md, non-goals: tabs, and one document per window), or asking the
+        // user which of the dropped files wins - and that question belongs to the
+        // unsaved-text policy that does not exist yet (an Open onto a dirty buffer is
+        // still decided by the bridge's flush discipline, not by a queue here). A
+        // deferred second file would also need somewhere to live: an engine-side
+        // pending-drop list would be a SECOND buffer the port owns and the bridge
+        // cannot see, which is precisely the shape rule 1 refuses. So the deferral
+        // needs a brief, not a for-loop, and until it has one the honest behaviour
+        // is the one this line can justify: the gesture's first file is opened, the
+        // rest are dropped rather than half-applied.
+        //
+        // Discarded here means DISCARDED, not hidden: no event, no log, no retry,
+        // because the port has nothing to say about a file it was not told to act on
+        // (and an event would be a vocabulary change smuggled in as a bug fix).
+        if let Some(path) = paths.into_iter().next() {
             // Flow is ignored on purpose: only `Shutdown` returns `Exit`, and this
             // is an `Open`. A dropped file must never become a quit path.
             let _ = self.handle(Command::Open { path });
@@ -2919,6 +2950,44 @@ mod tests {
         assert_eq!(
             engine.deadline, autosave,
             "and two poll wakes still wrote no state"
+        );
+    }
+
+    /// FIX-B (MINOR): one gesture, one open. A multi-file drop is ONE
+    /// `IDropTarget::Drop` handing several paths over in one wake, and chaining an
+    /// Open per path did not "open them all" - each Open rebinds the buffer the next
+    /// replaces, so the user ended up looking at the LAST file after N recents
+    /// entries and N session writes for documents they never saw. The first is now
+    /// opened and the rest discarded (the policy that would choose differently does
+    /// not exist yet - see `Engine::poll_drops`).
+    ///
+    /// Asserted as the pair that makes the claim exact: the first path's `Loaded`,
+    /// the whole buffer consumed, and NO event at all for the second - including no
+    /// `LoadFailed`, which `loaded()` trips on. A discard that reported a failure
+    /// would be a refusal, and a refusal is a decision this port may not make.
+    #[test]
+    fn one_wake_opens_the_first_dropped_path_and_discards_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("01-first.notes");
+        let second = dir.path().join("02-second.notes");
+        std::fs::write(&first, "first\n").expect("write first");
+        std::fs::write(&second, "second\n").expect("write second");
+        let queued: DropQueue =
+            std::sync::Arc::new(std::sync::Mutex::new(vec![first.clone(), second.clone()]));
+        let takes: DropTakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut engine, events) = drop_wired(queued.clone(), takes, dir.path());
+
+        engine.next_drop = Instant::now();
+        engine.on_tick();
+
+        assert_eq!(
+            loaded(drain(&events)),
+            vec![first],
+            "the wake opens the FIRST path of the gesture and nothing else"
+        );
+        assert!(
+            queued.lock().unwrap().is_empty(),
+            "the take drained the whole buffer, so the second cannot come back later"
         );
     }
 
