@@ -63,9 +63,14 @@ pub fn arm_file_drop(handle: WindowHandle) -> Result<DropGuard, DropArmError> {
     // so it is a caller with no window yet, not an OS failure, and the two answers
     // mean different things to whoever reads them.
     let hwnd = to_isize(handle)?;
-    platform_arm(hwnd)?;
+    // The platform reports one fact about how the arming succeeded, and this module
+    // carries it across the port unchanged: `took_over` is `notes-platform`'s
+    // answer, translated at the boundary into a type this crate may name. What the
+    // bridge DOES with it is above the port, as ever.
+    let took_over = platform_arm(hwnd)?;
     Ok(DropGuard {
         hwnd,
+        took_over,
         _priv: (),
         _thread_affine: PhantomData,
     })
@@ -134,6 +139,12 @@ pub struct DropGuard {
     /// A number, not a lease: it names no window by itself, and `disarm` re-checks
     /// it the way every other `notes-platform` seam does.
     hwnd: isize,
+    /// `notes-platform`'s answer from the arming call: did this arm take the
+    /// window over from a target that was already there (its own comment says a
+    /// re-arm of our own registration reports FALSE, so this is not "was armed
+    /// twice"). Copied at construction and never re-read from the OS, because the
+    /// question is about the moment of arming and only the moment of arming.
+    took_over: bool,
     /// Private marker: the only way to hold one of these is to have armed one.
     _priv: (),
     /// THE AFFINITY MARKER, and the reason this type cannot cross a thread:
@@ -142,6 +153,20 @@ pub struct DropGuard {
     /// it could refuse. Nothing is ever stored in it; the type IS the claim. Proved
     /// by the two `compile_fail` blocks on this struct and their control.
     _thread_affine: PhantomData<*const ()>,
+}
+
+impl DropGuard {
+    /// Did arming this window displace somebody else's drop target?
+    ///
+    /// The only fact platform reports about a successful arm, and it is a fact
+    /// about the PAST (what the pre-emptive revoke found), so it does not change
+    /// over the guard's life and needs no lock to read. What to say about a true
+    /// answer belongs to the bridge: on Windows today the displaced target is
+    /// winit's own handler, which is the deal this port struck deliberately.
+    #[must_use]
+    pub fn took_over(&self) -> bool {
+        self.took_over
+    }
 }
 
 impl Drop for DropGuard {
@@ -203,16 +228,21 @@ fn to_isize(handle: WindowHandle) -> Result<isize, DropArmError> {
 /// The cfg is a build fact, not a decision, which is the
 /// same reason `gateway::platform_host` is split in two.
 #[cfg(windows)]
-fn platform_arm(hwnd: isize) -> Result<(), DropArmError> {
-    notes_platform::windows::file_drop::arm(hwnd).map_err(|error| match error {
-        notes_platform::PlatformError::InvalidHandle => DropArmError::InvalidHandle,
-        other => DropArmError::Ole(other.to_string()),
-    })
+fn platform_arm(hwnd: isize) -> Result<bool, DropArmError> {
+    notes_platform::windows::file_drop::arm(hwnd)
+        // The struct crosses here and no further: `DropArm` is a platform type and
+        // the port may not name one, so the field is read at the boundary and the
+        // fact travels as a bool. Nothing is decided about it.
+        .map(|arm| arm.took_over)
+        .map_err(|error| match error {
+            notes_platform::PlatformError::InvalidHandle => DropArmError::InvalidHandle,
+            other => DropArmError::Ole(other.to_string()),
+        })
 }
 
 /// See [`platform_arm`].
 #[cfg(not(windows))]
-fn platform_arm(_hwnd: isize) -> Result<(), DropArmError> {
+fn platform_arm(_hwnd: isize) -> Result<bool, DropArmError> {
     Err(DropArmError::Unsupported)
 }
 
@@ -339,9 +369,9 @@ mod tests {
         );
     }
 
-    /// The guard is ONE `isize` and two zero-sized markers: it holds the handle and
-    /// the registration's lifetime, and nothing else — no `Sender`, no `PathBuf`, no
-    /// copy of what anybody dropped.
+    /// The guard is ONE `isize`, ONE `bool` and two zero-sized markers: it holds the
+    /// handle, the one fact platform reported, and the registration's lifetime, and
+    /// nothing else — no `Sender`, no `PathBuf`, no copy of what anybody dropped.
     ///
     /// The assertion is deliberately about SIZE, because that is the only half of
     /// the claim a runtime test can make: `_priv` (unconstructible from outside) and
@@ -354,8 +384,9 @@ mod tests {
     fn the_guard_carries_the_handle_and_nothing_else() {
         assert_eq!(
             core::mem::size_of::<DropGuard>(),
-            core::mem::size_of::<isize>(),
-            "an isize, a private marker, an affinity marker: none of them costs a byte"
+            core::mem::size_of::<(isize, bool)>(),
+            "one word and a bool that lands in the padding the alignment already \
+             reserves: the report is free, and the two markers cost no bytes"
         );
         // The positive half, in-crate: what this type DOES still promise.
         fn assert_still_crossable_as_data<T: 'static>() {}
