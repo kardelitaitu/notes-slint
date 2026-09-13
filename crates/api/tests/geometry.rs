@@ -60,6 +60,25 @@ fn wait_for_calls(host: &Host, at_least: usize, what: &str) {
     }
 }
 
+/// The idle cadence, and therefore the wait a two-sample claim needs: the
+/// engine's own tick is AUTOSAVE_IDLE (750 ms) and the MAJOR-5 guard is TWO
+/// idle periods, so a test that counts SAMPLES counts them in ticks, not in
+/// milliseconds it hopes for.
+const AUTOSAVE_TICK: Duration = Duration::from_millis(750);
+
+/// Waits for at_least `restore_frame_rect` READS, on the same clock as
+/// [`wait_for_calls`]: registration is asynchronous and the flush decides for
+/// itself WHEN a measure is allowed (the MAJOR-5 guard bars it for two idle
+/// periods), so a test that is about SAMPLES waits on the receipt, never on a
+/// millisecond it hopes for.
+fn wait_for_reads(host: &Host, at_least: usize, what: &str) {
+    let deadline = Instant::now() + ANSWER * 2;
+    while host.restore_reads() < at_least {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// D40, in one assertion set: one move, frame pixels, scale 1.0, the CLAMPED
 /// rect. The input rect hangs 780 px off a 1920 work area - 20 visible pixels,
 /// under the port's MIN_VISIBLE of 32 - so the clamp has real work to do, and
@@ -369,6 +388,190 @@ fn an_unanswered_show_state_writes_the_rect_and_keeps_the_session_write_armed() 
         settled.rect,
         Rect::new(320, 240, 1024, 768),
         "and the retry cost the rect nothing: both halves came from one measure"
+    );
+    gateway.close().expect("shutdown joins the engine");
+}
+
+/// THE 1.92 s REPRO, HEADLESS. A window that was NEVER maximised answered
+/// showCmd == 3 (Maximized) exactly ONCE, while it settled: the real HWND
+/// appeared +94 ms after launch, so the first measure the MAJOR-5 guard allows
+/// (two idle periods after the registration's async move, t~1.59 s) read a
+/// maximised window that did not exist yet, and the port persisted
+/// maximized: true from that single sample at t~1.92 s. Every answer after it
+/// was Unknown - which the port already treats as "leave the bit alone", so the
+/// stale true survived, and because the show half of that write was never
+/// COMPLETE the pending bit stayed armed and kept re-writing the lie. A
+/// never-maximised app came back maximised, and no lane asserted otherwise.
+///
+/// THE DISCIPLINE THIS PINS: the show bit gets the SAME discipline the rect has
+/// always had - a measurement is only a fact when it repeats. One transient
+/// sample must never change the persisted bit. The rect is held AT REST here
+/// (800x600@120,90, the port's own default) because the repro's tell was that
+/// the window never moved: only the bit did.
+#[test]
+fn a_single_transient_maximised_sample_never_persists_the_bit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(
+        !dir.path().join("session.json").is_file(),
+        "a fresh install: whatever lands in the file is a claim the port made"
+    );
+    let at_rest = FrameRect::new(120, 90, 800, 600);
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(at_rest),
+            // The transient: the FIRST measure the guard allows says maximised.
+            restore_show: ShowState::Maximized,
+            ..Answers::default()
+        },
+    );
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+
+    // restore_frame_rect is called from exactly one site, and only when no move
+    // is in flight, so THIS read is the first allowed measure. From here the
+    // answer is honest again: Unknown, like a window that is settling, or
+    // minimised, or simply was never maximised.
+    wait_for_reads(&host, 1, "the first allowed measure");
+    host.set_restore_show(ShowState::Unknown);
+    // Three idle periods: the second confirming sample had every chance to
+    // arrive, and the file has every chance to be written again by a flush that
+    // still believes the bit is unsettled.
+    std::thread::sleep(3 * AUTOSAVE_TICK);
+
+    let persisted = read_session(dir.path()).expect("a fresh install must persist");
+    assert!(
+        !persisted.maximized,
+        "one transient showCmd==3 sample persisted the bit: the window was never \
+         maximised, its rect never moved, and every answer after the first was \
+         Unknown: {persisted:?}"
+    );
+    assert_eq!(
+        persisted.rect,
+        Rect::new(120, 90, 800, 600),
+        "and the rect stored beside it is the one at rest, so nothing else \
+         explains the bit: {persisted:?}"
+    );
+    assert!(
+        host.restore_reads() >= 2,
+        "the proof needs a SECOND sample to have been taken and refused: reads {}",
+        host.restore_reads()
+    );
+    gateway.close().expect("shutdown joins the engine");
+}
+
+/// THE SAME DISCIPLINE SYMMETRICALLY, and in the direction that LOSES a state
+/// the user really left behind rather than inventing one: a window seeded
+/// maximised (last launch was maximised, and it still is) that answers
+/// SW_SHOWNORMAL exactly once while it settles must not have its bit cleared.
+/// maximized: false is a CHANGE too, so it costs the same two samples.
+#[test]
+fn a_single_transient_normal_sample_never_clears_a_stored_maximised_bit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_session(
+        dir.path(),
+        &Session {
+            rect: Rect::new(120, 90, 800, 600),
+            maximized: true,
+            ..Session::default()
+        },
+    )
+    .expect("seed the maximised fixture");
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(FrameRect::new(120, 90, 800, 600)),
+            restore_show: ShowState::Normal,
+            ..Answers::default()
+        },
+    );
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    // The no-move branch issues no async move, so the first flush tick is
+    // already an allowed measure: the transient does not need a guard to hide in.
+    wait_for_reads(&host, 1, "the first measure");
+    host.set_restore_show(ShowState::Unknown);
+    std::thread::sleep(3 * AUTOSAVE_TICK);
+
+    let persisted = read_session(dir.path()).expect("the session persisted");
+    assert!(
+        persisted.maximized,
+        "one transient SW_SHOWNORMAL sample cleared a maximised window's bit: the \
+         latch is symmetric, because a false change costs the user the state they \
+         actually left: {persisted:?}"
+    );
+    gateway.close().expect("shutdown joins the engine");
+    let final_state = read_session(dir.path()).expect("still there after the quit");
+    assert!(
+        final_state.maximized,
+        "and the quit must not undo it either: {final_state:?}"
+    );
+}
+
+/// M9, THE POSITIVE HALF ACROSS TICKS: a REAL maximise is not one sample, it is
+/// the window answering the same thing on every flush until the user says
+/// otherwise - so the latch must not swallow it. No quit, no guard lift, no
+/// last-chance flush: the bit reaches session.json because TWO measures agreed,
+/// which is the whole claim, and it stays there when the seam goes mute.
+#[test]
+fn two_consecutive_maximised_samples_persist_the_bit_without_any_quit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_session(
+        dir.path(),
+        &Session {
+            rect: Rect::new(120, 90, 800, 600),
+            ..Session::default()
+        },
+    )
+    .expect("seed the un-maximised fixture");
+    let (gateway, _rx, host) = start_with(
+        dir.path(),
+        Answers {
+            restore: Some(FrameRect::new(120, 90, 800, 600)),
+            restore_show: ShowState::Maximized,
+            ..Answers::default()
+        },
+    );
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+
+    let deadline = Instant::now() + ANSWER * 2;
+    let confirmed = loop {
+        if let Ok(session) = read_session(dir.path()) {
+            if session.maximized {
+                break session;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a window that answered Maximized on every tick never persisted the bit \
+             (reads {}): the latch must not swallow a real maximise",
+            host.restore_reads()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        host.restore_reads() >= 2,
+        "the bit arrived from ONE measure, not two confirming ones: reads {}",
+        host.restore_reads()
+    );
+    // And a seam that goes mute afterwards does not take it back: Unknown is the
+    // absence of an answer, never a No.
+    host.set_restore_show(ShowState::Unknown);
+    std::thread::sleep(2 * AUTOSAVE_TICK);
+    assert_eq!(
+        read_session(dir.path()).expect("still there"),
+        confirmed,
+        "a confirmed maximise must survive a mute seam"
     );
     gateway.close().expect("shutdown joins the engine");
 }

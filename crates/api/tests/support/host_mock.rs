@@ -155,6 +155,18 @@ impl Host {
         *lock(&self.shared.answers) = answers;
     }
 
+    /// Moves ONLY the show answer, leaving every other answer exactly where it
+    /// was. The fixtures that are ABOUT the bit need this: the claim under test
+    /// is that one transient `SW_SHOWMAXIMIZED` sample must never reach the
+    /// file, and that is only provable if the rect the fake reports does not
+    /// change at the same moment - a test that swapped the whole world could not
+    /// tell a latch failure from a rect move. [`Self::set_answers`] replaces
+    /// everything; this replaces the one question the sample answers.
+    pub fn set_restore_show(&self, show: ShowState) {
+        let mut answers = self.answers();
+        answers.restore_show = show;
+    }
+
     /// Every [`set_frame_rect`]: (handle, rect, scale). The assertions in
     /// tests/geometry.rs are about this list - its length, its rect, and the scale.
     pub fn moves(&self) -> Vec<(isize, FrameRect, f32)> {

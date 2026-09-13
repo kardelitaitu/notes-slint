@@ -160,14 +160,18 @@ enum Target {
 /// different things.
 ///
 /// `rect` says a position was read, so the stored rect may be replaced.
-/// `show` says the platform ALSO answered the maximised question -
-/// `Maximized` or `Normal`, not [`ShowState::Unknown`]. A write retired on a
-/// measure that skipped that question is a write that never comes back for
-/// it: a GeometryChanged tick landing on a minimised window stores the rect,
-/// leaves `session.maximized` exactly as it found it, and would otherwise
-/// clear the pending bit with the user's last-seen state still unwritten
-/// (maximise, minimise, quit: the bit is lost). So the rect may write, but
-/// only a COMPLETE measure may retire it.
+/// `show` says the maximised question is SETTLED for this write: the answer -
+/// or the lack of one - needs nothing further from a later tick. Three states
+/// settle it: the seam answered [`ShowState::Unknown`] and no confirmation is
+/// half-built, an answering sample AGREED with the stored bit, or a CHANGE was
+/// confirmed and applied (see [`Engine::note_show_sample`]). Everything else
+/// leaves it unsettled, which is how the write stays armed for the second
+/// sample. A write retired on a measure that skipped that question is a write
+/// that never comes back for it: a GeometryChanged tick landing on a minimised
+/// window stores the rect, leaves `session.maximized` exactly as it found it,
+/// and would otherwise clear the pending bit with the user's last-seen state
+/// still unwritten (maximise, minimise, quit: the bit is lost). So the rect
+/// may write, but only a COMPLETE measure may retire it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Measurement {
     rect: bool,
@@ -317,6 +321,16 @@ pub(crate) struct Engine {
     /// position - true of the screen for a moment, poison for the file. The
     /// flush refuses to store a rect measured inside that window.
     last_move_issued: Option<Instant>,
+    /// THE SHOW BIT'S CONFIRMATION STREAK: the last ANSWERING show state
+    /// (maximised or not - never Unknown) and how many measures in a row
+    /// answered it that way. A CHANGE to `session.maximized` needs
+    /// [`Engine::SHOW_CONFIRMATIONS`] of these before it is applied, for the
+    /// same reason `last_move_issued` exists for the rect: one read of a
+    /// settling window is a measurement in progress, not a fact. An Unknown
+    /// answer neither extends nor breaks the streak - it is the absence of a
+    /// sample, and a window that is minimised at one tick and visible at the
+    /// next is still the same window.
+    show_streak: Option<(bool, u32)>,
     /// F3 (the retry half of the pin readback): the pin state the platform
     /// last CONFIRMED by reading the window's style back, or `None` when
     /// nothing is confirmed - no apply has run, or the last apply was refused.
@@ -412,6 +426,7 @@ impl Engine {
             measure_failure_latched: false,
             epoch: 0,
             last_move_issued: None,
+            show_streak: None,
             // Nothing is a fact about the window until an apply has read it
             // back, including on a restart whose session.json says `pinned`.
             pin_confirmed: None,
@@ -469,7 +484,9 @@ impl Engine {
                 // before the Sender is dropped, so a failure is still REPORTED and
                 // still reaches whoever owns the channel.
                 Err(RecvTimeoutError::Disconnected) => {
-                    self.flush_state();
+                    // The abort IS a last chance: this is the flush after which the thread
+                    // ends, so a show sample taken here has no later tick either.
+                    self.flush_state(true);
                     break;
                 }
             }
@@ -506,7 +523,9 @@ impl Engine {
     }
 
     fn on_tick(&mut self) {
-        self.flush_state();
+        // A tick is never the last chance: there is always another tick, and a show
+        // bit that changed on one sample is waiting for its second there.
+        self.flush_state(false);
         self.deadline = Instant::now() + AUTOSAVE_IDLE;
     }
 
@@ -524,6 +543,14 @@ impl Engine {
                 // by hand. That guard is the difference between a restore and a theft.
                 let first = self.window.is_none();
                 self.window = Some(handle);
+                if first {
+                    // F3's rule, applied to the show streak: a streak was a
+                    // measurement of THAT window. A recreate settles all over again -
+                    // which is exactly the transient the 1.92 s repro was - so the
+                    // count starts from nothing, not from whatever the window that
+                    // died was answering.
+                    self.show_streak = None;
+                }
                 // MAJOR 4: the shutdown drain re-runs this arm for any
                 // RegisterWindow queued behind Shutdown - exactly the state in
                 // which the UI thread already holds the bounded join. The
@@ -567,11 +594,11 @@ impl Engine {
                     // write, and rewriting session.json on every exit is a
                     // battery-life bug in a notepad.
                     let before = self.session.clone();
-                    let _ = self.measure_rect();
+                    let _ = self.measure_rect(true);
                     if self.session != before {
                         self.queue(Target::Session);
                     }
-                    self.flush_state();
+                    self.flush_state(true);
                 }
                 self.window = None;
                 // F3: a confirmation was a fact about THAT window. The handle is
@@ -1226,7 +1253,7 @@ impl Engine {
     /// read-back at quit is honest: that is where the window really is.
     fn final_flush(&mut self) {
         self.last_move_issued = None;
-        self.flush_state();
+        self.flush_state(true);
     }
 
     /// How many pixels must stay on screen after a clamp, per axis. Core takes the
@@ -1236,6 +1263,11 @@ impl Engine {
     /// back, few enough that a nearly-offscreen window still reads as where the user
     /// left it. THE ONE NUMBER IN THIS SLICE WITH NO OWNER.
     const MIN_VISIBLE: u32 = 32;
+
+    /// How many CONSECUTIVE answering measures a CHANGE to `session.maximized`
+    /// must be seen by before it is applied. Two - because one is exactly what
+    /// the 1.92 s repro was; see [`Engine::note_show_sample`].
+    const SHOW_CONFIRMATIONS: u32 = 2;
 
     /// Places the window and applies the pin, through the host seams (D46, D48).
     ///
@@ -1535,7 +1567,15 @@ impl Engine {
     /// clamped when it was written, so keeping it is not a new claim. A seam that
     /// answers with an error did refuse, and the refusal is reported: the alternative
     /// is persisting a rect known to be wrong. The result says WHAT was
-    fn measure_rect(&mut self) -> Measurement {
+    /// `terminal` is the LAST-CHANCE flag: this is the final measure this
+    /// window will ever get (the unregister arm, the shutdown drain, the abort
+    /// flush), and there is no later tick to confirm anything. It is the same
+    /// judgement [`Engine::final_flush`] already makes about the move-in-flight
+    /// guard - "at shutdown there IS no later tick" -
+    /// extended to the show bit: the window's last honest read-back is the
+    /// state the user actually left, so it persists on one sample. Mid-session
+    /// (`terminal == false`) a change needs [`Engine::SHOW_CONFIRMATIONS`].
+    fn measure_rect(&mut self, terminal: bool) -> Measurement {
         let Some(handle) = self.window else {
             return Measurement::NONE;
         };
@@ -1563,7 +1603,7 @@ impl Engine {
                 // either way. Nothing inside the guard ran while a move was in
                 // flight, so nothing was learned about the show state - which is
                 // exactly what an incomplete Measurement means.
-                let mut show_learned = false;
+                let mut show_settled = false;
                 if !move_in_flight {
                     if rect != self.session.rect {
                         self.session.rect = rect;
@@ -1574,19 +1614,42 @@ impl Engine {
                     // bridge creating the window maximised); until now NOTHING
                     // wrote it, which is what made "comes back maximised" a
                     // promise the code could not keep. The mapping is a
-                    // MEASUREMENT, not a decision: Maximized and Normal are what
-                    // the window is now. Unknown is not a No - it is the absence
-                    // of an answer, usually a minimised window - so it leaves
-                    // the stored bit exactly as it found it rather than
-                    // spending a real bit on a question nobody was asked.
+                    // MEASUREMENT, not a decision - and, like the rect's, ONE
+                    // SAMPLE OF IT IS A MEASUREMENT IN PROGRESS:
+                    //
+                    // THE 1.92 s REPRO, WHICH THIS IS THE FIX FOR. A window that
+                    // had NEVER been maximised reported showCmd == 3 (Maximized)
+                    // on exactly one measure: the real HWND appeared +94 ms after
+                    // launch, the first measure the MAJOR-5 guard allows is two
+                    // idle periods later (t~1.59 s), and the port persisted
+                    // `maximized: true` at t~1.92 s while the rect
+                    // (800x600@120,90) never moved. Every answer after the
+                    // transient was Unknown - which this code reads as "leave the
+                    // bit alone", so the stale true SURVIVED - and because the
+                    // show half of that write was never COMPLETE the pending bit
+                    // stayed armed and re-persisted the lie for the life of the
+                    // process. A never-maximised app came back maximised from a
+                    // state no user ever chose, and no lane asserted otherwise.
+                    //
+                    // So a CHANGE now gets the discipline the rect has always
+                    // had: [`Engine::note_show_sample`] applies it only after
+                    // [`Engine::SHOW_CONFIRMATIONS`] consecutive answering
+                    // samples, SYMMETRIC for true AND false (one transient
+                    // Normal on a genuinely maximised window loses the state the
+                    // user left, which is the same bug pointed the other way),
+                    // and the terminal flush keeps single-sample authority for
+                    // the reason [`Engine::final_flush`] already gives for
+                    // lifting the move-in-flight guard. Unknown is not a No and
+                    // not a Yes either: it is the absence of a sample, so it
+                    // neither confirms a change nor breaks a streak mid-measure.
+                    // The repro is pinned headless by
+                    // `a_single_transient_maximised_sample_never_persists_the_bit`.
                     match placement.show {
                         ShowState::Maximized => {
-                            self.session.maximized = true;
-                            show_learned = true;
+                            show_settled = self.note_show_sample(true, terminal);
                         }
                         ShowState::Normal => {
-                            self.session.maximized = false;
-                            show_learned = true;
+                            show_settled = self.note_show_sample(false, terminal);
                         }
                         // F1: the rect above WAS learned, so it may be written;
                         // the show half was not, so the write stays armed and
@@ -1609,7 +1672,7 @@ impl Engine {
                 }
                 Measurement {
                     rect: true,
-                    show: show_learned,
+                    show: show_settled,
                 }
             }
             Err(err) => {
@@ -1632,6 +1695,57 @@ impl Engine {
         }
     }
 
+    /// THE SHOW BIT'S LATCH: one ANSWERING sample of the show state, recorded,
+    /// and the verdict on whether the show question is SETTLED for this write.
+    /// False means "a change is waiting for its second sample", which is what
+    /// keeps `pending.session` armed at the write site so a later tick can
+    /// finish it - the same door F1 already used for an unanswered show, now
+    /// also holding an unconfirmed one.
+    ///
+    /// The rules, each one a decision worth stating:
+    /// * A sample that AGREES with the stored bit settles at once: there is no
+    ///   change to confirm, so nothing is outstanding and the write may retire.
+    ///   (Without this, a healthy maximised launch would re-arm the write
+    ///   forever on a bit that already says what the window says.)
+    /// * A sample that CONTRADICTS it proposes a change, and a change is applied
+    ///   only on the SHOW_CONFIRMATIONS-th consecutive agreeing sample. One
+    ///   transient reading - the settling window of the 1.92 s repro, which
+    ///   persisted `maximized: true` from a single Maximized measure while its
+    ///   rect never moved, and kept it because every later answer was Unknown
+    ///   and the incomplete write stayed armed - therefore never reaches the
+    ///   file at all. Symmetric: a single transient Normal does not clear a
+    ///   maximised window's bit either.
+    /// * Unknown never reaches this function. It is the absence of a sample, so
+    ///   it neither confirms a change nor breaks the streak: a window minimised
+    ///   on one tick is the same window on the next, and resetting the count
+    ///   there would lose a real maximise to a moment of silence. Unknown still
+    ///   leaves the write armed, so the streak does get its second sample.
+    /// * `terminal` - the unregister arm, the shutdown drain, the abort flush -
+    ///   applies a change on ONE sample, exactly as [`Engine::final_flush`]
+    ///   lifts the move-in-flight guard: at quit there IS no later tick to
+    ///   confirm with, and the window's last honest read-back is the state the
+    ///   user actually left. Keeping a maximise that arrived too late to be
+    ///   confirmed out of the file would break M9 on the path that matters.
+    ///
+    /// The count is kept, not just the last value, so three ticks of the same
+    /// answer confirm once and stay confirmed; a contradicting answer restarts
+    /// it at one. Both directions are the same code.
+    fn note_show_sample(&mut self, seen: bool, terminal: bool) -> bool {
+        let count = match self.show_streak {
+            Some((value, n)) if value == seen => n + 1,
+            _ => 1,
+        };
+        self.show_streak = Some((seen, count));
+        if self.session.maximized == seen {
+            return true;
+        }
+        if terminal || count >= Self::SHOW_CONFIRMATIONS {
+            self.session.maximized = seen;
+            return true;
+        }
+        false
+    }
+
     /// The code page THIS HOST can decode ANSI with (D27): the user's persisted
     /// choice when there is one, else the machine's ANSI code page through the
     /// [`HostFacts`] seam, else [`None`] - and [`None`] means an ANSI file is
@@ -1648,7 +1762,10 @@ impl Engine {
     /// reports a failure rather than hiding it - ONCE per failure, until the
     /// next success, for the session (M5: the tick would otherwise report
     /// forever), per attempt for settings and documents.
-    fn flush_state(&mut self) {
+    /// `terminal` is the last-chance flag, read by
+    /// [`Engine::note_show_sample`]: the unregister arm, the shutdown drain and the
+    /// abort flush pass true - there is no later tick. The idle tick passes false,
+    fn flush_state(&mut self, terminal: bool) {
         let pending = self.pending;
         if !pending.session && !pending.settings {
             return;
@@ -1701,7 +1818,7 @@ impl Engine {
             // deferred. Only an in-flight move (stale read-back) skips it.
             let measurable = !move_in_flight;
             let measured = if has_backend && measurable {
-                self.measure_rect()
+                self.measure_rect(terminal)
             } else {
                 // Headless (no backend): nothing can contradict the stored
                 // value, so the measure is vacuously good.
