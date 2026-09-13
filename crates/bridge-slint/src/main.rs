@@ -270,6 +270,22 @@ fn write_lock_fixture(path: &Path) -> std::io::Result<u64> {
     Ok(body.len() as u64)
 }
 
+/// S4f: the 9 MiB fixture, whose ONLY job is to be refused. D9 answers from the stat alone, so
+/// this file never becomes a document - which is exactly what makes it the cheapest live witness
+/// for the `Event::LoadFailed` arm the read-only fixture cannot exercise (that one is readable,
+/// so it answers `Loaded`). Kept deliberately separate from write_lock_fixture: two different
+/// verdicts, two different proofs.
+fn write_big_fixture(path: &Path) -> std::io::Result<u64> {
+    use std::io::Write;
+    let chunk = "x".repeat(1024);
+    let mut file = std::fs::File::create(path)?;
+    for _ in 0..9216 {
+        file.write_all(chunk.as_bytes())?;
+    }
+    file.flush()?;
+    Ok(9216 * chunk.len() as u64)
+}
+
 fn run_attrib(path: &Path, flag: &str) -> std::io::Result<()> {
     let made = std::process::Command::new("attrib")
         .arg(flag)
@@ -1343,6 +1359,44 @@ fn main() {
                             // the tick calls, and only one line may appear.
                             text_pump(&ui, &third_gw, &third_pump);
                             text_pump(&ui, &third_gw, &third_pump);
+                            // S4f: THE REFUSAL, WITNESSED. Same act, same door, one file that D9
+                            // answers from the stat alone: this open must come back as
+                            // Event::LoadFailed { reason: TooLarge }, because the read-only fixture
+                            // above is READABLE and so can never exercise that arm. What makes it
+                            // free is the semantics: a refusal adopts nothing, so the document never
+                            // changes hands - no buffer write, no lock, no generation step - and the
+                            // ladder below proves it by stepping only for the seed's own path change.
+                            let big = third_dir.0.join("s8-big.notes");
+                            match write_big_fixture(&big) {
+                                Ok(bytes) => {
+                                    report(&format!(
+                                        "big-act: wrote {bytes} bytes to {}, asking Command::Open - expecting a refusal, not a document",
+                                        big.display()
+                                    ));
+                                    let before = third_pump.borrow().load_answers;
+                                    let sent = Instant::now();
+                                    send(&third_gw, Command::Open { path: big });
+                                    while third_pump.borrow().load_answers == before
+                                        && sent.elapsed() < LOCK_WAIT
+                                    {
+                                        std::thread::sleep(Duration::from_millis(2));
+                                        drain(&third_events, &third_pump, &ui.as_weak());
+                                    }
+                                    let answers = third_pump.borrow().load_answers;
+                                    report(&format!(
+                                        "big-act: the port {} after {:?} (load_answers {} -> {})",
+                                        if answers == before {
+                                            "STAYED SILENT past the bound - the refusal was never heard"
+                                        } else {
+                                            "answered, and the line above it is the witness"
+                                        },
+                                        sent.elapsed(),
+                                        before,
+                                        answers
+                                    ));
+                                }
+                                Err(e) => report(&format!("big-act: could not write the fixture: {e}")),
+                            }
                             // RESTORE, so the caption tail and the honest shutdown both run on the
                             // document they were written for.
                             let seed = third_pump.borrow().seed.clone();
@@ -1716,6 +1770,17 @@ fn main() {
                 }
             }
             None => report("lock-act: no fixture to clean (the act did not create one)"),
+        }
+        // S4f: the 9 MiB refusal fixture, named rather than remembered - it was never adopted, so
+        // there is no attribute to clear and no state to consult. Leaving it behind would give the
+        // next run a recent file that refuses to open, which is a lie about the disk.
+        let big = dir.0.join("s8-big.notes");
+        match std::fs::remove_file(&big) {
+            Ok(()) => report(&format!("big-act: cleaned up {}", big.display())),
+            Err(e) => report(&format!(
+                "big-act: cleanup {} (nothing to clean if it says not found): {e}",
+                big.display()
+            )),
         }
     }
     // R2b: THE HONEST SHUTDOWN, in the order that cannot lose text. The close that
