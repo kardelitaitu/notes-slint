@@ -53,8 +53,11 @@ pub enum LineEnding {
 ///
 /// Six booleans-and-enums of pure data, deliberately `Copy`: it travels inside
 /// [`Event::Loaded`](crate::Event::Loaded) and the bridge keeps a copy for the
-/// status line. Every field is here because a specific piece of UI has to render
-/// it honestly — nothing is speculative.
+/// status line. Every field was introduced because a specific piece of UI had to
+/// render it honestly. One exception is on the list now and says so below:
+/// [`FileMeta::oversize`] has had no live setter since D9 turned that open into a
+/// refusal, so the honest form of "nothing is speculative" is "nothing was added
+/// speculatively" — and this is the field that outlived its own reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileMeta {
     /// Detected on load, written back unchanged (§4.5).
@@ -67,9 +70,40 @@ pub struct FileMeta {
     /// The file is read-only on disk. Drives the status line, and the save path
     /// fails with `SaveError::ReadOnly` rather than clearing the flag.
     pub read_only: bool,
-    /// The 8 MiB size guard verdict (D9): the file was opened READ-ONLY because
-    /// it is too big to edit safely. Nothing is ever refused — a refused open
-    /// is a lost document.
+    /// The 8 MiB size-guard verdict (D9) — **a bit no live path ever sets true.**
+    ///
+    /// What used to be claimed here ("the file was opened READ-ONLY because it is
+    /// too big to edit safely. Nothing is ever refused — a refused open is a lost
+    /// document") describes the PRE-D9 world, and stopped being true when the guard
+    /// moved to the stat: an [`Open`](crate::Command::Open) over the guard is now
+    /// REFUSED, with `Event::LoadFailed { reason: LoadError::TooLarge }` and no
+    /// buffer, no `Loaded` and no `FileMeta` at all (`Engine::open`,
+    /// engine.rs:930-946). The reason D9 could not see is that the empty read-only
+    /// buffer put FOUR invented facts on the status line — an encoding, a line
+    /// ending, a trailing-newline bit and a read-only flag, for bytes nobody had
+    /// read — and left Save As able to write that empty buffer over a real 9 MiB
+    /// file and report `Saved` (B1). Refusing the load protects the user's
+    /// document; "nothing is ever refused" was about never losing an edit, never
+    /// about pretending to have read something. Pinned by the test that names it:
+    /// `an_oversize_file_is_refused_from_the_stat_and_cannot_be_overwritten`,
+    /// crates/api/tests/session.rs:806-835.
+    ///
+    /// So today every [`FileMeta`] the engine builds hard-codes this to `false`
+    /// (engine.rs:995, 1073, 1156, 1318, plus the two constructors below at 524 and
+    /// 638), and a bridge that renders it renders `false` on every event it can
+    /// receive.
+    ///
+    /// WHY THE BIT STAYS, rather than being deleted along with the dead branch: it
+    /// is the seam where an "open it anyway, read-only, too big to edit" policy
+    /// would hang without touching the wire — `read_only`-plus-`oversize` is exactly
+    /// what such a policy has to say, and core's `Skip::Oversize` (document.rs, the
+    /// autosave gate) already refuses to WRITE such a document. It also keeps two
+    /// different facts from collapsing into one on the status line: "the disk says
+    /// don't write" and "the size says don't write", which this file's own test
+    /// asserts (`D9: oversized and read-only are distinct`). Deleting it would be a
+    /// vocabulary change dressed as a cleanup, and it costs nothing: the
+    /// `size_of::<FileMeta>() <= 16` assertion at the bottom of this file still
+    /// holds with it set.
     pub oversize: bool,
     /// ADR-0001, PER DOCUMENT: has this file been saved once explicitly, so
     /// autosave is armed for it? `false` on a freshly opened foreign file,

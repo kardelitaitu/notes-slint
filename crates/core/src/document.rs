@@ -186,6 +186,24 @@ impl Document {
         if self.read_only {
             return Some(Skip::ReadOnly);
         }
+        // Skip::Oversize is UNREACHABLE THROUGH THE ENGINE TODAY, and that is a
+        // fact about the caller, not a dead branch here: no engine path ever sets
+        // this flag. All three `Document::open` calls hard-code `false` for it
+        // (api/engine.rs:447 session restore, :974-979 open, :1051 missing scratch),
+        // and an over-guard open is refused at the STAT before any Document exists —
+        // `LoadFailed { reason: LoadError::TooLarge }`, api/engine.rs:930-946, pinned
+        // by api/tests/session.rs:806-835.
+        //
+        // It stays because the guarantee is CORE's and not the engine's: a document
+        // that carries the oversize verdict never autosaves, whoever constructed it
+        // and whatever the port's policy does next. If the "open read-only anyway"
+        // policy ever returns (see the field comment on api's FileMeta::oversize),
+        // this arm is the one thing standing between a 9 MiB file and a rewrite on a
+        // debounce. Its POSITION is load-bearing too: checked BEFORE
+        // ForeignFileNotArmed and BEFORE Clean, so an oversize document is never
+        // misreported as merely un-armed or merely saved. Removing it would be safe
+        // against today's engine and fatal against tomorrow's, which is the wrong
+        // trade to make in the crate whose whole job is do-no-harm.
         if self.oversize {
             return Some(Skip::Oversize);
         }

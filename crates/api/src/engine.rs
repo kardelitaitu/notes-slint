@@ -866,11 +866,21 @@ impl Engine {
     ///
     /// The order is the cold-start rule (whitepaper §2): [`is_oversize`] answers
     /// from the length, so a 9 MiB file is decided on the stat without reading,
-    /// allocating or decoding anything. Per D9 nothing is refused outright - the
-    /// document still opens, and [`FileMeta::oversize`] plus
-    /// [`FileMeta::read_only`] carry the verdict, which is what
-    /// [`LoadError::TooLarge`] is for on the paths that cannot present an empty
-    /// read-only buffer at all.
+    /// allocating or decoding anything.
+    ///
+    /// And the VERDICT of that decision is a refusal, not a presentation: over the
+    /// guard this emits [`Event::LoadFailed`] carrying [`LoadError::TooLarge`] and
+    /// returns - nothing opens, no buffer exists, no [`FileMeta`] is built, because
+    /// there is nothing honest to render. The sentence that used to sit here ("per
+    /// D9 nothing is refused outright - the document still opens, and
+    /// [`FileMeta::oversize`] carries the verdict") described the pre-D9 reading of
+    /// that rule and is contradicted by this method's own body sixty lines below.
+    /// D9 protects the user's DOCUMENT; an empty read-only buffer did the opposite,
+    /// because it invented four facts about bytes nobody had read and left `Save As`
+    /// free to write them back over a real 9 MiB file. [`FileMeta::oversize`]
+    /// survives as a bit no live path sets - its field doc says why the seam is kept
+    /// and why [`LoadError::TooLarge`] is no longer a fallback for "paths that
+    /// cannot present a buffer" but the answer itself.
     fn open(&mut self, path: &Path) {
         // THE READ GATE, before the first stat: the write side has refused
         // these names in core's atomic write since path_policy landed, but a

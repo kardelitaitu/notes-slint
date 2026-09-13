@@ -187,10 +187,19 @@
 //!   interval replaces it. M4 changes the BODY of the tick arm, not its shape.
 //! * The [`.notes` frontmatter seam delegates to [`notes_core::format`], which
 //!   landed as contracted, so the port parses nothing itself.
-//! * A file over the D9 guard opens read-only with an empty buffer
-//!   [`FileMeta::oversize`] rather than being refused: a half-loaded buffer is the
-//!   one option that could shorten the user's file. [`LoadError::TooLarge`] stays
-//!   in the vocabulary for the paths that cannot present that at all.
+//! * A file over the D9 guard is **refused**, at the stat: [`Event::LoadFailed`]
+//!   carrying [`LoadError::TooLarge`], with no `Loaded`, no buffer and no
+//!   [`FileMeta`]. This rule used to read "opens read-only with an empty buffer
+//!   rather than being refused, because a half-loaded buffer is the one option that
+//!   could shorten the user's file", and the reasoning inverted: an EMPTY buffer is
+//!   the maximally shortened file, and pointing Save As at it is how a 9 MiB note
+//!   becomes zero bytes with `Saved` reported. [`LoadError::TooLarge`] is therefore
+//!   not a reserve for "the paths that cannot present a buffer" - it IS the verdict,
+//!   and no path in the port opens an oversize file. [`FileMeta::oversize`] is the
+//!   one surviving trace of the old policy: a bit every construct site sets to
+//!   `false`, kept as the seam a future "open read-only anyway" rule would hang from
+//!   (its field doc is the authority; core's `Skip::Oversize` already refuses to
+//!   write such a document, unreachable today and correct to keep).
 //!
 //! # The channels, and why unbounded is load-bearing
 //!
