@@ -266,6 +266,15 @@ const CLICK_AT: Duration = Duration::from_millis(3000);
 // R1/R2 act times. The frame act goes first so the maximise is in the state the
 // close act then has to carry out of the window, and the two closes are far enough
 // apart to see whether the declined one really left the window on screen.
+/// S5: the frame act stands down for the DRAG CHAIN runs, for the same documented reason
+/// the close pair did (see SYNTHETIC_CLOSE_ACTS): a window that ends maximised comes BACK
+/// maximised, and from then on every relaunch restores a maximised frame - which masks the
+/// one thing the chain is measuring, a moved rect surviving a round trip. Its own evidence
+/// ("frame: synthetic toggled to ...") is on record from every earlier run. Flip to true to
+/// restore it; S5's finding about what a drag does TO a maximised window is in the report,
+/// and it needed this act ON to be seen.
+const SYNTHETIC_FRAME_ACTS: bool = false;
+
 const MAX_AT: Duration = Duration::from_millis(14000);
 const CLOSE_AT: Duration = Duration::from_millis(18000);
 const CLOSE2_AT: Duration = Duration::from_millis(21000);
@@ -281,6 +290,17 @@ const CLOSE2_AT: Duration = Duration::from_millis(21000);
 /// Flip to true to bring both acts back; their evidence and this one cannot share a run,
 /// because a granted close ends it.
 const SYNTHETIC_CLOSE_ACTS: bool = false;
+/// S5: when the synthetic drag runs. BEFORE MAX_AT, because a maximised window reports a
+/// normalised position and this arithmetic is about chrome, not show state; and well before
+/// the save cycle, so the port has time to store the moved rect before the run ends.
+const DRAG_AT: Duration = Duration::from_millis(7000);
+
+/// S5: the SECOND drag, deliberately placed AFTER MAX_AT so it lands on a maximised window
+/// when the frame act is on. That is the regression test for the finding this guard
+/// answers: the store must still hold the rect from DRAG_AT, not a target computed from the
+/// maximised frame origin. When the frame act stands down, this is just another move.
+const DRAG2_AT: Duration = Duration::from_millis(16000);
+
 const END: Duration = Duration::from_millis(25000);
 
 fn main() {
@@ -368,6 +388,20 @@ fn main() {
     }
     let shown = fingerprint_of(window);
     report(&format!("after-show: toolkit reads {shown:?}"));
+    // S5, THE RESTORE HALF of the question the drag asks. The port stores FRAME pixels and
+    // this toolkit reports frame-inclusive physical px, so a correct restore is delta <0,0>.
+    // The first bridge's bug shows up here as a constant offset in Y (the bar) that repeats
+    // on every relaunch - printed at BOTH ends of a run because the walk is cumulative: the
+    // startup number IS the previous run's exit number.
+    report(&format!(
+        "drag-check[startup]: intended <{},{}> actual <{},{}> delta <{},{}>",
+        session.rect.x,
+        session.rect.y,
+        shown.rect.x,
+        shown.rect.y,
+        shown.rect.x - session.rect.x,
+        shown.rect.y - session.rect.y
+    ));
     let started = Instant::now();
     let hwnd = hwnd_of(window);
     match hwnd {
@@ -662,6 +696,28 @@ fn main() {
                     ui.set_buffer(format!("{base}+typed").into());
                 }
             }
+            // ---- S5: the drag act, through the one function a real drag would use ----
+            {
+                let mut p = third_pump.borrow_mut();
+                if p.drag_step == 0 && now >= DRAG_AT {
+                    p.drag_step = 1;
+                    drop(p);
+                    drag_by(&ui.as_weak(), &third_pump, 60, 40, "synthetic");
+                    drag_release(&third_gw, "synthetic");
+                    drain(&third_events, &third_pump, &ui.as_weak());
+                } else if p.drag_step == 1 && now >= DRAG2_AT {
+                    // THE REGRESSION PROBE. With the frame act ON this fires on a maximised
+                    // window and must refuse: no move, no store ask that could carry a
+                    // meaningless target, and the exit check still reads the rect the user
+                    // actually placed. With the frame act off it is simply a second move, so
+                    // the chain keeps working either way.
+                    p.drag_step = 2;
+                    drop(p);
+                    drag_by(&ui.as_weak(), &third_pump, 60, 40, "synthetic-2");
+                    drag_release(&third_gw, "synthetic-2");
+                    drain(&third_events, &third_pump, &ui.as_weak());
+                }
+            }
             // ---- S4c: stage the failure, type, then clear the way ----
             {
                 let mut p = third_pump.borrow_mut();
@@ -775,7 +831,7 @@ fn main() {
             // R1 then R2, driven from the loop so the run needs no hands.
             {
                 let mut p = third_pump.borrow_mut();
-                if !p.max_toggled && now >= MAX_AT {
+                if SYNTHETIC_FRAME_ACTS && !p.max_toggled && now >= MAX_AT {
                     p.max_toggled = true;
                     drop(p);
                     toggle_max(&ui.as_weak(), &third_gw, "synthetic");
@@ -974,6 +1030,25 @@ fn main() {
         let weak = ui.as_weak();
         ui.on_toggle_max(move || toggle_max(&weak, &gw, "double-click"));
     }
+    // S5: THE DRAG WIRES, closed by the four approved markup lines. Chrome's band emits a
+    // delta per frame and one release, and both land on the SAME two functions the synthetic
+    // acts call - so the arithmetic, the maximised guard and the once-per-drag store ask
+    // exist exactly once, whether the pointer came from a hand or from the timer.
+    {
+        let weak = ui.as_weak();
+        let pump = Rc::clone(&pump);
+        ui.on_drag_delta(move |dx, dy| {
+            // Lengths in, integer physical px out. Scale 1.0 on this probe, and any
+            // conversion belongs in drag_by with the rest of the geometry arithmetic - not
+            // duplicated in a handler whose only job is to forward. Note what this handler
+            // does NOT hold: no gateway, because moving a window asks the port for nothing.
+            drag_by(&weak, &pump, dx as i32, dy as i32, "title-band");
+        });
+    }
+    {
+        let gw = Rc::clone(&gateway);
+        ui.on_drag_ended(move || drag_release(&gw, "title-band"));
+    }
     ui.run().ok();
     // R2b: THE HONEST SHUTDOWN, in the order that cannot lose text. The close that
     // granted is what lands here - and by then the debounce has NOT run, so any byte
@@ -1039,6 +1114,19 @@ fn main() {
         pump.borrow().dot_words
     ));
     report(&format!("exit {}", measured(&dir, started.elapsed())));
+    // S5, THE PERSISTENCE HALF: not what the toolkit says it is right now, but what the PORT
+    // WROTE - the coordinates the next launch restores from. Delta <0,0> means a dragged
+    // rect survives the round trip without walking; anything else IS the bug class, in the
+    // one number M3 consumes.
+    match (pump.borrow().drag_target, stored_xy(&dir)) {
+        (Some((tx, ty)), Some((sx, sy))) => report(&format!(
+            "drag-check[exit]: intended <{tx},{ty}> actual <{sx},{sy}> delta <{},{}>",
+            sx - tx as i64,
+            sy - ty as i64
+        )),
+        (Some(_), None) => report("drag-check[exit]: the port wrote no rect to compare"),
+        (None, _) => report("drag-check[exit]: no drag ran this lifecycle"),
+    }
 }
 
 /// The poll's memory, as data.
@@ -1214,6 +1302,97 @@ fn toggle_max(weak: &slint::Weak<Spike>, gw: &Rc<RefCell<Option<Gateway>>>, via:
     send(gw, Command::GeometryChanged);
 }
 
+/// THE DRAG. One implementation, two triggers - the title band's `drag-delta` and the
+/// synthetic act below both land here, for the same reason toggle_max does: the frame
+/// arithmetic is the part that can be wrong, and it must not exist twice.
+///
+/// THE BUG THIS IS SHAPED AROUND: the frame/client double-count. A band that moves the
+/// window by reading one kind of rect and writing the other walks it across the screen by
+/// its own chrome, every drag, and the relaunch walks it again (smoke.rs: "the relaunch
+/// rect walked by its own chrome"). So: read `position()`, which this toolkit reports
+/// PHYSICAL and FRAME-INCLUSIVE (recorded at fingerprint_of above, i-slint-core api.rs:562)
+/// add the pointer's delta to THAT, and write the sum. The bar's own height appears nowhere
+/// in this function - not needing it is the test of whether the double-count is possible.
+///
+/// DPI, stated rather than assumed silently: `set_position` takes LOGICAL px and this probe
+/// runs on the primary monitor at scale 1.0, so logical == physical and the cast below is
+/// an identity. At 1.25 or 1.5 the division by `window.scale_factor()` belongs in THIS
+/// function and nowhere else, which is the point of having one.
+fn drag_by(weak: &slint::Weak<Spike>, pump: &RefCell<Pump>, dx: i32, dy: i32, via: &str) {
+    let Some(ui) = weak.upgrade() else { return };
+    let window = ui.window();
+    // GUARD, decision (1): refuse a delta while the window is maximised.
+    //
+    // Why this is not paranoia - measured, in the run that produced the rule: a maximised
+    // window reports position() <-8,-8> (the invisible 8 px border), so "read, add the
+    // pointer's delta, write" is arithmetically perfect and semantically wrong. It asked
+    // for <52,32>, the toolkit agreed, and the PORT STORED 52,32 as the normal position -
+    // destroying a restore point the user had put at <180,130>, while every delta needle
+    // read <0,0>. The check cannot see this class, because the walk it hunts for is not
+    // happening: the INPUT is meaningless, not the arithmetic.
+    //
+    // The shipped-app candidate is (2), WINDOWS RESTORE-UNDER-POINTER: releasing a maximised
+    // title bar restores the window with the cursor inside its new width, which is what a
+    // user expects and what this refuses to imitate half-way. It costs two things this spike
+    // does not have - the press position as an ABSOLUTE screen point (drag-delta carries a
+    // delta precisely so markup cannot lie about placement, so the callback would need a
+    // second argument), and a set_maximized(false) taken through toggle_max's door rather
+    // than a second window call. Both are geometry decisions, and this is the one place
+    // either would live. Reported once per maximised episode, because a real drag emits a
+    // frame per mouse move and a flood would bury the finding.
+    if window.is_maximized() {
+        let mut p = pump.borrow_mut();
+        if !p.drag_refused_shown {
+            p.drag_refused_shown = true;
+            drop(p);
+            report("drag[refused]: maximised, window unmoved");
+        }
+        return;
+    }
+    // THE FRAME-INCLUSIVE READ - "dragging starts with a frame rect read", same call the
+    // round-trip probe uses, taken after the show so there is no pre-show placeholder to
+    // do arithmetic with.
+    let here = window.position();
+    let want = (here.x + dx, here.y + dy);
+    window.set_position(LogicalPosition::new(want.0 as f32, want.1 as f32));
+    let back = window.position();
+    pump.borrow_mut().drag_target = Some(want);
+    report(&format!(
+        "drag[{via}]: from <{},{}> by <{dx},{dy}> slint-max={} -> intended <{},{}> toolkit reads <{},{}> delta <{},{}>",
+        here.x,
+        here.y,
+        window.is_maximized(),
+        want.0,
+        want.1,
+        back.x,
+        back.y,
+        back.x - want.0,
+        back.y - want.1
+    ));
+    // A delta that landed means the window is not maximised: re-arm the refusal print, so a
+    // later maximise is reported once again instead of never.
+    pump.borrow_mut().drag_refused_shown = false;
+}
+
+/// THE RELEASE - the other half of a drag, and the reason the two are separate functions.
+/// Moving the window is a per-frame act; asking the port to STORE a rect is not. Chrome
+/// emits drag-ended once, the synthetic act calls this once, and the per-frame path above
+/// sends nothing at all: a GeometryChanged per mouse move would have the engine measuring
+/// and writing a session on every frame of a drag.
+fn drag_release(gw: &Rc<RefCell<Option<Gateway>>>, via: &str) {
+    report(&format!(
+        "drag[{via}]: released, asking the port to store the rect"
+    ));
+    send(gw, Command::GeometryChanged);
+}
+
+/// The x,y the PORT last wrote - the coordinates the NEXT launch restores from, which is
+/// the only place a walk can hide where the toolkit's own read cannot see it.
+fn stored_xy(dir: &StateDir) -> Option<(i64, i64)> {
+    let src = std::fs::read_to_string(dir.0.join("session.json")).ok()?;
+    Some((json_int(&src, "x")?, json_int(&src, "y")?))
+}
+
 /// One recent row, one `Command::Open`. THE SHARED PATH: the TouchArea's generated
 /// callback calls this, and so does the synthetic click in the timer, which is what
 /// lets an unattended run exercise the same code a click would.
@@ -1334,6 +1513,15 @@ struct Pump {
     menu_act: u64,
     /// The one keystroke aimed at the seed document.
     seed_key_done: bool,
+    /// S5: which drag act has run - 0 none, 1 the plain move, 2 the one aimed at the
+    /// maximised state (a refusal when the frame act is on, a second move when it is off).
+    drag_step: u64,
+    /// The refusal print is once per maximised episode, not once per mouse-move frame.
+    drag_refused_shown: bool,
+    /// The FRAME-INCLUSIVE target the last drag asked for. The exit check compares this
+    /// against what the port actually persisted, which is what the next launch restores
+    /// from; kept here because the tick that printed it is long gone.
+    drag_target: Option<(i32, i32)>,
     /// How many autosave toggles this bridge has sent. The port echoes NO autosave event,
     /// so the menu check can only follow the ask - printed as 'menu: ...' so the
     /// convention is visible instead of pretending to be a report.

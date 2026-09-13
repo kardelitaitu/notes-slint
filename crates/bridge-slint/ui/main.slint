@@ -90,6 +90,14 @@ export component Spike inherits Window {
     /// that flushes and joins the engine (see the close contract in main.rs).
     callback quit-asked();
 
+    // S5: THE DRAG, forwarded exactly like the double-click. Chrome carries the pointer's
+    // DELTA - origin-independent, and the only geometry fact a title band is allowed to
+    // know - plus the release. Turning a delta into a frame-inclusive target is drag_by()
+    // in main.rs, and the port is asked to STORE a rect once per drag, on the drop, not
+    // once per frame.
+    callback drag-delta(length, length);
+    callback drag-ended();
+
     // ---- S5: recents, as delivered ----
     // `Event::RecentsUpdated(Vec<RecentEntry>)` has been arriving, unused, since S4.
     // `core` already decided the label (`display`), the cap and the missing-file mark,
@@ -134,6 +142,12 @@ export component Spike inherits Window {
         // toggle_max() the synthetic driver calls - one implementation, two triggers.
         toggle-max-requested => {
             root.toggle-max();
+        }
+        drag-delta(dx, dy) => {
+            root.drag-delta(dx, dy);
+        }
+        drag-ended => {
+            root.drag-ended();
         }
         open-asked => {
             root.open-asked();

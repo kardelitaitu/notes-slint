@@ -86,6 +86,20 @@ export component Chrome inherits Rectangle {
     /// triggers - which is exactly why it is a callback and not a window call in here.
     callback toggle-max-requested();
 
+    /// THE DRAG ASK. Chrome reports the pointer's movement between frames and NOTHING
+    /// else: no position, no window call, no opinion about what frame-inclusive means.
+    /// The bug class this keeps out is the double-count - a title band that moves the
+    /// window by itself reads a CLIENT rect and writes a FRAME position, so every drag
+    /// walks the window a chrome-height further than the pointer went, and the next
+    /// restore does it again (smoke.rs carries the history: "the relaunch rect walked by
+    /// its own chrome"). A delta is origin-independent, which is why the markup may carry
+    /// exactly this and nothing else.
+    callback drag-delta(length, length);
+
+    /// The release. One GeometryChanged per DRAG, not one per frame: the port is asked to
+    /// store a rect when the user stops moving the window.
+    callback drag-ended();
+
     // ---- the dot ----------------------------------------------------------------
     // failed outranks dirty: dirty already says "you have unsaved text" and the amber exists
     // to add "and the app could not write it". A failed save over a clean buffer is the
@@ -253,8 +267,41 @@ export component Chrome inherits Rectangle {
         y: 0px;
         width: root.width - Theme.slot-width * 2;
         height: parent.height;
+
+        // Pointer state, local to this band. mouse-x/mouse-y are relative to the band, so
+        // their DIFFERENCE is the pointer's movement whatever the origin - the only
+        // geometry fact a title band is allowed to know.
+        property <length> last-x: 0px;
+        property <length> last-y: 0px;
+        // A click on the band is not a drag, and it must not ask the port to store a rect
+        // that has not moved. This bit is what tells the two apart.
+        property <bool> moved-since-down: false;
+
+        // 1.17 API NOTE, recorded because it cost a build: TouchArea has NO 'dragged' and
+        // 'pressed' is a PROPERTY there, not a callback. So a drag is the 'moved' callback
+        // guarded by the pressed bit, and its two edges are one changed handler - down
+        // samples the pointer, up ends the drag.
+        changed pressed => {
+            if max-band.pressed {
+                max-band.last-x = max-band.mouse-x;
+                max-band.last-y = max-band.mouse-y;
+                max-band.moved-since-down = false;
+            } else if max-band.moved-since-down {
+                max-band.moved-since-down = false;
+                root.drag-ended();
+            }
+        }
         double-clicked => {
             root.toggle-max-requested();
+        }
+        moved => {
+            if max-band.pressed {
+                max-band.moved-since-down = true;
+                root.drag-delta(max-band.mouse-x - max-band.last-x,
+                                max-band.mouse-y - max-band.last-y);
+                max-band.last-x = max-band.mouse-x;
+                max-band.last-y = max-band.mouse-y;
+            }
         }
     }
 
