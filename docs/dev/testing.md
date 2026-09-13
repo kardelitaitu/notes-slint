@@ -17,7 +17,7 @@ cargo run -p xtask -- fixtures verify
 
 ### `cargo test --workspace`
 
-Unit and integration tests for all five workspace members. The port's tests are
+Unit and integration tests for all six workspace members. The port's tests are
 headless by design: `crates/api/tests/support/host_mock.rs` stands in for the host,
 so session, debounce, reentrancy and geometry behaviour are tested with no window at
 all. The bridge's two test binaries (`ime_seam.rs`, `paint_cost.rs`) are also
