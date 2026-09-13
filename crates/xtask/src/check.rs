@@ -339,6 +339,38 @@ fn step_specs() -> Vec<StepSpec> {
             quick_skippable: true,
             budget_secs: 900,
         },
+        // M5-S1: THE PRODUCT GETS JUDGED OFF THIS MACHINE TOO. Same instrument as the
+        // "smoke" row above, pointed at notes-slint.exe by smoke's own --binary flag, so
+        // the row runs the PRODUCT contract leg (startup lines, alive at 45 s, a WM_CLOSE
+        // answered by exiting 0) rather than gpui's needle schedule against bytes that no
+        // longer speak it. The gap this closes is the one README M2 states: 3f/3g link and
+        // lint this binary, and nothing ever launched it on an evidence trail.
+        //
+        // Advisory and --quick-skipped for exactly the "smoke" row's reason - a runner
+        // with no desktop is not a broken repo, and a GUI row that reddens for an
+        // environmental reason trains people to ignore it. That is a judgement about
+        // DESKTOPS only: the compile verdict for the same exe stays GATED above here.
+        // budget_secs 120 copied from "smoke": it must exceed the harness's own bounded
+        // waits (its pwsh child is killed at 40 s), and CI pays for the compile inside the
+        // step on a cold target dir.
+        StepSpec {
+            name: "smoke-slint",
+            display: "cargo run --locked -p xtask -- smoke --binary=slint (advisory: opens a real window on this desktop)",
+            program: "cargo",
+            args: &[
+                "run",
+                "--locked",
+                "-p",
+                "xtask",
+                "--quiet",
+                "--",
+                "smoke",
+                "--binary=slint",
+            ],
+            advisory: true,
+            quick_skippable: true,
+            budget_secs: 120,
+        },
         StepSpec {
             name: "docs",
             display: "pwsh .agents/skills/doc-management/scripts/check-docs.ps1 (advisory: red while the docs split is uncommitted)",
@@ -369,7 +401,7 @@ fn joined(names: &[&str]) -> String {
 ///
 /// THIS IS ALSO THE INNER COMMAND LINE. The aggregate step in ci.yml runs
 /// `cargo run --locked -p xtask -- check`, and that outer --locked governs only
-/// the resolve that BUILDS xtask; the thirteen cargo rows this roster spawns each
+/// the resolve that BUILDS xtask; the fourteen cargo rows this roster spawns each
 /// resolve AGAIN, in `run_child` below, from `spec.args`. So the authority the
 /// gate is supposed to have over Cargo.lock passes through here or not at all,
 /// and `every_row_that_resolves_a_graph_carries_the_lock` is what keeps that
@@ -781,19 +813,19 @@ mod tests {
             );
             locked += 1;
         }
-        // 13 and 15, and they moved together on purpose: this is the assertion the
+        // 14 and 16, and they move together on purpose: this is the assertion the
         // M5-S0 slint pair was expected to trip, and tripping it is the POINT - a
         // roster that grows without this count being re-read is a roster nobody is
         // looking at. fmt (no graph) and docs (pwsh) are still the only two exemptions,
-        // so 15 - 2 = 13, and the two new rows carry --locked like every other cargo
-        // row above them (the per-row assert is what proves that half).
+        // so 16 - 2 = 14, and the row the M5-S1 slint smoke added carries --locked like
+        // every other cargo row above it (the per-row assert is what proves that half).
         assert_eq!(
-            locked, 13,
-            "thirteen rows resolve a graph here; another number means the roster changed shape and this statement is now about a different list",
+            locked, 14,
+            "fourteen rows resolve a graph here; another number means the roster changed shape and this statement is now about a different list",
         );
         assert_eq!(
             step_specs().len(),
-            15,
+            16,
             "fmt and docs are the two exempt rows"
         );
     }
