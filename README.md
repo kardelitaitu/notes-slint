@@ -28,8 +28,8 @@ product, and the editing surface can stay deliberately minimal.
 ## Stack
 
 - **Engine:** Rust — pure, headless, unit-testable, no UI or OS types in the core.
-- **UI:** [GPUI](https://github.com/zed-industries/gpui), Zed's GPU-accelerated toolkit,
-  isolated behind a bridge so the toolkit itself is a swappable detail.
+- **UI:** [Slint](https://slint.dev), swapping in for GPUI behind the same bridge rule — one adapter
+  per toolkit, so the toolkit itself stays a swappable detail; in flight ([note](.agents/notes/proposed/2026-09-13-bridge-slint-spike.md)).
 - **Platform:** Windows first. macOS and Linux planned; the plan and its honest limits
   (Wayland restricts both window positioning and always-on-top) are in the whitepaper §6.
 
