@@ -24,7 +24,7 @@
 //! the port, and nothing here should be copied into one.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -34,6 +34,7 @@ use notes_api::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, LogicalPosition, LogicalSize, Timer, TimerMode};
+mod title_contract;
 
 // The UI lives in ui/main.slint, imported rather than inlined: that file is one of
 // xtask smoke's freshness roots, so editing the markup behind a built binary makes the
@@ -231,6 +232,9 @@ fn main() {
         return;
     };
     let window = ui.window();
+    // The untitled arm is an ACT, not an absence: name it before anything is
+    // visible, so the markup default cannot be seen by a user or a test.
+    publish_title(&ui, None, false, "startup");
 
     // ---- (a) placed at the stored rect, BEFORE anything is visible ------------
     // The stored rect is FRAME pixels, physical; Slint takes LOGICAL CLIENT pixels.
@@ -720,6 +724,20 @@ struct Poll {
     sampled: bool,
 }
 
+/// THE TITLE, from the port's fact and nowhere else. `title_words` is what the strip
+/// centre shows; `window_title` is what Alt+Tab, the taskbar preview and a screen
+/// reader speak. Both come from `title_contract`, the same two pure functions
+/// bridge-gpui calls (its main.rs:851-861), so the wording cannot drift between
+/// bridges - and both are PRINTED, because that print is the only honest measurement
+/// of this mount a headless run can make: no screenshot was taken.
+fn publish_title(ui: &Spike, path: Option<&Path>, loaded: bool, via: &str) {
+    let words = title_contract::title_words(path, loaded);
+    let title = title_contract::window_title(path, loaded);
+    ui.set_title_words(words.clone().into());
+    ui.set_os_title(title.clone().into());
+    report(&format!("title: {via} words={words:?} os-title={title:?}"));
+}
+
 /// FNV-1a over the file's own bytes. A checksum rather than a hash crate on purpose:
 /// this bridge may not add a dependency to prove a byte-for-byte claim, and the
 /// question is only ever "did anything change at all".
@@ -1034,21 +1052,18 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                 drop(p);
                 if let Some(ui) = weak.upgrade() {
                     ui.set_buffer(adopted.clone().into());
-                    // The title shows what the PORT says is open - file name only,
-                    // taken off the event's own path.
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    ui.set_file_name(name.into());
+                    publish_title(&ui, Some(path), true, "loaded");
                 }
                 report(&format!(
                     "load: epoch={epoch} announced, buffer adopted ({} bytes, CR-normalised)",
                     adopted.len()
                 ));
             }
-            Event::Rebound { epoch, .. } => {
+            Event::Rebound { epoch, path, .. } => {
                 pump.borrow_mut().epoch = *epoch;
+                if let Some(ui) = weak.upgrade() {
+                    publish_title(&ui, Some(path), true, "rebound");
+                }
                 report(&format!(
                     "rebind: epoch={epoch} announced; the next Flush echoes it"
                 ));

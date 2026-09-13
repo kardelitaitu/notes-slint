@@ -9,12 +9,18 @@
 //  4. `export { X }` takes no trailing semicolon (the semicolon is a hard error).
 
 import { TextEdit } from "std-widgets.slint";
+// S2 owns the strip and the palette; this file only mounts them.
+import { Chrome } from "chrome.slint";
+import { Theme } from "theme.slint";
 
 export component Spike inherits Window {
     // The file name in the title is a FACT the port reported (`Loaded`/`Rebound`
     // carry the path); the bridge never invents it, so it is one-way Event -> UI.
-    in property <string> file-name: "no document";
-    title: "notes-slint S5 - " + root.file-name;
+    // The OS title is a STRING THE BRIDGE BUILDS from the port's fact (see
+    // `title_contract`), and Rust writes it on every arm - markup computes nothing.
+    in property <string> os-title: "notes";
+    in property <string> title-words: "Untitled";
+    title: root.os-title;
     // R1 THE FRAME CONTRACT, flipped for real: no OS frame, so the strip below is the
     // only title bar and the only drag handle, and `resize-border-width` is what
     // leaves Slint a border to grab. The risk this is here to measure is that an
@@ -48,6 +54,10 @@ export component Spike inherits Window {
     // The only thing the strip may decide by itself. `in-out`, per finding 3.
     in-out property <int> taps: 0;
 
+    // Chrome's guess at what the click meant, recorded so the run can show it was
+    // dropped on the way to the port. Nothing else reads it.
+    in-out property <bool> asked-guess: false;
+
     // THE BUFFER, and the whole reason `in-out` is not a workaround: the port's text
     // lands here on a load, and every keystroke lands here too, so Rust reads one
     // property instead of reaching into a widget (architecture 5.5 - the bridge owns
@@ -75,48 +85,39 @@ export component Spike inherits Window {
     property <length> row-h: 15px;
     property <length> stack-h: root.recents.length * root.row-h;
 
-    // --- title strip: the pin ask ---
-    bar := Rectangle {
+    // --- THE TITLE STRIP: S2's Chrome, mounted, not re-implemented ---
+    // Chrome owns the look, the drag and the caption. It is handed facts and returns
+    // asks; everything it shows arrives from an Event.
+    chrome := Chrome {
         x: 0px;
         y: 0px;
         width: parent.width;
         height: 28px;
-        background: pinned ? #445566 : #2b2b2b;
-
-        pin-toggle := TouchArea {
-            double-clicked => {
-                root.toggle-max();
-            }
-            clicked => {
-                root.taps += 1;
-                // No local flip of `pinned`: the click asks, the port answers.
-                root.toggled-pin();
-            }
-        }
-
-        Text {
-            x: 8px;
-            vertical-alignment: center;
-            text: pinned ? "PINNED - port-confirmed" : "unpinned";
-            color: #eeeeee;
-            font-size: 12px;
-        }
-
-        Text {
-            x: parent.width - 70px;
-            vertical-alignment: center;
-            text: taps > 0 ? "tapped" : "";
-            color: #999999;
-            font-size: 11px;
+        title: root.title-words;
+        pinned: root.pinned;
+        // Not derived from anything this spike owns yet: the port has no dirty /
+        // save-failed surface reaching Rust here, so idle beats a lie.
+        dirty: false;
+        save-failed: false;
+        autosave: false;
+        // C1: Chrome carries a pin STATE, never a window level - nothing in this file
+        // names always-on-top or a level, and notes-platform stays the one
+        // WS_EX_TOPMOST writer. The bool Chrome hands back is the WIDGET'S GUESS at
+        // what the user wants; it is dropped here, and the ask goes through the one
+        // existing path in Rust, which decides from the port's last confirmed bit.
+        toggled-pin(asked) => {
+            root.taps += 1;
+            root.asked-guess = asked;
+            root.toggled-pin();
         }
     }
 
     // --- what the port last said, and the editor (S4 wires its text) ---
     status-line := Text {
         x: 8px;
-        y: bar.height + 2px;
+        y: chrome.height + 2px;
         text: root.status;
-        color: #bbbbbb;
+        color: Theme.text-secondary;
         font-size: 11px;
     }
 
@@ -130,7 +131,7 @@ export component Spike inherits Window {
             x: 6px;
             vertical-alignment: center;
             text: name;
-            color: #d0d0d0;
+            color: Theme.text-row;
             font-size: 11px;
         }
         TouchArea {

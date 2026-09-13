@@ -139,4 +139,61 @@ export global Theme {
     /// Deliberately NOT lifted: the 6px row inset at `ui/main.slint:101`. It is the
     /// one spacing the spike never repeats, so it stays a literal until a second
     /// use says which scale value it was meant to be.
+
+    // ---- S2: bar chrome, harvested from the FIRST bridge ------------------------
+    // chrome.slint ports crates/bridge-gpui/src/titlebar.rs. These are values that file
+    // already ships and this bridge did not have yet, so each is cited to the line it
+    // comes from for the same reason the palette above is: a token whose number nobody
+    // can check is a second opinion waiting to drift.
+
+    /// AMBER - named for the color, not for one state, because the model uses this exact
+    /// number for THREE: the save-failed dot (titlebar.rs:62 with :97-103), the lit pin
+    /// glyph (:349) and the open hamburger (:338). Calling it 'dot-save-failed' and
+    /// reusing it for the pin would be a lie; calling it 'amber' and listing its roles
+    /// keeps one hex and three honest users of it.
+    in property <color> amber: #e5a63b;
+
+    /// RED: plain unsaved dirt, and NOTHING else. Section 4.4's point is that amber must
+    /// not be visually reducible to this. titlebar.rs:63.
+    in property <color> red: #e06c75;
+
+    /// "The unlit colour, for the glyph the port did NOT confirm" - the comment at
+    /// titlebar.rs:65 is why this is its own token rather than a dimmed hover trick:
+    /// un-pinned is a state the port reports, and it has its own gray. 0x9a9a9a.
+    in property <color> icon-muted: #9a9a9a;
+
+    /// The dot's size and the air between it and the title: titlebar.rs:157-158,
+    /// .size(px(7.)) and .mr(px(6.)).
+    in property <length> dot-size: 7px;
+    in property <length> dot-gap: 6px;
+
+    /// A hover tint, DERIVED rather than picked (polish.md: derive secondary colors from
+    /// the palette). The first bridge takes its hover from the kit's Button theme; this
+    /// bridge has no kit, so the only honest source is the foreground of whatever scheme
+    /// is showing, pushed nearly transparent. 0.88 is the one number in this block that
+    /// is a judgment - reopen it against a screenshot, not against a rule.
+    out property <brush> hover-bg: Palette.foreground.transparentize(0.88);
+
+    /// The popup's frame, all of it measured off titlebar.rs:249-262: 190px wide, 4px off
+    /// the left, 4px padding, 2px between rows, 6px radius, #2a2a2a behind #e6e6e6. One
+    /// block because it is one element over there.
+    in property <length> menu-width: 190px;
+    in property <length> menu-inset: 4px;
+    in property <length> menu-pad: 4px;
+    in property <length> menu-gap: 2px;
+    in property <length> menu-radius: 6px;
+    in property <color> menu-bg: #2a2a2a;
+    in property <color> menu-fg: #e6e6e6;
+
+    /// The menu's type: titlebar.rs:262 sets text_size(px(13.)); 13 over the 14px body
+    /// the editor ships is the ratio, applied as 1rem * Theme.font-scale-menu.
+    in property <float> font-scale-menu: 0.93;
+
+    /// ROW HEIGHT - and the one value in this file that is NOT harvested. The model's
+    /// rows are a kit Button .small() (titlebar.rs:271-279) and that height is not a
+    /// number anywhere in this repo's source. 20px fits a 13px line with 3.5px of leading
+    /// either side, which is what that popup looks like across the way. REOPEN CONDITION:
+    /// when Chrome is mounted, measure it against the first bridge and replace this with
+    /// what is seen.
+    in property <length> menu-row-height: 20px;
 }

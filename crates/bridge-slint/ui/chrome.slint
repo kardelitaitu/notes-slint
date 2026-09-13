@@ -1,0 +1,300 @@
+// S2 BAR GEOMETRY for the slint bridge: the FIRST bridge's title bar, ported as markup.
+//
+// The model is crates/bridge-gpui/src/titlebar.rs - the only shipped implementation of
+// ADR-0003's band, and the one where these decisions were already argued out: the 60px slot
+// at either end of the centre (:57 + the slot() helper at :296), what the centre may say
+// (:124), the four rows the popup may offer and why two plausible ones are absent (:183),
+// and the dot's three states with their precedence (:67-104). This file re-states their
+// SHAPE in slint. It does not re-decide them, and every place the shape could not cross the
+// bridge is said out loud below instead of being smoothed over.
+//
+// NOT PORTED, and why:
+//   * The RIGHT region and the drag. There the kit's own TitleBar draws the Windows caption
+//     buttons and owns the drag (titlebar.rs:5-9). Here no-frame is on and the caption area
+//     is not ours, so the right slot keeps its PURPOSE - the centring argument needs both
+//     ends to be the same fixed width - without duplicating a caption.
+//   * Click-away. The kit has a window-level on_mouse_down_out; a slint TouchArea has no
+//     "outside" event, and the nearest equivalent (a full-window forward-touch layer) has to
+//     be installed by whoever mounts Chrome, not by a component inside it. So dismissal here
+//     is the model's other two routes: the hamburger's own second click, and a row picking
+//     itself. Escape is unwired in BOTH bridges and named as the gap (titlebar.rs:244-246).
+//   * The popup as "last child of the window's root element" (titlebar.rs:236-240). A
+//     component cannot choose its own sibling order, so painting above the editor is decided
+//     wherever Chrome is mounted. The frame is OPAQUE for that reason: a translucent menu
+//     laid over text is unreadable, and z-order is not something this file can guarantee.
+//   * One geometry divergence: the first bridge's band is the kit's 34px
+//     (TITLE_BAR_HEIGHT); this bar is the 28px this bridge already ships (Theme.bar-height,
+//     harvested from ui/main.slint). That height is the kit's argument, not ADR-0003's.
+//
+// Nothing is mounted from here and no Rust is owed by this file: every value the bar cannot
+// decide itself arrives as an 'in' property (the port's answers - pinned, dirty,
+// save-failed, autosave, title) and every click leaves as a callback that only ASKS. That is
+// the spike's rule, not a style: the UI never flips 'pinned' locally, because notes-platform
+// through the port is the single WS_EX_TOPMOST writer.
+
+import { Theme } from "theme.slint";
+
+/// The dot's three states as a value, not as a color, so the precedence is one readable
+/// expression and only one line owns hex digits - the same separation Dot / dot_state() /
+/// Dot::color() keep in the model (titlebar.rs:67-104).
+enum DotState {
+    clean,
+    dirty,
+    failed,
+}
+
+/// THE BAR: left slot (hamburger + pin), centred dot and title, matching empty right slot.
+export component Chrome inherits Rectangle {
+    // 100%, not parent.width: a component's ROOT element has no 'parent' id - slint
+    // refuses it (measured). The percentage reaches the same number and keeps Chrome
+    // mountable at any width, which is what a bar is for.
+    width: 100%;
+    height: Theme.bar-height;
+
+    // ---- what the port reported -------------------------------------------------
+    in property <string> title: "Untitled";
+    in property <bool> pinned: false;
+    in property <bool> dirty: false;
+    in property <bool> save-failed: false;
+    /// The wire's own word ('autosave'): a row that always said "Auto-save" would render a
+    /// toggle whose position is invisible (titlebar.rs:188-206).
+    in property <bool> autosave: false;
+
+    // ---- what the bar may decide by itself --------------------------------------
+    // 'in-out', not 'in': a handler may not assign an 'in' property (this bridge's own
+    // finding 3), and the menu is local state - it opens a list of things the app already
+    // knows how to do, so unlike the pin it asks the port nothing and expects no answer.
+    in-out property <bool> menu-open: false;
+
+    // ---- the asks ---------------------------------------------------------------
+    // toggled-pin carries the state to ASK for, because this closure cannot see the wire and
+    // the bridge must not keep a second copy of the bit (titlebar.rs:310-311).
+    callback toggled-pin(bool);
+    callback open-asked();
+    callback save-as-asked();
+    callback autosave-asked();
+    /// Quit is not a command: it closes this window, which is the one shutdown route that
+    /// flushes and joins the engine (titlebar.rs:226-232). Its own callback so the bridge
+    /// cannot mistake it for a fifth command.
+    callback quit-asked();
+
+    // ---- the dot ----------------------------------------------------------------
+    // failed outranks dirty: dirty already says "you have unsaved text" and the amber exists
+    // to add "and the app could not write it". A failed save over a clean buffer is the
+    // impossible-but-cheap case; the failure is still the more urgent word, so it wins. That
+    // is the whole of dot_state(), and it is the only precedence rule in this file.
+    // 'dot-state', not 'dot': the element below is 'dot-cell := Rectangle', and this
+    // bridge has already been bitten once by a short name that another scope owns
+    // (ui/main.slint finding 5: plain 'row' is refused). Renaming was DUE DILIGENCE, NOT
+    // THE FIX - measured: with the old names and the stray 'animate background' deleted,
+    // the red dot painted anyway. The bug was the animate, and the comment at the bar paint
+    // says so. Kept the rename because a property and an id that differ by a suffix in
+    // different scopes is still a trap the next reader should not have to step around.
+    property <DotState> dot-state: root.save-failed ? DotState.failed
+        : root.dirty ? DotState.dirty : DotState.clean;
+    property <brush> dot-paint:
+        root.dot-state == DotState.failed ? Theme.amber
+        : root.dot-state == DotState.dirty ? Theme.red
+        // Clean paints NOTHING: a dot that is always on screen cannot carry a state.
+        : transparent;
+
+    // THE BAR PAINT, on a filling child, as a PLAIN binding - no 'animate' beside it.
+    //
+    // What was measured here (slint-viewer 1.17.1, --check clean, three renders):
+    //   background ternary + 'animate background' on the same element  -> the lit color
+    //     NEVER appeared in the render (histogram had no #445566 at all);
+    //   the same binding with the animate deleted                      -> #445566 painted
+    //     5237 px, and the dirty dot's red with it (32 px of a 7px circle);
+    //   a cross-fading overlay driven by 'opacity: pinned ? 1 : 0' plus 'animate opacity'
+    //     -> lit color absent again.
+    // So an animate sitting on the very property that carries a STATE is not safe to ship
+    // on the two signals this app cannot afford to lose (pinned, dirty). Mechanism not
+    // settled - a screenshot is one frame, and the dot's 'animate width' survived the same
+    // test - which is exactly why it is stated instead of explained. REOPEN: watch a live
+    // window change state, and if the ease is the thing breaking the paint, file it
+    // against slint; polish.md's 150-200ms is still honored where nothing observable is
+    // asked to animate (the hover tints below, which a screenshot cannot show either way).
+    bar-bg := Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.pinned ? Theme.bar-bg-pinned : Theme.bar-bg;
+    }
+
+    // ---- LEFT: one 60px slot, two buttons ---------------------------------------
+    // 60px because that is what the model measures for the same shape (titlebar.rs:50-57):
+    // two buttons' widths, and the empty right slot has to match it or the centring below
+    // reads as a left shift.
+    HorizontalLayout {
+        x: 0px;
+        y: 0px;
+        width: Theme.slot-width;
+        height: parent.height;
+        alignment: center;
+
+        // The hamburger: three strokes computed from the theme, not an asset file. That is
+        // the right call for the same reason the pin is the WRONG one - icons-and-theming.md
+        // reserves Path and hand-drawn shapes for geometry you compute or animate, and gives
+        // icon SETS to Image + svg; this is three rectangles, and the pin is a glyph.
+        menu-btn := Rectangle {
+            width: Theme.icon-size;
+            height: parent.height;
+            hover-menu := Rectangle {
+                width: parent.width;
+                height: parent.height;
+                background: Theme.hover-bg;
+                opacity: menu-touch.has-hover ? 1 : 0;
+                animate opacity { duration: 180ms; }
+            }
+            for line[index] in [0, 1, 2]: Rectangle {
+                x: 5px;
+                y: parent.height / 2 - 5px + index * 4px;
+                width: parent.width - 10px;
+                height: 2px;
+                border-radius: 1px;
+                background: root.menu-open ? Theme.amber : Theme.icon-muted;
+            }
+            menu-touch := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    root.menu-open = !root.menu-open;
+                }
+            }
+        }
+
+        // THE PIN: the glyph changes as well as the color, because colour alone is the one
+        // signal this app cannot own - a grey-on-dark bar is exactly where a tint difference
+        // is the first thing a user loses (titlebar.rs:106-116).
+        pin-btn := Rectangle {
+            width: Theme.icon-size;
+            height: parent.height;
+            hover-pin := Rectangle {
+                width: parent.width;
+                height: parent.height;
+                background: Theme.hover-bg;
+                opacity: pin-touch.has-hover ? 1 : 0;
+                animate opacity { duration: 180ms; }
+            }
+            Image {
+                x: (parent.width - Theme.icon-size) / 2;
+                y: (parent.height - Theme.icon-size) / 2;
+                width: Theme.icon-size;
+                height: Theme.icon-size;
+                source: root.pinned ? @image-url("icons/pin.svg") : @image-url("icons/unpin.svg");
+                colorize: root.pinned ? Theme.amber : Theme.icon-muted;
+            }
+            pin-touch := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    // Ask, never flip: 'pinned' above is the port's answer, not a wish.
+                    root.toggled-pin(!root.pinned);
+                }
+            }
+        }
+    }
+
+    // ---- CENTRE: dot + title, centred in the WHOLE band -------------------------
+    // Both ends are the same fixed width, so this alignment is centring rather than
+    // "whatever the buttons left over" (titlebar.rs:50-53).
+    centre := HorizontalLayout {
+        x: Theme.slot-width;
+        y: 0px;
+        width: parent.width - Theme.slot-width * 2;
+        height: parent.height;
+        alignment: center;
+
+        // Clean contributes ZERO width, exactly as the model's empty div does; the step to
+        // 7px is animated so the title slides instead of jumping.
+        dot-cell := Rectangle {
+            width: root.dot-state == DotState.clean ? 0px : Theme.dot-size;
+            height: Theme.dot-size;
+            y: (parent.height - Theme.dot-size) / 2;
+            border-radius: Theme.dot-size / 2;
+            background: root.dot-paint;
+            animate width { duration: 180ms; }
+        }
+        title-text := Text {
+            text: root.title;
+            color: Theme.text-primary;
+            font-size: 1rem * Theme.font-scale-menu;
+            vertical-alignment: center;
+            overflow: elide;
+            // max-width, NOT horizontal-stretch. Measured on a screenshot: with stretch
+            // the Text absorbs the whole centre region, so 'alignment: center' centres an
+            // already-full-width box and the dot walks to x=60 - the model's flex_1 +
+            // items_center gives [dot][title] as ONE centred group, which is what this is.
+            // The clamp is what keeps a long title from pushing the group out of the band;
+            // elide then does the truncation ADR-0003 allows (see the tooltip caveat above).
+            max-width: root.width - Theme.slot-width * 2 - Theme.dot-size - Theme.dot-gap;
+            // ADR-0003 permits centre truncation only because a tooltip exists to give the
+            // whole path back. That tooltip is still owed in the FIRST bridge too
+            // (titlebar.rs:16-27), and it is owed here: eliding without it is the honest
+            // interim, and the full path still reaches the user via the status line and the
+            // OS title.
+        }
+    }
+
+    // ---- RIGHT: the matching empty slot ----------------------------------------
+    Rectangle {
+        x: parent.width - Theme.slot-width;
+        y: 0px;
+        width: Theme.slot-width;
+        height: parent.height;
+    }
+
+    // ---- THE POPUP: four rows, the port's vocabulary ------------------------------
+    // Open / Save As / Auto-save / Quit, in that order (titlebar.rs:183). Two plausible rows
+    // are absent BECAUSE THE LIST SAYS SO, not because they were forgotten: no New (no
+    // command creates a document without a path) and no plain Save (there is no
+    // Command::Save - which is also why the menu bar has no Save).
+    //
+    // A GridLayout, per polish.md: "align form labels and fields with a GridLayout, not
+    // nested boxes with eyeballed widths". Label in column 1, chord right-aligned in column
+    // 2, and a full-row cell per row for the tint and the click. Quit's chord is the empty
+    // string because the model returns None there (titlebar.rs:211-218) - an invented chord
+    // is exactly the drift the table exists to prevent.
+    menu := Rectangle {
+        x: Theme.menu-inset;
+        y: parent.height;
+        width: Theme.menu-width;
+        height: Theme.menu-pad * 2 + 4 * Theme.menu-row-height + 3 * Theme.menu-gap;
+        visible: root.menu-open;
+        background: Theme.menu-bg;
+        border-radius: Theme.menu-radius;
+        border-width: 1px;
+        border-color: Theme.bar-edge;
+
+        GridLayout {
+            x: Theme.menu-pad;
+            y: Theme.menu-pad;
+            width: parent.width - Theme.menu-pad * 2;
+            height: parent.height - Theme.menu-pad * 2;
+            spacing-vertical: Theme.menu-gap;
+            spacing-horizontal: Theme.gap;
+
+            // Row 0 - Open
+            Rectangle { col: 0; row: 0; colspan: 2; background: Theme.hover-bg; opacity: row-open.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 0; text: "Open"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            Text { col: 1; row: 0; text: "Ctrl+O"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            row-open := TouchArea { col: 0; row: 0; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.open-asked(); root.menu-open = false; } }
+
+            // Row 1 - Save As: the ONLY save this app has, and the act ADR-0001 arms
+            // autosave after on a foreign file.
+            Rectangle { col: 0; row: 1; colspan: 2; background: Theme.hover-bg; opacity: row-save.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 1; text: "Save As"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            Text { col: 1; row: 1; text: "Ctrl+S"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            row-save := TouchArea { col: 0; row: 1; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.save-as-asked(); root.menu-open = false; } }
+
+            // Row 2 - Auto-save, labelled with the state it will TOGGLE
+            Rectangle { col: 0; row: 2; colspan: 2; background: Theme.hover-bg; opacity: row-autosave.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 2; text: root.autosave ? "Auto-save (on)" : "Auto-save (off)"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            Text { col: 1; row: 2; text: "Ctrl+T"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            row-autosave := TouchArea { col: 0; row: 2; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.autosave-asked(); root.menu-open = false; } }
+
+            // Row 3 - Quit: no chord, and a different kind of act (close, not command)
+            Rectangle { col: 0; row: 3; colspan: 2; background: Theme.hover-bg; opacity: row-quit.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 3; text: "Quit"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            Text { col: 1; row: 3; text: ""; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            row-quit := TouchArea { col: 0; row: 3; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.quit-asked(); root.menu-open = false; } }
+        }
+    }
+}
