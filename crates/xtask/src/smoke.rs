@@ -135,6 +135,38 @@ const CLOSE_SECS: u64 = 10;
 /// internally, so a wedged child cannot hang the gate.
 const OUTER_SECS: u64 = WINDOW_SECS + CLOSE_SECS + 20;
 
+/// Which cargo profile an artifact was built by.
+///
+/// NOT a CLI input yet - `--binary` is the slice that lets a caller name one, and
+/// today every leg asks for [Profile::Debug]. It exists now because the profile was
+/// baked into two string literals: `target/debug/...` in [GPUI_TARGET] and
+/// `.join("debug")` in [resolve_exe]. That is the same bug shape this file just
+/// fixed for the target - a literal quietly encoding one choice stops being one choice
+/// the moment a second one appears. With the type here, the profile is an argument with
+/// two legal values and [ArtifactTarget::exe_rel] is the only place the string is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    Debug,
+    /// Described, not driven: no leg builds or resolves a release artifact yet, so
+    /// this variant is constructed only by the tests that prove [Profile::dir] and
+    /// [ArtifactTarget::exe_rel] actually vary with it. Same shape as the marker on
+    /// [SLINT_TARGET], same reason for the marker rather than a deletion: the seam is
+    /// worth nothing if it has one legal value, and the day `--binary` grows a
+    /// profile the consumer is the thing that removes this allow.
+    #[allow(dead_code)]
+    Release,
+}
+
+impl Profile {
+    /// The directory cargo writes this profile's bins into.
+    pub const fn dir(self) -> &'static str {
+        match self {
+            Profile::Debug => "debug",
+            Profile::Release => "release",
+        }
+    }
+}
+
 /// One built artifact the harness can point at: which package, which bin inside it,
 /// where the exe lands by default, which build script decides its embedded resources,
 /// and what may make it stale. The struct exists because there are now TWO bridges in
@@ -152,8 +184,16 @@ pub struct ArtifactTarget {
     pub pkg: &'static str,
     /// The bin target inside it, as `--bin` takes it.
     pub bin: &'static str,
-    /// Where the exe sits when nobody set CARGO_TARGET_DIR.
-    pub exe_rel: &'static str,
+    /// Where the exe sits IN THE DEBUG PROFILE when nobody set CARGO_TARGET_DIR.
+    ///
+    /// A const FIELD, and named `_debug` so nobody mistakes it for the truth
+    /// about the row, for exactly the reason the launched name used to be a literal:
+    /// `const &str`, and a const context cannot call the formatting function
+    /// below. The guard against the two drifting is
+    /// `exe_name_is_the_bin_target_plus_the_windows_extension`, which asserts
+    /// this field EQUALS `exe_rel(Profile::Debug)` for BOTH rows - so the
+    /// projection is checked against the seam rather than restated beside it.
+    pub exe_rel_debug: &'static str,
     /// The build script that decides the embedded manifest. Empty until the target has
     /// one - and see [crate::smoke::build_embeds_manifest], which reads it.
     pub build_rs: &'static str,
@@ -171,7 +211,7 @@ pub struct ArtifactTarget {
 const GPUI_TARGET: ArtifactTarget = ArtifactTarget {
     pkg: "notes-bridge-gpui",
     bin: "notes-gpui",
-    exe_rel: "target/debug/notes-gpui.exe",
+    exe_rel_debug: "target/debug/notes-gpui.exe",
     build_rs: "crates/bridge-gpui/build.rs",
     freshness_roots: &[
         "crates/bridge-gpui/src",
@@ -203,7 +243,7 @@ const GPUI_TARGET: ArtifactTarget = ArtifactTarget {
 const SLINT_TARGET: ArtifactTarget = ArtifactTarget {
     pkg: "notes-bridge-slint",
     bin: "notes-slint",
-    exe_rel: "target/debug/notes-slint.exe",
+    exe_rel_debug: "target/debug/notes-slint.exe",
     build_rs: "",
     freshness_roots: &[
         "crates/bridge-slint/src",
@@ -224,14 +264,19 @@ const SLINT_TARGET: ArtifactTarget = ArtifactTarget {
     ],
 };
 
-const BIN_REL: &str = GPUI_TARGET.exe_rel;
-/// Just the file name, for a CARGO_TARGET_DIR that replaces the whole tree. Stays a
-/// literal for one reason: `concat!` cannot read a const struct's field, and a
-/// `format!` at this position would stop it being a const. What keeps it honest is the
-/// test `exe_name_is_the_bin_target_plus_the_windows_extension`, which fails the day the
-/// two stop agreeing - a code span, not a doc link, because `mod tests` is not built by
-/// `cargo doc` and a link to it could not resolve.
-pub const EXE_NAME: &str = "notes-gpui.exe";
+const BIN_REL: &str = GPUI_TARGET.exe_rel_debug;
+/// THE FILE NAME SMOKE LAUNCHES, derived from the row rather than written again.
+///
+/// This used to be `pub const EXE_NAME: &str = "notes-gpui.exe"` - a third copy of
+/// the bin name that a rename could leave standing, guarded only by a test comparing
+/// it to [GPUI_TARGET::bin]. Once [ArtifactTarget::bin_file] existed the literal had
+/// no job: the `CARGO_TARGET_DIR` branch of [resolve_exe] takes the derived name,
+/// and the only place that still needs the spelled-out string is the test that pins
+/// what `notes-gpui` means to CI and to [crate::manifest]. Deleting a guarded
+/// duplicate beats guarding a duplicate.
+pub fn exe_name() -> String {
+    GPUI_TARGET.bin_file()
+}
 const BUILD_HINT: &str = "cargo build -p notes-bridge-gpui --bin notes-gpui";
 const SESSION_FILE: &str = "session.json";
 /// The other file in the same directory, and the one the RECENTS live in (core's
@@ -290,6 +335,23 @@ exit 0
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Probe {
     kv: BTreeMap<String, String>,
+}
+
+impl ArtifactTarget {
+    /// THE PATH SEAM: `target/{profile}/{bin}.exe`. Every place that used to
+    /// concatenate `"debug"` with an exe name goes through here, so a profile is
+    /// one argument instead of a fourth literal for somebody to forget.
+    pub fn exe_rel(&self, profile: Profile) -> String {
+        format!("target/{}/{}.exe", profile.dir(), self.bin)
+    }
+
+    /// Just the file name, for a CARGO_TARGET_DIR that replaces the whole tree - the
+    /// The test `exe_name_is_the_bin_target_plus_the_windows_extension` pins what
+    /// this returns against the spelled-out name CI, [crate::manifest] and the smoke
+    /// steps all use by hand - so the derivation is checked, not assumed.
+    pub fn bin_file(&self) -> String {
+        format!("{}.exe", self.bin)
+    }
 }
 
 impl Probe {
@@ -3077,11 +3139,31 @@ fn restore_session(path: &Path, bytes: Option<&[u8]>) {
 /// unused. A harness that cannot be pointed at a build is not a harness. The
 /// resolution is pure and returned with the reason it chose, because the path is
 /// the thing a reader needs to trust the verdict.
+/// THE PROFILE EVERY LEG RUNS AT TODAY, expressed as a guard rather than a habit.
+///
+/// gpui's leg is Debug for a concrete reason, not a default: [BUILD_ARGS] builds a
+/// debug bin, [crate::manifest] rewrites and reads back
+/// `target/debug/notes-gpui.exe`, and CI's artifact chain names that same path -
+/// so a Release exe would have smoke judge a file nothing in this repo produces.
+/// When `--binary` grows a profile argument, THIS is the function that stops
+/// being constant, and the assertion below is what fails the day somebody widens one
+/// side and not the other. Until then it takes the target and ignores it, which is
+/// honest: the seam exists so the profile has one home, not so it can vary.
+const fn driven_profile(target: &ArtifactTarget) -> Profile {
+    let _ = target;
+    Profile::Debug
+}
+
+/// The guard, evaluated at compile time: if the driven profile ever stops being
+/// Debug for the target smoke actually runs, this does not build.
+const _: () = assert!(matches!(driven_profile(&GPUI_TARGET), Profile::Debug));
+
 pub fn resolve_exe(root: &Path, target_dir: Option<&str>) -> (PathBuf, &'static str) {
+    let profile = driven_profile(&GPUI_TARGET);
     let trimmed = target_dir.unwrap_or_default().trim();
     if trimmed.is_empty() {
         return (
-            root.join(BIN_REL),
+            root.join(GPUI_TARGET.exe_rel(profile)),
             "no CARGO_TARGET_DIR in the environment, so the workspace default",
         );
     }
@@ -3094,7 +3176,9 @@ pub fn resolve_exe(root: &Path, target_dir: Option<&str>) -> (PathBuf, &'static 
         root.join(base)
     };
     (
-        base.join("debug").join(EXE_NAME),
+        // Same helper the non-redirected branch's path is built from, so a
+        // redirected lane's exe is named by exactly one expression in this crate.
+        base.join(profile.dir()).join(exe_name()),
         "CARGO_TARGET_DIR, honoured as asked",
     )
 }
@@ -5451,13 +5535,29 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
             // The exe is what gets built later, not what is on disk now: neither row's
             // exe may be asserted to exist here, or this test would need a build.
             assert!(
-                Path::new(t.exe_rel).is_relative(),
+                Path::new(t.exe_rel_debug).is_relative(),
                 "the {label} row's exe path must be workspace-relative, not absolute",
             );
+            // The const projection and the seam must be THE SAME STRING. Without
+            // this the field could quietly keep saying "debug" after the seam grew a
+            // real profile, which is the exact drift the field's doc claims a test
+            // prevents - so the claim is checked here, per row.
             assert_eq!(
-                t.exe_rel,
-                format!("target/debug/{}.exe", t.bin),
-                "the {label} row's exe must sit where cargo puts a debug bin of that name"
+                t.exe_rel_debug,
+                t.exe_rel(Profile::Debug),
+                "the {label} row's Debug projection is no longer what the seam builds"
+            );
+            // And the seam is not a tautology: a Release row has to differ, or the
+            // profile argument means nothing and the enum is decoration.
+            assert_eq!(
+                t.exe_rel(Profile::Release),
+                format!("target/release/{}.exe", t.bin),
+                "the {label} row's Release path is not the same seam with the other profile"
+            );
+            assert_ne!(
+                t.exe_rel(Profile::Debug),
+                t.exe_rel(Profile::Release),
+                "the {label} row resolves both profiles to one path"
             );
             for dir in t.freshness_roots {
                 if !root.join(dir).is_dir() {
@@ -5508,7 +5608,7 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
         );
     }
 
-    /// `EXE_NAME` is a literal because `concat!` cannot read a const struct's field, and
+    /// the launched file name is derived, and `concat!` cannot read a const struct's field, and
     /// a literal is exactly the kind of thing that rots quietly: rename the bin target
     /// and smoke keeps launching (and then judging) a file cargo no longer emits. This
     /// is the test that doc comment points at. It pins BOTH rows' exe names, since the
@@ -5516,9 +5616,18 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
     #[test]
     fn exe_name_is_the_bin_target_plus_the_windows_extension() {
         assert_eq!(
-            EXE_NAME,
+            exe_name(),
             format!("{}.exe", GPUI_TARGET.bin),
-            "EXE_NAME must stay bin + the Windows extension, or smoke launches nothing"
+            "the launched name must stay bin + the Windows extension, or smoke launches nothing"
+        );
+        // The one place the spelled-out string still earns its keep: several OTHER
+        // surfaces name this file by hand - CI's artifact path, the manifest step's
+        // default target, the smoke step's needles - and none of them can be reached
+        // from here. So the derived name is pinned against the literal they assume.
+        assert_eq!(
+            exe_name(),
+            "notes-gpui.exe".to_string(),
+            "the launched exe changed: rename it in ci.yml's artifact paths and in              xtask manifest's default target in the SAME commit, or smoke judges a file              nothing builds"
         );
         assert_eq!(
             BIN_REL,
@@ -5526,16 +5635,23 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
             "the default exe path and the launched name must agree about the same bin"
         );
         assert_eq!(
-            SLINT_TARGET.exe_rel,
+            SLINT_TARGET.exe_rel_debug,
             format!("target/debug/{}.exe", SLINT_TARGET.bin),
             "the second bridge's described exe is named the same way, even unrun"
         );
+        // And the derivation is not circular: the row's bin, the derived name and the
+        // literal above are three spellings of one fact.
+        assert_eq!(
+            GPUI_TARGET.bin_file(),
+            exe_name(),
+            "the gpui row and the launched name disagree"
+        );
         // The two agree by construction, not by coincidence of the same literal:
-        // a redirected build still has to be named EXE_NAME.
+        // a redirected build still has to be named the same file.
         let (exe, _) = resolve_exe(Path::new("wherever"), Some("C:/builds/lane-4"));
         assert_eq!(
             exe.file_name().and_then(|n| n.to_str()),
-            Some(EXE_NAME),
+            Some("notes-gpui.exe"),
             "the CARGO_TARGET_DIR branch resolves to the same file name: {exe:?}"
         );
     }
