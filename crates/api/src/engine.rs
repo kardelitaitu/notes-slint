@@ -63,6 +63,23 @@ use crate::gateway::EventTx;
 /// then the cadence is fixed and the tick's job is the session write.
 const AUTOSAVE_IDLE: Duration = Duration::from_millis(750);
 
+/// How often the engine asks its host for paths somebody dropped on the window.
+///
+/// A poll, and it is a poll because the OS will not wake THIS thread: the
+/// `IDropTarget` callback lands on the window's own thread, inside a drag loop
+/// Windows drives for the sender, where the only legal act is to note the paths
+/// and get out - which is what notes-platform does, buffering them. So the other
+/// end has to ask, and this is the rate at which it asks.
+///
+/// 120 ms is a latency choice with no owner and no precedent in this crate, so it
+/// is named rather than inlined: a path that lands here waits at most one poll to
+/// become a [`Command::Open`], which reads as instant to a hand that has just let
+/// go of a mouse button, and a faster rate buys nothing a user can see while
+/// costing a wake-up and a host call per tick. It deliberately does NOT share
+/// [`AUTOSAVE_IDLE`] - see the `next_drop` field for what merging the two clocks
+/// breaks.
+const DROP_POLL: Duration = Duration::from_millis(120);
+
 /// How many commands the shutdown drain will process, at most. Why the budget is
 /// a count rather than a duration, and what happens when it runs out, is written
 /// down at [`Engine::drain`].
@@ -294,6 +311,20 @@ pub(crate) struct Engine {
     /// on the next tick instead of losing the change.
     pending: Pending,
     deadline: Instant,
+    /// The SECOND clock: when to next ask the host for dropped paths. See
+    /// [`DROP_POLL`] for the rate and [`Engine::poll_drops`] for the act.
+    ///
+    /// A separate field because it is a separate QUESTION. `deadline` asks "has this
+    /// buffer been quiet long enough to write"; this asks "has the host been asked
+    /// about drops recently". Fold them into one instant and every 120 ms poll
+    /// re-arms the 750 ms flush, so autosave NEVER fires on the one desktop shape
+    /// where files get dropped at all. Invisible on a quiet machine, fatal on a live
+    /// one - which is why the two clocks are apart in the struct, not merely apart
+    /// in the code, and why [`Engine::on_tick`] has to ask which of them rang.
+    ///
+    /// Advanced by [`Engine::poll_drops`] and nowhere else, and first thing there,
+    /// so no path can leave a due poll due forever and spin [`Engine::receive`].
+    next_drop: Instant,
     /// M5: a failed SESSION write is reported once, then latched until a write
     /// succeeds - see [`Engine::flush_state`]. Documents are different: one
     /// event per failed attempt is the contract there (ADR-0001). The session
@@ -433,6 +464,12 @@ impl Engine {
             backend,
             facts,
             deadline: Instant::now() + AUTOSAVE_IDLE,
+            // A FULL interval ahead, never a zeroed one: `Instant::default()` is the
+            // epoch and so already behind `now`, which would make the loop's first
+            // wake a drop poll before any window exists and - off Windows, where the
+            // seam answers empty forever - leave `receive()` spinning at the poll
+            // rate for the life of the process.
+            next_drop: Instant::now() + DROP_POLL,
             session,
         }
     }
@@ -466,8 +503,12 @@ impl Engine {
                         break;
                     }
                 }
-                // The tick arm: the session write's other home, and where M4's
-                // periodic-flush policy will go.
+                // The tick arm: the session write's other home, where M4's
+                // periodic-flush policy will go, and - since the drop door - the
+                // ONLY caller of the poll. That stays true because a Timeout is the
+                // only event meaning "a clock rang and nobody sent anything"; which
+                // of the two clocks rang is asked inside [`Engine::on_tick`], so a
+                // third clock changes that method and not this arm.
                 Err(RecvTimeoutError::Timeout) => self.on_tick(),
                 // The ABORT path: Gateway::drop took the last Sender. recv hands
                 // over everything already queued before reporting Disconnected,
@@ -516,17 +557,117 @@ impl Engine {
 
     /// When the tick arm should next run; None means "wait for a command forever".
     ///
-    /// Fixed today, and a method because M4 makes it depend on the document: a
-    /// dirty buffer, the debounce and a loaded interval all move it.
+    /// THE EARLIEST OF THE TWO CLOCKS, which is the whole of how the drop poll is
+    /// scheduled: [`Engine::receive`] already waits exactly here and already answers
+    /// `Timeout` when the bound is behind `now`, so folding the poll in at this one
+    /// point is what makes "never sleep past [`DROP_POLL`] while a window could be
+    /// dropped on" true without touching the wait, the arms or the loop.
+    ///
+    /// The poll clock is folded in only where a seam exists to answer it. With no
+    /// host there is nothing to take - off Windows that is permanent, not a delay -
+    /// and 8 wake-ups a second that each return immediately would be a battery cost
+    /// paid for a call that cannot exist. A build fact, not a decision.
+    ///
+    /// Still fixed today, and still a method because M4 makes the flush half depend
+    /// on the document: a dirty buffer, the debounce and a loaded interval all move
+    /// it.
     fn next_deadline(&self) -> Option<Instant> {
-        Some(self.deadline)
+        Some(match &self.backend {
+            Some(_) => self.deadline.min(self.next_drop),
+            None => self.deadline,
+        })
     }
 
+    /// The timeout arm, now serving TWO independent clocks with one wake-up.
+    ///
+    /// It has to ask which one rang, and the order is the contract: the drop poll
+    /// FIRST, so a path taken here becomes a [`Command::Open`] whose recents and
+    /// session changes are carried by the flush in THIS tick instead of waiting for
+    /// the next one; the flush SECOND and behind its own gate, because a poll wake
+    /// must not write state 6x more often than the cadence asks (see the `next_drop`
+    /// field for the worse version, where the poll also re-arms the flush and
+    /// autosave dies).
     fn on_tick(&mut self) {
+        if Instant::now() >= self.next_drop {
+            self.poll_drops();
+        }
+        if Instant::now() < self.deadline {
+            // A poll-only wake: the flush keeps its own appointment.
+            return;
+        }
         // A tick is never the last chance: there is always another tick, and a show
         // bit that changed on one sample is waiting for its second there.
         self.flush_state(false);
         self.deadline = Instant::now() + AUTOSAVE_IDLE;
+    }
+
+    /// THE DROP DOOR: ask the host what has been dropped since the last ask, and
+    /// hand every path to the same [`Self::handle`] the loop's own Ok arm uses.
+    ///
+    /// The `Open` is not sent anywhere. It is not queued, no `Sender` is touched,
+    /// nothing is waited on, and the thread does not change: this is a direct call
+    /// into the arm that already exists for [`Command::Open`], one wake-up later
+    /// than a bridge send would have been. That is what keeps rule 4 intact - the
+    /// reentrancy trap guards a thread that queues a command and then WAITS on its
+    /// own queue, and this path neither queues nor waits. What protects it instead
+    /// is that [`WindowBackend::take_dropped_paths`] DRAINS, so the list cannot
+    /// feed itself, and that `handle` cannot reach back here (`Open` never ticks,
+    /// and only the timeout arm polls) - so the depth is one, by construction and
+    /// not by luck.
+    ///
+    /// Two guards, in this order:
+    ///
+    /// * **Advance the poll clock first**, unconditionally, before anything can
+    ///   return early. A due-and-left-due `next_drop` would make
+    ///   [`Engine::receive`] answer `Timeout` immediately forever - a 120 ms spin,
+    ///   which is exactly the CPU burn the existing no-spin test watches for.
+    /// * **Never while draining.** A shutdown drain is the one moment the UI thread
+    ///   is already waiting on this thread's exit, and the `draining` flag is this
+    ///   struct's existing answer to "is side-effecting host work allowed now"
+    ///   (MAJOR 4: the restore move and the pin skip for the same reason). Opening
+    ///   a document at that moment would add a full read, a recents write and a
+    ///   fresh generation of text to a quit that has already been priced. The paths
+    ///   are left in the host's buffer, which is also what notes-platform does on
+    ///   `disarm`: a drop that arrived is never thrown away, only not acted on.
+    ///
+    /// The order has a cost, and it is named here rather than found later: a poll
+    /// wake runs BEFORE the flush, so a drop landing in the same instant as an
+    /// autosave deadline delays that write by the read of the dropped file. The
+    /// delay is one pass over a buffer the host already drained, the flush still
+    /// runs on the same wake, and the reverse order is worse - it would persist a
+    /// session naming the file the drop was about to replace.
+    ///
+    /// `drain` never reaches this method today - it calls `handle`, not `on_tick` -
+    /// so the gate is what keeps that a RULE instead of an accident of the call
+    /// graph, and the two tests are honest about which half each one holds:
+    /// `the_shutdown_drain_never_asks_for_dropped_paths` is the LOAD-BEARING one
+    /// (it drives the real `handle(Shutdown)` -> `drain` graph, so it is the proof
+    /// about the sequence the process actually runs), while
+    /// `the_poll_gate_refuses_to_ask_while_draining` pins the early-return itself,
+    /// from a state no path in this build produces. They fail SEPARATELY, which is
+    /// the point of having both: delete the gate and ONLY the second fails (the
+    /// drain still never reaches this method, so the first keeps passing); put a
+    /// bare `take_dropped_paths` into `drain`, bypassing the gate, and ONLY the
+    /// first fails. Neither test is a restatement of the other.
+    fn poll_drops(&mut self) {
+        self.next_drop = Instant::now() + DROP_POLL;
+        if self.draining {
+            return;
+        }
+        // SCOPED, and it has to be: `take_dropped_paths` is `&mut self` on the
+        // seam, so holding that borrow across the loop would make `self.handle`
+        // a second mutable borrow of the engine. The list is owned the moment it
+        // comes back - `Vec<PathBuf>`, copied out of the buffer by design - so the
+        // borrow ends here and the opens are free to do whatever the engine does.
+        let paths = match self.backend.as_mut() {
+            Some(backend) => backend.take_dropped_paths(),
+            None => return,
+        };
+        for path in paths {
+            // Flow is ignored on purpose: only `Shutdown` returns `Exit`, and this
+            // is an `Open`. A dropped file must never become a quit path.
+            let _ = self.handle(Command::Open { path });
+        }
     }
 
     /// Handles one command. Only [`Command::Shutdown`] returns [`Flow::Exit`].
@@ -2626,6 +2767,251 @@ mod tests {
             out.push(event);
         }
         out
+    }
+
+    // ------------------------------------------------------------------
+    // FILE DROP (S4): the second clock, and the door it opens.
+    // ------------------------------------------------------------------
+
+    /// The fake's buffer: what the next take hands over, and what it DRAINS.
+    type DropQueue = std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>;
+    /// How many times the engine ASKED. Kept separate from the queue because the
+    /// count is the assertion that matters here: "no second `Loaded`" is also
+    /// exactly what a poll that never ran looks like.
+    type DropTakes = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+    /// A seam that answers the drop poll and NOTHING else - the `PinBackend` rule,
+    /// and the same one tests/support/host_mock.rs states: every other seam
+    /// `panic!`s, so a drop test that accidentally registers a window or measures
+    /// a rect fails by NAMING the call it should not have made rather than by
+    /// quietly agreeing with it.
+    struct DropBackend {
+        queued: DropQueue,
+        takes: DropTakes,
+    }
+
+    impl WindowBackend for DropBackend {
+        fn take_dropped_paths(&mut self) -> Vec<PathBuf> {
+            self.takes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut queued = self
+                .queued
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut queued)
+        }
+
+        fn set_topmost(&mut self, _handle: isize, _on: bool) -> PinOutcome {
+            panic!("the drop fixture has no answer for set_topmost")
+        }
+        fn frame_rect(&self, _handle: isize) -> PlatformResult<FrameRect> {
+            panic!("the drop fixture has no answer for frame_rect")
+        }
+        fn restore_frame_rect(&self, _handle: isize) -> PlatformResult<Placement> {
+            panic!("the drop fixture has no answer for restore_frame_rect")
+        }
+        fn set_frame_rect(
+            &mut self,
+            _handle: isize,
+            _rect: FrameRect,
+            _scale: f32,
+        ) -> PlatformResult<()> {
+            panic!("the drop fixture has no answer for set_frame_rect")
+        }
+        fn set_restore_frame_rect(
+            &mut self,
+            _handle: isize,
+            _rect: FrameRect,
+        ) -> PlatformResult<()> {
+            panic!("the drop fixture has no answer for set_restore_frame_rect")
+        }
+        fn primary_work_area(&self) -> PlatformResult<FrameRect> {
+            panic!("the drop fixture has no answer for primary_work_area")
+        }
+    }
+
+    /// An engine with a drop seam, and a state dir that EXISTS: the `Open` these
+    /// tests trigger pushes recents, so the fixture must not fail on the place a
+    /// write would go. The caller holds the `TempDir` for the length of the test,
+    /// which is what keeps the directory alive under the path being read.
+    fn drop_wired(
+        queued: DropQueue,
+        takes: DropTakes,
+        state: &Path,
+    ) -> (Engine, mpsc::Receiver<Event>) {
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let engine = Engine::new(
+            cmd_rx,
+            event_tx,
+            StateDir(state.to_path_buf()),
+            Session::default(),
+            Settings::default(),
+            Some(Box::new(DropBackend { queued, takes })),
+            None,
+        );
+        (engine, event_rx)
+    }
+
+    /// The `Loaded` paths in a batch, and a tripwire on the shape next to them: a
+    /// `LoadFailed` is a door that opened on nothing, so it fails here loudly.
+    fn loaded(events: Vec<Event>) -> Vec<PathBuf> {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Loaded { path, .. } => Some(path),
+                other => {
+                    assert!(!matches!(other, Event::LoadFailed { .. }), "{other:?}");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// THE DOOR, end to end: a path the host hands over on a poll becomes a
+    /// `Loaded`, through the real [`Command::Open`] arm and a real file, and the
+    /// SAME poll ringing again does not re-open it. Four assertions, each killing a
+    /// different way this could pass while broken:
+    ///
+    /// 1. exactly one `Loaded`, naming the dropped path - the door works;
+    /// 2. the autosave deadline UNCHANGED across the wake - a poll-only wake neither
+    ///    runs the flush nor re-arms it. (The naive one-clock version of this
+    ///    feature passes 1, 3 and 4 and starves autosave forever, which is the bug
+    ///    the two-clock design exists to avoid, so this is the assertion that
+    ///    distinguishes the design from the shortcut.);
+    /// 3. the fake's buffer empty - the take DRAINED, it did not peek;
+    /// 4. takes == 2 after the second tick - the engine ASKED again and found
+    ///    nothing, the only reading that separates "never re-opened" from "stopped
+    ///    polling".
+    #[test]
+    fn a_dropped_path_is_opened_on_the_next_tick_and_never_again() {
+        let dir = tempfile::tempdir().expect("a state dir for the fixture");
+        let dropped = dir.path().join("thrown-in.notes");
+        std::fs::write(&dropped, "from explorer\n").expect("write the dropped note");
+
+        let queued: DropQueue = std::sync::Arc::new(std::sync::Mutex::new(vec![dropped.clone()]));
+        let takes: DropTakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut engine, events) = drop_wired(queued.clone(), takes.clone(), dir.path());
+        let autosave = engine.deadline;
+
+        // Ring the SECOND clock only: no command was sent, nothing was shut down.
+        engine.next_drop = Instant::now();
+        engine.on_tick();
+
+        assert_eq!(
+            loaded(drain(&events)),
+            vec![dropped.clone()],
+            "(1) the door"
+        );
+        assert_eq!(
+            engine.deadline, autosave,
+            "(2) the flush kept its appointment"
+        );
+        assert!(queued.lock().unwrap().is_empty(), "(3) the take drained");
+
+        engine.next_drop = Instant::now();
+        engine.on_tick();
+        assert!(loaded(drain(&events)).is_empty(), "(4a) no second open");
+        assert_eq!(
+            takes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "(4b) the second poll RAN and had nothing to say"
+        );
+        assert_eq!(
+            engine.deadline, autosave,
+            "and two poll wakes still wrote no state"
+        );
+    }
+
+    /// THE STRUCTURAL HALF, and the load-bearing one of the two: the shutdown drain
+    /// runs the queue and never reaches the timeout arm, so a drop that landed
+    /// during quit is not opened with a UI thread already waiting on this thread's
+    /// exit. Proved on the real call graph - `handle(Shutdown)` IS what `run()`
+    /// calls - so moving the poll into `drain` or into `handle` breaks THIS test.
+    /// The paths stay in the host's buffer rather than being cleared, which is also
+    /// notes-platform's own `disarm` rule: a drop in flight toward a closing
+    /// window is data, not litter.
+    #[test]
+    fn the_shutdown_drain_never_asks_for_dropped_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dropped = dir.path().join("late.notes");
+        std::fs::write(&dropped, "arrived during quit\n").expect("write");
+        let queued: DropQueue = std::sync::Arc::new(std::sync::Mutex::new(vec![dropped.clone()]));
+        let takes: DropTakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut engine, events) = drop_wired(queued.clone(), takes.clone(), dir.path());
+
+        assert_eq!(engine.handle(Command::Shutdown), Flow::Exit);
+
+        assert_eq!(
+            takes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the drain never asks the host"
+        );
+        assert!(loaded(drain(&events)).is_empty(), "so nothing is Loaded");
+        assert_eq!(
+            queued.lock().unwrap().len(),
+            1,
+            "and the path is not consumed"
+        );
+    }
+
+    /// THE GATE HALF, driven directly, and honest about being the weaker claim:
+    /// NOTHING in this build calls `poll_drops` while `draining` is set - the test
+    /// above is what makes that true - so this pins the early-return as a RULE, not
+    /// as an observed sequence. It earns its place by naming which guard is which:
+    /// delete the `if self.draining` line and THIS fails while the structural one
+    /// keeps passing. It also pins the part of `poll_drops` that is not about the
+    /// gate at all - the clock advances even on a skipped wake, which is what stops
+    /// the loop spinning on a due poll it refuses to serve.
+    #[test]
+    fn the_poll_gate_refuses_to_ask_while_draining() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dropped = dir.path().join("held.notes");
+        std::fs::write(&dropped, "x\n").expect("write");
+        let queued: DropQueue = std::sync::Arc::new(std::sync::Mutex::new(vec![dropped.clone()]));
+        let takes: DropTakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut engine, _events) = drop_wired(queued.clone(), takes.clone(), dir.path());
+        let asked = || takes.load(std::sync::atomic::Ordering::SeqCst);
+
+        engine.draining = true;
+        engine.poll_drops();
+        assert_eq!(asked(), 0, "draining: the host is not asked at all");
+        assert_eq!(queued.lock().unwrap().len(), 1, "and nothing is consumed");
+        assert!(
+            engine.next_drop > Instant::now(),
+            "the clock moved on the skipped wake, so receive() cannot spin on it"
+        );
+
+        engine.draining = false;
+        engine.poll_drops();
+        assert_eq!(asked(), 1, "not draining: exactly one ask");
+        assert!(queued.lock().unwrap().is_empty(), "and the buffer drained");
+    }
+
+    /// THE BOUND, and the reason `receive()` needed no change at all: with a seam
+    /// the wait is the EARLIER of the two clocks, so it can never sleep past a poll;
+    /// with no seam the poll clock is not folded in, so a host that cannot answer is
+    /// not woken eight times a second to find out again.
+    #[test]
+    fn the_wait_is_bounded_by_the_earlier_of_the_two_clocks() {
+        let queued: DropQueue = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let takes: DropTakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (polled, _events) = drop_wired(queued, takes, Path::new("unused-in-this-test"));
+        let bound = polled
+            .next_deadline()
+            .expect("the idle cadence is on")
+            .saturating_duration_since(Instant::now());
+        assert!(
+            bound <= DROP_POLL,
+            "a seam means the wait never exceeds the poll: {bound:?}"
+        );
+
+        let bare = engine();
+        assert_eq!(
+            bare.next_deadline(),
+            Some(bare.deadline),
+            "no seam: no poll clock at all"
+        );
+        assert!(bare.deadline > Instant::now(), "and that wake is not due");
     }
 
     /// F1, THE READBACK CONTRACT: with a window registered, a `SetPinned` is

@@ -12,6 +12,7 @@
 //! [`Arc<Mutex<..>>`] because the engine owns the boxes and usually runs on
 //! another thread: the [`Send`] bound on the traits rules out [`Rc<RefCell<..>>`].
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use notes_platform::{
@@ -46,6 +47,11 @@ pub enum Call {
     },
     PrimaryWorkArea,
     Codepage,
+    /// One ask for the paths somebody dropped on the window. Recorded because
+    /// the COUNT is the assertion: a poll that never calls it and a poll that calls
+    /// it and finds nothing look identical from the events, and the difference is
+    /// the whole difference between "drained" and "never asked".
+    TakeDropped,
 }
 
 /// What the fake host answers, and where it refuses.
@@ -96,6 +102,12 @@ pub struct Answers {
     /// follow-up once the verbatim signature is handed over - the mock
     /// carries the answer so that follow-up is testable when it lands.
     pub scale: f32,
+    /// The FILE-DROP queue: exactly what the next [`take_dropped_paths`] hands
+    /// over, and it DRAINS. Empty by default, which is the trait's own answer, so
+    /// every fixture written before the drop poll existed behaves unchanged - a
+    /// host that never has anything is indistinguishable from a host with no drop
+    /// support, and no existing assertion shifts by a byte.
+    pub drops: Vec<PathBuf>,
 }
 
 impl Default for Answers {
@@ -114,6 +126,7 @@ impl Default for Answers {
             fail_work_area: None,
             block_move_ms: 0,
             scale: 1.0,
+            drops: Vec::new(),
         }
     }
 }
@@ -165,6 +178,35 @@ impl Host {
     pub fn set_restore_show(&self, show: ShowState) {
         let mut answers = self.answers();
         answers.restore_show = show;
+    }
+
+    /// Moves ONLY the drop queue, leaving every other answer where it was - the
+    /// same reason [`Self::set_restore_show`] moves one question: a test about the
+    /// drain must not move the geometry, the codepage or a refusal at the same
+    /// moment, or it cannot tell which answer it observed. REPLACES the queue, so
+    /// `set_drops(vec![])` is how a test says "nothing more is coming".
+    ///
+    /// ALLOWED-as-unused on purpose, and so is [`Self::drop_takes`]: the engine's own
+    /// tests drive a local fixture instead (they need the queue and the counter as
+    /// shared cells the box cannot hand back), and the integration suite that takes
+    /// the drop door is the next slice. `dead_code` is per TARGET and this file is
+    /// compiled into three of them, so an accessory one target does not call is a
+    /// gate error. notes-platform's `took_over()` carries the same allow for the same
+    /// reason: the consumer is not here YET, which is not the same as dead.
+    #[allow(dead_code)]
+    pub fn set_drops(&self, paths: Vec<PathBuf>) {
+        self.answers().drops = paths;
+    }
+
+    /// How many times the engine ASKED. The count is the point: "the second tick
+    /// emitted no `Loaded`" is also what a poll that never ran looks like, and only
+    /// these two facts together separate "drained" from "never asked".
+    #[allow(dead_code)]
+    pub fn drop_takes(&self) -> usize {
+        self.calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::TakeDropped))
+            .count()
     }
 
     /// Every [`set_frame_rect`]: (handle, rect, scale). The assertions in
@@ -301,6 +343,22 @@ impl WindowBackend for Host {
     fn primary_work_area(&self) -> PlatformResult<FrameRect> {
         self.record(Call::PrimaryWorkArea);
         Ok(self.answers().work_area)
+    }
+
+    /// THE OVERRIDE, and the reason it exists: the trait's own default answers
+    /// `Vec::new()` (S1), so without this the engine's drop poll could never be
+    /// driven from a test at all - a suite that passes on a host which structurally
+    /// cannot produce a drop proves nothing. This answers what the fixture was told
+    /// and DRAINS it, which is the real seam's contract: `take_buffered` is
+    /// `mem::take`, so a second call sees nothing unless something arrived between
+    /// the two. The record happens either way, including on the empty answer,
+    /// because the ASK is the observable.
+    fn take_dropped_paths(&mut self) -> Vec<PathBuf> {
+        self.record(Call::TakeDropped);
+        // The guard is the mutable borrow: `Answers::drops` is reached through
+        // `DerefMut`, which is how the round-trip setter above writes too.
+        let mut answers = self.answers();
+        std::mem::take(&mut answers.drops)
     }
 }
 
