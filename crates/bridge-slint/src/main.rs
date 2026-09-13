@@ -229,23 +229,65 @@ const READ_ONLY_AT: Duration = Duration::from_millis(12000);
 const KEY2_AT: Duration = Duration::from_millis(13500);
 const WRITE_BACK_AT: Duration = Duration::from_millis(17000);
 
-/// S4c: THE MENU, WITH NO HANDS. A row's click cannot be synthesised from outside the
-/// window, so the tick invokes the ROOT callback each forwarded row reaches - which is
-/// precisely the wire a click drives: Chrome -> root.open-asked() -> the Rust handler ->
-/// the Command. What this does NOT prove is the one markup line per row (Chrome's own
-/// callback reaching root's), and that is proven by the component compiling and the popup
-/// drawing. One act per tick slot, in the order a user would try them.
-const MENU_OPEN_AT: Duration = Duration::from_millis(18500);
-const MENU_SAVEAS_AT: Duration = Duration::from_millis(20600);
-const MENU_AUTOSAVE_AT: Duration = Duration::from_millis(21000);
-const MENU_QUIT_AT: Duration = Duration::from_millis(21500);
+/// S6: THE CHORDS, WITH NO HANDS EITHER. A key press cannot be injected - there is no
+/// public Slint API to feed a FocusScope a KeyEvent (checked against the vendored
+/// 1.17.1 sources: no `dispatch_key_input`, no `KeyInputEvent` anywhere in `slint` or
+/// `i-slint-core`), so the tick drives the SAME root callbacks the capture handler calls,
+/// walking the SHORTCUTS table to decide which one and printing the needle from the table's
+/// own display string. That makes the table load-bearing at runtime instead of a comment.
+/// What it still does NOT prove is the near half - a physical key reaching
+/// capture-key-pressed and matching there. That half is on the manual list, and the
+/// compile-time witness for it is `slint-viewer --check` on the capture tree.
+const CHORD_AT: Duration = Duration::from_millis(18500);
+
+/// Where steps 1..n of the walk start, and why the first step is alone: the audit needs a
+/// seed-current window - Open makes the seed current, SEED_KEY_AT types into it, and the
+/// 750 ms debounce decides when the save can land. Every other chord breaks that window.
+/// Alt+2 opens a DIFFERENT recent (this run's was s4-loop, which is how the audit silently
+/// saved the wrong file twice, printing a perfectly confident hash line about it), Save As
+/// re-points the engine, and Auto-save disarms it. So the tail starts after the flush would
+/// have landed, and the seed keeps its moment.
+const CHORD_TAIL_AT: Duration = Duration::from_millis(21600);
+/// 1100 ms, not 800: the seed's own save (SEED_KEY_AT plus the 750 ms debounce) has to
+/// land INSIDE the walk, between the two steps that make the seed current and the step that
+/// turns autosave off. At 800 ms Auto-save fired 150 ms before the flush, and the audit
+/// silently disappeared again - which is how a needle that never prints is worth more than a
+/// comment that says it should.
+const CHORD_EVERY: Duration = Duration::from_millis(500);
+
+/// Which table rows to drive, by index into SHORTCUTS: Open, Alt+2, Auto-save, Save As,
+/// Clear recents. The order is a constraint, not a preference, and it cost a run to learn:
+///  * Alt+2 before Clear - clearing first empties the list the recents act reads, so the Alt
+///    needle would prove nothing.
+///  * Save As AFTER the seed keystroke (SEED_KEY_AT, 19.2 s). Ctrl+S re-points the engine at
+///    s4-loop.notes, and the seed's own flush lands ~750 ms after that keystroke; driving
+///    Save As first meant no Event::Saved ever carried the seed path, so the do-no-harm[saved]
+///    audit silently vanished from the run - the §4.5 line-ending question went UNTESTED,
+///    twice, and nothing complained because the needle was simply absent. This order keeps
+///    the seed current across its own save: Open makes it current, Alt+2 re-selects the same
+///    file, and only then does Save As move on.
+///
+/// Quit closes the sequence and has no chord, which is the table's own absence, not an
+/// oversight.
+const CHORD_DRIVE: &[usize] = &[0, 5, 2, 1, 3];
+const CHORD_QUIT_AT: Duration = Duration::from_millis(23900);
 
 /// S9 follow-up: one keystroke AFTER the Open row made the seed the current document, so
 /// an autosave lands ON THE SEED and the do-no-harm rule is tested where it can actually
 /// break - on the write, not just on the read. The engine saves to whatever path is
-/// current, so this has to sit between the Open row and the Save As row; the 750 ms
-/// debounce then puts the Saved at ~19.95 s, still 1.5 s clear of the Quit.
-const SEED_KEY_AT: Duration = Duration::from_millis(19200);
+/// current, so this sits after Open AND after Alt+2 (an Open of the same file - a second
+/// Open re-adopts last_sent and CANCELS a pending flush, which is the collision the previous
+/// ordering hit); the 750 ms debounce then puts the Saved at ~20.55 s, ahead of the
+/// Auto-save step at 20.7 s.
+/// ADR-0001 is why this exists. The seed is a FOREIGN file, and a foreign document is not
+/// armed for autosave until an explicit SaveAs names it - so every earlier attempt to audit
+/// a save OF THE SEED produced no Event::Saved at all: the bridge typed, the debounce
+/// elapsed, the Flush went out (or was skipped) and the engine simply did not write, which
+/// reads as a missing needle rather than a disarmed document. Arming = an explicit SaveAs of
+/// the seed onto itself, BEFORE the keystroke; it is also a save-path test on its own, since
+/// the text is unchanged and only the line endings could move.
+const SEED_ARM_AT: Duration = Duration::from_millis(19400);
+const SEED_KEY_AT: Duration = Duration::from_millis(20200);
 
 /// S4b: when the one in-run keystroke lands. After the pin experiment has finished
 /// (PIN_AT + HOLD + SETTLE) and after the seed Open has adopted a buffer, so the tick
@@ -344,6 +386,11 @@ fn main() {
         return;
     };
     let window = ui.window();
+    // S6: the legend FIRST, before any event can overwrite the status line - menu.rs prints
+    // it on the first frame for the same reason: with no menu bar, this is the only place a
+    // user learns the keys exist. Printed rather than only set, because a needle is evidence
+    // and a status line at t=0 is overwritten by the first Event.
+    report(&format!("chord: legend {}", legend()));
     // The untitled arm is an ACT, not an absence: name it before anything is
     // visible, so the markup default cannot be seen by a user or a test.
     publish_title(&ui, None, false, "startup");
@@ -751,6 +798,34 @@ fn main() {
                         }
                         None => report("save-fail: no loop path was recorded, nothing to stage"),
                     }
+                } else if !p.seed_armed && now >= SEED_ARM_AT {
+                    p.seed_armed = true;
+                    let found = p.seed.clone();
+                    let text = lf(&ui.get_buffer());
+                    let revision = {
+                        p.edits += 1;
+                        p.last_sent = text.clone();
+                        p.edits
+                    };
+                    drop(p);
+                    match found {
+                        Some(path) => {
+                            report(&format!(
+                                "do-no-harm: arming the seed with an explicit SaveAs of itself (ADR-0001) -> {}",
+                                path.display()
+                            ));
+                            send(
+                                &third_gw,
+                                Command::SaveAs {
+                                    path,
+                                    text,
+                                    revision,
+                                },
+                            );
+                            drain(&third_events, &third_pump, &ui.as_weak());
+                        }
+                        None => report("do-no-harm: no seed file was written, nothing to arm"),
+                    }
                 } else if !p.key2_done && now >= KEY2_AT {
                     p.key2_done = true;
                     let base = p.last_sent.clone();
@@ -777,35 +852,34 @@ fn main() {
                     }
                 }
             }
-            // ---- S4c: fire the menu rows through the same callbacks a click uses ----
-            let fired: Option<(u64, &str)> = {
-                let mut p = third_pump.borrow_mut();
-                if p.menu_act == 0 && now >= MENU_OPEN_AT {
-                    p.menu_act = 1;
-                    Some((1, "Open"))
-                } else if p.menu_act == 1 && now >= MENU_SAVEAS_AT {
-                    p.menu_act = 2;
-                    Some((2, "Save As"))
-                } else if p.menu_act == 2 && now >= MENU_AUTOSAVE_AT {
-                    p.menu_act = 3;
-                    Some((3, "Auto-save"))
-                } else if p.menu_act == 3 && now >= MENU_QUIT_AT {
-                    p.menu_act = 4;
-                    Some((4, "Quit"))
-                } else {
-                    None
+            // ---- S6: drive the chords THROUGH THE TABLE, into the row callbacks ----
+            // One walk of SHORTCUTS: the display string in the needle is the table's, so a
+            // row that was edited or deleted shows up in the log rather than hiding.
+            let driven = third_pump.borrow().menu_act;
+            let total = CHORD_DRIVE.len() as u64;
+            if driven < total {
+                let at = chord_at(driven);
+                if now >= at {
+                    let row = SHORTCUTS[CHORD_DRIVE[driven as usize]];
+                    third_pump.borrow_mut().menu_act = driven + 1;
+                    match route_of(row.3) {
+                        Some(route) => fire(&ui, route, row.1, row.2),
+                        None => report(&format!(
+                            "chord: {} -> UNROUTED TABLE ROW ({}): nothing fired",
+                            row.1, row.3
+                        )),
+                    }
+                    // The same instant a real key would be followed by a redraw: the events
+                    // the command answers with are drained on the next tick anyway, but this
+                    // keeps the needle and its consequence adjacent in the log.
+                    drain(&third_events, &third_pump, &ui.as_weak());
                 }
-            };
-            if let Some((step, name)) = fired {
+            } else if driven == total && now >= CHORD_QUIT_AT {
+                third_pump.borrow_mut().menu_act = driven + 1;
                 report(&format!(
-                    "menu: firing the {name} row\'s callback at t+{now:?} (row {step} of 4)"
+                    "menu: firing the Quit row's callback at t+{now:?} (no chord, by the table)"
                 ));
-                match step {
-                    1 => ui.invoke_open_asked(),
-                    2 => ui.invoke_save_as_asked(),
-                    3 => ui.invoke_autosave_asked(),
-                    _ => ui.invoke_quit_asked(),
-                }
+                ui.invoke_quit_asked();
             }
             // (2) THE SYNTHETIC CLICK. Aim at the first row that is NOT the file this
             // probe seeded, so what lands is a RECENT file the port listed.
@@ -998,6 +1072,10 @@ fn main() {
             let dirty = pump.borrow().dirty;
             note_dot(&pump, &weak, dirty, "autosave-row");
         });
+    }
+    {
+        let gw = Rc::clone(&gateway);
+        ui.on_clear_recents_asked(move || clear_recents(&gw, "asked"));
     }
     {
         let pump = Rc::clone(&pump);
@@ -1386,6 +1464,107 @@ fn drag_release(gw: &Rc<RefCell<Option<Gateway>>>, via: &str) {
     send(gw, Command::GeometryChanged);
 }
 
+/// THE CHORD TABLE, ported row for row from the first bridge's menu.rs SHORTCUTS - the same
+/// four commands, the same ten recents, the same alt-0 -> "recent 10" quirk. The table is
+/// LOAD-BEARING, not a comment: the synthetic driver walks it to decide what to fire and
+/// prints the needle from its own display string, the legend is generated from it, and the
+/// tests below fail if a row names an act nothing routes to. That is menu.rs's trick ported
+/// - a dead key becomes a test failure instead of a key that does nothing on a machine.
+///
+/// (binding, display, what, act) - the act is a stable name, resolved by route_of().
+const SHORTCUTS: &[(&str, &str, &str, &str)] = &[
+    ("ctrl-o", "Ctrl+O", "Open", "open"),
+    ("ctrl-s", "Ctrl+S", "Save As", "save-as"),
+    ("ctrl-t", "Ctrl+T", "toggle auto-save", "autosave"),
+    (
+        "ctrl-shift-r",
+        "Ctrl+Shift+R",
+        "clear recent files",
+        "clear-recents",
+    ),
+    ("alt-1", "Alt+1", "recent 1", "recent-0"),
+    ("alt-2", "Alt+2", "recent 2", "recent-1"),
+    ("alt-3", "Alt+3", "recent 3", "recent-2"),
+    ("alt-4", "Alt+4", "recent 4", "recent-3"),
+    ("alt-5", "Alt+5", "recent 5", "recent-4"),
+    ("alt-6", "Alt+6", "recent 6", "recent-5"),
+    ("alt-7", "Alt+7", "recent 7", "recent-6"),
+    ("alt-8", "Alt+8", "recent 8", "recent-7"),
+    ("alt-9", "Alt+9", "recent 9", "recent-8"),
+    ("alt-0", "Alt+0", "recent 10", "recent-9"),
+];
+
+/// What a chord resolves to. The reason this is an enum and not a closure is the rule the
+/// whole spike runs on: a key press and a row click must reach the SAME function, so a
+/// Route is fired by invoking the callback the row invokes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Open,
+    SaveAs,
+    Autosave,
+    ClearRecents,
+    Recent(usize),
+}
+
+/// A table act name to a Route. None means the table gained a row nothing implements, which
+/// every_chord_routes_somewhere turns into a failing test.
+fn route_of(act: &str) -> Option<Route> {
+    match act {
+        "open" => Some(Route::Open),
+        "save-as" => Some(Route::SaveAs),
+        "autosave" => Some(Route::Autosave),
+        "clear-recents" => Some(Route::ClearRecents),
+        other => other
+            .strip_prefix("recent-")
+            .and_then(|n| n.parse::<usize>().ok())
+            .map(Route::Recent),
+    }
+}
+
+/// THE LEGEND, generated from the same rows (menu.rs::legend() in shape), because on a
+/// frameless window with no menu bar there is nothing else that can tell a user the commands
+/// exist. Filtered by route_of, so an unbound row cannot advertise itself.
+fn legend() -> String {
+    SHORTCUTS
+        .iter()
+        .filter(|(.., act)| route_of(act).is_some())
+        .map(|(_, display, what, ..)| format!("{display} {what}"))
+        .collect::<Vec<_>>()
+        .join("  |  ")
+}
+
+/// The 5th row's act and Ctrl+Shift+R's, one function for both triggers. Nothing to
+/// translate: the port owns the list, the cap and the dedupe, so the bridge only asks - and
+/// the Event::RecentsUpdated that comes back is both the redraw AND the witness that the
+/// command landed.
+fn clear_recents(gw: &Rc<RefCell<Option<Gateway>>>, via: &str) {
+    report(&format!("recents: {via} -> Command::ClearRecents"));
+    send(gw, Command::ClearRecents);
+}
+
+/// Fire one resolved Route through the callback its ROW uses. A real key press and the
+/// synthetic driver differ only in how the Route was chosen.
+/// Step n of the walk: Open on its own at CHORD_AT, the rest spaced from CHORD_TAIL_AT.
+/// See CHORD_TAIL_AT for why a uniform spacing silently audits the wrong file.
+fn chord_at(step: u64) -> Duration {
+    if step == 0 {
+        CHORD_AT
+    } else {
+        CHORD_TAIL_AT + CHORD_EVERY * ((step - 1) as u32)
+    }
+}
+
+fn fire(ui: &Spike, route: Route, display: &str, what: &str) {
+    report(&format!("chord: {display} -> {what}"));
+    match route {
+        Route::Open => ui.invoke_open_asked(),
+        Route::SaveAs => ui.invoke_save_as_asked(),
+        Route::Autosave => ui.invoke_autosave_asked(),
+        Route::ClearRecents => ui.invoke_clear_recents_asked(),
+        Route::Recent(index) => ui.invoke_open_at_index(index as i32),
+    }
+}
+
 /// The x,y the PORT last wrote - the coordinates the NEXT launch restores from, which is
 /// the only place a walk can hide where the toolkit's own read cannot see it.
 fn stored_xy(dir: &StateDir) -> Option<(i64, i64)> {
@@ -1505,11 +1684,16 @@ struct Pump {
     /// The file SaveAs landed on. Autosave rewrites THIS name, so it is where the failure
     /// has to be staged; kept because the tick cannot re-derive it.
     loop_path: Option<PathBuf>,
+    /// S6c: the seed's explicit SaveAs (the arming act), once.
+    seed_armed: bool,
     /// The three acts, each once.
     ro_done: bool,
     key2_done: bool,
     wb_done: bool,
-    /// Which menu row has been fired: 0 none, then Open, Save As, Auto-save, Quit.
+    /// How many CHORD_DRIVE steps have been driven: 0 none, then one per row of Open, Alt+2,
+    /// Auto-save, Save As, Clear recents, and one past the end once Quit has fired. Named for
+    /// the rows because a chord and its row reach the same callback; the number records which
+    /// step of the table walk ran and nothing more.
     menu_act: u64,
     /// The one keystroke aimed at the seed document.
     seed_key_done: bool,
@@ -1809,5 +1993,192 @@ fn describe(event: &Event) -> String {
             .next()
             .unwrap_or("unknown")
             .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod chords {
+    //! The table is the contract, so the table gets tested - the way menu.rs does it in the
+    //! first bridge. Nothing here can press a key: there is no public Slint API that feeds a
+    //! FocusScope a KeyEvent (checked against the vendored 1.17.1 sources - no
+    //! dispatch_key_input, no KeyInputEvent anywhere in slint or i-slint-core). So these
+    //! guard the half that IS machine-checkable: every row routes, the markup spells the same
+    //! chords, and the decisions a reader would otherwise re-litigate (Ctrl+T is auto-save,
+    //! not new note) are assertions instead of comments.
+    use super::*;
+
+    const MARKUP: &str = include_str!("../ui/main.slint");
+    const POPUP: &str = include_str!("../ui/chrome.slint");
+
+    /// A double quote without writing one: the assertion below needs the QUOTED letter the
+    /// markup compares against, and escaping a quote through two layers of here-string is how
+    /// the first draft of this file broke the build.
+    fn quoted(word: &str) -> String {
+        let q = 34u8 as char;
+        format!("{q}{word}{q}")
+    }
+
+    /// The capture handler's body, up to the next top-level construct.
+    fn capture_body() -> &'static str {
+        MARKUP
+            .split("capture-key-pressed(event)")
+            .nth(1)
+            .expect("the FocusScope has a capture-key-pressed handler")
+    }
+
+    #[test]
+    fn every_chord_routes_somewhere() {
+        for row in SHORTCUTS {
+            assert!(
+                route_of(row.3).is_some(),
+                "chord {} names act {}, which nothing implements",
+                row.0,
+                row.3
+            );
+        }
+    }
+
+    #[test]
+    fn table_shape_matches_the_first_bridge() {
+        assert_eq!(SHORTCUTS.len(), 14, "four commands plus ten recents");
+        assert_eq!(
+            SHORTCUTS.iter().filter(|r| r.0.starts_with("alt-")).count(),
+            10
+        );
+        assert_eq!(
+            SHORTCUTS
+                .iter()
+                .filter(|r| r.0.starts_with("ctrl-"))
+                .count(),
+            4
+        );
+        let mut displays: Vec<&str> = SHORTCUTS.iter().map(|r| r.1).collect();
+        displays.sort();
+        displays.dedup();
+        assert_eq!(
+            displays.len(),
+            SHORTCUTS.len(),
+            "two chords cannot share a display spelling"
+        );
+        let mut keys: Vec<&str> = SHORTCUTS.iter().map(|r| r.0).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            SHORTCUTS.len(),
+            "one binding cannot route two acts"
+        );
+    }
+
+    #[test]
+    fn alt_zero_is_the_tenth_recent_not_the_zeroth() {
+        let row = SHORTCUTS
+            .iter()
+            .find(|r| r.0 == "alt-0")
+            .expect("alt-0 row");
+        assert_eq!(row.1, "Alt+0");
+        assert_eq!(row.2, "recent 10");
+        assert_eq!(
+            route_of(row.3),
+            Some(Route::Recent(9)),
+            "zero-based index, tenth entry"
+        );
+    }
+
+    #[test]
+    fn ctrl_t_is_toggle_autosave_and_there_is_no_new_note_chord() {
+        let row = SHORTCUTS
+            .iter()
+            .find(|r| r.0 == "ctrl-t")
+            .expect("ctrl-t row");
+        assert_eq!(route_of(row.3), Some(Route::Autosave));
+        assert!(
+            SHORTCUTS.iter().all(|r| !r.2.contains("new")),
+            "no new-note chord anywhere: it needs a port Command and an ADR conversation"
+        );
+    }
+
+    #[test]
+    fn legend_names_every_bound_chord_and_nothing_else() {
+        let words = legend();
+        for row in SHORTCUTS {
+            assert!(
+                words.contains(&format!("{} {}", row.1, row.2)),
+                "legend lost {}",
+                row.1
+            );
+        }
+        assert_eq!(words.matches("  |  ").count(), SHORTCUTS.len() - 1);
+    }
+
+    #[test]
+    fn markup_agrees_with_the_table_on_every_spelling() {
+        // The drift guard: the popup's chord column and the capture handler are the two places
+        // a chord is spelled in markup. If either drops a row, this fails instead of shipping
+        // a key nothing labels or a label nothing binds.
+        for row in SHORTCUTS {
+            if let Some(chord) = row.0.strip_prefix("ctrl-") {
+                // The LAST segment is the key: "ctrl-o" is o, and "ctrl-shift-r" is r with a
+                // shift. Deriving it beats hard-coding a letter per row, and it is this
+                // derivation that caught the first draft of this test failing on its own
+                // assumption (it looked for a key named "shift-r", which no keyboard sends).
+                let letter = chord.rsplit('-').next().unwrap_or(chord);
+                assert!(
+                    POPUP.contains(row.1),
+                    "the popup lost its {} chord cell",
+                    row.1
+                );
+                assert!(
+                    MARKUP.contains(&quoted(letter)),
+                    "the capture tree lost the {} branch",
+                    row.0
+                );
+                if chord.contains("shift-") {
+                    assert!(
+                        MARKUP.contains("event.modifiers.shift"),
+                        "a two-modifier chord needs the shift test, and it must come FIRST"
+                    );
+                    assert!(
+                        MARKUP.contains("!event.modifiers.shift"),
+                        "the plain-Ctrl branches must exclude shift, or Ctrl+Shift+R arrives twice"
+                    );
+                }
+            } else {
+                assert!(
+                    MARKUP.contains("event.modifiers.alt"),
+                    "the capture tree lost the Alt branch"
+                );
+            }
+        }
+        assert!(
+            MARKUP.contains("root.clear-recents-asked()"),
+            "Alt/Ctrl+Shift+R must reach the 5th row's own callback"
+        );
+        assert!(
+            MARKUP.contains("root.open-at-index(9)"),
+            "Alt+0 must reach the tenth recents row"
+        );
+    }
+
+    #[test]
+    fn capture_path_ends_by_rejecting_everything_it_did_not_match() {
+        // The negative claim, pinned down: the handler accepts each chord it matches and its
+        // LAST act is a reject, which is what leaves Ctrl+A/C/V/X/Z and every typed character
+        // to the editor. Grep-quality proof, not behavioural - behaviour needs a real key.
+        let body = capture_body();
+        assert_eq!(
+            body.matches("EventResult.accept").count(),
+            14,
+            "one accept per bound chord"
+        );
+        assert_eq!(
+            body.matches("EventResult.reject").count(),
+            1,
+            "exactly one fall-through exit"
+        );
+        assert!(
+            body.rfind("EventResult.reject") > body.rfind("EventResult.accept"),
+            "the reject must come last, or a chord silently swallows the editor's keys"
+        );
     }
 }

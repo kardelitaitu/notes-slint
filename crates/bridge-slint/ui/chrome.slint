@@ -73,6 +73,12 @@ export component Chrome inherits Rectangle {
     callback open-asked();
     callback save-as-asked();
     callback autosave-asked();
+
+    /// S6: Clear recents. Its own ask because its own command - `Command::ClearRecents`
+    /// exists in the port and nothing else in this bar sends it. It is also the only row
+    /// whose chord (Ctrl+Shift+R) takes two modifiers, which is why the chord table in
+    /// main.rs routes by name instead of by a hand-copied string.
+    callback clear-recents-asked();
     /// Quit is not a command: it closes this window, which is the one shutdown route that
     /// flushes and joins the engine (titlebar.rs:226-232). Its own callback so the bridge
     /// cannot mistake it for a fifth command.
@@ -313,11 +319,17 @@ export component Chrome inherits Rectangle {
         height: parent.height;
     }
 
-    // ---- THE POPUP: four rows, the port's vocabulary ------------------------------
-    // Open / Save As / Auto-save / Quit, in that order (titlebar.rs:183). Two plausible rows
-    // are absent BECAUSE THE LIST SAYS SO, not because they were forgotten: no New (no
-    // command creates a document without a path) and no plain Save (there is no
-    // Command::Save - which is also why the menu bar has no Save).
+    // ---- THE POPUP: five rows, the port's vocabulary -------------------------------
+    // Open / Save As / Auto-save / Clear recents / Quit (titlebar.rs:183, with Clear under
+    // the recents it acts on and Quit last). Two plausible rows are absent BECAUSE THE LIST
+    // SAYS SO, not because they were forgotten: no New and no plain Save.
+    //
+    // THE DIVERGENCE, recorded instead of invented: the first bridge's table binds Ctrl+T to
+    // ToggleAutosave (menu.rs binding_for), NOT to a new note - and "new note" has no port
+    // command at all (nothing in Command creates a document without a path, and ADR-0001's
+    // arming rule is precisely about that hole). So new-note is parked as an
+    // add-the-Command-plus-an-ADR conversation: not in this popup, not in the chord table,
+    // and not something to quietly invent because the README mentions a Ctrl+T.
     //
     // A GridLayout, per polish.md: "align form labels and fields with a GridLayout, not
     // nested boxes with eyeballed widths". Label in column 1, chord right-aligned in column
@@ -328,7 +340,7 @@ export component Chrome inherits Rectangle {
         x: Theme.menu-inset;
         y: parent.height;
         width: Theme.menu-width;
-        height: Theme.menu-pad * 2 + 4 * Theme.menu-row-height + 3 * Theme.menu-gap;
+        height: Theme.menu-pad * 2 + 5 * Theme.menu-row-height + 4 * Theme.menu-gap;
         visible: root.menu-open;
         background: Theme.menu-bg;
         border-radius: Theme.menu-radius;
@@ -362,11 +374,19 @@ export component Chrome inherits Rectangle {
             Text { col: 1; row: 2; text: "Ctrl+T"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
             row-autosave := TouchArea { col: 0; row: 2; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.autosave-asked(); root.menu-open = false; } }
 
-            // Row 3 - Quit: no chord, and a different kind of act (close, not command)
-            Rectangle { col: 0; row: 3; colspan: 2; background: Theme.hover-bg; opacity: row-quit.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
-            Text { col: 0; row: 3; text: "Quit"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
-            Text { col: 1; row: 3; text: ""; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
-            row-quit := TouchArea { col: 0; row: 3; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.quit-asked(); root.menu-open = false; } }
+            // Row 3 - Clear recents: the 5th row, and the chord parity rule is why it is a
+            // ROW and not only a key (menu.rs: a label names a key the map binds, or the
+            // legend lies). It sits above Quit because Quit is the different kind of act.
+            Rectangle { col: 0; row: 3; colspan: 2; background: Theme.hover-bg; opacity: row-clear.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 3; text: "Clear recents"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            Text { col: 1; row: 3; text: "Ctrl+Shift+R"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            row-clear := TouchArea { col: 0; row: 3; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.clear-recents-asked(); root.menu-open = false; } }
+
+            // Row 4 - Quit: no chord, and a different kind of act (close, not command)
+            Rectangle { col: 0; row: 4; colspan: 2; background: Theme.hover-bg; opacity: row-quit.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 4; text: "Quit"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            Text { col: 1; row: 4; text: ""; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            row-quit := TouchArea { col: 0; row: 4; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.quit-asked(); root.menu-open = false; } }
         }
     }
 }

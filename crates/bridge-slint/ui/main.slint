@@ -86,6 +86,8 @@ export component Spike inherits Window {
     callback open-asked();
     callback save-as-asked();
     callback autosave-asked();
+    // S6: the 5th row, forwarded like the other four.
+    callback clear-recents-asked();
     /// Quit is not a command: it closes the window, which is the only shutdown route
     /// that flushes and joins the engine (see the close contract in main.rs).
     callback quit-asked();
@@ -112,6 +114,68 @@ export component Spike inherits Window {
     // name. A fifth 1.17 finding, and the reason these are suffixed.
     property <length> row-h: 15px;
     property <length> stack-h: root.recents.length * root.row-h;
+
+    // S6: THE CHORD SCOPE. The nesting IS the mechanism: capture-key-pressed on the
+    // OUTERMOST scope runs before the focused child's key handler (events-and-overlays), so
+    // this sees Ctrl+O first, and every key it returns Ignore for keeps travelling to
+    // TextEdit - which is why nothing below mentions Ctrl+A/C/V/X/Z: an editor chord that is
+    // not in this table reaches the caret untouched. No imperative focus() anywhere, which is
+    // the other half of the same rule (a bridge that steals focus to route a key loses the
+    // caret).
+    //
+    // THE DIFF SHAPE, on purpose: the children below are NOT re-indented, so the body reads
+    // as if it were still one level. Slint does not care and a 90-line re-indent would bury
+    // the four lines that matter in a wall of whitespace. Delete this note the first time
+    // anything reformats this file.
+    keys := FocusScope {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        forward-focus: editor;
+
+        capture-key-pressed(event) => {
+            // Shift first: Ctrl+Shift+R is a different act from a hypothetical Ctrl+R, and a
+            // shift-letter arrives as the UPPER-case glyph, hence to_lowercase everywhere.
+            if (event.modifiers.control && event.modifiers.shift
+                    && event.text.to_lowercase() == "r") {
+                root.clear-recents-asked();
+                return EventResult.accept;
+            }
+            if (event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift) {
+                if (event.text.to_lowercase() == "o") {
+                    root.open-asked();
+                    return EventResult.accept;
+                }
+                if (event.text.to_lowercase() == "s") {
+                    root.save-as-asked();
+                    return EventResult.accept;
+                }
+                // menu.rs binds Ctrl+T to ToggleAutosave, NOT to a new note; see the popup
+                // header in chrome.slint for why new-note is parked rather than invented.
+                if (event.text.to_lowercase() == "t") {
+                    root.autosave-asked();
+                    return EventResult.accept;
+                }
+            }
+            // Alt+1..9 = recent 1..9, Alt+0 = recent 10 - the ten-rows-in-one-hand convention,
+            // and the same open-at-index(int) the recents rows call.
+            if (event.modifiers.alt && !event.modifiers.control && !event.modifiers.shift) {
+                if (event.text == "1") { root.open-at-index(0); return EventResult.accept; }
+                if (event.text == "2") { root.open-at-index(1); return EventResult.accept; }
+                if (event.text == "3") { root.open-at-index(2); return EventResult.accept; }
+                if (event.text == "4") { root.open-at-index(3); return EventResult.accept; }
+                if (event.text == "5") { root.open-at-index(4); return EventResult.accept; }
+                if (event.text == "6") { root.open-at-index(5); return EventResult.accept; }
+                if (event.text == "7") { root.open-at-index(6); return EventResult.accept; }
+                if (event.text == "8") { root.open-at-index(7); return EventResult.accept; }
+                if (event.text == "9") { root.open-at-index(8); return EventResult.accept; }
+                if (event.text == "0") { root.open-at-index(9); return EventResult.accept; }
+            }
+            // THE NEGATIVE CLAIM, in one line: everything else - every editor chord, every
+            // typed character, every unbound key - goes back to the focused child untouched.
+            return EventResult.reject;
+        }
 
     // --- THE TITLE STRIP: S2's Chrome, mounted, not re-implemented ---
     // Chrome owns the look, the drag and the caption. It is handed facts and returns
@@ -158,6 +222,9 @@ export component Spike inherits Window {
         autosave-asked => {
             root.autosave-asked();
         }
+        clear-recents-asked => {
+            root.clear-recents-asked();
+        }
         quit-asked => {
             root.quit-asked();
         }
@@ -202,4 +269,5 @@ export component Spike inherits Window {
         // property, and the pump reads only the property.
         text <=> root.buffer;
     }
+    } // keys := FocusScope - closes the S6 chord wrap (see its comment above)
 }
