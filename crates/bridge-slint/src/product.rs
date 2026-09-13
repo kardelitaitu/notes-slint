@@ -48,9 +48,12 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-use notes_api::{Command, DropGuard, Gateway, Settings, StateDir, WindowHandle, resolve_state_dir};
+use notes_api::{
+    Command, DropGuard, Exit, Gateway, Rect, Settings, StateDir, WindowHandle, resolve_state_dir,
+};
 use slint::{
     CloseRequestResponse, ComponentHandle, LogicalPosition, LogicalSize, Timer, TimerMode,
 };
@@ -60,7 +63,7 @@ mod surface;
 mod title_contract;
 mod ui_gen;
 
-use plumbing::{arm_drop_target, hwnd_of, note_dot, publish_title, report, send};
+use plumbing::{arm_drop_target, fingerprint_of, hwnd_of, note_dot, publish_title, report, send};
 use surface::{Pump, drain, legend, text_pump};
 use ui_gen::Spike;
 
@@ -81,7 +84,74 @@ fn state_dir() -> StateDir {
     resolve_state_dir(&exe_dir, appdata.as_deref())
 }
 
+/// STRIP-4a row 2: the settle watch, in bridge-gpui's SHAPE - an episode, not a count. Its
+/// constants are gpui's (main.rs:380 GEOMETRY_QUIET 250 ms, :385 GEOMETRY_FORCE 1 s), and what is
+/// deliberately NOT inherited is the probe's cap of two sends: that cap was a measurement budget
+/// for one act walk, and a user who keeps dragging has to end up with the port holding the rect
+/// the window is ACTUALLY at. Unbounded here, on purpose.
+const GEOMETRY_QUIET: Duration = Duration::from_millis(250);
+const GEOMETRY_FORCE: Duration = Duration::from_millis(1000);
+/// How long this root is willing to wait for the two things that must not hang it: the last
+/// flush, and (after an abandoned join) the port's terminal signal that the engine is gone. The
+/// second number is gpui's 10 s (bridge-gpui/src/main.rs:2478-2481), the first deliberately far
+/// shorter: AUTOSAVE_IDLE is 750 ms, so 2 s is already two and a half idle periods and a disk that has
+/// not answered by then is not going to answer before a person gives up.
+const SAVE_WAIT: Duration = Duration::from_millis(2000);
+const EXIT_REWAIT: Duration = Duration::from_secs(10);
+
+/// What the watch remembers: the rect last seen, when it last differed from what the port was
+/// told, and when the port was last told.
+#[derive(Default)]
+struct Settle {
+    seen: Option<Rect>,
+    changed_at: Option<Instant>,
+    sent_at: Option<Instant>,
+}
+
+/// THE DECISION, separated from the measuring so it can be tested without a window.
+/// Quiet long enough: the drag ended, tell the port. Still moving but the last tell was a FORCE
+/// interval ago: tell anyway, because a drag that never stops must not mean a stale rect forever
+/// (gpui's comment on its own force: a resize episode is bounded by FORCE, not by a count).
+fn settle_says(moved_for: Duration, since_send: Option<Duration>) -> bool {
+    moved_for >= GEOMETRY_QUIET || since_send.is_some_and(|ago| ago >= GEOMETRY_FORCE)
+}
+
+/// STRIP-4a row 3, the part that CAN be unit-tested: the one line a panic gets, before the
+/// default hook unwinds. A windows_subsystem binary makes a panic otherwise INVISIBLE
+/// (bridge-gpui/src/main.rs:1396 says exactly that), so the line has to name itself as a panic,
+/// carry the payload, and carry the location when the runtime had one - because the exit code
+/// alone does not tell a person WHICH invariant broke.
+fn panic_note(what: &str, where_: Option<&str>) -> String {
+    match where_ {
+        Some(at) => format!("panic: {what} at {at}"),
+        None => format!("panic: {what}"),
+    }
+}
+
 fn main() {
+    // STRIP-4a row 3: install FIRST, so a panic in the port's own startup is caught by it too.
+    // The default hook still runs afterwards (that is what keeps std's report and a NONZERO exit
+    // code), and nothing here calls process::exit itself: aborting on a panic would take the
+    // trace line with it.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // The payload, not Display: reading it as a str-or-String is what works on every
+        // toolchain this crate may be built with (PanicHookInfo::message is the newer, nicer
+        // door, and rust-version here does not promise it). A payload that is neither is
+        // still named, because the point of the line is THAT it happened, not the prose.
+        let what = info
+            .payload()
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| info.payload().downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "(unprintable panic payload)".to_string());
+        let where_ = info
+            .location()
+            .map(|at| format!("{}:{}", at.file(), at.line()));
+        report(&panic_note(&what, where_.as_deref()));
+        default_hook(info);
+    }));
+
     // ---- whitepaper 5.5, in order: query, place, show, handle, register, pin ----
     let dir = state_dir();
     report(&format!("startup: state dir {}", dir.0.display()));
@@ -204,6 +274,7 @@ fn main() {
     let tick_events = Rc::clone(&events);
     let tick_pump = Rc::clone(&pump);
     let tick_drops = Rc::clone(&drop_guard);
+    let tick_settle = Rc::new(RefCell::new(Settle::default()));
     let weak = ui.as_weak();
     let tick = Timer::default();
     tick.start(TimerMode::Repeated, Duration::from_millis(8), move || {
@@ -231,6 +302,38 @@ fn main() {
                 arm_drop_target(hwnd, &tick_drops);
             }
         }
+        // STRIP-4a row 2: measure, then ask the pure decision. Two things are deliberately NOT
+        // done here: no rect is sent on the FIRST frame (nothing changed, and a send the port
+        // treats as a move would let a restore be re-stored with the toolkit's rounding drift),
+        // and no cap on how many sends one session may make.
+        {
+            let now = Instant::now();
+            let measured = fingerprint_of(ui.window()).rect;
+            let mut st = tick_settle.borrow_mut();
+            let same = st.seen.as_ref().is_some_and(|previous| {
+                previous.x == measured.x
+                    && previous.y == measured.y
+                    && previous.w == measured.w
+                    && previous.h == measured.h
+            });
+            if !same {
+                st.changed_at = Some(now);
+                st.seen = Some(measured);
+            }
+            if let Some(changed) = st.changed_at {
+                let moved_for = now.saturating_duration_since(changed);
+                let since_send = st.sent_at.map(|at| now.saturating_duration_since(at));
+                if settle_says(moved_for, since_send) {
+                    send(&tick_gw, Command::GeometryChanged);
+                    st.sent_at = Some(now);
+                    st.changed_at = None;
+                    report(&format!(
+                        "geometry: told the port after {moved_for:?} quiet (forced: {})",
+                        since_send.is_some_and(|ago| ago >= GEOMETRY_FORCE)
+                    ));
+                }
+            }
+        }
         drain(&tick_events, &tick_pump, &ui.as_weak());
         text_pump(&ui, &tick_gw, &tick_pump);
     });
@@ -254,15 +357,147 @@ fn main() {
     // The guard drops here, and dropping it is what disarms the target. Printed, because a lease
     // that ends quietly is how dragging onto the window stops working between two runs and nobody
     // notices until a user files it.
+    // STRIP-4a row 1: THE HONEST SHUTDOWN. WHERE it runs is the finding, not a detail. The brief
+    // asked for the sequence on granted close, inside the callback; the port documents why that
+    // exact place is a measured deadlock - Gateway::close warns "never call it from the engine
+    // thread", and the note above its bounded join records the hang it replaced: "the thread
+    // calling close() from the window's own close callback is the one thread that owner needs in
+    // order to pump" (api/src/gateway.rs:444-458). So the close callback only COUNTS and GRANTS,
+    // and everything below runs after ui.run() returned: same sequence, minus the hang.
+    //
+    // ORDER, because the order is what makes the join mean something: (1) kill the wake timer and
+    // with it every clone its closure held, (2) one last compare of buffer against what was sent,
+    // (3) wait BOUNDED for the Saved that answers it, (4) UnregisterWindow so the engine stops
+    // measuring a window that is gone, (5) disarm the drop lease, (6) close() - Shutdown plus the
+    // port's own bounded join - and answer with a trace line and an exit code, NEVER with a panic.
+    drop(tick);
+    report(&format!(
+        "shutdown: gateway clones still alive after the timer died: {} (1 = the wake closure is really gone)",
+        Rc::strong_count(&gateway)
+    ));
+    text_pump(&ui, &gateway, &pump);
+    drain(&events, &pump, &ui.as_weak());
+    let dirty_at_exit = pump.borrow().dirty;
+    let saves_at_entry = pump.borrow().saves;
+    let asked = Instant::now();
+    while dirty_at_exit && pump.borrow().saves == saves_at_entry && asked.elapsed() < SAVE_WAIT {
+        std::thread::sleep(Duration::from_millis(10));
+        text_pump(&ui, &gateway, &pump);
+        drain(&events, &pump, &ui.as_weak());
+    }
+    report(&format!(
+        "shutdown: the last flush {} (dirty at exit: {}, waited {:?})",
+        if pump.borrow().saves != saves_at_entry {
+            "landed"
+        } else if !dirty_at_exit {
+            "was not needed - the buffer matched what was sent"
+        } else {
+            "DID NOT land in the wait, closing anyway"
+        },
+        dirty_at_exit,
+        asked.elapsed()
+    ));
+    send(&gateway, Command::UnregisterWindow);
     let held = drop_guard.borrow_mut().take().is_some();
     report(&format!(
         "drop: disarmed on exit (a guard was held: {held})"
     ));
-    tick.stop();
-    // HONEST ABOUT WHAT THIS DOES NOT DO: the tick closure holds a clone of the gateway, so
-    // dropping this Rc does NOT shut the engine down - the process exiting does. The probe prints a
-    // whole shutdown around Exit::{QueueClosed, Abandoned, Panicked} and flushes the buffer on the
-    // way out; that sequence is STRIP-4 item 2, and it is the one place where this root is quieter
-    // than the probe for a real reason rather than by omission. Naming it here so the next reader
-    // does not mistake a dropped Rc for a joined engine.
+    match gateway.borrow_mut().take() {
+        None => report("shutdown: no gateway left to close - something already took it"),
+        Some(handle) => match handle.close() {
+            // The ordinary ending, and the only one that may say nothing alarming: every accepted
+            // command, the final session write included, was carried out before this returned.
+            Ok(()) => report("shutdown: joined cleanly, the session write ran"),
+            // No reader left and the thread joined: an engine that had already exited on its own
+            // terms. Silent about ONE thing only - whether this call stopped a save (it did not,
+            // there was nothing to stop) - and NOT a claim that a save happened.
+            Err(Exit::QueueClosed) => {
+                report("shutdown: the queue had no reader; the thread joined")
+            }
+            Err(Exit::Abandoned(waited)) => {
+                // A verdict about the DEADLINE, not about the engine: a Flush queued behind
+                // Shutdown does real work (temp write, fsync, rename) and on slow storage that
+                // outruns the port's own join budget while the engine is perfectly healthy.
+                // So wait again, bounded, for the port's terminal signal - the channel closing -
+                // exactly as the first bridge does, and if THAT expires, leave nonzero: a silent
+                // exit in the middle of a possible save is the one outcome this app must not have.
+                report(&format!(
+                    "shutdown: the engine was still working after {waited:?} - waiting again, bounded, for the port to close its channel",
+                ));
+                let since = Instant::now();
+                let mut gone = false;
+                while since.elapsed() < EXIT_REWAIT {
+                    if let Err(mpsc::RecvTimeoutError::Disconnected) =
+                        events.recv_timeout(Duration::from_millis(50))
+                    {
+                        gone = true;
+                        break;
+                    }
+                }
+                report(&format!(
+                    "shutdown: {} after {:?}",
+                    if gone {
+                        "the engine went away"
+                    } else {
+                        "THE ENGINE NEVER WENT AWAY - the newest edit may not be on disk"
+                    },
+                    since.elapsed()
+                ));
+                if !gone {
+                    std::process::exit(1);
+                }
+            }
+            Err(Exit::Panicked) => {
+                // The case this whole path was rewritten for: an engine that unwound drops the
+                // queue and joins INSTANTLY, which is observably identical to a clean exit unless
+                // the thread's own ending is consulted. Nonzero, and worded so no reader can
+                // mistake it for "your note was saved".
+                report(
+                    "shutdown: THE ENGINE PANICKED on the way out - nothing after this line can promise the bytes landed",
+                );
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_panic_note_names_a_panic_the_payload_and_the_place() {
+        // Row 3's testable half, and the ONLY half this ships: a trigger would mean writing a
+        // deliberate panic into a product root, which is not a thing to leave in a binary that
+        // people run. The hook itself is three lines and is checked by reading it.
+        assert_eq!(
+            panic_note("index out of bounds", Some("product.rs:7")),
+            "panic: index out of bounds at product.rs:7"
+        );
+        assert_eq!(panic_note("gone", None), "panic: gone");
+        // The word that makes it findable in a merged log, and the prefix the smoke contract
+        // owns - the note goes out through report(), never through its own writer.
+        assert!(panic_note("x", None).starts_with("panic:"));
+    }
+
+    #[test]
+    fn a_drag_that_never_stops_still_tells_the_port() {
+        // Row 2's pure decision: quiet ends an episode, force bounds a drag, and NOTHING caps the
+        // count - which is the probe's rule explicitly not inherited. If these numbers drift from
+        // gpui's, the two bridges stop agreeing about when a rect is official.
+        assert!(!settle_says(Duration::from_millis(200), None));
+        assert!(settle_says(GEOMETRY_QUIET, None));
+        assert!(!settle_says(
+            Duration::from_millis(50),
+            Some(Duration::from_millis(500))
+        ));
+        assert!(
+            settle_says(Duration::from_millis(50), Some(GEOMETRY_FORCE)),
+            "a continuous drag must send once per FORCE interval forever"
+        );
+        assert_eq!(
+            (GEOMETRY_QUIET, GEOMETRY_FORCE),
+            (Duration::from_millis(250), Duration::from_millis(1000))
+        );
+    }
 }

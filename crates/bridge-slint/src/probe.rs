@@ -30,7 +30,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use notes_api::{
-    Command, DropGuard, Exit, Gateway, Rect, Settings, StateDir, WindowHandle, resolve_state_dir,
+    Command, DropGuard, Exit, Gateway, Settings, StateDir, WindowHandle, resolve_state_dir,
 };
 // STRIP-2b: hwnd_of moved to plumbing, but the probe's own RISK-3 print still asks the
 // toolkit for the INNER handle directly, so the trait is in scope here too.
@@ -38,8 +38,8 @@ use raw_window_handle::HasWindowHandle;
 use slint::{ComponentHandle, LogicalPosition, LogicalSize, Timer, TimerMode};
 mod plumbing;
 pub(crate) use plumbing::{
-    Fingerprint, arm_drop_target, do_no_harm, fnv1a, hwnd_of, lf, note_dot, port_said,
-    publish_title, report, send,
+    Fingerprint, arm_drop_target, do_no_harm, fingerprint_of, fnv1a, hwnd_of, lf, note_dot,
+    port_said, publish_title, report, send,
 };
 mod surface;
 mod title_contract;
@@ -213,16 +213,6 @@ fn run_attrib(path: &Path, flag: &str) -> std::io::Result<()> {
         made.status,
         String::from_utf8_lossy(&made.stderr).trim()
     )))
-}
-
-fn fingerprint_of(window: &slint::Window) -> Fingerprint {
-    let position = window.position();
-    let size = window.size();
-    Fingerprint {
-        rect: Rect::new(position.x, position.y, size.width, size.height),
-        maximized: window.is_maximized(),
-        minimized: window.is_minimized(),
-    }
 }
 
 /// The quiet window before a change is reported, in the spirit of the gpui bridge's

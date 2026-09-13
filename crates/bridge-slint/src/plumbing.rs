@@ -287,3 +287,13 @@ pub(crate) fn hwnd_of(window: &slint::Window) -> Option<i64> {
         _ => None,
     }
 }
+
+pub(crate) fn fingerprint_of(window: &slint::Window) -> Fingerprint {
+    let position = window.position();
+    let size = window.size();
+    Fingerprint {
+        rect: Rect::new(position.x, position.y, size.width, size.height),
+        maximized: window.is_maximized(),
+        minimized: window.is_minimized(),
+    }
+}
