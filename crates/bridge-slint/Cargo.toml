@@ -11,8 +11,25 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
+# `[lints] workspace = true` is deliberately NOT used here, so the lints the workspace
+# sets are REPEATED below with the one exception the toolkit's own generated code needs -
+# and the exception is named where it cannot be mistaken for a pattern, or silently
+# copied into a shipped bridge. See the unsafe_code note.
+[lints.rust]
+# "deny", not "forbid" - and not "allow", which is what a first pass here said.
+# Measured on slint 1.17.1: the slint! expansion emits vtable statics whose own
+# #[allow(unsafe_code)] wraps real unsafe, so `forbid` is an instant E0453:
+# "allow(unsafe_code) incompatible with previous forbid". An inherited
+# `[lints] workspace = true` cannot relax the workspace forbid - the block has to be
+# local. `deny` keeps AGENTS.md's gate on everything hand-written in this crate while
+# the toolkit's generated code still compiles. A true `forbid` needs the slint!
+# expansion behind its own crate boundary: a shipped-bridge shape decision, not a
+# spike one.
+unsafe_code = "deny"
+unused_crate_dependencies = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
 
 [[bin]]
 name = "notes-slint"
@@ -20,6 +37,12 @@ path = "src/main.rs"
 
 [dependencies]
 notes-api = { workspace = true }
-# 1.17.1 is what "1.17" resolves to today (cargo search on this branch; the lock
-# records the exact pair). Declared ONCE, in the workspace table, never spelled here.
+# Inherited whole, with NOTHING added here, and that is a cargo rule rather than a
+# style preference: a member may not override `default-features` when the workspace
+# table sets it - the manifest is refused outright. So compat-1-2 (mandatory),
+# backend-winit, renderer-software and raw-window-handle-06 are declared once, at the
+# root, with the reasons. A member that needs another feature may add one; it cannot
+# subtract, and it must not restate what it inherits.
 slint = { workspace = true }
+# The trait objects `window_handle()` hands back; the same pin bridge-gpui uses.
+raw-window-handle = { workspace = true }

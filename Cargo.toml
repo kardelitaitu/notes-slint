@@ -51,7 +51,31 @@ unicode-segmentation = "1"
 # And why the gate can already see it: "slint" is a ROOT in arch.rs's UI_TOOLKITS list,
 # so "a second toolkit may not reach core, the port or platform" is enforced from the
 # first commit of the spike rather than added after the first leak.
-slint = "1.17"
+# FEATURES ARE DECLARED HERE, ONCE, because a member CANNOT override them: cargo
+# refuses the manifest with "`default-features = false` cannot override workspace's
+# `default-features`" - which is exactly how this line earned its shape. Measured on
+# 1.17.1, so the list is not taste:
+#   - compat-1-2 is MANDATORY, not decoration. default-features=false with only
+#     backend-winit + renderer-software + raw-window-handle-06 does NOT build:
+#     slint-1.17.1/lib.rs:210 compile_error!s unless compat-1-2 is enabled.
+#   - default-features=false is the point. It drops femtovg / glutin / OpenGL,
+#     accessibility and system-tray, so the spike window is software-rendered and its
+#     normal tree is i-slint-backend-winit + i-slint-renderer-software and nothing
+#     else (proven out-of-tree). backend-winit implies std.
+#   - raw-window-handle-06 is what makes `window_handle()` exist, the accessor that
+#     proves an HWND is reachable, and it holds the same 0.6 handle family that the
+#     port hands notes-platform.
+# A later member may ADD features; it cannot subtract these without editing this line.
+slint = {
+    version = "1.17",
+    default-features = false,
+    features = [
+        "compat-1-2",
+        "backend-winit",
+        "renderer-software",
+        "raw-window-handle-06",
+    ],
+}
 windows = { version = "0.61", features = ["Win32_Foundation","Win32_UI_WindowsAndMessaging","Win32_UI_Shell","Win32_Graphics_Gdi"] }
 
 [workspace.lints.rust]
