@@ -8,10 +8,17 @@
 //!
 //! Exit codes follow check-arch's convention: 0 everything green, 1 a
 //! non-advisory step failed (or timed out), 2 a non-advisory step could not
-//! be run at all. Advisory steps (the bridge check, the docs validator) are
-//! REPORTED, never gate: the bridge is excluded from the workspace gate by
-//! design (D1), and the docs validator is red on a clean checkout while the
-//! docs split is uncommitted. Every child gets a wall-clock budget; a
+//! be run at all. The advisory steps (smoke, docs) are REPORTED, never gate: a
+//! runner with no desktop is not a broken repo, and the docs validator is red on
+//! a clean checkout while the docs split is uncommitted.
+//!
+//! Do not read the workspace rows as the bridge gate: `--exclude notes-bridge-gpui`
+//! removes ONE member from those two invocations, and it was never a statement
+//! about either bridge being ungated. Both bridges are GATED, each by a named row -
+//! gpui by bridge-build/bridge-clippy (its own steps, because the exclusion takes it
+//! out of the workspace pair) and slint by slint-build/slint-clippy for the LINK and
+//! the LINT, with its tests riding the workspace `clippy`/`test` rows it is not
+//! excluded from. Every child gets a wall-clock budget; a
 //! timeout is its own outcome and fails the run if the step is a gate.
 
 use std::path::Path;
@@ -283,6 +290,55 @@ fn step_specs() -> Vec<StepSpec> {
             quick_skippable: true,
             budget_secs: 900,
         },
+        // M5-S0: THE OTHER BRIDGE GETS THE SAME TWO ROWS, because until this commit
+        // the SHIPPING product had never been linked by any gate in this file. The
+        // asymmetry was invisible by construction: notes-bridge-slint is NOT the
+        // excluded member, so it appeared in `clippy` and `test` above and looked
+        // fully covered - but `cargo test` links a test harness, not a bin, and
+        // `cargo clippy` never links at all. So a bridge that does not compile into
+        // notes-slint.exe was green here, and is green in CI, every day. Same shape,
+        // same budget, same quick-skippability as bridge-build/bridge-clippy, and the
+        // same reason: BUILD owns the link verdict, CLIPPY owns every target.
+        //
+        // No --config future-incompat-report here, unlike the gpui step: that flag
+        // exists for ONE measured footer in gpui's graph (proc-macro-error2, ci.yml
+        // step 3b's comment). Slint's graph was not measured for it, and a
+        // suppression copied without a measurement is how a warning silently stops
+        // being visible. Add it with a number, not by analogy.
+        StepSpec {
+            name: "slint-build",
+            display: "cargo build --locked -p notes-bridge-slint --bin notes-slint",
+            program: "cargo",
+            args: &[
+                "build",
+                "--locked",
+                "-p",
+                "notes-bridge-slint",
+                "--bin",
+                "notes-slint",
+            ],
+            advisory: false,
+            quick_skippable: true,
+            budget_secs: 900,
+        },
+        StepSpec {
+            name: "slint-clippy",
+            display: "cargo clippy --locked -p notes-bridge-slint --all-targets -- -D warnings",
+            program: "cargo",
+            args: &[
+                "clippy",
+                "--locked",
+                "-p",
+                "notes-bridge-slint",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            advisory: false,
+            quick_skippable: true,
+            budget_secs: 900,
+        },
         StepSpec {
             name: "docs",
             display: "pwsh .agents/skills/doc-management/scripts/check-docs.ps1 (advisory: red while the docs split is uncommitted)",
@@ -313,7 +369,7 @@ fn joined(names: &[&str]) -> String {
 ///
 /// THIS IS ALSO THE INNER COMMAND LINE. The aggregate step in ci.yml runs
 /// `cargo run --locked -p xtask -- check`, and that outer --locked governs only
-/// the resolve that BUILDS xtask; the twelve steps this roster spawns each
+/// the resolve that BUILDS xtask; the thirteen cargo rows this roster spawns each
 /// resolve AGAIN, in `run_child` below, from `spec.args`. So the authority the
 /// gate is supposed to have over Cargo.lock passes through here or not at all,
 /// and `every_row_that_resolves_a_graph_carries_the_lock` is what keeps that
@@ -725,13 +781,19 @@ mod tests {
             );
             locked += 1;
         }
+        // 13 and 15, and they moved together on purpose: this is the assertion the
+        // M5-S0 slint pair was expected to trip, and tripping it is the POINT - a
+        // roster that grows without this count being re-read is a roster nobody is
+        // looking at. fmt (no graph) and docs (pwsh) are still the only two exemptions,
+        // so 15 - 2 = 13, and the two new rows carry --locked like every other cargo
+        // row above them (the per-row assert is what proves that half).
         assert_eq!(
-            locked, 11,
-            "eleven rows resolve a graph here; another number means the roster changed shape and this statement is now about a different list",
+            locked, 13,
+            "thirteen rows resolve a graph here; another number means the roster changed shape and this statement is now about a different list",
         );
         assert_eq!(
             step_specs().len(),
-            13,
+            15,
             "fmt and docs are the two exempt rows"
         );
     }
@@ -784,12 +846,43 @@ mod tests {
             !names.contains(&"bridge"),
             "the advisory cargo-check bridge row is back: {names:?}"
         );
+        // And the same two rows for the SECOND bridge, because "the bridge" stopped
+        // naming one crate the moment slint shipped. Named out loud rather than by a
+        // loop over prefixes: a slint row that quietly becomes advisory or disappears
+        // has to be reported by name, which is the whole reason this test exists.
+        let slint_build = specs
+            .iter()
+            .find(|s| s.name == "slint-build")
+            .unwrap_or_else(|| panic!("slint-build row is gone: {names:?}"));
+        let slint_lint = specs
+            .iter()
+            .find(|s| s.name == "slint-clippy")
+            .unwrap_or_else(|| panic!("slint-clippy row is gone: {names:?}"));
+        assert!(
+            !slint_build.advisory && !slint_lint.advisory,
+            "a slint row was demoted to advisory: notes-slint.exe is the shipping artifact of              the bridge this project chose, so its link and its lint gate"
+        );
+        assert_eq!(
+            slint_build.args.join(" "),
+            "build --locked -p notes-bridge-slint --bin notes-slint"
+        );
+        assert_eq!(
+            slint_lint.args.join(" "),
+            "clippy --locked -p notes-bridge-slint --all-targets -- -D warnings"
+        );
+        assert!(
+            slint_build.quick_skippable && slint_lint.quick_skippable,
+            "the slint rows must stay out of --quick, exactly like the gpui pair"
+        );
+
         for spec in &specs {
-            if spec.args.contains(&"notes-bridge-gpui") && spec.args.contains(&"check") {
-                panic!(
-                    "{} re-introduces an advisory-shaped cargo check of the bridge",
-                    spec.name
-                );
+            for pkg in ["notes-bridge-gpui", "notes-bridge-slint"] {
+                if spec.args.contains(&pkg) && spec.args.contains(&"check") {
+                    panic!(
+                        "{} re-introduces an advisory-shaped cargo check of {pkg}",
+                        spec.name
+                    );
+                }
             }
         }
     }

@@ -128,11 +128,22 @@ jobs:
         run: cargo fmt --all -- --check
 
       # --- 2. lints -----------------------------------------------------------
-      # notes-bridge-gpui is excluded from THIS invocation only because gpui is pinned to
-      # =0.2.2: one upstream deprecation would fail the workspace run for every crate at
-      # once, and the exclusion keeps the verdict attributable. It is NOT a loophole - the
-      # bridge is linted by its own named step below (3c), same -D warnings, its own
-      # red/green. See 3b/3c for which bridge checks gate and which do not.
+      # notes-bridge-gpui is excluded from THIS invocation only, and the word is the
+      # whole point: exactly ONE member is named, so notes-bridge-slint IS in this run and
+      # in step 3 below. The reason for the one exclusion is gpui's pin to =0.2.2 - one
+      # upstream deprecation would fail the workspace run for every crate at once, and the
+      # exclusion keeps the verdict attributable.
+      #
+      # WHAT THIS COMMENT USED TO IMPLY, and why it is spelled out now: it said "the
+      # bridge is linted by its own named step below", singular, at a time when there was
+      # one bridge. Read that way this line was the reason nobody noticed that the
+      # SHIPPING product had never been BUILT in CI - slint passed here (it is not
+      # excluded) and passed the test step, which looks like total coverage, and neither
+      # step ever links a bin. Coverage of a bridge is now named per bridge:
+      #   notes-bridge-gpui   clippy/test: excluded here -> 3c lints it, 3b links it.
+      #   notes-bridge-slint  clippy/test: IN this run and in step 3 -> 3f links it,
+      #                       3g lints every target. Its tests gate, because nothing
+      #                       excludes them; gpui's do not, and stay advisory (below).
       # DELIBERATELY UNBOUNDED (and this is step 2, the first cargo step of the job, so it
       # pays for the cold dependency compile out of Swatinem/rust-cache). Warm, the subset
       # measured below costs 1.7 s; cold, nothing here was measurable this session without
@@ -464,6 +475,74 @@ jobs:
             9) echo "::error::SMOKE EXIT 9 - THE STARTUP ANNOUNCE NEVER REACHED THE LIVE UI (TRACE_FAILED_EXIT). Everything 1/4/5 accuse is absent here: the app built, launched, painted a window, took a real WM_CLOSE, exited 0 by itself and wrote session.json - and the stderr this step redirected from the live process named no RecentsUpdated while the state dir the APP RESOLVED held recents that were there to announce. That is roadmap M2 exit item 5 (Recents) asserted for the first time where no headless test can reach: the port knew the list and the running app was never shown it. Read the 'smoke: recents at startup: N read from <path>' line and the 'smoke: trace:' lines in the log above BEFORE blaming the app, because both ways this is NOT a product bug are printed rather than assumed: N=0 makes the claim NOT JUDGED (the engine announces only a NON-EMPTY list, and the count comes from the ONE directory the app itself opens - target/debug/data when the portable marker is there, the roaming profile only otherwise - so an install with no settings.toml in its own state dir cannot produce the line and never reddens this arm; the path is printed so a reader can see WHICH dir was counted), and a 0-byte capture is the redirect failing to see the app, also NOT JUDGED. A real 9 says a non-empty list went unannounced to a live window - a rendering gap, not a persistence gap, so it belongs to the bridge lane and not to core or api. The evidence line names which voice carried it: [rendered] is a status line the UI showed, [arrived] is the bridge per-event arrival line - the strongest voice always available, since a startup batch can hide the announce from the rendered line without losing it - and [delivered, never rendered] is the exit drain naming an event that never got a frame. The STRONGEST voice present is cited, not the first line written. Advisory like every code here: the step stays continue-on-error because a GUI row going red on a machine with no desktop is noise, and an armed arm is what keeps a REAL red readable without gating on it." ;;
             *) echo "::error::SMOKE COULD NOT JUDGE (exit $status) - the harness itself failed before any verdict: no PowerShell to post WM_CLOSE with, the probe script could not be written or run, unreadable mtimes on the sources (a broken instrument, deliberately not reported as 5/stale), or a bad invocation of cargo xtask smoke. This arm deliberately names NO numbers - an arm that enumerates codes is a list that goes out of date, and it has already gone stale twice in this file - so anything reaching here is an unknown contract change: read it as no information about the app, never as a pass and never as a missing desktop." ;;
           esac
+          exit $status
+
+      # --- 3f/3g. THE SECOND BRIDGE, linked and linted -------------------------
+      # M5-S0, and the finding behind it is worth keeping in the file: the gate job built
+      # ONE exe, notes-gpui.exe, and this repo now ships a second binary. Nothing about
+      # that gap was visible in the roster - slint is not the excluded member, so it rode
+      # steps 2 and 3 green from the day it landed - but clippy never LINKS and
+      # `cargo test` links a test harness, never a `[[bin]]`. So the crates that hold
+      # `[lints]` exceptions the other crates cannot (this bridge denies unsafe_code and
+      # repeats the workspace lints locally, precisely so a toolkit macro problem stays
+      # attributable), a build.rs-free crate whose exe is produced by nothing in CI, and a
+      # bin rename in Cargo.toml were all invisible here.
+      # Commands byte-for-byte as check.rs's slint-build / slint-clippy rows resolve them
+      # (signature() drops --config and its value, so adding one later cannot break the
+      # match - but see the flag note in check.rs: NO future-incompat suppression here,
+      # because none was measured for slint's graph).
+      # GATE both, not advisory, matching the rows: a link break in the shipped front
+      # door must not be able to reach master as an annotation. UNBOUNDED on purpose like
+      # 3b/3c, with the same reasoning (a cold slint compile is minutes; the 45-minute job
+      # timeout is the backstop, and a guessed step timeout below the cold graph build
+      # turns a slow green into a false red).
+      # POSITION: after 3e deliberately, not beside 3b. 3d mutates the exe 3b linked and
+      # 3e launches that same file; the slint pair builds a DIFFERENT binary, so placing
+      # it between that write and its read-back would only make the chain harder to read.
+      # What it does NOT do, stated so nobody assumes it: there is no manifest step for
+      # notes-slint.exe. crates/bridge-slint has no build.rs and no app.manifest today, so
+      # `xtask manifest` has nothing of ours to verify in that artifact; giving the second
+      # bridge the same identity/DPI declaration is an M5 slice with a decision in it, not
+      # a freebie to extend here.
+      - name: slint — cargo build --locked -p notes-bridge-slint --bin notes-slint (the exe must link)
+        id: slint_build
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          cargo build --locked -p notes-bridge-slint --bin notes-slint 2>&1 | tee "$RUNNER_TEMP/slint-build.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          while IFS= read -r line; do
+            echo "::error::$line"
+          done < <(grep -E '^error' "$RUNNER_TEMP/slint-build.log" | head -12 || true)
+          if [ "$status" = "0" ]; then
+            echo "slint build: notes-slint.exe linked."
+          else
+            echo "::error::SLINT BUILD FAILED (exit $status) - notes-slint.exe did not link, or a dependency did not compile. This is the gate that says the SECOND shipped binary is buildable; the crate names in the annotations above say which."
+          fi
+          exit $status
+
+      # Separate step, separate name, for the reason 3c already states: "the lint broke"
+      # and "the link broke" must be two different red cells. --all-targets, so the
+      # in-crate #[cfg(test)] module and the support/ mock this bridge's tests share are
+      # linted too - the same surface that quietly accumulates dead_code under
+      # -D warnings everywhere else.
+      - name: clippy (slint) — cargo clippy --locked -p notes-bridge-slint --all-targets -- -D warnings
+        id: slint_clippy
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          cargo clippy --locked -p notes-bridge-slint --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/slint-clippy.log" || status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          while IFS= read -r line; do
+            echo "::error::$line"
+          done < <(grep -E '^(error|warning)(\[[0-9A-Za-z-]+\])?:' "$RUNNER_TEMP/slint-clippy.log" | head -12 || true)
+          if [ "$status" = "0" ]; then
+            echo "clippy (slint): clean at -D warnings."
+          else
+            echo "::error::CLIPPY FAILED ON THE SLINT BRIDGE (exit $status) - a lint, or a real compile error, under -D warnings."
+          fi
           exit $status
 
       # --- 4. architecture invariants (== the `cargo arch` alias) ------------
