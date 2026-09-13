@@ -1,10 +1,12 @@
-// The strip's transitional state, stated rather than silenced: the modules below were written
-// for a root that ALSO measured and probed, so a dozen items (the dialog mailbox, the
-// fingerprint witness, the pin hold, the legend's own print) are used by the probe and unused
-// HERE while STRIP-4 items 1-4 are still owed. Deleting them would break the probe; calling
-// them from here would mean writing the acts into the product, which is the opposite of this
-// slice. So the allow lives at this root, where the lie is smallest, and the comment names
-// what will remove it.
+// STILL NEEDED AFTER STEP B, and now it names exactly what: the callback wiring landed, so the
+// dialog mailbox, ask_dialog/answer_dialog and the whole of wire_callbacks are LIVE here — they are
+// no longer part of the reason this allow exists. What is left is items that live in surface.rs and
+// belong to the probe only: `caption_glyph` (surface.rs:419, the max/restore asset word — nothing in
+// the product asks for it) and the probe's measurement fields on `Pump` (`asked`, `hold_reported`,
+// `ticks` and their neighbours, surface.rs:657-671). Deleting them would break the other root;
+// calling them from here would be writing acts into the product, which is STRIP-4's opposite. So the
+// allow stays at this root, where the lie is smallest, and the two names above are what must go (or
+// move behind a per-item allow in surface.rs, outside this fence) before it can.
 #![allow(dead_code)]
 #![windows_subsystem = "windows"]
 
@@ -64,7 +66,7 @@ mod title_contract;
 mod ui_gen;
 
 use plumbing::{arm_drop_target, fingerprint_of, hwnd_of, note_dot, publish_title, report, send};
-use surface::{Pump, drain, legend, text_pump};
+use surface::{DialogReply, Pump, answer_dialog, drain, legend, text_pump, wire_callbacks};
 use ui_gen::Spike;
 
 /// THE PORT RULE AND NOTHING ELSE. The probe overrides its state dir with a directory beside its
@@ -264,6 +266,19 @@ fn main() {
     ));
     note_dot(&pump, &ui.as_weak(), false, "start");
 
+    // STEP B, dated 2026-09-15: the toolkit's asks get their ONE hook call, here, after the window
+    // exists and after Pump holds the stored autosave bit - both of which the handlers read. Before
+    // this line the product root had no handler for open-asked / save-as-asked / autosave-asked /
+    // open-at-index / quit-asked at all, so every chord and every menu row fell on the floor:
+    // main.slint fired the callback into a Rust side that had never registered one.
+    // The mailbox is NOT decoration - ask_dialog answers THROUGH it even when SLINT_NO_DIALOG makes
+    // it skip the modal, so an Open/SaveAs ask with no reader would be a silent dead end. One
+    // try_recv per wake in the tick below, never an await, exactly the probe's rule.
+    let (dialog_tx, dialog_rx) = mpsc::channel::<DialogReply>();
+    let dialog_rx = Rc::new(RefCell::new(dialog_rx));
+    wire_callbacks(&ui, &gateway, &pump, &dialog_tx);
+    report("wiring: menu rows and chords hooked (open, save-as, autosave, recent, quit)");
+
     // ---- the loop: a WAKE, not a clock ----
     // 8 ms is a poll interval, and the probe's 8 ms tick is a SCHEDULE: twenty-four *_AT consts, an
     // END that hides the window at 28 s, and acts that open files nobody asked for. This has none
@@ -274,6 +289,7 @@ fn main() {
     let tick_events = Rc::clone(&events);
     let tick_pump = Rc::clone(&pump);
     let tick_drops = Rc::clone(&drop_guard);
+    let tick_dialog_rx = Rc::clone(&dialog_rx);
     let tick_settle = Rc::new(RefCell::new(Settle::default()));
     let weak = ui.as_weak();
     let tick = Timer::default();
@@ -336,6 +352,15 @@ fn main() {
         }
         drain(&tick_events, &tick_pump, &ui.as_weak());
         text_pump(&ui, &tick_gw, &tick_pump);
+        // The picker's answer, if a person finished choosing. Read here and nowhere else, so no
+        // callback on the loop ever waits for a modal (probe.rs:722-728 in shape, minus its act
+        // prints): while the dialog thread is still blocked, this try_recv simply misses.
+        {
+            let rx = tick_dialog_rx.borrow();
+            while let Ok(reply) = rx.try_recv() {
+                answer_dialog(reply, &tick_gw, &tick_pump, &ui);
+            }
+        }
     });
 
     // CLOSE IS QUIT. The probe holds the window on the first request on purpose, because it is
