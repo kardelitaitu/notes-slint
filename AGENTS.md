@@ -66,12 +66,12 @@ Rules that are easy to break politely:
   geometry *storage* is core work. Measured on 2026-09-14, and silent in both bridges' comments
   until then: **the handle may not exist yet after `show()`** — winit materialises the platform
   window on the first event pump, so a root registers on the first wake that can read an HWND and
-  then stops (`crates/bridge-slint/src/product.rs:283-304`); and measured the same day, on the next
+  then stops (`crates/bridge-slint/src/product.rs:456-497`); and measured the same day, on the next
   line of that same startup: **focus must be claimed once the window is materialised** — the
   outermost `FocusScope` captures no key until a *visible* focus item exists, so the first
   keystrokes are dead until a root asks, and Slint 1.17 exposes no public focus door, so it borrows
   the one its own generated `.focus()` compiles to (`claim_focus`,
-  `crates/bridge-slint/src/product.rs:240-257`).
+  `crates/bridge-slint/src/product.rs:242-259`).
 - **Autosave is asynchronous.** A save failure has no caller to return `Err` to — it must
   arrive as `Event::SaveFailed`. Do not add a synchronous `Result`-returning save path
   just because it is convenient.

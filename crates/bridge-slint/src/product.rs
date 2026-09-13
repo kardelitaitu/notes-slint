@@ -213,7 +213,7 @@ fn panic_note(what: &str, where_: Option<&str>) -> String {
 /// a click, this product's chords are DEAD until a pointer press lands inside the window. Not a
 /// theory about the harness - the mechanism is readable in 1.17 and both halves of it are true:
 ///   * every chord this app answers lives in `capture-key-pressed` on the markup's OUTERMOST
-///     FocusScope (ui/main.slint:191), and Slint runs that capture pass only along the path from the
+///     FocusScope (ui/main.slint:188), and Slint runs that capture pass only along the path from the
 ///     window to its CURRENT focus item (i-slint-core window.rs:1074, then the `capture_key_event`
 ///     loop at :1098). No focus item, no path, no chord - the keystroke is swallowed and the status
 ///     line never moves;
