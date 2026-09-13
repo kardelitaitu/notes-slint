@@ -36,7 +36,9 @@ fn usage() {
     eprintln!(
         "       it by reading the resource back: exit 0 verified, 20 no SDK, 21 read-back refused"
     );
-    eprintln!("usage: cargo xtask smoke [--reuse-state] [--no-build]");
+    eprintln!(
+        "usage: cargo xtask smoke [--reuse-state] [--no-build] [--require-ours] [--binary=gpui|slint|slint-probe]"
+    );
     eprintln!(
         "       builds notes-gpui first (exit 4 if it does not compile) and proves the exe is"
     );

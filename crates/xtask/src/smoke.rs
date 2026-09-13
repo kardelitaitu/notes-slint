@@ -319,6 +319,14 @@ pub enum Leg {
     /// The full needle schedule: self-hide, the window/close/session triple, the
     /// geometry and recents probes. Only the gpui artifact speaks it today.
     GpuiSchedule,
+    /// THE PRODUCT CONTRACT, and it is a different contract: the startup lines the
+    /// product says on its OWN stderr, a window that is still THERE at 45s (nothing
+    /// in the product self-hides, so "alive" is assertable rather than inferred), and
+    /// a WM_CLOSE the app answers by exiting 0 by itself. Deliberately NOT
+    /// [Leg::GpuiSchedule]: the product stopped saying the needles that schedule
+    /// reads, so pointing it at that schedule would print a verdict about a binary
+    /// that was never meant to answer them.
+    Product,
     /// Resolved, buildable, and NOT judged - with the reason, so `--binary slint`
     /// cannot read as a pass, nor as a product failure.
     NotWired(&'static str),
@@ -329,8 +337,25 @@ pub fn leg_for(target: &ArtifactTarget) -> Leg {
     // accident, and an accident should surface as a wrong verdict loudly.
     if target.bin == GPUI_TARGET.bin {
         Leg::GpuiSchedule
+    } else if target.bin == SLINT_TARGET.bin {
+        // THE PRODUCT OF THE SECOND BRIDGE. Its sibling `notes-slint-probe` is the
+        // same package and a different contract again - the instrumented bytes still
+        // answer the needle schedule - so that row falls through to [Leg::NotWired]
+        // and stays there until somebody wires a schedule leg to it. One package,
+        // two bins, two legs: which is why a target is not a package name.
+        Leg::Product
     } else {
         Leg::NotWired(target.bin)
+    }
+}
+
+/// The ONE honest reason a [Leg::NotWired] row is not judged, so the decline at
+/// runtime names a cause instead of shrugging.
+fn not_wired_reason(target: &ArtifactTarget) -> &'static str {
+    if target.bin == SLINT_PROBE_TARGET.bin {
+        "the only schedule this harness speaks is the gpui one, and pointing it at the          instrumented probe bytes is a port, not a flag: its needles are the same lines          the probe leg would have to re-decide, so that leg is its own slice of work"
+    } else {
+        "no leg was ever written for this artifact"
     }
 }
 
@@ -1860,7 +1885,13 @@ pub fn staleness(
 
 /// Say which binary was tested: path, age, and the HEAD it was built against.
 /// Without this line a green run cannot be attributed to a tree at all.
-fn report_binary(exe: &Path, root: &Path, built: bool) {
+///
+/// The CAUSE of a manifest state is named from the SELECTED row's own build script,
+/// and never from gpui's. This used to print bridge-gpui's build.rs sentence over
+/// whatever exe was on display, which for the slint product read as "bridge-slint's
+/// build script embeds nothing" - a claim about a file that row does not have. A
+/// reader must not be handed another artifact's explanation for these bytes.
+fn report_binary(exe: &Path, root: &Path, built: bool, target: &ArtifactTarget) {
     let age = mtime_of(exe)
         .and_then(|t| t.elapsed().ok())
         .map(|d| format!("{}s old", d.as_secs()))
@@ -1879,14 +1910,26 @@ fn report_binary(exe: &Path, root: &Path, built: bool) {
         if built { "yes" } else { "NO (--no-build)" },
         head
     );
-    let embed = match build_embeds_manifest(root) {
-        Some(true) => "build.rs EMBEDS app.manifest at link time",
-        Some(false) => {
-            "build.rs does NOT embed anything, so these bytes did not come \
- from cargo build - they came from a post-link 'cargo xtask manifest' \
- run, or from the toolkit's own manifest"
+    let embed = if target.build_rs.is_empty() {
+        format!(
+            "{} declares NO build script of its own, so NOTHING of ours is embedded into \
+ these bytes at link time - the manifest's only possible authors are the toolkit itself or a \
+ post-link 'cargo xtask manifest' run (and {} build.rs explains {} bytes, not these)",
+            target.pkg, GPUI_TARGET.pkg, GPUI_TARGET.bin
+        )
+    } else {
+        match build_embeds_manifest(root) {
+            Some(true) => format!("{} EMBEDS app.manifest at link time", target.build_rs),
+            Some(false) => format!(
+                "{} does NOT embed anything, so these bytes did not come from cargo build \
+ - they came from a post-link 'cargo xtask manifest' run, or from the toolkit's own manifest",
+                target.build_rs
+            ),
+            None => format!(
+                "{} could not be read, so the cause is unknown",
+                target.build_rs
+            ),
         }
-        None => "build.rs could not be read, so the cause is unknown",
     };
     match manifest_of(root, exe) {
         Ok(m) => {
@@ -1895,14 +1938,30 @@ fn report_binary(exe: &Path, root: &Path, built: bool) {
                 m.identity, m.long_path, m.per_monitor, embed
             );
             if let crate::manifest::ReadBack::Missing(absent) = crate::manifest::read_back(&m) {
+                // The CAUSE is named from the row again: "the kit migration build.rs"
+                // is a bridge-gpui sentence, and printing it over another artifact's
+                // bytes accuses a file that exe was never linked with.
+                let why = if target.build_rs.is_empty() {
+                    format!(
+                        "{} has NO build script at all, so nothing could have embedded our \
+ declaration into it at link time: the post-link 'cargo xtask manifest' step is the only door \
+ to a compliant exe here.",
+                        target.pkg
+                    )
+                } else {
+                    format!(
+                        "{} embeds NOTHING (the kit migration stopped it), so a plain cargo \
+ build is NOT compliant: the post-link 'cargo xtask manifest' step is required and CI gates on \
+ it.",
+                        target.build_rs
+                    )
+                };
                 println!(
-                    "SMOKE WARN: this exe does NOT carry our manifest - no {:?}. Since the kit \
- migration build.rs embeds NOTHING, so a plain cargo build is NOT compliant: the \
- post-link 'cargo xtask manifest' step is required and CI gates on it. Locally \
+                    "SMOKE WARN: this exe does NOT carry our manifest - no {:?}. {} Locally \
  this stays a warning, because a bare cargo run still gets PerMonitorV2 from the \
  toolkit - byte-identical DPI semantics - and a red nobody can clear without \
  learning a new command trains people to ignore red. --require-ours makes it 8.",
-                    absent
+                    absent, why
                 );
             }
         }
@@ -3445,7 +3504,8 @@ pub fn run(args: &[String]) -> i32 {
     // make - a box with a perfect window station answers the same 2. 2 says the harness
     // itself stopped before judging anything, which is exactly what happened here: the
     // missing leg is ours, not the desktop's.
-    if let Leg::NotWired(bin) = leg_for(target) {
+    let leg = leg_for(target);
+    if let Leg::NotWired(bin) = &leg {
         println!(
             "smoke: NOT JUDGED - '{bin}' resolves to {} ({}) but no leg speaks its contract yet.",
             exe.display(),
@@ -3460,17 +3520,25 @@ pub fn run(args: &[String]) -> i32 {
             BINARY_NAMES
                 .iter()
                 .filter(|n| {
-                    matches!(
+                    !matches!(
                         leg_for(select_target(n).unwrap_or(&GPUI_TARGET)),
-                        Leg::GpuiSchedule
+                        Leg::NotWired(_)
                     )
                 })
                 .copied()
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        // WHY this one is not judged, named at the row rather than guessed by the
+        // reader: the product leg shipped, so a decline after it is a specific
+        // absence and not the general "nobody got here yet".
+        println!("smoke:   reason: {}", not_wired_reason(target));
         println!(
-            "smoke:   the product leg (alive at 45s, the startup lines on piped stderr, a clean taskkill drain - and NOT the shutdown-honesty needles, which are not shipped yet) and the probe leg (today's schedule against notes-slint-probe.exe) are the next slice's work. This run launched nothing: there is NO verdict about {bin} in either direction."
+            "smoke:   judged legs today: the gpui needle schedule, and the product contract \
+             (the startup lines on piped stderr, alive at 45s, a WM_CLOSE answered by an exit 0 \
+             with the session write joined) against {}.exe. This run launched nothing: there \
+             is NO verdict about {bin} in either direction.",
+            SLINT_TARGET.bin
         );
         return HARNESS_EXIT;
     }
@@ -3498,7 +3566,7 @@ pub fn run(args: &[String]) -> i32 {
             }
         }
     };
-    report_binary(&exe, &root, built);
+    report_binary(&exe, &root, built, target);
     // The strict shape, opt-in: the line above always names what is in the exe,
     // and this decides whether a foreign manifest is allowed to pass. Not
     // default, because the ordinary state on a developer machine is that nobody
@@ -3528,7 +3596,13 @@ pub fn run(args: &[String]) -> i32 {
         println!("smoke: window=MISSING close=NOBIN session=NOBIN 0.0s");
         return STEP_FAILED_EXIT;
     }
-    match staleness(mtime_of(&exe), newest_source(&root, &GPUI_TARGET)) {
+    // THE ROOTS THE SELECTED ROW NAMES. This call used to pass &GPUI_TARGET by
+    // literal, and that was the false-5 half of the wiring: judging notes-slint.exe
+    // for freshness against bridge-gpui's sources cries "stale" the moment anybody
+    // touches a gpui file, and stays silent when the slint sources move. Same shape
+    // as the --binary bug the row exists to fix, one call site further down: a
+    // literal quietly encoding one choice after a second choice has appeared.
+    match staleness(mtime_of(&exe), newest_source(&root, target)) {
         Stale::OlderThan {
             source,
             delta_secs,
@@ -3548,6 +3622,17 @@ pub fn run(args: &[String]) -> i32 {
             return HARNESS_EXIT;
         }
         Stale::Fresh => {}
+    }
+
+    // THE PRODUCT LEG BRANCHES HERE, and the place matters. Everything above is
+    // row-driven and belongs to BOTH legs: the build comes from the selected row's
+    // build_args(), the freshness roots from that row, the manifest's CAUSE from that
+    // row's own build script. Everything below is the gpui NEEDLE SCHEDULE - the
+    // self-hide, the probe state dir, the session/geometry/recents triple - and the
+    // product stopped saying those lines on purpose. So the product is judged by its
+    // own contract from here, and the schedule never sees these bytes.
+    if matches!(leg, Leg::Product) {
+        return run_product_leg(target, &exe);
     }
 
     let started = Instant::now();
@@ -3875,6 +3960,452 @@ pub fn run(args: &[String]) -> i32 {
         let _ = fs::remove_file(junk);
     }
     code
+}
+
+/// How long the PRODUCT must still be there, on screen and running, before the
+/// harness is allowed to ask it to close. This is the assertion the needle schedule
+/// can never make, because that schedule's own artifact hides itself: the product has
+/// no self-hide, so "alive at 45s" is a fact about the shipped app rather than a
+/// favour done to the probe.
+const PRODUCT_ALIVE_SECS: u64 = 45;
+/// The product probe's outer bound: every window the script itself bounds, plus the
+/// same 20s headroom [OUTER_SECS] keeps for the same reason.
+const PRODUCT_OUTER_SECS: u64 = WINDOW_SECS + PRODUCT_ALIVE_SECS + CLOSE_SECS + 20;
+
+/// THE PREFIX, asserted rather than assumed: [crate] = plumbing.rs's `report()` is the
+/// one voice the product has with no console, and a line in somebody else's voice is
+/// not the product saying it. Slint's own warnings share this stderr.
+pub const PRODUCT_VOICE: &str = "notes-gpui: ";
+
+/// What the product owes BEFORE its window is judged alive, each needle paired with
+/// the file that emits it, so a red line says which promise broke instead of leaving
+/// a reader to grep for the string. Every needle is spelled WITHOUT the voice prefix
+/// and matched only on a line that carries it.
+pub const PRODUCT_STARTUP_NEEDLES: &[(&str, &str)] = &[
+    (
+        "startup: state dir ",
+        "product.rs - where it decided to keep its state",
+    ),
+    (
+        "chord: legend",
+        "product.rs - the chords a user has to reach the menu by",
+    ),
+    (
+        "startup: entering the loop",
+        "product.rs - that it got as far as running",
+    ),
+    (
+        "drop: armed hwnd=",
+        "plumbing.rs - a real handle, armed for drops",
+    ),
+];
+
+/// What the product owes AFTER the harness asks it to close, in order. These two are
+/// the whole shutdown-honesty claim: the close was granted the FIRST time, and the
+/// session write ran on a thread that was joined rather than abandoned.
+pub const PRODUCT_CLOSE_NEEDLES: &[(&str, &str)] = &[
+    (
+        "close: requested #1, granted",
+        "product.rs - the first WM_CLOSE was accepted, not swallowed",
+    ),
+    (
+        "shutdown: joined cleanly",
+        "product.rs - the save thread was joined, so the session write ran",
+    ),
+];
+
+/// Which owed lines a capture is missing - and which arrived in the wrong voice.
+/// Pure over its inputs, because the assert is the product of this leg and a verdict
+/// nobody can test is a verdict nobody can trust.
+pub fn product_gaps(trace: &str, needles: &[(&str, &str)], phase: &str) -> Vec<String> {
+    let mut gaps = Vec::new();
+    for (needle, source) in needles {
+        let hits: Vec<&str> = trace
+            .lines()
+            .filter(|l| l.contains(needle))
+            .collect::<Vec<_>>();
+        match hits.first() {
+            None => gaps.push(format!(
+                "SMOKE FAIL: {phase} - the product never said {needle:?}; that line comes from \
+ {source}, and its absence means the step it reports did not happen"
+            )),
+            Some(line) => {
+                if !line.trim_start().starts_with(PRODUCT_VOICE) {
+                    gaps.push(format!(
+                        "SMOKE FAIL: {phase} - {needle:?} appeared on stderr WITHOUT the \
+ {PRODUCT_VOICE:?} voice (line: {line:?}), so this harness cannot credit it to the product's \
+ own report()"
+                    ));
+                }
+            }
+        }
+    }
+    gaps
+}
+
+/// The three reasons this MACHINE cannot host a product run, in the order the two
+/// existing scripts (PROBE and GEOMETRY_PROBE) already distinguish them: no Win32
+/// declarations to compile, a non-interactive session, and an interactive session with
+/// no windowed process on it. Named apart because they are fixed apart, and because a
+/// decline that says "no desktop" has been read as an app bug often enough to matter.
+pub fn product_station_gaps(p: &Probe) -> Vec<String> {
+    let mut gaps = Vec::new();
+    if !p.flag("WIN32") {
+        gaps.push("this PowerShell could not compile the Win32 declarations (WIN32=0)".to_string());
+    }
+    if !p.flag("INTERACTIVE") {
+        gaps.push("[Environment]::UserInteractive is false, so the session has no window station a GUI can be shown in".to_string());
+    }
+    if !p.flag("WINDOWED") {
+        gaps.push("no process on this session owns a top-level window (WINDOWED=0), so there is no desktop to be seen on".to_string());
+    }
+    gaps
+}
+
+/// The product's own probe. It launches the exe with its stderr captured, waits for a
+/// REAL window, sits on it for ALIVE_SECS, then closes it through the one sanctioned
+/// door - [System.Diagnostics.Process]::CloseMainWindow, the WM_CLOSE the existing
+/// PROBE already drives - and reports whether the app left by itself.
+///
+/// It decides nothing, in the file's existing discipline: KEY=VALUE out, verdict in
+/// Rust. And the kill at the end is a TEARDOWN ON FAILURE only: a force-kill is
+/// reported as FORCED=1, which the verdict turns into a failure rather than a pass.
+const PRODUCT_PROBE: &str = r#"
+param([Parameter(Mandatory)][string]$Exe, [string]$OutFile, [string]$ErrFile,
+       [int]$WindowSecs = 10, [int]$AliveSecs = 45, [int]$CloseSecs = 10)
+$ErrorActionPreference = 'SilentlyContinue'
+$code = @'
+using System;
+using System.Runtime.InteropServices;
+public static class PROD {
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+}
+'@
+$win32 = [bool](Add-Type -TypeDefinition $code -PassThru)
+"WIN32=$([int]$win32)"
+$interactive = [bool][Environment]::UserInteractive
+"INTERACTIVE=$([int]$interactive)"
+$windowed = (Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1)
+"WINDOWED=$([int][bool]($null -ne $windowed))"
+if (-not ($win32 -and $interactive -and ($null -ne $windowed))) { 'DESKTOP=0'; 'PROBE_DONE=1'; exit 0 }
+'DESKTOP=1'
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$p = Start-Process -FilePath $Exe -PassThru -RedirectStandardOutput $OutFile -RedirectStandardError $ErrFile
+if ($null -eq $p) { 'SPAWN=0'; 'PROBE_DONE=1'; exit 0 }
+'SPAWN=1'
+"PID=$($p.Id)"
+$deadline = (Get-Date).AddSeconds($WindowSecs)
+$handle = [IntPtr]::zero
+while ((Get-Date) -lt $deadline) {
+    $p.Refresh()
+    if ($p.MainWindowHandle -ne 0) { $handle = $p.MainWindowHandle; break }
+    if ($p.HasExited) { break }
+    Start-Sleep -Milliseconds 100
+}
+"LAUNCH_MS=$($sw.ElapsedMilliseconds)"
+"HANDLE=$([int64]$handle)"
+"TITLE=$($p.MainWindowTitle)"
+# THE ALIVE WINDOW: sit on the process until AliveSecs have passed since the launch,
+# polling for the one thing that would end it early. A product that quits in the middle
+# of this has failed the claim the schedule can't reach, and it is not re-launched.
+while ((-not $p.HasExited) -and ($sw.Elapsed.TotalSeconds -lt $AliveSecs)) {
+    Start-Sleep -Milliseconds 250
+    $p.Refresh()
+}
+"ALIVE_MS=$($sw.ElapsedMilliseconds)"
+"ALIVE=$([int][bool]((-not $p.HasExited) -and ([int64]$p.MainWindowHandle -ne 0)))"
+if ($p.HasExited) { "EXIT_CODE_EARLY=$($p.ExitCode)" } else { 'EXIT_CODE_EARLY=' }
+# THE CLOSE: WM_CLOSE through CloseMainWindow, the same door PROBE uses. Nothing here
+# kills the app unless it refused to leave, and a kill is reported, not hidden.
+$closed = $false
+$visible = $false
+if (-not $p.HasExited) {
+    $p.Refresh()
+    if ([int64]$p.MainWindowHandle -ne 0) { $visible = [PROD]::IsWindowVisible($p.MainWindowHandle) }
+    $closed = $p.CloseMainWindow()
+}
+"VISIBLE_AT_CLOSE=$([int][bool]$visible)"
+"CLOSE_REQUESTED=$([int][bool]$closed)"
+$exited = $false
+if (-not $p.HasExited) { $exited = $p.WaitForExit($CloseSecs * 1000) }
+"EXITED_WITHOUT_KILL=$([int][bool]$exited)"
+if ($exited) {
+    'FORCED=0'
+    "EXIT_CODE=$($p.ExitCode)"
+} else {
+    'FORCED=1'
+    Stop-Process -Id $p.Id -Force
+    $p.WaitForExit()
+    "EXIT_CODE_AFTER_FORCE=$($p.ExitCode)"
+}
+'PROBE_DONE=1'
+exit 0
+"#;
+
+/// Same two-PowerShell fallback the first probe uses: a runner may ship either, and
+/// neither is a dependency of this crate.
+fn spawn_product_probe(script: &Path, exe: &Path, out: &Path, err: &Path) -> Result<Child, String> {
+    let mut missing = Vec::new();
+    for program in ["pwsh", "powershell"] {
+        let spawned = Command::new(program)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(script)
+            .arg("-Exe")
+            .arg(exe)
+            .arg("-OutFile")
+            .arg(out)
+            .arg("-ErrFile")
+            .arg(err)
+            .arg("-WindowSecs")
+            .arg(WINDOW_SECS.to_string())
+            .arg("-AliveSecs")
+            .arg(PRODUCT_ALIVE_SECS.to_string())
+            .arg("-CloseSecs")
+            .arg(CLOSE_SECS.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        match spawned {
+            Ok(child) => return Ok(child),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(program.to_string());
+            }
+            Err(e) => return Err(format!("cannot run {program}: {e}")),
+        }
+    }
+    Err(format!(
+        "no PowerShell to run the product probe with (tried: {})",
+        missing.join(", ")
+    ))
+}
+
+/// Kill anything the failed run left on screen. ONLY called on a failure path: on a
+/// pass the app has already exited by itself, and that is the whole claim.
+fn product_teardown(target: &ArtifactTarget) {
+    println!(
+        "smoke: teardown: the run did not pass, so a product window left open would be  misread by the next one - killing any lingering {}.exe",
+        target.bin
+    );
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", &target.bin_file()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// THE PRODUCT LEG: build and freshness were already done from the selected row, so
+/// what is left is the launch, the lines, the 45s, the close, and the exit code.
+///
+/// What it deliberately does NOT do: move the user's session.json aside, seed a recent,
+/// read a rect or poll a pin. Those are the needle schedule's claims about gpui's
+/// contract; the product's state dir is its own, and this leg judges what the product
+/// promised. Every verdict reuses an existing CONTRACT code - 0, 1, 2, 3 - and the
+/// table gains no row, because a default `--binary=slint` run cannot return anything
+/// the ci.yml arms do not already cover.
+fn run_product_leg(target: &ArtifactTarget, exe: &Path) -> i32 {
+    println!(
+        "smoke: LEG=PRODUCT - {} is judged by the product contract: the startup lines on \
+ its own captured stderr, still alive at {PRODUCT_ALIVE_SECS}s, and a WM_CLOSE it answers by \
+ exiting 0 BY ITSELF. The needle schedule is not run against these bytes.",
+        exe.display()
+    );
+    let script = temp_path("product-probe", "ps1");
+    let out_file = temp_path("product-out", "txt");
+    let err_file = temp_path("product-err", "txt");
+    let junk = [script.clone(), out_file.clone(), err_file.clone()];
+    let cleanup = |tag: &str| {
+        let _ = tag;
+        for p in junk.iter() {
+            let _ = fs::remove_file(p);
+        }
+    };
+    if let Err(e) =
+        fs::File::create(&script).and_then(|mut f| f.write_all(PRODUCT_PROBE.as_bytes()))
+    {
+        println!("SMOKE FAIL: cannot write the product probe: {e}");
+        return HARNESS_EXIT;
+    }
+    let started = Instant::now();
+    let mut child = match spawn_product_probe(&script, exe, &out_file, &err_file) {
+        Err(e) => {
+            println!("SMOKE FAIL: {e}");
+            println!("smoke: product=NOPOWERSHELL alive=NOBUILD close=NOBUILD 0.0s");
+            cleanup("spawn");
+            return HARNESS_EXIT;
+        }
+        Ok(child) => child,
+    };
+    let probe = match wait_bounded(&mut child, PRODUCT_OUTER_SECS) {
+        Err(e) => {
+            println!("SMOKE FAIL: {e}");
+            println!("smoke: product=TIMEOUT alive=TIMEOUT close=TIMEOUT 0.0s");
+            product_teardown(target);
+            cleanup("timeout");
+            return STEP_FAILED_EXIT;
+        }
+        Ok(None) => {
+            println!("SMOKE FAIL: the product probe reported no exit status at all");
+            product_teardown(target);
+            cleanup("nostatus");
+            return HARNESS_EXIT;
+        }
+        Ok(Some(status)) => {
+            let stdout = read_pipe(child.stdout.as_mut());
+            if !status.success() {
+                println!("smoke: note - the product probe child itself exited {status}");
+            }
+            parse_probe(&stdout)
+        }
+    };
+    let trace = report_captured(&err_file, "the product on its own stderr").unwrap_or_default();
+    let _ = report_captured(&out_file, "the product on stdout");
+    println!(
+        "smoke: product pid={} handle={} title={:?} launch_ms={} alive_at={}ms ALIVE={} \
+ visible_at_close={} exit_code_early={:?}",
+        probe.get("PID").unwrap_or("?"),
+        probe.number("HANDLE").unwrap_or(0),
+        probe.get("TITLE").unwrap_or(""),
+        probe.number("LAUNCH_MS").unwrap_or(-1),
+        probe.number("ALIVE_MS").unwrap_or(-1),
+        probe.flag("ALIVE"),
+        probe.flag("VISIBLE_AT_CLOSE"),
+        probe.get("EXIT_CODE_EARLY").filter(|v| !v.is_empty())
+    );
+    // THREE CLASSES OF DECLINE, before any claim: this machine cannot host the run,
+    // which is not the app's fault and never gets a red against it.
+    if !probe.flag("PROBE_DONE") || !probe.flag("SPAWN") || !probe.flag("DESKTOP") {
+        let gaps = product_station_gaps(&probe);
+        if !gaps.is_empty() {
+            println!(
+                "smoke: DECLINED - this window station cannot host a product run: {}",
+                gaps.join("; ")
+            );
+            println!(
+                "smoke: a decline is not a verdict about the app: nothing was launched that  could fail (DESKTOP={:?}, keys seen [{}])",
+                probe.get("DESKTOP").unwrap_or("<absent>"),
+                probe.keys()
+            );
+            cleanup("declined");
+            return DECLINED_EXIT;
+        }
+        // The desktop was there and the probe still did not answer: that is the
+        // harness's own failure, and it says so rather than borrowing the app's code.
+        println!(
+            "SMOKE FAIL: the product probe never completed (keys seen: [{}]) - a missing  key is never a pass, and here it is the harness, not the app",
+            probe.keys()
+        );
+        product_teardown(target);
+        cleanup("incomplete");
+        return HARNESS_EXIT;
+    }
+    let mut gaps: Vec<String> = Vec::new();
+    if probe.number("HANDLE").unwrap_or(0) == 0 {
+        gaps.push(format!(
+            "SMOKE FAIL: startup - no top-level window within {WINDOW_SECS}s \
+ (pid={}, title={:?}): the product never showed, so nothing downstream is creditable",
+            probe.get("PID").unwrap_or("?"),
+            probe.get("TITLE").unwrap_or("")
+        ));
+    } else if let Some(ms) = probe.number("LAUNCH_MS") {
+        if ms > COLD_START_BUDGET_MS {
+            gaps.push(format!(
+                "SMOKE FAIL: startup - launch to window took {ms}ms, over the \
+ {COLD_START_BUDGET_MS}ms cold-start budget (whitepaper §2)"
+            ));
+        }
+    }
+    gaps.extend(product_gaps(
+        &trace,
+        PRODUCT_STARTUP_NEEDLES,
+        "the startup lines",
+    ));
+    if !probe.flag("ALIVE") {
+        gaps.push(format!(
+            "SMOKE FAIL: alive - the product was NOT there at {PRODUCT_ALIVE_SECS}s \
+ (gone by {}ms, exit code after the early end: {:?}). The needle schedule cannot make \
+ this claim, because its artifact hides itself; the product has no self-hide, so a \
+ process that quit early quit on its own",
+            probe.number("ALIVE_MS").unwrap_or(-1),
+            probe.get("EXIT_CODE_EARLY").unwrap_or("<absent>")
+        ));
+    }
+    // The close phase: only judged if the app was actually alive to be asked.
+    if probe.flag("ALIVE") {
+        if !probe.flag("VISIBLE_AT_CLOSE") {
+            gaps.push(
+                "SMOKE FAIL: close - the window was not visible when the close was asked \
+ (VISIBLE_AT_CLOSE=0), so the WM_CLOSE went to something a user could not have closed"
+                    .to_string(),
+            );
+        }
+        if !probe.flag("CLOSE_REQUESTED") {
+            gaps.push(
+                "SMOKE FAIL: close - CloseMainWindow (WM_CLOSE) was not accepted, so the \
+ graceful-shutdown path was never asked to run and its silence would prove nothing"
+                    .to_string(),
+            );
+        }
+        gaps.extend(product_gaps(
+            &trace,
+            PRODUCT_CLOSE_NEEDLES,
+            "the close lines",
+        ));
+        if probe.flag("FORCED") || !probe.flag("EXITED_WITHOUT_KILL") {
+            gaps.push(format!(
+                "SMOKE FAIL: close - the app did NOT exit by itself within {CLOSE_SECS}s of \
+ WM_CLOSE and was force-killed (code after the kill: {:?}). A force-kill is not a graceful \
+ shutdown and cannot PASS whatever code it ends with",
+                probe.get("EXIT_CODE_AFTER_FORCE")
+            ));
+        } else {
+            match probe.number("EXIT_CODE") {
+                Some(0) => {}
+                Some(code) => gaps.push(format!(
+                    "SMOKE FAIL: close - the app exited on its own, with code {code}, not 0"
+                )),
+                None => gaps.push(
+                    "SMOKE FAIL: close - EXIT_CODE is absent, so the exit status is unknown"
+                        .to_string(),
+                ),
+            }
+        }
+    }
+    let elapsed = started.elapsed();
+    if gaps.is_empty() {
+        println!(
+            "smoke: product=PASS alive=PASS close=PASS exit=0 {:.1}s",
+            elapsed.as_secs_f64()
+        );
+        println!(
+            "smoke:   what this proves: {} said its startup lines, was still on screen at \
+ {PRODUCT_ALIVE_SECS}s, took a WM_CLOSE, said the close and the joined shutdown, and left \
+ with 0 by itself. What it does NOT prove: the rect, the pin, the recents trace, or the \
+ maximised cycle - those are the needle schedule's claims, and this leg does not run it.",
+            target.bin
+        );
+        cleanup("pass");
+        return PASS_EXIT;
+    }
+    for note in &gaps {
+        println!("{note}");
+    }
+    println!(
+        "smoke: product=FAIL gaps={} alive={} close={} {:.1}s",
+        gaps.len(),
+        probe.flag("ALIVE"),
+        probe.flag("EXITED_WITHOUT_KILL"),
+        elapsed.as_secs_f64()
+    );
+    product_teardown(target);
+    cleanup("fail");
+    STEP_FAILED_EXIT
 }
 
 /// One-line description of whatever already sits on the session path.
@@ -5961,13 +6492,246 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
             Leg::GpuiSchedule,
             "the gpui leg is the one thing that must stay wired"
         );
-        for name in ["slint", "slint-probe"] {
-            let t = select_target(name).unwrap();
+        // THE COUNT MOVED: exactly one of these rows is still unwired, and it is the
+        // instrumented one. `notes-slint` now answers to the product contract, which
+        // is the whole subject of this commit - so this assert is the day the
+        // doc comment above it ("exactly ONE of them has a leg") got re-read.
+        assert_eq!(
+            leg_for(select_target("slint").unwrap()),
+            Leg::Product,
+            "the second bridge's PRODUCT bin is judged by the product leg now; if this \
+             goes red, either the row or the leg moved and the decline text lies"
+        );
+        let probe = select_target("slint-probe").unwrap();
+        assert_eq!(
+            leg_for(probe),
+            Leg::NotWired(probe.bin),
+            "the probe leg was wired without the schedule being ported - the decline path\
+             and its exit-2 CONTRACT text have to be retired in the same commit that does it"
+        );
+        // And the refusal that stands has a REASON that is not empty and not a shrug.
+        assert!(
+            not_wired_reason(probe).len() > 40 && not_wired_reason(probe).contains("schedule"),
+            "a decline that names no cause is the shrug this print exists to avoid: {:?}",
+            not_wired_reason(probe)
+        );
+    }
+
+    /// THE SELECTION REGRESSION, in the direction the code once got wrong: every
+    /// selectable artifact answers for its OWN roots and nothing else's. The freshness
+    /// call in run() used to hand `newest_source` the GPUI_TARGET literal, so
+    /// `--binary=slint` cried "stale" over a bridge-gpui edit and stayed silent about
+    /// a bridge-slint one - a false 5 and a false pass from one wrong argument. The
+    /// next test pins the rows; THIS one pins the walk, both directions.
+    #[test]
+    fn each_selectable_artifact_is_stale_only_by_its_own_sources() {
+        let dir = std::env::temp_dir().join(format!("xtask-own-roots-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        // Every root and file of every row, all of them an hour old, so nothing is
+        // stale by accident of being missing.
+        let mut all: Vec<&str> = Vec::new();
+        for t in [&GPUI_TARGET, &SLINT_TARGET, &SLINT_PROBE_TARGET].iter() {
+            for root in t.freshness_roots.iter().chain(t.freshness_files.iter()) {
+                if !all.contains(root) {
+                    all.push(root);
+                }
+            }
+        }
+        for rel in &all {
+            let path = dir.join(rel);
+            // A root is a DIRECTORY, and set_mtime needs a write handle - opening a
+            // directory that way is Access-denied on Windows. So the stamp goes on the
+            // file inside it, which is also the file the freshness walk actually reads.
+            let stamp = if rel.ends_with(".toml") || rel.ends_with(".lock") {
+                fs::write(&path, "# fixture\n").expect("write a file input");
+                path
+            } else {
+                fs::create_dir_all(&path).expect("source tree");
+                let inner = path.join("lib.rs");
+                fs::write(&inner, "// fixture\n").expect("write a root file");
+                inner
+            };
+            set_mtime(&stamp, past);
+        }
+        let exe = dir.join("notes-slint.exe");
+        fs::write(&exe, b"MZ").expect("write the exe");
+        set_mtime(&exe, std::time::SystemTime::now());
+
+        // A BRIDGE-SLINT edit: newer than the exe, and invisible to gpui's roots.
+        let slint_src = dir.join("crates/bridge-slint/src/product.rs");
+        fs::write(&slint_src, "// touched\n").expect("write the slint source");
+        set_mtime(
+            &slint_src,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+        );
+        assert!(
+            !GPUI_TARGET
+                .freshness_roots
+                .iter()
+                .any(|r| r.contains("bridge-slint")),
+            "the gpui row must not claim the second bridge's sources - that is how the \
+             two rows start answering for each other"
+        );
+        let gpui_newest = newest_source(&dir, &GPUI_TARGET).expect("gpui row answers");
+        assert_eq!(
+            staleness(mtime_of(&exe), Some(gpui_newest.clone())),
+            Stale::Fresh,
+            "a bridge-slint edit must NOT make the gpui artifact look stale"
+        );
+        let slint_newest = newest_source(&dir, &SLINT_TARGET).expect("slint row answers");
+        assert_eq!(
+            slint_newest.1, slint_src,
+            "the slint row must find the file its own row names"
+        );
+        assert!(
+            matches!(
+                staleness(mtime_of(&exe), Some(slint_newest.clone())),
+                Stale::OlderThan { .. }
+            ),
+            "and the SAME file must make the slint artifact stale - the one-row-fits-all \
+             call site used to get both halves of this backwards"
+        );
+        // The probe row shares the slint sources (same package) and so sees the same
+        // staleness, which is the point of it being a row and not a field.
+        assert_eq!(
+            newest_source(&dir, &SLINT_PROBE_TARGET).map(|(m, _)| m),
+            Some(slint_newest.0)
+        );
+
+        // THE OTHER DIRECTION: a bridge-gpui edit, newer still.
+        let gpui_src = dir.join("crates/bridge-gpui/src/lib.rs");
+        fs::write(&gpui_src, "// touched\n").expect("write the gpui source");
+        set_mtime(
+            &gpui_src,
+            std::time::SystemTime::now() + std::time::Duration::from_secs(120),
+        );
+        assert_eq!(
+            newest_source(&dir, &GPUI_TARGET).map(|(_, p)| p),
+            Some(gpui_src.clone()),
+            "the gpui row sees its own bridge"
+        );
+        assert_eq!(
+            newest_source(&dir, &SLINT_TARGET).map(|(_, p)| p),
+            Some(slint_src),
+            "the slint row keeps seeing the slint file: gpui is not an input to it, and a \
+             freshness answer that changed here means a root list leaked between rows"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The flag, the row and the leg, as one chain: what `--binary=X` parses to must be
+    /// what selects a row and what picks the CONTRACT, so no surface can disagree with
+    /// another about what the flag meant.
+    #[test]
+    fn the_binary_flag_the_row_and_the_leg_agree_for_every_legal_name() {
+        for name in BINARY_NAMES {
+            let args = vec![format!("--binary={name}")];
+            let inv = parse_args(&args).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(&inv.binary, name, "the parser stored somebody else's name");
+            let row = select_target(inv.binary).expect("a parsed name always selects");
+            let leg = leg_for(row);
+            let spelled = match &leg {
+                Leg::GpuiSchedule => "GpuiSchedule",
+                Leg::Product => "Product",
+                Leg::NotWired(b) => *b,
+            };
+            match (*name, &leg) {
+                ("gpui", Leg::GpuiSchedule)
+                | ("slint", Leg::Product)
+                | ("slint-probe", Leg::NotWired(_)) => {}
+                _ => panic!(
+                    "--binary={name} picked the {spelled} leg, which is not the contract \
+                     that name selects: {leg:?}"
+                ),
+            }
+            // And the row the leg was picked from is the row whose exe gets resolved:
+            // no leg may be speaking a contract while pointed at another artifact's bin.
+            let (exe, _) = resolve_exe(Path::new("wherever"), None, row);
             assert_eq!(
-                leg_for(t),
-                Leg::NotWired(t.bin),
-                "a slint leg was wired without this file's decline path being retired -                  and the exit-2 CONTRACT text says the harness stops before judging, so                  update both or neither"
+                exe.file_name().and_then(|n| n.to_str()),
+                Some(format!("{}.exe", row.bin).as_str()),
+                "the {name} leg resolves something other than its own exe"
             );
         }
+        // Two names, one package: the rows are distinct BECAUSE the bins are.
+        assert_ne!(
+            select_target("slint").unwrap().bin,
+            select_target("slint-probe").unwrap().bin
+        );
+    }
+
+    /// The product's own line judge: a needle counts only when the product said it in
+    /// its own voice, and a missing one is named with the file that owes it. Slint's
+    /// warnings share the stderr, so "the words appeared" is not the claim.
+    #[test]
+    fn a_product_needle_counts_only_in_the_product_voice() {
+        let said = concat!(
+            "notes-gpui: startup: state dir C:\\Notes\\target\\debug\\data\n",
+            "notes-gpui: chord: legend Ctrl+O open \u{b7} 1 in the list\n",
+            "notes-gpui: startup: entering the loop; nothing in it fires on a schedule\n",
+            "notes-gpui: drop: armed hwnd=0x1234 (this window)\n",
+        );
+        let mut whole = said.to_string();
+        assert!(product_gaps(&whole, PRODUCT_STARTUP_NEEDLES, "startup").is_empty());
+        // Missing one line is a named gap, not a near-miss.
+        let partial = "notes-gpui: startup: state dir D:\\data\nnotes-gpui: chord: legend x\n";
+        let gaps = product_gaps(partial, PRODUCT_STARTUP_NEEDLES, "startup");
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        assert!(gaps.iter().any(|g| g.contains("entering the loop")));
+        assert!(gaps.iter().any(|g| g.contains("armed hwnd")));
+        // The WRONG VOICE is not the product talking: no prefix, no credit.
+        let borrowed = "startup: entering the loop\nslint: drop: armed hwnd=0x1\n";
+        let gaps = product_gaps(borrowed, PRODUCT_STARTUP_NEEDLES, "startup");
+        assert_eq!(gaps.len(), 4, "{gaps:?}");
+        let voiced = "startup: entering the loop\n".replace("startup", "notes-gpui: startup");
+        let one = format!("{voiced}\n");
+        assert_eq!(
+            product_gaps(&one, &[("entering the loop", "product.rs")], "s").len(),
+            0
+        );
+        // And a line that carries the words WITHOUT the prefix is reported as such.
+        let quiet = "warning: startup: entering the loop\n";
+        let gaps = product_gaps(quiet, &[("entering the loop", "product.rs")], "s");
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("voice"), "{}", gaps[0]);
+        whole.push_str("notes-gpui: close: requested #1, granted (a product closes the first time)\nnotes-gpui: shutdown: joined cleanly, the session write ran\n");
+        assert_eq!(whole.matches("notes-gpui: ").count(), 6);
+        assert!(product_gaps(&whole, PRODUCT_CLOSE_NEEDLES, "close").is_empty());
+    }
+
+    /// The three classes of "this machine cannot host the check", named apart, because
+    /// a decline that says only "no desktop" is the sentence that got read as an app bug.
+    #[test]
+    fn the_station_decline_names_which_of_the_three_causes_it_is() {
+        let all_three = product_station_gaps(&probe(&[
+            ("WIN32", "0"),
+            ("INTERACTIVE", "0"),
+            ("WINDOWED", "0"),
+        ]));
+        assert_eq!(all_three.len(), 3, "{all_three:?}");
+        assert!(all_three[0].contains("WIN32=0"));
+        assert!(all_three[1].contains("UserInteractive"));
+        assert!(all_three[2].contains("top-level window"));
+        // One cause, one sentence: a box that merely has no windowed process must not be
+        // told its PowerShell is broken.
+        let one = product_station_gaps(&probe(&[
+            ("WIN32", "1"),
+            ("INTERACTIVE", "1"),
+            ("WINDOWED", "0"),
+        ]));
+        assert_eq!(one.len(), 1, "{one:?}");
+        assert!(one[0].contains("WINDOWED=0"));
+        assert!(
+            product_station_gaps(&probe(&[
+                ("WIN32", "1"),
+                ("INTERACTIVE", "1"),
+                ("WINDOWED", "1")
+            ]))
+            .is_empty()
+        );
+        // A key ABSENT reads as 0, i.e. as a decline: absence is never a host.
+        assert_eq!(product_station_gaps(&Probe::default()).len(), 3);
     }
 }
