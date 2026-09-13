@@ -28,8 +28,11 @@ product, and the editing surface can stay deliberately minimal.
 ## Stack
 
 - **Engine:** Rust — pure, headless, unit-testable, no UI or OS types in the core.
-- **UI:** [Slint](https://slint.dev), swapping in for GPUI behind the same bridge rule — one adapter
-  per toolkit, so the toolkit itself stays a swappable detail; in flight ([note](.agents/notes/proposed/2026-09-13-bridge-slint-spike.md)).
+- **UI:** [Slint](https://slint.dev) — it **ships**: `crates/bridge-slint` builds `notes-slint.exe`,
+  beside the instrumented probe that proved the window contract (`notes-slint-probe.exe`). GPUI
+  remains the other bridge, not the past tense of this one. Same rule on both sides: one adapter per
+  toolkit, so the toolkit stays a swappable detail ([record](.agents/notes/implemented/2026-09-14-strip-program.md),
+  [how it got here](.agents/notes/implemented/2026-09-13-bridge-slint-spike.md)).
 - **Platform:** Windows first. macOS and Linux planned; the plan and its honest limits
   (Wayland restricts both window positioning and always-on-top) are in the whitepaper §6.
 
@@ -61,7 +64,7 @@ placement validator fails the build when two files claim the same section.
 |---|---|
 | **M0** | **Spike — done 2026-09-10.** Does a standalone GPUI app build and run on Windows, and can we set topmost, set position, and open a native file dialog? Verdict: viable, every blocking question passed ([docs/roadmap.md](docs/roadmap.md) §12). |
 | M1 | **Done.** Core engine, headless. Tested with no window at all. |
-| M2 | **In flight.** First usable UI — *you can use it as a notepad.* |
+| M2 | **In flight, on two bridges.** First usable UI — *you can use it as a notepad.* The Slint product passes its own smoke leg locally (`cargo xtask smoke --binary=slint`); what is still owed is the CI evidence trail (this repo has no remote, so no workflow has ever run) and the human eye-pass list — [detail](docs/roadmap.md) §9. |
 | M3 | **Done.** Restore, monitor validation, DPI, and coming back maximised — the last one machine-proven, the smoke harness asserting the restore rect is unchanged across a real maximise-close-relaunch. |
 | M4 | **Done.** Autosave and pin. |
 | M5 | Polish, and the Windows portable + installer builds. |
@@ -75,7 +78,10 @@ Detail: [docs/roadmap.md](docs/roadmap.md) §9. Ship targets: `win-install`, `wi
 Tracked in §10 ([docs/open-questions.md](docs/open-questions.md)), and worked through one
 at a time in [`.agents/notes/proposed/`](.agents/notes/proposed/), which currently holds
 four open notes: how autosave arms on a foreign file when the port has no plain Save
-command, the title-bar `Root` overlay, a `New document` command, and the Slint bridge swap. Coming back maximised is settled and shipped
+command, the title-bar `Root` overlay, a `New document` command, and who owns the autosave
+retry cadence now that the two bridges answer it differently. One question left this list by
+shipping: the Slint swap is settled and built
+([`2026-09-14-strip-program`](.agents/notes/implemented/2026-09-14-strip-program.md)). Coming back maximised is settled and shipped
 ([`2026-09-12-maximized-persistence`](.agents/notes/implemented/2026-09-12-maximized-persistence.md)).
 
 The rule that used to block M1 — autosave on files the app did not create — is settled:

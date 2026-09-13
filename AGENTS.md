@@ -20,7 +20,9 @@ M0 ran on 2026-09-10 and came back **viable** — the results are recorded in
 M1 (the headless `core` + `api` engine), M3 (window persistence) and M4 (autosave, pin,
 recents) are built and tested; what is demonstrably working, and where it diverged from the
 plan, is recorded in [`.agents/notes/implemented/`](.agents/notes/implemented/). M2 — the
-first usable `bridge-gpui` UI — is being built slice by slice on top of that engine.
+first usable UI — is being built slice by slice on top of that engine, and as of 2026-09-14 it is
+being built on **two** bridges: `bridge-gpui`, and `bridge-slint`, which now ships a product
+(`notes-slint`) beside the instrumented probe that earned it (`notes-slint-probe`).
 
 The architecture invariants below are live, not aspirations: CI already runs the layering
 gate (`cargo xtask check-arch` in `.github/workflows/ci.yml`), and it fails the build when
@@ -35,7 +37,8 @@ breaks something the product depends on.
 crates/core       pure Rust. No gpui, no windows crate, no platform, no unsafe.
 crates/platform   OS primitives that take a window handle and decide nothing.
 crates/api        the port. Commands in, Events out. No UI types, knows no bridge exists.
-crates/bridge-*   one adapter per UI toolkit. bridge-gpui is the only one built.
+crates/bridge-*   one adapter per UI toolkit. Two are built: bridge-gpui, and bridge-slint
+                  (two bins: notes-slint is the product, notes-slint-probe is the frozen instrument).
 ```
 
 ```sh
@@ -60,11 +63,16 @@ Rules that are easy to break politely:
   toolkits (whitepaper §5.5).
 - **Startup order is fixed** (whitepaper §5.5): query session → bridge creates window *at
   the saved rect* → register handle → apply topmost. Geometry *restore* is bridge work;
-  geometry *storage* is core work.
+  geometry *storage* is core work. Measured on 2026-09-14, and silent in both bridges' comments
+  until then: **the handle may not exist yet after `show()`** — winit materialises the platform
+  window on the first event pump, so a root registers on the first wake that can read an HWND and
+  then stops (`crates/bridge-slint/src/product.rs:283-304`).
 - **Autosave is asynchronous.** A save failure has no caller to return `Err` to — it must
   arrive as `Event::SaveFailed`. Do not add a synchronous `Result`-returning save path
   just because it is convenient.
-- **Do not design a `trait Bridge`** while GPUI is the only implementation. The seam is
+- **Do not design a `trait Bridge`** while GPUI is the only implementation *(the premise is now
+  false — there are two adapters since 2026-09-14 — and the rule is kept anyway: R12's reason was
+  never the count, it was guessing a shape from what you have; see the strip record)*. The seam is
   "api has no UI types", already enforced. An interface guessed from one implementation
   encodes that implementation's shape into what you call generic (whitepaper §8, R12).
 - **Do no harm.** Loading then saving a foreign file must be byte-identical: preserve

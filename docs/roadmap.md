@@ -3,7 +3,7 @@ title: Roadmap
 type: planning
 owns: ['§9, §12']
 status: living
-updated: 2026-09-12
+updated: 2026-09-14
 ---
 
 # Roadmap
@@ -80,6 +80,30 @@ recents and menu work now in the tree):
 **3 of 7 machine-proven** (1, 5, and the scratch half of 7). The remaining four — 2, 3, 4, 6 —
 are exactly what the outstanding bridge slices are for.
 
+**The honesty gate on the second bridge (2026-09-14).** M2 is no longer single-bridge work:
+`bridge-slint` ships `crates/bridge-slint/src/product.rs` as `notes-slint.exe`, with the instrument
+that proved the window contract frozen beside it as `notes-slint-probe.exe`, and `surface.rs` /
+`plumbing.rs` / `ui_gen.rs` shared underneath. Outcome record:
+[`2026-09-14-strip-program`](../.agents/notes/implemented/2026-09-14-strip-program.md). What that
+makes proved, and what it does not, kept apart on purpose:
+
+- **Proved, locally.** The product has a harness leg of its own — `cargo xtask smoke
+  --binary=slint` (`crates/xtask/src/smoke.rs`, `Leg::Product`) — judged against its own §5.5
+  contract: the startup lines on its own captured stderr, still alive at 45 s, a visible window
+  given a real `WM_CLOSE`, the close and joined-shutdown lines, and exit code 0 taken without a
+  kill. The close, geometry and panic-hook sequence behind it was driven live from outside the
+  process at `2fc924f3`.
+- **Not proved: any of it upstream.** `git remote -v` is empty, so `.github/workflows/ci.yml` —
+  including its slint build and clippy rows — has never executed anywhere. Not one of the seven
+  checks above changes status on this bridge's account, and no row here may be promoted to done
+  until a push makes the CI evidence trail exist.
+- **Not judged, by design.** `--binary=slint-probe` returns `Leg::NotWired` and exit **2** — the
+  harness's own "I did not judge" code, not a machine decline (that is 3) and not an app failure.
+
+M2 therefore stays **in flight**. What is left is the CI evidence trail after a first push, plus the
+human eye-pass list no harness reaches: the popup, caption and About glyphs on a real screen, a real
+Explorer drag rather than a synthesised one, the over-8 MiB refusal as a user sees it, and the
+read-only caret.
 **M3 — Window persistence.**
 `platform` trait + Windows backend. Restore, validate against monitors, clamp off-screen,
 handle maximised + DPI. Test on 100/150/200% scaling and with a monitor unplugged.
