@@ -11,7 +11,10 @@
 import { TextEdit } from "std-widgets.slint";
 
 export component Spike inherits Window {
-    title: "notes-slint spike (pin + pump)";
+    // The file name in the title is a FACT the port reported (`Loaded`/`Rebound`
+    // carry the path); the bridge never invents it, so it is one-way Event -> UI.
+    in property <string> file-name: "no document";
+    title: "notes-slint S5 - " + root.file-name;
     no-frame: false;
 
     // C1, and this line is the whole point: Slint's OWN always-on-top property is
@@ -30,6 +33,21 @@ export component Spike inherits Window {
     // the editor, api never sees a keystroke).
     in-out property <string> buffer;
     callback toggled-pin();
+
+    // ---- S5: recents, as delivered ----
+    // `Event::RecentsUpdated(Vec<RecentEntry>)` has been arriving, unused, since S4.
+    // `core` already decided the label (`display`), the cap and the missing-file mark,
+    // so the bridge renders exactly what it was handed and keeps the paths in Rust -
+    // a row is a row, and a path never needs to travel through the markup.
+    in property <[string]> recents;
+    callback open-at-index(int);
+    // Row height is a constant, and the layout is deliberately crude: this is a
+    // spike list to prove the model binds and a click maps back to an index.
+    // NOTE the names: plain `row` is refused - "Cannot override property 'row'",
+    // because Rectangle already answers to a layout-attachment property of that
+    // name. A fifth 1.17 finding, and the reason these are suffixed.
+    property <length> row-h: 15px;
+    property <length> stack-h: root.recents.length * root.row-h;
 
     // --- title strip: the pin ask ---
     bar := Rectangle {
@@ -73,11 +91,31 @@ export component Spike inherits Window {
         font-size: 11px;
     }
 
+    // One row per entry, `for` over the array the port sent.
+    for name[index] in root.recents: Rectangle {
+        x: 0px;
+        y: status-line.y + 18px + index * root.row-h;
+        width: parent.width;
+        height: root.row-h;
+        Text {
+            x: 6px;
+            vertical-alignment: center;
+            text: name;
+            color: #d0d0d0;
+            font-size: 11px;
+        }
+        TouchArea {
+            clicked => {
+                root.open-at-index(index);
+            }
+        }
+    }
+
     editor := TextEdit {
         x: 0px;
-        y: status-line.y + 18px;
+        y: status-line.y + 18px + root.stack-h;
         width: parent.width;
-        height: parent.height - status-line.y - 18px;
+        height: parent.height - status-line.y - 18px - root.stack-h;
         font-size: 14px;
         // Two-way binding: `set_buffer` repaints the widget, typing refills the
         // property, and the pump reads only the property.

@@ -50,8 +50,18 @@ fn report(why: &str) {
     eprintln!("notes-gpui: {why}");
 }
 
-/// Portable-first, so both binaries read the SAME session.json: a `data` directory
-/// beside the exe wins, which is `target/debug/data` for a dev build.
+/// PER-INSTANCE ISOLATION IS A BRIDGE CHOICE, NOT A PORT GAP - and this is the
+/// correction to what this file claimed last slice. `Gateway::start` takes the
+/// directory as an argument (`pub fn start(state_dir: StateDir, settings: Settings)`
+/// at crates/api/src/gateway.rs:258) and resolves nothing itself; `resolve_state_dir`
+/// is a pure function the CALLER runs, which is how `xtask`'s tests point a Gateway at
+/// a throwaway dir. So api needs no new surface: the bridge simply picks.
+///
+/// The pick below still runs the production rule (portable `data` beside the exe wins,
+/// else %APPDATA%\notes-gpui) and reports it, then OVERRIDES the answer with a
+/// directory beside this spike's own probe files. Without that both debug bridges read
+/// and write `target/debug/data`, and a pin or geometry needle printed here can be a
+/// fact about the OTHER process - which is what happened twice in earlier slices.
 fn state_dir() -> StateDir {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -61,7 +71,18 @@ fn state_dir() -> StateDir {
     let appdata = (!portable)
         .then(|| std::env::var_os("APPDATA").map(PathBuf::from))
         .flatten();
-    resolve_state_dir(&exe_dir, appdata.as_deref())
+    let resolved = resolve_state_dir(&exe_dir, appdata.as_deref());
+    let mine = exe_dir.join("slint-probe").join("data");
+    if std::fs::create_dir_all(&mine).is_ok() {
+        report(&format!(
+            "state-dir: isolated {} (port rule alone would give {})",
+            mine.display(),
+            resolved.0.display()
+        ));
+        return StateDir(mine);
+    }
+    report("state-dir: could not create the isolated dir, sharing the resolved one");
+    resolved
 }
 
 /// An integer out of session.json, by scan. Crude on purpose: a probe may not add a
@@ -162,6 +183,10 @@ const TICK_MS: u64 = 2000;
 /// (its main.rs:122) rather than reading core's - and the same rule with it: a
 /// Flush only goes out when the buffer actually changed.
 const AUTOSAVE_IDLE: Duration = Duration::from_millis(750);
+
+/// When the probe drives a recent row by itself: after the seed's open, so the list
+/// holds more than one file and the click has something to aim at.
+const CLICK_AT: Duration = Duration::from_millis(3000);
 const END: Duration = Duration::from_millis(25000);
 
 fn main() {
@@ -320,6 +345,34 @@ fn main() {
                 grew.len()
             ));
             ui.set_buffer(grew.into());
+
+            // (1) THE DO-NO-HARM SEAM, end to end, through the port ONLY: seed a file
+            // whose bytes are CRLF on disk, open it with `Command::Open`, let the
+            // adoption put LF text in the buffer, and re-hash the file on the way out.
+            // If the bridge or core rewrote the ending, the hash moves and this prints
+            // hash-equal=0. No notes-core, no platform - text crosses as a Command.
+            let seed = place.join("s5-seed.notes");
+            let raw = "line one\r\nline two\r\nline three\r\n".to_string();
+            if std::fs::write(&seed, raw.as_bytes()).is_ok() {
+                let mut p = pump.borrow_mut();
+                p.seed = Some(seed.clone());
+                p.hash_before = fnv1a(raw.as_bytes());
+                p.hash_len = raw.len();
+                p.flushes_at_open = p.edits;
+                drop(p);
+                report(&format!(
+                    "seed: wrote {} bytes (CRLF x{}) fnv={:#x} to {}",
+                    raw.len(),
+                    raw.matches("\r\n").count(),
+                    fnv1a(raw.as_bytes()),
+                    seed.display()
+                ));
+                report(&format!("open: asked {} via Command::Open", seed.display()));
+                send(&gateway, Command::Open { path: seed });
+                drain(&events, &pump, &ui.as_weak());
+            } else {
+                report("seed: could not write the CRLF file beside the exe");
+            }
         } else {
             report("save-as: could not create the probe directory beside the exe");
         }
@@ -479,7 +532,29 @@ fn main() {
             }
             // ---- S4: the text loop, on the bridge's own cadence ----
             text_pump(&ui, &third_gw, &third_pump);
+            // (2) THE SYNTHETIC CLICK. Aim at the first row that is NOT the file this
+            // probe seeded, so what lands is a RECENT file the port listed.
+            {
+                let mut p = third_pump.borrow_mut();
+                if !p.click_done && now >= CLICK_AT {
+                    p.click_done = true;
+                    let seed = p.seed.clone();
+                    let target = p
+                        .recent_paths
+                        .iter()
+                        .position(|path| Some(path.as_path()) != seed.as_deref());
+                    drop(p);
+                    match target {
+                        Some(index) => {
+                            open_recent(&third_gw, &third_pump, index, "synthetic");
+                            drain(&third_events, &third_pump, &ui.as_weak());
+                        }
+                        None => report("recents: synthetic click skipped - only the seeded file is in the list"),
+                    }
+                }
+            }
             if now >= END {
+                do_no_harm(&third_pump);
                 report(&format!("probe over {}", measured(&third_dir, now)));
                 ui.window().hide().ok();
             }
@@ -497,6 +572,15 @@ fn main() {
             send(&gw, Command::SetPinned(next));
         });
     }
+    // A recent row is an ask, the same shape as the pin strip: index in, Command out,
+    // and the text comes back through Loaded - never from the click itself.
+    {
+        let gw = Rc::clone(&gateway);
+        let pump = Rc::clone(&pump);
+        ui.on_open_at_index(move |index| {
+            open_recent(&gw, &pump, index as usize, "touch");
+        });
+    }
     ui.run().ok();
     drain(&events, &pump, &ui.as_weak());
     report(&format!("exit {}", measured(&dir, started.elapsed())));
@@ -511,6 +595,18 @@ struct Poll {
     changed: Option<Instant>,
     sends: usize,
     sampled: bool,
+}
+
+/// FNV-1a over the file's own bytes. A checksum rather than a hash crate on purpose:
+/// this bridge may not add a dependency to prove a byte-for-byte claim, and the
+/// question is only ever "did anything change at all".
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// LF-normalise an incoming buffer, byte-for-byte the rule `bridge-gpui` states at
@@ -591,6 +687,45 @@ fn text_pump(ui: &Spike, gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>
     );
 }
 
+/// The other half of the seam: read the seeded file again and say whether a single
+/// byte moved. Print the flush counter too, because "no spurious Flush" is the
+/// mechanism by which it should not have moved.
+fn do_no_harm(pump: &RefCell<Pump>) {
+    let p = pump.borrow();
+    let Some(seed) = p.seed.clone() else {
+        report("do-no-harm: no seed file was written, nothing to compare");
+        return;
+    };
+    let bytes = std::fs::read(&seed).unwrap_or_default();
+    let after = fnv1a(&bytes);
+    report(&format!(
+        "do-no-harm: {} bytes fnv={after:#x} (seeded {} bytes fnv={:#x}) hash-equal={} flush-since-open={}",
+        bytes.len(),
+        p.hash_len,
+        p.hash_before,
+        u8::from(after == p.hash_before && bytes.len() == p.hash_len),
+        p.edits - p.flushes_at_open
+    ));
+}
+
+/// One recent row, one `Command::Open`. THE SHARED PATH: the TouchArea's generated
+/// callback calls this, and so does the synthetic click in the timer, which is what
+/// lets an unattended run exercise the same code a click would.
+fn open_recent(gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>, index: usize, via: &str) {
+    let found = pump.borrow().recent_paths.get(index).cloned();
+    match found {
+        Some(path) => {
+            pump.borrow_mut().click_pending = Some(path.clone());
+            report(&format!(
+                "recents: {via} row {index} -> Open {}",
+                path.display()
+            ));
+            send(gw, Command::Open { path });
+        }
+        None => report(&format!("recents: {via} row {index} names no path")),
+    }
+}
+
 /// What the pin pump remembers. Deliberately holds no opinion about the window: the
 /// only bool in here that is a FACT is the one an `Event::Pinned` wrote.
 #[derive(Default)]
@@ -616,6 +751,23 @@ struct Pump {
     /// `Saved` count, so the first one (the answer to this probe's own `SaveAs`) can
     /// be told apart from a later one, which only the autosave path could have sent.
     saves: u64,
+    // ---- S5 ----
+    /// The paths behind the rendered recent rows, in the order the port sent them,
+    /// so a row index maps back to the file it names.
+    recent_paths: Vec<PathBuf>,
+    /// The CRLF file this probe seeded beside the exe, and its bytes on the way IN.
+    seed: Option<PathBuf>,
+    hash_before: u64,
+    hash_len: usize,
+    /// `edits` as it stood when the open was asked: if the adoption is honest, this
+    /// does not move before the run ends.
+    flushes_at_open: u64,
+    /// Rows the last `RecentsUpdated` carried, so the needle prints on a CHANGE
+    /// rather than on every delivery.
+    rows: usize,
+    /// The synthetic click: fired once, and its answer is matched by path.
+    click_done: bool,
+    click_pending: Option<PathBuf>,
     /// Times the pump has run. `drains` climbing while `seen` stays 0 is the proof
     /// that the callback and its 8ms poll are live and the port is simply silent.
     drains: u64,
@@ -661,6 +813,27 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
             pump.answered = true;
         }
         report(&format!("event: {}", describe(event)));
+        // The synthetic click's verdict: the Loaded that answers it is identified by
+        // PATH, not by timing, so a stray load can never be credited to the click.
+        if let Event::Loaded { path, epoch, .. } = event {
+            let hit = {
+                let mut p = pump.borrow_mut();
+                if p.click_pending.as_deref() == Some(path.as_path()) {
+                    p.click_pending = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if hit {
+                report(&format!(
+                    "open-by-recents: epoch={epoch} landed a Loaded for {}",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
+            }
+        }
         match event {
             Event::Pinned(on) => {
                 let mut pump = pump.borrow_mut();
@@ -704,7 +877,9 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
             // No other event carries an epoch, and `Saved { path, revision }` (:334)
             // deliberately does not - a save does not change the generation, so a
             // bridge that read epoch from it would be one bump out of step.
-            Event::Loaded { epoch, text, .. } => {
+            Event::Loaded {
+                epoch, text, path, ..
+            } => {
                 let adopted = lf(text);
                 let mut p = pump.borrow_mut();
                 p.epoch = *epoch;
@@ -712,6 +887,13 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                 drop(p);
                 if let Some(ui) = weak.upgrade() {
                     ui.set_buffer(adopted.clone().into());
+                    // The title shows what the PORT says is open - file name only,
+                    // taken off the event's own path.
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ui.set_file_name(name.into());
                 }
                 report(&format!(
                     "load: epoch={epoch} announced, buffer adopted ({} bytes, CR-normalised)",
@@ -723,6 +905,34 @@ fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint::Weak<Spik
                 report(&format!(
                     "rebind: epoch={epoch} announced; the next Flush echoes it"
                 ));
+            }
+            Event::RecentsUpdated(list) => {
+                let rows = list.len();
+                let names: Vec<slint::SharedString> = list
+                    .iter()
+                    .map(|entry| entry.display.clone().into())
+                    .collect();
+                {
+                    let mut p = pump.borrow_mut();
+                    p.recent_paths = list.iter().map(|entry| entry.path.clone()).collect();
+                }
+                // The label is core's (`display`), the cap is core's, the missing-file
+                // mark is core's. The bridge renders and keeps the paths beside it.
+                if let Some(ui) = weak.upgrade() {
+                    // 1.17 finding: `ModelRc` is built from a slice or an `Rc<dyn Model>` - not
+                    // from a `Vec` (only `VecModel` takes a Vec), so the borrowed slice it is.
+                    ui.set_recents(slint::ModelRc::from(names.as_slice()));
+                }
+                // Print on a CHANGE only: three updates used to mean three needles.
+                let changed = {
+                    let mut p = pump.borrow_mut();
+                    let changed = p.rows != rows;
+                    p.rows = rows;
+                    changed
+                };
+                if changed {
+                    report(&format!("recents: rendered {rows} rows"));
+                }
             }
             Event::Saved { path, revision } => {
                 let which = {
