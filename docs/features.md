@@ -100,8 +100,10 @@ Consequences that need designing, not assuming:
   `_ => {}`. What ships instead is a drop target owned in `platform`, armed through one
   synchronous, thread-affine call at the port (ADR-0004) and polled by the engine into the **same
   `Command::Open` the menu uses** — so a drop is an open, arms no new autosave rule (ADR-0001
-  unchanged), and adds no `Command` and no `Event`. Built and shipping on the Slint bridge;
-  `bridge-gpui` does not arm it (the S7 slice was not run).
+  unchanged), and adds no `Command` and no `Event`.
+  **Status: armed on both bridges** — `bridge-slint` and, since `d2a98b76`, `bridge-gpui` — where
+  arming means displacing the `IDropTarget` each toolkit registers for itself (ADR-0005); the one
+  thing still owed is a human dragging a real file onto a real window, which no headless run can do.
   Chain: [2026-09-13-file-drop-chain](../.agents/notes/implemented/2026-09-13-file-drop-chain.md).
 - **Title display.** The title bar's centre shows, in order: the open file's real name with
   its real extension (§10.1 changes the default, not this rule), else `Untitled` for a new

@@ -114,6 +114,11 @@ B, **on Slint**. Five rungs, bottom up:
 
 ## State of the two bridges
 
+> **AMENDED — this section is FALSE as of the second pass (see
+> "Amendments" at the end of this note).** It is left standing below, unchanged, because it is a
+> true record of what the tree said on the morning it was written, and the reason it was written
+> that way — no gpui needle, no S7 slice — is the reason the correction is worth dating.
+
 **`bridge-gpui` does NOT arm a drop target.** The S7 slice of the spike plan was not run:
 `arm_file_drop` is imported nowhere in that crate (only `crates/bridge-slint/src/main.rs:35`
 imports it), and gpui has no `platform`-level takeover behind it, for the reason above. Dropping a
@@ -134,6 +139,7 @@ whoever runs that slice: one call on the thread that pumps the window, one guard
   seams macOS and Linux fill at M6–M8; nothing above `platform` changes when they do.
 - Two bridges, one behaviour: until S7 runs, the same feature works on one build and not the other.
   That is the divergence a user reports as a bug, and it is why this section exists.
+  **SUPERSEDED the same day — S7 ran (`d2a98b76`); both bridges arm. See "Amendments".**
 
 ## Reopening conditions
 
@@ -141,5 +147,74 @@ whoever runs that slice: one call on the thread that pumps the window, one guard
   `platform` drop target becomes redundant — though the thread-affine arm stays ours.
 - If gpui remains the shipped toolkit, S7 must run; do not close this note's gap by deleting the
   §4.4 bullet.
+  **CLOSED the same day** — S7 ran, gpui arms, and its takeover is recorded in ADR-0005. The
+  live reopen condition is now the opposite one: when gpui or Slint starts delivering the payload
+  itself, the arm must be withdrawn (ADR-0005, and Slint upstream #1967).
 - If the 120 ms poll is ever folded into the autosave tick "to save a timer", read
   `engine.rs:314-327` first and expect autosave to stop firing.
+
+## Amendments (same day: `831d6cf5`, `d2a98b76`, `d634c325`)
+
+Everything above stood when it was written and is left standing. Four things changed underneath it
+before the day was out, and the reason each is recorded here rather than by editing the text is that
+this is an outcome record: what was believed, and when it stopped being true.
+
+**1. The gpui section above is false — S7 ran, and gpui arms now (`d2a98b76`).**
+`arm_file_drop` is imported at `crates/bridge-gpui/src/main.rs:83`, called from
+`arm_drop_target` (`:1975-2016`) on the loop thread immediately after the handle is read
+(`:1671`), and put down by `disarm_drop_target` at both exits (`:1768`, `:1782`, `:2018-2032`).
+The premise of the original section — that gpui had nothing to take — was right about the payload
+and wrong about the target: **gpui registers its own** `IDropTarget` per window
+(`gpui-pre-windows-0.3.4/src/window.rs:1094`, registered `:1469-1471`) and feeds its own input
+pipeline. Taking it costs this bridge nothing, because the payload is `pub(crate)`
+(`gpui-pre-0.3.4/src/app.rs:689`) and the two public neighbours carry no path
+(`app.rs:2524-2530`). That asymmetry — a target we can take, a delivery nobody can read — is what
+ADR-0005 records, along with the reopen condition that kills it: **the day this bridge grows a
+drop-to-tab gesture, or gpui exposes the paths, arming becomes opt-in**
+(`bridge-gpui/src/main.rs:1952-1957`).
+
+**2. The arm takes the toolkit's target, and the run now says whose it took.**
+The slint and winit half of the story above needs one correction of its own: winit does not merely
+fail to forward `DroppedFile`, it **registers the target slint discards** — so once our arm is in
+place, winit's handler is revoked, stops being called, and its `DroppedFile` events stop existing
+at all. That is what `DropArm::took_over` reports (`crates/platform/src/windows/file_drop.rs:375`,
+`:420`), computed by `took_over_from` (`:402`) and carried out as a return value, never cached
+in a static. The live needles, in the run output:
+
+- `drop: armed hwnd=0x… (took the toolkit drop target; our copy cursor is the law now)`
+  (`bridge-slint/src/main.rs:230-237`)
+- `drop: armed hwnd=0x… (took gpui's own drop target; its FileDropEvent had no subscriber here, so
+  nothing was given up)` (`bridge-gpui/src/main.rs:1997-2004`)
+- `drop: disarmed on exit (a guard was held: true)` (`bridge-slint/src/main.rs:1737-1744`,
+  `bridge-gpui/src/main.rs:2022-2031`)
+- and, if a second site names the same window: `drop: already armed …` (`bridge-slint:211-216`,
+  `bridge-gpui:1983-1986`)
+
+The `false` wording ("quiet - nothing was registered") is chosen to stay true under both readings
+of that bool — nothing there, or we displaced ourselves — because the bridge does not interpret the
+flag, it reports it.
+
+**3. A refused open now has a voice: the `LoadFailed` arm exists.**
+`bridge-slint/src/main.rs:3029-3041` renders `Event::LoadFailed { path, reason }`, and for an
+oversize drop that is `api/src/event.rs:281` — **"file is too large to open"** — emitted from
+`api/src/engine.rs:872`/`:904` from the stat alone. **It adopts nothing**: no `Loaded`, no
+`FileMeta`, no epoch, so the caret, the buffer and the title keep the document the user was
+looking at (`bridge-slint:250-258`, `bridge-gpui/src/main.rs:3390-3403`). D9 was always this
+strong; what was missing was the sentence. Note what the bridge deliberately does NOT do: it does
+not re-spell the verdict (`:3029`), because a second copy of a port string is how the two drift.
+
+**4. The oversize lock lever was wrong, and D9's verdict is why.**
+The first cut of the live lock probe used a 9 MiB file on the theory that an oversized load arrives
+read-only. That theory was false: **D9 is a refusal, not a verdict attached to a load** — nothing is
+loaded, so the read-only flag never reaches the bridge. All four `FileMeta` construction sites in
+`engine.rs` (995, 1073, 1156, 1318) hard-code `oversize: false`, which makes the
+`lock_verdict` `oversize` arm **unreachable today** and kept only as the one-call path for the
+day the port carries it (`bridge-slint:250-258`). The only lever that reaches
+`FileMeta::read_only` is the file attribute, and std cannot set it from a bridge:
+`PermissionsExt::set_readonly` is the unstable `windows_permissions_ext` (rust#152956), and the
+`windows` crate is exactly what the layering rule forbids a bridge to import. So the probe asks
+the OS's own utility through a process — `attrib +R`, `attrib -R` on the way out
+(`bridge-slint:260-266`, `run_attrib` at `:289-298`) — with the child's stderr reported, since
+a silent failure there is indistinguishable from a port that never answers, which is the exact
+mistake this act was replacing. The 9 MiB fixture survives only as a witness for the `LoadFailed`
+arm above (`:273-277`), where it belongs.
