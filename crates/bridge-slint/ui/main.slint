@@ -174,9 +174,9 @@ export component Spike inherits Window {
     // S6: THE CHORD SCOPE. The nesting IS the mechanism: capture-key-pressed on the
     // OUTERMOST scope runs before the focused child's key handler (events-and-overlays), so
     // this sees Ctrl+O first, and every key it returns Ignore for keeps travelling to
-    // TextEdit - which is why nothing below mentions Ctrl+A/C/V: an editor chord that is not in
-    // this table reaches the caret untouched. No imperative focus() anywhere, which is the other
-    // half of the same rule (a bridge that steals focus to route a key loses the caret). ONE
+    // TextEdit - why nothing below names Ctrl+A/C/V: a chord not in this table reaches the caret
+    // untouched. No imperative focus() but product.rs claim_focus's startup caret handoff, which
+    // routes no key so chords live before the first click. That is the other half of the rule. ONE
     // exception, and this sentence is the reason S10b had to edit it: Ctrl+Z and Ctrl+Y ARE named
     // below - not as commands, but as a quarantine that arms only after the first document
     // switch. See undo_quarantined() in src/main.rs for why, and for what it costs.

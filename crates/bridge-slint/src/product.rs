@@ -68,7 +68,7 @@ use slint::{
 // SAME path the macro's own generated .focus() compiles to (i-slint-compiler generator/rust.rs:3635
 // emits WindowInner::from_pub(..).set_focus_item(.., FocusReason::Programmatic)), so the root borrows
 // the toolkit's door rather than inventing one - the only alternative is an imperative focus() in the
-// markup, which main.slint:178 rules out on purpose.
+// markup, which main.slint:178 forbids for routing; claim_focus is the caret handoff it allows.
 use slint::private_unstable_api::re_exports::{FocusReason, WindowInner};
 
 mod plumbing;
@@ -220,7 +220,9 @@ fn panic_note(what: &str, where_: Option<&str>) -> String {
 ///   * the thing that installs a focus item is a pointer press (i-slint-backend-winit accesskit.rs:810
 ///     calls set_focus_item with FocusReason::PointerClick), which is exactly why the one click the
 ///     E2E run made unlocked every key for the rest of the session. `forward-focus: editor` names WHO
-///     to focus once the scope is asked; nothing in the markup or in this root ever did the asking.
+///     to focus once the scope is asked; nothing in the markup did the asking. The door used is a
+///     version TRIPWIRE: `slint::private_unstable_api` is #[doc(hidden)] - a slint version bump can
+///     break this door; check i-slint-core generated .focus() when raising the pin.
 ///
 /// So the root does the asking, from the head of the chain - the same call the generated .focus()
 /// makes, with FocusReason::Programmatic, which is the reason the walk is allowed to start at the
@@ -234,9 +236,9 @@ fn panic_note(what: &str, where_: Option<&str>) -> String {
 /// on the next wake" (the caller's budget, `FOCUS_TRIES`), and `true` means STOP ASKING FOR GOOD:
 /// set_focus_item redirects to the open popup's window when one exists (window.rs:1232-1239), so a
 /// root that kept re-asserting focus could park it in somebody's menu. It lands once, then it keeps
-/// its hands off - which is also why this does not contradict main.slint:178's "no imperative
-/// focus()": that rule is about stealing focus to ROUTE a key, and this takes the focus exactly once,
-/// before any key has been routed or any caret existed to lose.
+/// its hands off - which is also why this does not contradict main.slint:178: that rule is about
+/// stealing focus to ROUTE a key, and the markup now names this fn as its one exception. This takes
+/// the focus exactly once, before any key was routed or any caret existed to lose.
 fn claim_focus(window: &slint::Window) -> bool {
     let inner = WindowInner::from_pub(window);
     let held = || {
