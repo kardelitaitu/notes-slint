@@ -15,6 +15,9 @@ use std::path::Path;
 use std::rc::Rc;
 
 use notes_api::{Command, DropGuard, Event, Gateway, Rect, WindowHandle, arm_file_drop};
+// STRIP-2b: hwnd_of came with its trait, which is the whole reason the raw-window-handle
+// dependency is used by BOTH roots rather than by the probe alone.
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::Spike;
 use crate::surface::Pump;
@@ -257,5 +260,30 @@ pub(crate) fn arm_drop_target(hwnd: i64, holder: &Rc<RefCell<Option<DropGuard>>>
                 "drop: ARM FAILED - {e}, dragging files onto the window will do nothing"
             ));
         }
+    }
+}
+
+/// What the PORT said the window was, straight out of `InitialState`: one string, so the
+/// startup print and the first-visible print cannot disagree with each other, and neither
+/// one reaches into a state directory the bridge does not own. `measured()` stays where its
+/// question is genuinely "what did the port WRITE to disk" - the persistence probes.
+pub(crate) fn port_said(rect: &Rect, scale: f32, maximized: bool, pinned: bool) -> String {
+    format!(
+        "port says {}x{} at {},{} scale {scale} maximized={maximized} pinned={pinned}",
+        rect.w, rect.h, rect.x, rect.y
+    )
+}
+
+/// The HWND. Slint's own `window_handle()` is infallible and returns ITS handle
+/// object; the raw-window-handle question is the INNER call, which is a `Result`.
+/// That inner answer is what risk 3 is about, so it is reported separately.
+pub(crate) fn hwnd_of(window: &slint::Window) -> Option<i64> {
+    // Two steps, and the first must be a binding: the outer handle owns what the inner
+    // one borrows.
+    let outer = window.window_handle();
+    let handle = outer.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get() as i64),
+        _ => None,
     }
 }

@@ -32,9 +32,9 @@ unused_crate_dependencies = "warn"
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 
-# STRIP-0, dated 2026-09-15: TWO names, ONE source. This is the honest transitional lie, and it
-# is a lie about the future, not about the present: the product IS the probe for exactly this
-# commit. `notes-slint` is the name every downstream owner fences against - the icon and version
+# STRIP-2b, dated 2026-09-15: THE TRANSITIONAL LIE IS OVER. STRIP-0 declared TWO names over ONE
+# source and said out loud that the product was the probe for exactly that commit; this is the
+# commit that ends it - the two names now have two sources. `notes-slint` is the name every downstream owner fences against - the icon and version
 # resource, the application manifest, the portable folder, the %APPDATA% identity, the smoke leg
 # (xtask/src/smoke.rs: bin "notes-slint" -> notes-slint.exe), and check.rs's slint-build row - so
 # it is declared FIRST and keeps compiling the probe until STRIP-1..n land a real product source
@@ -45,7 +45,7 @@ all = { level = "deny", priority = -1 }
 # above will say so loudly), not a reason to delay this table-setting.
 [[bin]]
 name = "notes-slint"
-path = "src/probe.rs"
+path = "src/product.rs"
 
 [[bin]]
 name = "notes-slint-probe"

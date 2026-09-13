@@ -32,11 +32,14 @@ use std::time::{Duration, Instant};
 use notes_api::{
     Command, DropGuard, Exit, Gateway, Rect, Settings, StateDir, WindowHandle, resolve_state_dir,
 };
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+// STRIP-2b: hwnd_of moved to plumbing, but the probe's own RISK-3 print still asks the
+// toolkit for the INNER handle directly, so the trait is in scope here too.
+use raw_window_handle::HasWindowHandle;
 use slint::{ComponentHandle, LogicalPosition, LogicalSize, Timer, TimerMode};
 mod plumbing;
 pub(crate) use plumbing::{
-    Fingerprint, arm_drop_target, do_no_harm, fnv1a, lf, note_dot, publish_title, report, send,
+    Fingerprint, arm_drop_target, do_no_harm, fnv1a, hwnd_of, lf, note_dot, port_said,
+    publish_title, report, send,
 };
 mod surface;
 mod title_contract;
@@ -133,17 +136,6 @@ fn json_flag(src: &str, key: &str) -> Option<bool> {
     }
 }
 
-/// What the PORT said the window was, straight out of `InitialState`: one string, so the
-/// startup print and the first-visible print cannot disagree with each other, and neither
-/// one reaches into a state directory the bridge does not own. `measured()` stays where its
-/// question is genuinely "what did the port WRITE to disk" - the persistence probes.
-fn port_said(rect: &Rect, scale: f32, maximized: bool, pinned: bool) -> String {
-    format!(
-        "port says {}x{} at {},{} scale {scale} maximized={maximized} pinned={pinned}",
-        rect.w, rect.h, rect.x, rect.y
-    )
-}
-
 /// The frame rect as the PORT last measured and wrote it - this spike's GetWindowRect.
 fn measured(dir: &StateDir, at: Duration) -> String {
     match std::fs::read_to_string(dir.0.join("session.json")) {
@@ -165,20 +157,6 @@ fn measured(dir: &StateDir, at: Duration) -> String {
             format!("frame rect (port-measured) t+{at:?}: {rect} maximized={zoom} pinned={pin}")
         }
         Err(err) => format!("frame rect t+{at:?}: no session.json yet ({err})"),
-    }
-}
-
-/// The HWND. Slint's own `window_handle()` is infallible and returns ITS handle
-/// object; the raw-window-handle question is the INNER call, which is a `Result`.
-/// That inner answer is what risk 3 is about, so it is reported separately.
-fn hwnd_of(window: &slint::Window) -> Option<i64> {
-    // Two steps, and the first must be a binding: the outer handle owns what the inner
-    // one borrows.
-    let outer = window.window_handle();
-    let handle = outer.window_handle().ok()?;
-    match handle.as_raw() {
-        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get() as i64),
-        _ => None,
     }
 }
 
