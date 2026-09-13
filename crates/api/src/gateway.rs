@@ -1,4 +1,8 @@
-//! The Gateway: the port's only handle, and the only synchronous call in the app.
+//! The Gateway: the port's only handle, and its only synchronous call about a
+//! DOCUMENT — [`arm_file_drop`](crate::arm_file_drop) is the named exception rule 4
+//! of the crate docs grants, synchronous because OLE binds a drop target to the
+//! thread that registers it, and it answers about a registration, never about what
+//! the user has typed.
 //!
 //! Three things live here and nowhere else: the two channels, the one engine
 //! thread, and the pre-window read of session.json. Everything else in this crate

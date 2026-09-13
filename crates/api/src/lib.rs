@@ -70,6 +70,20 @@
 //! failure crosses the port as data. Never add a synchronous `Result`-returning
 //! save path "just because it is convenient" (AGENTS.md).
 //!
+//! **The one named exception, and why it is not this rule.** [`arm_file_drop`] is
+//! synchronous and DOES answer with a `Result`. It is not a convenience: OLE binds
+//! a drop target to the thread that registers it and pumps that window, so routing
+//! the act through the queue would run it on the engine thread, where nothing
+//! pumps — Explorer then freezes mid-drag, in the sender's process, with no error
+//! anywhere in ours. So it crosses by call, never by channel: it touches no
+//! `Sender`, no `Receiver` and no engine state, cannot block a frame behind a
+//! queue, and its `Result` belongs to a caller standing right there with the
+//! window. Its return value is also not a verdict about the user's data — it is
+//! whether a registration happened — which is why it may live in this crate at all
+//! (rule 1) and why the file it lands in owns no decision about a file. The rule
+//! still forbids what it always forbade: a second synchronous call that answers
+//! about a document.
+//!
 //! # Bound contract — where each decision is encoded
 //!
 //! * **D9** the size guard is 8 MiB and its verdict is *opened read-only*.
@@ -272,6 +286,7 @@ mod command;
 mod dto;
 mod engine;
 mod event;
+mod file_drop;
 mod gateway;
 
 pub use command::{Command, WindowHandle};
@@ -280,6 +295,11 @@ pub use engine::mark_current_thread_as_engine;
 pub use event::{
     Encoding, Event, FileMeta, LineEnding, LoadError, RecentEntry, SaveError, SkipReason, StateFile,
 };
+// The file-drop door: the port's ONLY synchronous `Result`-returning call, and the
+// only one that answers its caller instead of emitting an Event (rule 4 names it).
+// Three names, because a bridge has to be able to say what went wrong and to hold
+// the registration open — a guard it cannot name is a guard it cannot keep.
+pub use file_drop::{DropArmError, DropGuard, arm_file_drop};
 // `Exit` is the third name because `close()` answers with it: a bridge must be able to tell a
 // shutdown that ran its final save from one whose engine unwound, and that distinction is worth
 // nothing if the type carrying it is unreachable from outside the crate.
