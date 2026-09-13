@@ -19,15 +19,17 @@
 //! thing this module guarantees: every path is copied into owned `PathBuf`s
 //! before `Drop` returns.
 
+use std::collections::HashSet;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use windows::Win32::Foundation::{DRAGDROP_E_ALREADYREGISTERED, POINTL, RPC_E_CHANGED_MODE};
-use windows::Win32::System::DataExchange::GetClipboardData;
+use windows::Win32::System::Com::{APTTYPE, APTTYPE_STA, APTTYPEQUALIFIER, CoGetApartmentType};
+use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData};
 use windows::Win32::System::Ole::{
-    CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, IDropTarget, IDropTarget_Impl, OleInitialize,
-    RegisterDragDrop, RevokeDragDrop,
+    CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, IDropTarget, IDropTarget_Impl, OleGetClipboard,
+    OleInitialize, RegisterDragDrop, RevokeDragDrop,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
@@ -45,6 +47,22 @@ static BUFFER: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 /// because the difference between "we own this window's drops" and "something
 /// already did" is the difference between a takeover and a no-op.
 static TOOK_OVER: Mutex<bool> = Mutex::new(false);
+
+/// Which HWNDs THIS module registered, keyed by the raw handle value.
+///
+/// The multi-window limit this static carries, stated rather than hidden: the set
+/// is per-window, so arming two windows is tracked correctly, but the drop BUFFER
+/// above is process-wide and cannot say which window a path landed on. What this
+/// file supports today is therefore ONE drop target per process; a real
+/// multi-window build has to key the buffer by HWND too, which changes what
+/// take_dropped_paths MEANS, not just this file.
+// LazyLock because HashSet::new is not a const fn (its RandomState is not), so
+// this is the one static here that cannot be built at compile time.
+static ARMED: LazyLock<Mutex<HashSet<isize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Where the paths still buffered at the last disarm went. Platform has no
+/// logger, so the alternative to handing them back is letting them die silently.
+static LAST_DISARM: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 fn lock_or_recover<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     // A lock poisoned by somebody else's panic must not cost the user a drop:
@@ -137,60 +155,101 @@ impl IDropTarget_Impl for FileDropTarget_Impl {
 /// A failed read answers with an empty list, never an error: `Drop` has no
 /// channel for one, and the user's signal that their drop did nothing is the
 /// window not changing, which is the same signal an unreadable drop gives.
+// SAFETY: the whole block is clipboard and shell32 queries against handles OLE
+// owns for the duration of this Drop callback; nothing here frees them and
+// every path is copied out. The individual calls restate their own invariant
+// where they are made, which is what the ledger below checks.
 fn dropped_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
     unsafe {
-        // SAFETY: GetClipboardData is valid to call at any time on the thread
-        // Windows is pumping for; CF_HDROP names a format, not a handle we own.
-        // The returned HGLOBAL is owned by the drop and is only good for the
-        // duration of this call - which is why everything below copies.
-        let Ok(hglobal) = GetClipboardData(u32::from(CF_HDROP.0)) else {
-            return out;
-        };
-        let hdrop = HDROP(hglobal.0);
-        if hdrop.is_invalid() {
-            return out;
-        }
-        // SAFETY: DragQueryFileW with no buffer asks for the COUNT, and is the
-        // documented way to size the loop. The handle came from the call above
-        // and the drop is still in progress: this runs inside Drop().
-        let count = DragQueryFileW(hdrop, u32::MAX, None);
-        let mut name = vec![0u16; 1024];
-        for index in 0..count {
-            // SAFETY: `name` outlives the call and `count` is the number this
-            // HDROP reported, so the index is in range. A truncated long path is
-            // possible and is reported as whatever Windows copied - guessing at
-            // a longer path is worse than seeing a short one.
-            let len = DragQueryFileW(hdrop, index, Some(&mut name));
-            if len == 0 || len as usize >= name.len() {
-                continue;
+        // CRITICAL, and the reason this is not a bare GetClipboardData:
+        // reading the clipboard without owning the open can answer a STALE
+        // earlier Explorer copy. A stale HDROP is not a missed drop, it is
+        // the WRONG FILE opening, which is exactly what the do-no-harm rule
+        // (whitepaper 4.5) exists to make impossible. The documented
+        // IDropTarget::Drop sequence runs OleGetClipboard first: OLE flushes
+        // THIS drag's data object through the clipboard as a deferred render,
+        // and only then does GetClipboardData(CF_HDROP) name a handle that
+        // belongs to the drop in flight. OleSetClipboard is deliberately not
+        // called, so OLE keeps that flushed render until the next clipboard
+        // owner replaces it - a retained render, which costs memory and never
+        // a wrong path. The no-FORMATETC argument still holds, and this is
+        // why: there is nothing to ask the data object for, because OLE has
+        // already rendered it onto the clipboard for us.
+        //
+        // SAFETY: OleGetClipboard opens the clipboard for this thread and
+        // hands back the object it just flushed; the object is released when
+        // the binding below leaves scope. It is never called on - the flush is
+        // the point, the object is not.
+        let _flushed = OleGetClipboard().ok();
+        // SAFETY: the clipboard is open for this thread because the call above
+        // opened it. The HGLOBAL belongs to OLE, so nothing here frees it, and
+        // every path is copied into owned storage before the clipboard closes.
+        let hdrop = GetClipboardData(u32::from(CF_HDROP.0))
+            .ok()
+            .map(|hglobal| HDROP(hglobal.0))
+            .filter(|candidate| !candidate.is_invalid());
+        if let Some(hdrop) = hdrop {
+            // SAFETY: DragQueryFileW with no buffer asks for the COUNT, and is
+            // the documented way to size the loop. The handle came from the
+            // call above and the drop is still in progress: this runs inside
+            // Drop().
+            let count = DragQueryFileW(hdrop, u32::MAX, None);
+            for index in 0..count {
+                // NIT: ask THIS file's own length first - a null buffer returns
+                // the length without the terminator - and size the buffer from
+                // it, so nothing is cut at a fixed cap. The old 1024 could have
+                // handed back a shorter path than the one the user dropped.
+                let want = DragQueryFileW(hdrop, index, None) as usize;
+                if want == 0 {
+                    continue;
+                }
+                let mut name = vec![0u16; want + 1];
+                // SAFETY: name is one wider than the length OLE just reported
+                // for this index, so the terminator fits, and count bounds the
+                // index. got is compared against want before it is sliced.
+                let got = DragQueryFileW(hdrop, index, Some(&mut name)) as usize;
+                if got == 0 || got > want {
+                    continue;
+                }
+                out.push(PathBuf::from(std::ffi::OsString::from_wide(&name[..got])));
             }
-            out.push(PathBuf::from(std::ffi::OsString::from_wide(
-                &name[..len as usize],
-            )));
         }
+        // SAFETY: pairs the open that OleGetClipboard performed, on EVERY path
+        // including the ones that read nothing - leaving the clipboard open
+        // freezes every other clipboard user in the session. A failure here is
+        // not ours to act on, and there is no channel to report it through.
+        let _ = CloseClipboard();
     }
     out
 }
 
 /// Start receiving drops for `hwnd`.
 ///
-/// MUST be called on the thread that pumps that window's messages:
-/// `OleInitialize` initialises the COM apartment for the CALLING thread, and
-/// `RegisterDragDrop` binds the target to the thread that owns the window. Do
-/// either from a worker thread and the callbacks arrive on a thread that is not
-/// pumping, which is a silent hang rather than an error.
+/// MUST be called on the thread that pumps that window's messages, and the
+/// function now PROVES the thread qualifies instead of trusting the caller:
+/// `OleInitialize` initialises the calling thread's apartment and
+/// `CoGetApartmentType` is then asked what it actually is, with anything
+/// other than STA refused. See the MAJOR-1 note in the body.
 ///
-/// `RPC_E_CHANGED_MODE` from `OleInitialize` is not a failure: the toolkit
-/// (winit, gpui) usually initialises the apartment first, and Windows keeps the
-/// per-thread count, so our uninit on drop is not owed. Any other refusal is
-/// returned, never panicked on - a window without drops is degraded, not broken.
+/// The OLE initialisation count is deliberately NOT paid back, and this is the
+/// honest version of that sentence. `windows` types `OleInitialize` as
+/// `Result<()>`, so S_OK (this call created the apartment and owns a count to
+/// release) and S_FALSE (an earlier owner does) are indistinguishable once the
+/// mapping has run - informational severity is dropped by `ok()`. Guessing the
+/// other way is worse: an `OleUninitialize` for a count the toolkit still holds
+/// tears the apartment down from under winit or gpui mid-session. So the debt
+/// is one initialisation per process, chosen, and the previous wording here
+/// (`our uninit on drop is not owed`) was a claim this file cannot actually
+/// earn. Recording a bool would only pay back the S_OK case it cannot see.
 pub fn arm(hwnd: isize) -> PlatformResult<()> {
     let hwnd = crate::windows::to_hwnd(hwnd)?;
-    // SAFETY: OleInitialize initialises the COM apartment for the CALLING thread,
-    // which is documented as re-entrant-counted and safe to call again; `None` is
-    // the reserved argument. The whole point of the RPC_E_CHANGED_MODE branch is
-    // that a prior apartment in another model is not our business to fix.
+    let key = hwnd.0 as isize;
+    // SAFETY: OleInitialize initialises the COM apartment for the CALLING
+    // thread, is documented as re-entrant-counted and safe to call again, and
+    // None is the reserved argument. RPC_E_CHANGED_MODE is still not a
+    // failure HERE only in the sense that the apartment check below judges it
+    // on the merits instead of this call's word.
     if let Err(e) = unsafe { OleInitialize(None) } {
         if e.code() != RPC_E_CHANGED_MODE {
             return Err(PlatformError::Win32 {
@@ -199,71 +258,123 @@ pub fn arm(hwnd: isize) -> PlatformResult<()> {
             });
         }
     }
-    // Revoke first: arming twice on the same window is a reload, not a bug, and
-    // the alternative is answering DRAGDROP_E_ALREADYREGISTERED forever on the
-    // second call with no way to tell the caller which of the two happened.
-    //
-    // A refusal here is EXPECTED the first time - a window that never had a
-    // drop target says OLE_E_INVALIDHWND / DRAGDROP_E_NOTREGISTERED, and we are
-    // about to register one either way. So: no error path, and the registration
-    // below is what is actually judged.
-    // SAFETY: `hwnd` is validated by to_hwnd above. RevokeDragDrop on a window
-    // that never had a target is a documented plain refusal, and discarding it
-    // cannot leak: nothing was allocated for that window's drop target, and the
-    // registration below is the call that is actually judged.
-    unsafe {
-        RevokeDragDrop(hwnd).ok();
+    // MAJOR-1: RPC_E_CHANGED_MODE used to be swallowed blind, and that let an
+    // MTA thread through the door. If this thread is MTA - which is what a bare
+    // CoInitializeEx(NULL), a runtime default, or a toolkit that picked MTA
+    // leaves behind - OLE does NOT call an IDropTarget on it at all: it
+    // marshals every callback onto an RPC worker thread, so BUFFER would be
+    // written from a thread that owns neither the window nor a pump. Refuse to
+    // register on any answer but STA, and the thread claim above holds.
+    let mut apartment = APTTYPE(0);
+    let mut qualifier = APTTYPEQUALIFIER(0);
+    // SAFETY: both out-parameters are writable storage owned by this frame,
+    // and CoGetApartmentType either fills them or returns without writing.
+    unsafe { CoGetApartmentType(&mut apartment, &mut qualifier) }
+        .map_err(|e| crate::windows::win32_error("CoGetApartmentType", e))?;
+    if apartment != APTTYPE_STA {
+        return Err(PlatformError::Win32 {
+            api: "CoGetApartmentType",
+            message: format!(
+                "apartment is {} (qualifier {}), not STA: a drop target registered on this thread would be marshalled onto RPC workers",
+                apartment.0, qualifier.0
+            ),
+        });
+    }
+    // MAJOR-3: the pre-emptive revoke is now limited to a window THIS module
+    // registered. Revoking a registration we never made would tear down another
+    // member's drop target - the api installs a guard this crate cannot see, and
+    // a second bridge arming the same HWND is a future, not a fiction. ARMED is
+    // the record; a window absent from it is not ours to unregister.
+    if lock_or_recover(&ARMED).contains(&key) {
+        // SAFETY: this pair of our own earlier RegisterDragDrop on the same
+        // HWND, i.e. a reload. The answer is discarded because the
+        // registration below is the call that is actually judged.
+        unsafe {
+            RevokeDragDrop(hwnd).ok();
+        }
     }
     let target: IDropTarget = FileDropTarget.into();
-    // SAFETY: `hwnd` names a live window on this thread (to_hwnd checked it) and
-    // `target` is a valid IDropTarget whose vtable outlives this call because the
-    // box is leaked below - OLE keeps the pointer past the end of this statement,
-    // which is precisely why a normal drop here would be a use-after-free.
+    // SAFETY: `hwnd` names a live window (to_hwnd checked it) on a thread the
+    // apartment check above proved STA, and `target` is a valid IDropTarget
+    // whose vtable outlives this call because the box is forgotten on the very
+    // next line - OLE keeps the pointer past the end of this statement, which
+    // is precisely why a normal drop here would be a use-after-free.
     let registered = unsafe { RegisterDragDrop(hwnd, &target) };
+    // MAJOR-2: forget UNCONDITIONALLY, before the match. Both branches below
+    // leave this function, so the old placement ran it on one path only; and
+    // running the Release is not safe on either - on success OLE holds the
+    // pointer, and on ALREADYREGISTERED OLE holds ANOTHER target's while our
+    // box's post-failure refcount is documented too thinly to guess from. One
+    // leaked small object per arm is the safe side of that asymmetry.
+    std::mem::forget(target);
     if let Err(e) = registered {
         if e.code() != DRAGDROP_E_ALREADYREGISTERED {
             return Err(crate::windows::win32_error("RegisterDragDrop", e));
         }
-        // Something is already registered - us, from an earlier arm on this
-        // window, since nothing else in this process calls RegisterDragDrop.
-        // That is a takeover, and it is a success: the OS is pointing at A
-        // target, and the buffer is shared by every instance of ours.
+        // With the guarded pre-revoke above, an ALREADYREGISTERED answer can
+        // no longer mean "ours, from an earlier arm" - that case is revoked
+        // first now. So this answer means a FOREIGN target owns the window:
+        // still a success for the caller (drops will arrive, at somebody's
+        // target), recorded as a takeover, and deliberately NOT inserted into
+        // ARMED - which is precisely what stops our disarm from unregistering
+        // something we never registered.
         *lock_or_recover(&TOOK_OVER) = true;
         return Ok(());
     }
-    // LEAK the target. Windows holds the only strong reference from
-    // `RegisterDragDrop` until `RevokeDragDrop` (plus the refcount it takes on
-    // the interface itself), so a Rust-owned box would be dropped while the
-    // vtable pointer inside OLE is still live - a use-after-free scheduled by
-    // the next drag. There is no precedent for this in the crate yet: every
-    // other seam here passes a number in and gets a number back, and this is
-    // the first object handed over and never taken back. The precedent being
-    // followed is the OS's own - it documents the target as living until
-    // revoked - and `forget` is the smallest honest way to agree with it.
-    std::mem::forget(target);
+    lock_or_recover(&ARMED).insert(key);
     Ok(())
 }
 
-/// Stop receiving drops. The buffered paths are deliberately NOT cleared: a
-/// window that is closing may still have a file in there that the bridge means
-/// to write into its recents, and dropping data on a shutdown path is the one
-/// thing this app has promised it never does.
+/// Stop receiving drops for `hwnd`, and hand back what was still buffered.
+///
+/// MAJOR-3 again from the other side: the OS call happens only for a window
+/// this module registered. A window absent from ARMED gets a clean Ok with no
+/// revoke, because unregistering a foreign target is a cross-window bug that
+/// platform cannot see coming. The DRAGDROP_E_NOTREGISTERED path below stays
+/// reserved for a revoke we actually attempted and the OS refused - that answer
+/// is real information (the window is gone), and is still mapped, not swallowed.
+///
+/// MINOR: the buffer is no longer left to die with the process. Whatever a
+/// window had dropped and nobody drained is moved into LAST_DISARM, readable
+/// through `last_disarm_dropped`. It is NOT dropped on the floor here: a
+/// closing window may still hold the file the bridge means to put in its
+/// recents, and losing data on a shutdown path is the one thing this app has
+/// promised it never does.
 pub fn disarm(hwnd: isize) -> PlatformResult<()> {
     let hwnd = crate::windows::to_hwnd(hwnd)?;
-    // SAFETY: RevokeDragDrop takes an HWND already validated by to_hwnd and a
-    // target this thread registered; Windows documents calling it on an
-    // unregistered window as a plain refusal, and the result is discarded on
-    // purpose (see the note above), so no handle is released twice.
+    let key = hwnd.0 as isize;
+    let ours = lock_or_recover(&ARMED).remove(&key);
+    // MINOR: drain, do not abandon. The paths a bridge never picked up are
+    // moved where a reader can still find them instead of being left in a
+    // buffer whose window is gone.
+    let drained = std::mem::take(&mut *lock_or_recover(&BUFFER));
+    *lock_or_recover(&LAST_DISARM) = drained;
+    // MINOR: the takeover flag is per-arm, not per-process-lifetime. Left
+    // alone it would report a stale takeover forever after one foreign target
+    // was noticed, which is worse than no flag at all.
+    *lock_or_recover(&TOOK_OVER) = false;
+    if !ours {
+        return Ok(());
+    }
+    // SAFETY: ARMED said this module registered this HWND, so this is the
+    // documented pair of that call and no foreign target is touched. A window
+    // the toolkit already destroyed answers with a plain refusal, mapped below
+    // rather than swallowed, because that refusal is the information a caller
+    // needs; no handle is released twice because we release exactly one.
     match unsafe { RevokeDragDrop(hwnd) } {
         Ok(()) => Ok(()),
-        // DRAGDROP_E_NOTREGISTERED is the honest "was not armed" answer, and a
-        // caller that armed on a window the toolkit already destroyed gets the
-        // refusal it can act on. Mapped, not swallowed: the two cases look the
-        // same from here and are not the same event.
+        // Reserved, as the doc says, for a revoke we actually attempted.
         Err(e) => Err(crate::windows::win32_error("RevokeDragDrop", e)),
     }
 }
 
+/// The paths that were still buffered the last time `disarm` ran, drained and
+/// cleared. Read by the tests here and, from S4, by the exit-needle lane that
+/// reports what a shutdown found unsaved - platform has no logger of its own.
+#[allow(dead_code)]
+pub(crate) fn last_disarm_dropped() -> Vec<PathBuf> {
+    lock_or_recover(&LAST_DISARM).clone()
+}
 /// Was this arm a takeover of an already-registered window?
 // Consumed by the bridge in S3, which reports whether arming took a window over
 // from something else. Nothing in THIS crate calls it yet, and the test below does
@@ -275,7 +386,9 @@ pub(crate) fn took_over() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{buffer, take_buffered, took_over};
+    use super::{
+        ARMED, buffer, disarm, last_disarm_dropped, lock_or_recover, take_buffered, took_over,
+    };
     use std::path::PathBuf;
 
     /// The whole promise the bridge codes against, testable with no window, no
@@ -296,8 +409,28 @@ mod tests {
         assert!(take_buffered().is_empty(), "the take cleared it");
     }
 
+    /// The flag is per-arm: a process that never armed has never taken anything
+    /// over, and the bridge's report depends on that being the default.
     #[test]
     fn nothing_has_claimed_a_takeover_in_a_process_that_never_armed() {
         assert!(!took_over());
+    }
+
+    /// MAJOR-3's guard is only as good as the order of its checks, so pin the
+    /// order: a handle that is not a window is refused BEFORE any mutex is
+    /// touched, which means disarm cannot unregister something, drain the
+    /// buffer, or claim a takeover. This is the cheap way to test the guard
+    /// without a desktop, an apartment or a mouse.
+    #[test]
+    fn a_disarm_of_a_non_window_refuses_before_reaching_the_state() {
+        let err = disarm(0).expect_err("0 is not an HWND");
+        assert!(
+            matches!(err, crate::PlatformError::InvalidHandle),
+            "a bad handle must be refused, not revoked over: {err:?}"
+        );
+        assert!(lock_or_recover(&ARMED).is_empty(), "nothing was armed");
+        assert!(!took_over());
+        assert!(last_disarm_dropped().is_empty());
+        assert!(take_buffered().is_empty(), "the buffer was not drained");
     }
 }
