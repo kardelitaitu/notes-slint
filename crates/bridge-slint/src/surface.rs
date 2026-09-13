@@ -772,6 +772,12 @@ pub(crate) struct Pump {
     /// until the bytes actually land: a dot that blinks off on the next keystroke tells
     /// the user nothing changed, which is the opposite of section 4.4.
     pub(crate) save_failed: bool,
+    /// STRIP-4b row 1: how many times this bridge has re-sent AFTER a failure. Printed, not
+    /// decorative: a save that fails for a PERMANENT reason (locked by another program, disk full,
+    /// a path that went away) now retries every autosave idle, so this number is how loud that loop
+    /// is, and a live run can be read for it. See the SaveFailed arm for why the loop is the lesser
+    /// evil and for who should really own the policy.
+    pub(crate) retries: u64,
     /// The port has NO event that echoes autosave - engine.rs:601-602 assigns the bool
     /// and says nothing back - so this is InitialState's answer XORed by every
     /// Command::SetAutosave this bridge sends. The bridge's own last ask, named as such
@@ -1032,14 +1038,29 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 let rows = list.len();
                 let names: Vec<slint::SharedString> = list
                     .iter()
-                    .map(|entry| entry.display.clone().into())
+                    .map(|entry| {
+                        // STRIP-4b row 3: the port carries the bit (api/src/event.rs:182) and D13
+                        // says a vanished path STAYS in the list, greyed - "a greyed-out entry that
+                        // tells the truth beats one that quietly disappeared". bridge-gpui can
+                        // render disabled(!exists) because a real menu item has per-item state; the
+                        // rows here are plain text lines in main.slint with no per-row colour hook,
+                        // so the cheapest HONEST form is the word: " (missing)". The name stays
+                        // exactly as core formatted it, and the mark is appended, never substituted.
+                        if entry.exists {
+                            entry.display.clone().into()
+                        } else {
+                            format!("{} (missing)", entry.display).into()
+                        }
+                    })
                     .collect();
                 {
                     let mut p = pump.borrow_mut();
                     p.recent_paths = list.iter().map(|entry| entry.path.clone()).collect();
                 }
-                // The label is core's (`display`), the cap is core's, the missing-file
-                // mark is core's. The bridge renders and keeps the paths beside it.
+                // The label is core's (`display`, pre-formatted for the menu), the cap is core's,
+                // and the missing-file MARK is core's FACT (RecentEntry::exists) rendered by the
+                // bridge's own hand - see the map above. The bridge keeps the paths beside it for
+                // Alt+1..0, which routes by path and not by the words.
                 if let Some(ui) = weak.upgrade() {
                     // 1.17 finding: `ModelRc` is built from a slice or an `Rc<dyn Model>` - not
                     // from a `Vec` (only `VecModel` takes a Vec), so the borrowed slice it is.
@@ -1097,9 +1118,39 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
             Event::SaveFailed { reason, .. } => {
                 pump.borrow_mut().save_failed = true;
                 let dirty = pump.borrow().dirty;
+                // THE WITNESS COMES BACK. bridge-gpui clears its in-flight marker on Saved|SaveFailed
+                // (bridge-gpui/src/main.rs:996-1000) so a failure never leaves a bridge believing
+                // bytes went out. This bridge's equivalent marker is its SEND WITNESS - last_sent
+                // plus the edited flag - and the pump cleared BOTH AT THE SEND, which meant: bytes
+                // refused, witness clean, and nothing going out again until the user typed. A save
+                // failure that cannot retry is a silent loss of the newest edit (AGENTS.md 4.4), so
+                // the failure restores the witness and the next quiet tick re-sends.
+                //
+                // WHAT THAT BUYS AND WHAT IT COSTS, out loud: a permanent failure now retries every
+                // AUTOSAVE_IDLE, forever. Each retry is a real attempt that lands the moment the
+                // cause clears, and the printed count makes the loop audible instead of mysterious -
+                // but a cap wants a back-off, and this bridge has no business inventing that policy
+                // alone: gpui retries on the next edit and does not loop, so if the two bridges are
+                // to agree, the RETRY RULE BELONGS TO THE PORT. Raised here, not settled here.
+                {
+                    let mut p = pump.borrow_mut();
+                    p.last_sent.clear();
+                    p.edited_flag = true;
+                    p.retries += 1;
+                    report(&format!(
+                        "retry: a failed save restored the send witness (retry #{})",
+                        p.retries
+                    ));
+                }
                 note_dot(pump, weak, dirty, "save-failed");
                 if let Some(ui) = weak.upgrade() {
-                    ui.set_status(format!("save failed: {reason:?}").into());
+                    // STRIP-4b row 2: this printed the Debug of a public-contract enum - a variant
+                    // name, and for the inner kinds a couple of numbers, where a person needs a
+                    // sentence. The port says otherwise in its own source: "The Display text below
+                    // IS the user-visible copy: to_string() goes straight into a dialog or the status
+                    // line" (api/src/event.rs:188-191). One hex-owner rule: the port owns the
+                    // wording, the bridge owns the sentence around it.
+                    ui.set_status(format!("save failed: {reason}").into());
                 }
             }
             other => {
@@ -1229,6 +1280,69 @@ mod tests {
         assert!(
             src.contains("\"rebind: path={} epoch={epoch}"),
             "Rebound must print its path"
+        );
+    }
+
+    #[test]
+    fn a_failed_save_rearms_the_witness_and_the_copy_is_the_ports() {
+        // STRIP-4b rows 1 and 2, grep-grade: a guard that CALLS the arm cannot exist (drain needs
+        // a window and a queue), so the invariant is asserted against the source it is written in,
+        // sliced at this file's own test module - the self-grep trap this crate already learned.
+        let whole = include_str!("../src/surface.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        let arm = &src[src
+            .find("Event::SaveFailed { reason, .. } =>")
+            .expect("the arm")..];
+        let arm = &arm[..arm.find("other =>").expect("the next arm")];
+        assert!(
+            arm.contains("p.last_sent.clear();"),
+            "the send witness must come back"
+        );
+        assert!(
+            arm.contains("p.edited_flag = true;"),
+            "and so must the edited-flag witness"
+        );
+        assert!(
+            arm.contains("p.retries += 1;"),
+            "the loop is counted and printed, not hidden"
+        );
+        assert!(
+            !arm.contains("{reason:?}"),
+            "Debug of a public enum is not the user's copy"
+        );
+        assert!(
+            arm.contains("format!(\"save failed: {reason}\")"),
+            "the port's Display sentence, one owner of the wording"
+        );
+        assert!(
+            !src.contains("reason:?"),
+            "no Debug-formatted port copy may come back anywhere in the surface"
+        );
+    }
+
+    #[test]
+    fn a_vanished_recent_says_so_and_keeps_cores_label() {
+        // STRIP-4b row 3. The bit is the port's (api/src/event.rs:182), the mark reaches the row,
+        // and core's pre-formatted label is preserved rather than rewritten by the bridge.
+        let whole = include_str!("../src/surface.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        let arm = &src[src.find("Event::RecentsUpdated(list) =>").expect("the arm")..];
+        let arm = &arm[..arm.find("Event::Saved").expect("the next arm")];
+        assert!(
+            arm.contains("if entry.exists"),
+            "the mark comes from the port's bit"
+        );
+        assert!(
+            arm.contains("(missing)"),
+            "and reaches the row a person reads"
+        );
+        assert!(
+            arm.contains("entry.display.clone()"),
+            "core's label survives unchanged"
+        );
+        assert!(
+            !arm.contains("mark is core's. The bridge renders"),
+            "a comment must not claim a mark the code never drew - the old wording did"
         );
     }
 }
