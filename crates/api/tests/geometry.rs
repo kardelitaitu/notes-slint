@@ -392,22 +392,29 @@ fn an_unanswered_show_state_writes_the_rect_and_keeps_the_session_write_armed() 
     gateway.close().expect("shutdown joins the engine");
 }
 
-/// THE 1.92 s REPRO, HEADLESS. A window that was NEVER maximised answered
-/// showCmd == 3 (Maximized) exactly ONCE, while it settled: the real HWND
-/// appeared +94 ms after launch, so the first measure the MAJOR-5 guard allows
-/// (two idle periods after the registration's async move, t~1.59 s) read a
-/// maximised window that did not exist yet, and the port persisted
-/// maximized: true from that single sample at t~1.92 s. Every answer after it
-/// was Unknown - which the port already treats as "leave the bit alone", so the
-/// stale true survived, and because the show half of that write was never
-/// COMPLETE the pending bit stayed armed and kept re-writing the lie. A
-/// never-maximised app came back maximised, and no lane asserted otherwise.
+/// THE SHOW LATCH, PROVEN BY A MOCK - AND NOTHING MORE. This test claims
+/// nothing about the desktop: showCmd == 3 has been measured NEVER in the plain
+/// orderings and NEVER on the live slint hwnd, and the "1.92 s maximized: true
+/// on a never-maximised window" that first motivated the latch is VOID - RC2
+/// read the file and it never said true, because the slint spike's 40-byte
+/// needle parsed pinned: true as maximized: true. That phantom exercised
+/// neither this write path nor the guard nor the Unknown branch.
+///
+/// What IS established here is the only thing the port can be caught out on:
+/// hand it ONE answering sample that contradicts the stored bit and answer
+/// Unknown afterwards - what a settling, minimised or mid-recreate window
+/// reports - and the pre-latch port wrote maximized: true out of that single
+/// read and kept it, because Unknown reads as "leave the bit alone" and the
+/// incomplete show half kept the pending bit armed. Red against the code as it
+/// stood before 69de6c5e, green with the latch, and a claim about the PORT
+/// all the way down.
 ///
 /// THE DISCIPLINE THIS PINS: the show bit gets the SAME discipline the rect has
 /// always had - a measurement is only a fact when it repeats. One transient
 /// sample must never change the persisted bit. The rect is held AT REST here
-/// (800x600@120,90, the port's own default) because the repro's tell was that
-/// the window never moved: only the bit did.
+/// (800x600@120,90, the port's own default) so that NOTHING but the bit could
+/// explain a true in the file: a moving rect would leave the write an honest
+/// second story to hide behind.
 #[test]
 fn a_single_transient_maximised_sample_never_persists_the_bit() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -445,9 +452,9 @@ fn a_single_transient_maximised_sample_never_persists_the_bit() {
     let persisted = read_session(dir.path()).expect("a fresh install must persist");
     assert!(
         !persisted.maximized,
-        "one transient showCmd==3 sample persisted the bit: the window was never \
-         maximised, its rect never moved, and every answer after the first was \
-         Unknown: {persisted:?}"
+        "one transient answering sample was persisted: the mock said Maximized \
+         once and Unknown ever after, this window was never maximised and its \
+         rect never moved, so only the latch failing explains this: {persisted:?}"
     );
     assert_eq!(
         persisted.rect,
