@@ -91,8 +91,19 @@ const XTASK: &str = "xtask";
 /// be edited on every upstream rename is a list that will be forgotten, and a
 /// gate that stops firing while still printing 0 violations is the worst
 /// instrument failure available. So the match is by family, not by equality.
+///
+/// ONE MORE ROOT THAN THE TOOLKIT'S NAME: `slint` is the front door, not the
+/// package set. Slint ships its engine behind `i-slint-*` - core, compiler,
+/// macros, common, the selector/linuxkms/testing/winit backends, two renderers -
+/// and Cargo.lock carries ten of them today. [in_family] matches a root, then
+/// `root-…` or `root_…`, so a bare `slint` root never reaches a name that does not
+/// START with it: `i-slint-core` was invisible to `core-is-pure` and
+/// `port-is-ui-agnostic`, which is the same silent-green failure the paragraph
+/// above describes, arriving by way of a prefix rather than a rename. Adding the
+/// root costs nothing while no bridge has leaked (nothing outside
+/// notes-bridge-slint pulls any of the ten) and buys the gate its second toolkit.
 const UI_TOOLKITS: &[&str] = &[
-    "gpui", "winit", "egui", "eframe", "iced", "slint", "tauri", "gtk", "gdk", "web-sys",
+    "gpui", "winit", "egui", "eframe", "iced", "slint", "i-slint", "tauri", "gtk", "gdk", "web-sys",
 ];
 
 /// Win32 / browser FFI families: belong only in notes-platform. Roots as well,
@@ -1253,7 +1264,7 @@ mod tests {
     /// derived from RULES, so the only way to move the count is to add or remove a row -
     /// which is the property this assertion exists to keep.
     #[test]
-    fn rule_table_covers_five_packages() {
+    fn rule_table_covers_six_packages() {
         assert_eq!(checked_packages().len(), 6);
     }
 
@@ -1288,9 +1299,20 @@ mod tests {
         );
         // And the other bridge is NOT in the new row's allowed set. Read from the real
         // graph, because that is where the ban has to bite: two adapters, one port.
+        //
+        // The same graph now carries the reach the row was WRITTEN for, not just the one
+        // it was first proved against: NOTES_CORE and NOTES_PLATFORM sit here alongside
+        // NOTES_API and the toolkit. Until now the negative fixture named only the sibling
+        // bridge, so "a bridge reaching around the port to core or platform is caught" was
+        // a claim about the first adapter that the second adapter had never actually been
+        // tested against - the row could have been keyed to the wrong package, or its
+        // `allowed` list misread, and every assertion below would still have passed.
         let g = graph(
             &workspace(),
-            &[(NOTES_BRIDGE_SLINT, &[NOTES_API, "slint", NOTES_BRIDGE])],
+            &[(
+                NOTES_BRIDGE_SLINT,
+                &[NOTES_API, "slint", NOTES_BRIDGE, NOTES_CORE, NOTES_PLATFORM],
+            )],
             &[],
         );
         let found = evaluate(&g);
@@ -1302,6 +1324,32 @@ mod tests {
             hits.len(),
             1,
             "a second bridge importing the first is a reach-around, not a dependency: {found:?}"
+        );
+        // THE two hits, named. Both are forbidden members reached DIRECTLY, which is the
+        // form the invariant is about; a third name appearing here means the row's
+        // `allowed` set grew, and that is a design change with a note owed, not a fix.
+        let mut reaches: Vec<&str> = found
+            .iter()
+            .filter(|v| {
+                v.package == NOTES_BRIDGE_SLINT
+                    && v.rule == "bridge-sees-only-api"
+                    && (v.dep == NOTES_CORE || v.dep == NOTES_PLATFORM)
+            })
+            .map(|v| v.dep.as_str())
+            .collect();
+        reaches.sort_unstable();
+        assert_eq!(
+            reaches,
+            vec![NOTES_CORE, NOTES_PLATFORM],
+            "core and platform are what the bridge rule exists to refuse: {found:?}"
+        );
+        assert_eq!(
+            found
+                .iter()
+                .filter(|v| v.package == NOTES_BRIDGE_SLINT && v.rule == "bridge-sees-only-api")
+                .count(),
+            3,
+            "exactly the two reach-arounds plus the sibling bridge, never the port: {found:?}"
         );
     }
 
@@ -1653,6 +1701,58 @@ mod tests {
         assert!(
             v3.iter().any(|x| x.dep == "notes-bridge-gpui"),
             "but a core -> bridge edge is still the structural violation it is: {v3:?}"
+        );
+    }
+
+    /// The `i-slint` root in [UI_TOOLKITS], proved instead of asserted in prose. Slint
+    /// ships its engine behind `i-slint-*` - ten Cargo.lock packages, none of whose names
+    /// START with `slint` - and [in_family] matches a root plus `root-`/`root_`, so the
+    /// front-door name alone left every one of them outside `core-is-pure` and
+    /// `port-is-ui-agnostic`. Same failure shape as the gpui-pre hole above: a leak whose
+    /// name the rule table has never heard of prints "0 violations".
+    #[test]
+    fn the_slint_engine_packages_are_in_the_toolkit_family_not_only_its_front_door() {
+        for n in [
+            "slint",
+            "slint-macros",
+            "i-slint",
+            "i-slint-core",
+            "i-slint-core-macros",
+            "i-slint-compiler",
+            "i-slint-backend-winit",
+            "i-slint-renderer-skia",
+        ] {
+            assert!(in_family(UI_TOOLKITS, n), "{n} must be policed as UI code");
+        }
+        // The leak that used to be invisible: the engine pulled into pure core.
+        let g = graph(
+            &[
+                NOTES_CORE,
+                NOTES_API,
+                NOTES_PLATFORM,
+                NOTES_BRIDGE,
+                NOTES_BRIDGE_SLINT,
+            ],
+            &[
+                (NOTES_CORE, &["serde", "i-slint-core"]),
+                (NOTES_API, &[NOTES_CORE]),
+                (NOTES_PLATFORM, &["windows-sys"]),
+                (NOTES_BRIDGE, &[NOTES_API, "gpui"]),
+                (NOTES_BRIDGE_SLINT, &[NOTES_API, "slint"]),
+            ],
+            &[(NOTES_CORE, &["serde", "i-slint-core"])],
+        );
+        let v = evaluate(&g);
+        assert!(
+            v.iter()
+                .any(|x| x.rule == "core-is-pure" && x.dep == "i-slint-core"),
+            "an i-slint leak into core must fire, not be a name nobody listed: {v:?}"
+        );
+        // The sanctioned shape stays silent, or the root is a false-fail machine:
+        // `slint` behind the port is the one thing the second bridge may pull.
+        assert!(
+            !v.iter().any(|x| x.package == NOTES_BRIDGE_SLINT),
+            "the toolkit root must not condemn the bridge that owns it: {v:?}"
         );
     }
 

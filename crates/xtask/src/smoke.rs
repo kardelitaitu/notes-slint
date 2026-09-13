@@ -155,7 +155,7 @@ pub struct ArtifactTarget {
     /// Where the exe sits when nobody set CARGO_TARGET_DIR.
     pub exe_rel: &'static str,
     /// The build script that decides the embedded manifest. Empty until the target has
-    /// one - and see [crate::smoke::embeds_at_link_time], which reads it.
+    /// one - and see [crate::smoke::build_embeds_manifest], which reads it.
     pub build_rs: &'static str,
     /// Source DIRECTORIES that are inputs to this exe. `<crate>/src`, never `<crate>`:
     /// the long reason is at [SOURCE_ROOTS].
@@ -194,8 +194,11 @@ const GPUI_TARGET: ArtifactTarget = ArtifactTarget {
 /// branch, so the only thing to check about this row is that it names real paths: the
 /// crate exists, its sources and `ui/` exist, and `build_rs` is the name slice 1 will
 /// give its build script when (not if) Slint starts needing one - it has none today,
-/// which is why [SLINT_TARGET_HAS_NO_BUILD_SCRIPT_YET] pins the empty string instead of
-/// letting a plausible-looking path stand in for a fact.
+/// which is why the test `slint_target_has_no_build_script_yet` pins the empty string
+/// instead of letting a plausible-looking path stand in for a fact. Named in a code span
+/// rather than a doc link on purpose: the test lives in `mod tests`, which `cargo doc`
+/// does not build, so a link here would be an unresolved-link warning - the noise this
+/// comment used to be.
 #[allow(dead_code)] // described, not driven: no smoke leg runs this exe on this branch
 const SLINT_TARGET: ArtifactTarget = ArtifactTarget {
     pkg: "notes-bridge-slint",
@@ -224,9 +227,10 @@ const SLINT_TARGET: ArtifactTarget = ArtifactTarget {
 const BIN_REL: &str = GPUI_TARGET.exe_rel;
 /// Just the file name, for a CARGO_TARGET_DIR that replaces the whole tree. Stays a
 /// literal for one reason: `concat!` cannot read a const struct's field, and a
-/// `format!` at this position would stop it being a const. What keeps it honest is
-/// [exe_name_is_the_bin_target_plus_the_windows_extension], which fails the day the
-/// two stop agreeing.
+/// `format!` at this position would stop it being a const. What keeps it honest is the
+/// test `exe_name_is_the_bin_target_plus_the_windows_extension`, which fails the day the
+/// two stop agreeing - a code span, not a doc link, because `mod tests` is not built by
+/// `cargo doc` and a link to it could not resolve.
 pub const EXE_NAME: &str = "notes-gpui.exe";
 const BUILD_HINT: &str = "cargo build -p notes-bridge-gpui --bin notes-gpui";
 const SESSION_FILE: &str = "session.json";
@@ -5226,5 +5230,134 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
         .expect("real flag");
         assert_eq!(build_embeds_manifest(&dir), Some(true));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// This crate's directory, so a test can resolve a target row's paths the way the
+    /// harness does at run time (same trick as `check_ci`'s read of `ci.yml`). The
+    /// paths on an [ArtifactTarget] are workspace-root relative, never crate-relative:
+    /// smoke is run from the root and passes `root` down.
+    fn crate_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// The whole point of the struct is that there are TWO bridges, and a row that
+    /// names nothing real is worse than no row at all: it reads as coverage while the
+    /// second lane stays invisible to the next person who wires a leg. So both rows are
+    /// checked against the tree - every freshness root and file must exist, each exe
+    /// path must be `target/debug/<bin>.exe`, and the Slint row must still carry NO
+    /// build script, because `build_rs: ""` is a claim about the world and not a
+    /// placeholder.
+    ///
+    /// Exists-on-disk is the assertion, deliberately, and not `git ls-files`: the
+    /// freshness guard these paths feed (`identity::newest_mtime`) walks the filesystem,
+    /// so asking git would test a different thing than the code uses. That is also why
+    /// `crates/bridge-slint/ui/main.slint` is NOT named here - it is untracked working
+    /// memory owned by the slint lane, and a test in this crate that pinned it would
+    /// fail on their refactor rather than on a bug in ours. What this row promises is
+    /// the `ui/` DIRECTORY, and that is what gets pinned: it is tracked (via its NOTES)
+    /// and it is the unit the freshness root names.
+    #[test]
+    fn slint_target_has_no_build_script_yet() {
+        let root = crate_root();
+        let targets: [(&str, &ArtifactTarget); 2] =
+            [("gpui", &GPUI_TARGET), ("slint", &SLINT_TARGET)];
+        let mut missing: Vec<String> = Vec::new();
+        for (label, t) in targets {
+            assert!(
+                !t.pkg.is_empty() && !t.bin.is_empty(),
+                "the {label} row must name a package ({} as -p, {} as --bin)",
+                t.pkg,
+                t.bin,
+            );
+            // The exe is what gets built later, not what is on disk now: neither row's
+            // exe may be asserted to exist here, or this test would need a build.
+            assert!(
+                Path::new(t.exe_rel).is_relative(),
+                "the {label} row's exe path must be workspace-relative, not absolute",
+            );
+            assert_eq!(
+                t.exe_rel,
+                format!("target/debug/{}.exe", t.bin),
+                "the {label} row's exe must sit where cargo puts a debug bin of that name"
+            );
+            for dir in t.freshness_roots {
+                if !root.join(dir).is_dir() {
+                    missing.push(format!("{label} root {dir} is not a directory"));
+                }
+            }
+            for file in t.freshness_files {
+                if !root.join(file).is_file() {
+                    missing.push(format!("{label} file {file} is not a file"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "an ArtifactTarget naming paths that are not there is a row nobody can trust: {missing:?}"
+        );
+        // And now the fact the doc comment on SLINT_TARGET promises: the second bridge
+        // has no build script. `build_embeds_manifest` would answer `None` for it (no
+        // file to read), and smoke must never claim a cause for an exe it cannot ask.
+        assert!(
+            !GPUI_TARGET.build_rs.is_empty(),
+            "the first bridge's script is how smoke learns whether the build embedded"
+        );
+        assert!(
+            root.join(GPUI_TARGET.build_rs).is_file(),
+            "gpui build_rs {} must exist relative to {}",
+            GPUI_TARGET.build_rs,
+            root.display()
+        );
+        assert!(
+            !root.join(SLINT_TARGET.build_rs).is_file(),
+            "the slint row must not name a build script it does not have"
+        );
+        assert_eq!(
+            SLINT_TARGET.build_rs, "",
+            "empty, not a plausible path: slice 1 adds crates/bridge-slint/build.rs when \
+             Slint needs a link step, and this test is the day that changes"
+        );
+        assert_eq!(
+            BUILD_RS_REL, GPUI_TARGET.build_rs,
+            "the const smoke actually reads must stay the projection of the row it came from"
+        );
+        // The mechanism still works against the real tree for the row that HAS a script:
+        // an answer, not `None`.
+        assert!(
+            build_embeds_manifest(&root).is_some(),
+            "reading the real bridge build script must produce a verdict, not unknown"
+        );
+    }
+
+    /// `EXE_NAME` is a literal because `concat!` cannot read a const struct's field, and
+    /// a literal is exactly the kind of thing that rots quietly: rename the bin target
+    /// and smoke keeps launching (and then judging) a file cargo no longer emits. This
+    /// is the test that doc comment points at. It pins BOTH rows' exe names, since the
+    /// second row is the one no leg drives and therefore the one nothing else checks.
+    #[test]
+    fn exe_name_is_the_bin_target_plus_the_windows_extension() {
+        assert_eq!(
+            EXE_NAME,
+            format!("{}.exe", GPUI_TARGET.bin),
+            "EXE_NAME must stay bin + the Windows extension, or smoke launches nothing"
+        );
+        assert_eq!(
+            BIN_REL,
+            format!("target/debug/{}.exe", GPUI_TARGET.bin),
+            "the default exe path and the launched name must agree about the same bin"
+        );
+        assert_eq!(
+            SLINT_TARGET.exe_rel,
+            format!("target/debug/{}.exe", SLINT_TARGET.bin),
+            "the second bridge's described exe is named the same way, even unrun"
+        );
+        // The two agree by construction, not by coincidence of the same literal:
+        // a redirected build still has to be named EXE_NAME.
+        let (exe, _) = resolve_exe(Path::new("wherever"), Some("C:/builds/lane-4"));
+        assert_eq!(
+            exe.file_name().and_then(|n| n.to_str()),
+            Some(EXE_NAME),
+            "the CARGO_TARGET_DIR branch resolves to the same file name: {exe:?}"
+        );
     }
 }
