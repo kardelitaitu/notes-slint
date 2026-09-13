@@ -230,6 +230,24 @@ pub trait WindowBackend: Send {
     /// (the taskbar) occupies, so a window placed inside it stays usable. Not the
     /// screen resolution.
     fn primary_work_area(&self) -> PlatformResult<FrameRect>;
+
+    /// Take the file paths somebody dropped onto the window since the last call,
+    /// draining them. Empty means "nothing arrived", and it is also what a host
+    /// without drop support answers forever - which is the honest default, not a
+    /// stub someone forgot to fill in.
+    ///
+    /// The pull shape is the contract: the OS hands a drop over inside a drag loop
+    /// on the window's own thread, and the only thing allowed there is to note the
+    /// paths. What a dropped file MEANS - open it, refuse it, ask about unsaved
+    /// text - is decided above this crate, by whoever drains this.
+    ///
+    /// On Windows the buffer is filled by an `IDropTarget` registered with
+    /// `RegisterDragDrop`, so a call from a thread that neither owns the window nor
+    /// pumps its messages reads a buffer nothing can fill. See
+    /// `windows::file_drop::arm`.
+    fn take_dropped_paths(&mut self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
 }
 
 /// Machine facts that need no window handle. Same rule as [`WindowBackend`]:
@@ -318,6 +336,11 @@ mod tests {
     }
 
     impl WindowBackend for Mock {
+        fn take_dropped_paths(&mut self) -> Vec<std::path::PathBuf> {
+            self.calls.push("take dropped paths".to_string());
+            Vec::new()
+        }
+
         fn set_topmost(&mut self, handle: isize, on: bool) -> PinOutcome {
             self.calls.push(format!("topmost {handle:#x} {on}"));
             PinOutcome::Applied

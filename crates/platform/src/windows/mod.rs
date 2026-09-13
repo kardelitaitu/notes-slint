@@ -11,6 +11,7 @@
 
 #![allow(unsafe_code)]
 
+pub mod file_drop;
 pub mod monitors;
 pub mod paths;
 pub mod topmost;
@@ -53,6 +54,10 @@ impl WindowBackend for Backend {
 
     fn primary_work_area(&self) -> PlatformResult<FrameRect> {
         monitors::primary_work_area()
+    }
+
+    fn take_dropped_paths(&mut self) -> Vec<std::path::PathBuf> {
+        file_drop::take_buffered()
     }
 }
 

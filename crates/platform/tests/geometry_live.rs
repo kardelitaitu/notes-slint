@@ -35,11 +35,17 @@
 
 use std::sync::mpsc::{Sender, channel};
 
-// The package's dependency list is visible to this test target; naming it
-// here satisfies unused_crate_dependencies without using the error crate.
 use std::thread;
 use std::time::{Duration, Instant};
+// The package's dependency list is visible to this test target; naming it
+// here satisfies unused_crate_dependencies without using the error crate.
 use thiserror as _;
+
+// Every cfg(windows) dependency is visible to this crate root too, and
+// unused_crate_dependencies is a lint gate: windows-core is named only by the
+// #[implement] expansion inside the lib, so this root has to declare it used.
+#[cfg(windows)]
+use windows_core as _;
 
 use ::windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use ::windows::Win32::Graphics::Gdi::HBRUSH;

@@ -5035,6 +5035,7 @@ version = "0.0.1"
 dependencies = [
  "thiserror 2.0.20",
  "windows 0.61.3",
+ "windows-core 0.61.2",
 ]
 
 [[package]]

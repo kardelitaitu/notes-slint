@@ -388,3 +388,88 @@ saying why admitting a second toolkit changed the rule and what it did not chang
   combination that survives contact with a release.
 
 
+---
+
+## What the lane has actually produced (2026-09-13, S1-S4 + platform S1/S2)
+
+Appended as a record, not a rewrite: the five measurements above still stand and are
+still open. Everything below was built and measured this day; where a claim has no
+number behind it, it says so.
+
+### The spike, and the findings it cost
+Out-of-tree first (a standalone workspace at C:/dev/bridge-slint-spike), then reconciled
+in-tree as canonical. On slint 1.17.1: compat-1-2 must be enabled or the slint! macro
+refuses; the root unsafe_code = forbid cannot survive a member whose dependency expands
+ItemTreeVTable_static (E0453 x8), so that crate relaxes to deny locally; widgets are not
+builtins (TextEdit must come from std-widgets.slint); Rectangle.color is deprecated for
+background; a handler may not assign an in property, so anything the UI writes locally is
+in-out; export takes no trailing semicolon and relying on the implicit last-import
+re-export is deprecated; a property may not be named row (Rectangle already answers to
+it); and inside a changed handler the Window builtins need a receiver - close() is an
+unknown identifier, self.close() is the door.
+
+### C1 (one topmost writer) held under a live two-writer test
+Slint's own always-on-top property is never named in the markup, and the pin bit is
+rendered only from Event::Pinned. Measured on the real window: pinned: true
+WS_EX_TOPMOST=1 readback HELD across 1s, port silent on a repeat ask - reproduced every
+run. The HWND is genuinely not available before show() (appearing between t+61ms and
+t+270ms), and RegisterWindow DOES get an answer in-run: an earlier "no answer" finding
+was a poll artifact of the harness, not an engine fact, and the fix was to drain the
+event channel every tick (drains went 2 -> 1178).
+
+### The text loop, and what it proved about the port
+buffer -> Command::Flush on the bridge's own 750 ms quiet cadence, edit-to-flush
+measured at 750.99 ms; CRLF normalised on the way in only (mirroring
+bridge-gpui/src/editor.rs:2026), bytes kept as core's problem. Do-no-harm proven on a
+seeded CRLF file: 32 bytes in, hash-equal=1, flush-since-open=0. Slint does NOT
+normalise a lone CR - a 17-byte probe with one CRLF and one lone CR read back 17 bytes
+with CRs=2 LFs=1 - so normalise-on-entry is load-bearing for this toolkit too. The 1 MiB
+echo (set_buffer ~18 ms) is a property-in/out number, not paint latency, and is not
+quoted as typing latency.
+
+### Close and quit, which is where the data-loss path was
+on_close_requested declines the first request (KeepWindowShown, window verifiably still
+visible) and grants the second; on the granted close the bridge sends a final Flush if
+dirty, then Gateway::close(), and prints which arm of Exit came back - QueueClosed /
+Abandoned(Duration) / Panicked all matched, the first bridge in this repo to do so. The
+quit race was reproduced deliberately: a character appended on the same tick as the
+close cannot be saved by the debounce, and the bytes landed (exit: final flush sent
+(58 bytes rev=1 epoch=3) -> exit drain: 1 event(s) accounted for, the voice xtask smoke
+parses). Still NOT proven: an OS-initiated close (taskbar X / Alt+F4) on a no-frame
+window - self.close() reaches the same callback, but nothing here can press a real
+caption control.
+
+### Frame risk, and the reason it became an architecture rule
+With no-frame: true plus resize-border-width the restore rect did not ratchet across two
+cycles: the maximised overhang (-8,-8,3440x1392) never reached storage and every
+port-measured line stayed 800x600 at 120,90. What could NOT be read from a bridge is
+GetWindowPlacement.showCmd / WS_MAXIMIZEBOX - and that is the finding, not a detail:
+naming the OS in a bridge was convention, not instrument, until this day. check-arch now
+carries bridge-names-no-ffi, DirectOnly so a toolkit's own OS lineage below it stays
+legal (gpui's dialog through gpui-pre-windows, rfd through windows-sys), with
+raw-window-handle exempted because Command::RegisterWindow asks a bridge to hold exactly
+that type. While that rule was being written the first check-unsafe run printed
+files scanned: 0, unsafe: 0 on a tree holding 104 raw unsafe uses - a silent-green gate -
+because it read cargo metadata without --all-features/--filter-platform, so optional and
+target-gated deps resolved to nothing and every member was skipped as published. One
+flag; the fix is pinned by its own test.
+
+### What is NOT done
+- File drop exists only down-stack: WindowBackend::take_dropped_paths (default
+Vec::new()) plus platform's arm/disarm/take_buffered. No bridge consumes a drop yet and
+no real drag has ever been performed - the buffer tests pass with no window, no
+apartment and no mouse. arm/disarm are also unreachable from any legal caller today (a
+bridge may not import notes-platform), so S3 needs either a trait seam or a port
+command before this is more than machine-verified plumbing.
+- The title's APP_NAME is env(CARGO_PKG_NAME) on both sides, so Alt+Tab reads
+notes-bridge-gpui in one bridge and notes-bridge-slint in the other: same rule,
+different package name. Flagged as a product decision; nobody has prettified it.
+- The double-click-to-maximise emitter, recents polish, and dirty/save-failed/autosave
+fed from real port signals are queued (S4b). The chrome module is mounted; the strip is
+S2's, not a re-implementation.
+- Evidence: there is none to hand over. The requested
+C:/dev/bridge-slint-spike/cbm-evidence/ does not exist. Run logs were transient stderr
+files and the out-of-tree spike was declared redundant once the in-tree member became
+canonical, so nothing was archived. Every number above is reproducible-by-running, not
+an artifact.
+

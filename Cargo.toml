@@ -90,7 +90,10 @@ slint = {
         "raw-window-handle-06",
     ],
 }
-windows = { version = "0.61", features = ["Win32_Foundation","Win32_UI_WindowsAndMessaging","Win32_UI_Shell","Win32_Graphics_Gdi"] }
+windows = { version = "0.61", features = ["Win32_Foundation","Win32_UI_WindowsAndMessaging","Win32_UI_Shell","Win32_Graphics_Gdi","Win32_System_Ole","Win32_System_Com","Win32_System_SystemServices","Win32_System_DataExchange"] }
+# Paired to windows 0.61.3's own windows-core (lock-verified): the implement!
+# macro expands to ::windows_core:: paths, so platform must name the crate.
+windows-core = "0.61.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

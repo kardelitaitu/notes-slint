@@ -26,3 +26,6 @@ thiserror = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
+# implement! expands to ::windows_core:: paths; same version windows 0.61.3
+# already pulls (single copy in the lock), so no new lineage — just naming it.
+windows-core = { workspace = true }
