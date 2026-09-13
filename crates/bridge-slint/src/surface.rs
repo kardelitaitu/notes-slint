@@ -31,9 +31,10 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use notes_api::{Command, Event, Gateway};
+use slint::ComponentHandle;
 
 use crate::Spike;
 use crate::plumbing::{
@@ -198,21 +199,208 @@ pub(crate) fn next_generation(previous: i32) -> i32 {
     previous + 1
 }
 
-/// S10b: THE UNDO QUARANTINE, as a decision a test can hold. The capture handler in
-/// main.slint implements the same rule in markup (this file cannot call into it and markup
-/// cannot call into here, so the pair is held together by `the_quarantine_is_a_state_rule`,
-/// which greps every piece of the condition out of the mount).
-///
-/// Why a STATE rule and not two more table rows: SHORTCUTS is the legend of *commands*, each
-/// with a port Command behind it, and it is held at fourteen rows by tests that mirror
-/// menu.rs. Undo and redo are not commands - the port has no Command for them and never will -
-/// so rows for them would print them in a legend of commands and break the parity guard the
-/// table exists to keep. What is different here is that the rule is armed by generation, not
-/// by the key alone: the same keystroke is native undo on the first document and a swallowed
-/// hazard on the second, which is precisely the shape a table cannot express.
-/// Test-only on purpose, and dead-code-clean because of it: there is no Rust-side key path to
-/// call this from - the implementation is the markup branch, and this is the oracle the branch is
-/// grepped against. Wiring it into the binary would mean inventing a call site that lies.
+/// The bridge's declared autosave cadence, the same 750 ms `bridge-gpui` states
+/// (its main.rs:122) rather than reading core's - and the same rule with it: a
+/// Flush only goes out when the buffer actually changed.
+const AUTOSAVE_IDLE: Duration = Duration::from_millis(750);
+
+// S10b: THE UNDO QUARANTINE, as a decision a test can hold. The capture handler in
+// main.slint implements the same rule in markup (this file cannot call into it and markup
+// cannot call into here, so the pair is held together by `the_quarantine_is_a_state_rule`,
+// which greps every piece of the condition out of the mount).
+//
+// Why a STATE rule and not two more table rows: SHORTCUTS is the legend of *commands*, each
+// with a port Command behind it, and it is held at fourteen rows by tests that mirror
+// menu.rs. Undo and redo are not commands - the port has no Command for them and never will -
+// so rows for them would print them in a legend of commands and break the parity guard the
+// table exists to keep. What is different here is that the rule is armed by generation, not
+// by the key alone: the same keystroke is native undo on the first document and a swallowed
+// hazard on the second, which is precisely the shape a table cannot express.
+// Test-only on purpose, and dead-code-clean because of it: there is no Rust-side key path to
+// call this from - the implementation is the markup branch, and this is the oracle the branch is
+// grepped against. Wiring it into the binary would mean inventing a call site that lies.
+// (the fn this text describes is `undo_quarantined`, below, with its own copy of the summary)
+
+// STRIP-2b: the FLUSH DECISION moved here with the pump it reads. It is not instrumentation:
+// it is the rule for when the buffer's difference becomes a Command::Flush, the debounce
+// clock, and the locked refusal that sits ABOVE the dispatch. The probe's tick and the
+// product's tick call the same fn, which is what makes the refusal one rule instead of two.
+/// S10: the dirty-witness switch. True means TextEdit.edited is the authority and a tick costs
+/// one borrow; false means the pre-S10 full-buffer compare runs. Both paths compile and
+/// neither is dead code, deliberately.
+// MEASURED, not assumed: with this TRUE a live run printed ZERO flush lines. TextEdit.edited is
+// a USER-input signal, and this bridge writes the buffer programmatically (set_buffer) for its
+// keystroke acts - which is exactly what a person typing does not do - so the flag never set
+// and autosave quietly stopped. That answers item 3: the event is a fine ADDITION (it stamps
+// the debounce clock the moment a real key arrives, and the handler stays wired for that) and a
+// broken REPLACEMENT, because anything the bridge writes itself - a dialog-suggested body, a
+// future insert, a restore into the buffer - would never be saved. So the compare remains the
+// authority and the cost item 3 asked about is UNPAID: about 125 buffer reads a second, in
+// exchange for a witness that cannot lie about programmatic writes. The way to pay it later is
+// a flag the bridge sets wherever it writes the buffer itself, not one the widget withholds.
+pub(crate) const EDITED_IS_DIRTY_WITNESS: bool = false;
+
+/// THE TEXT LOOP. The buffer lives in the bridge and no keystroke crosses the port
+/// (architecture §5.5), so what crosses is one debounced Flush: only when the content
+/// actually differs from what was last sent, and only after AUTOSAVE_IDLE of quiet.
+/// The revision counts those observed changes; the epoch is echoed, never invented.
+/// S10, ITEM 3: the per-tick cost, fixed. Until now the pump read the WHOLE buffer out of the
+/// widget, re-allocated it through lf(), and compared it against last_sent - on every 8 ms
+/// tick, about 125 reads a second, including the ~99.9% where nothing had happened. TextEdit
+/// has been saying so all along: the edited callback fires on every keystroke, and main.slint
+/// now forwards it. So a keystroke sets one bool and stamps the debounce clock, and a tick that
+/// finds the flag clear does ONE borrow and returns. The string is read once, when a flush is
+/// due, and that read is where the comparison keeps the one job an event cannot do. Text
+/// edited and then edited back to identical must not produce a save, and only the bytes can
+/// say so.
+pub(crate) fn text_pump(ui: &Spike, gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>) {
+    // S8b: THE REFUSAL, deliberately ABOVE the witness dispatch so neither path can escape it.
+    // A locked document is one the port has already decided it will not save - the disk flag or
+    // D9's 8 MiB verdict - so sending is not merely useless: the log would print a flush for a
+    // save whose only possible answer is `SaveError::ReadOnly`, which is a record of an attempt
+    // the engine refuses to make. `last_sent` is kept IN SYNC and the edited witness and debounce
+    // clock cleared, so no phantom dirty survives the refusal; the buffer is remembered as what
+    // the pump WOULD have sent, and the dot is forced clean once, because LOCK beats DIRTY - a
+    // file that can never be saved has no unsaved state to advertise. Printed once per lock, not
+    // 125 times a second, because noise is how a finding stops being read. The honest cost: this
+    // branch reads the buffer every tick while locked, which is exactly the per-tick cost S10
+    // removed. Rare by definition, and it buys the no-phantom-dirty property the refusal needs;
+    // a locked document that later unlocks must not come back 300 edits behind.
+    let locked = {
+        let p = pump.borrow();
+        p.locked
+    };
+    if locked {
+        let first = {
+            let mut p = pump.borrow_mut();
+            let first = !p.lock_needled;
+            p.lock_needled = true;
+            p.last_sent = lf(&ui.get_buffer());
+            p.edited_flag = false;
+            p.pending_at = None;
+            first
+        };
+        if first {
+            note_dot(pump, &ui.as_weak(), false, "locked");
+            let word = pump.borrow().lock_word.clone();
+            report(&format!(
+                "flush[refused]: {word} - the port will not save this document; the buffer is tracked as sent, the dot is clean, and autosave never fires while it is locked"
+            ));
+        }
+        return;
+    }
+    if !EDITED_IS_DIRTY_WITNESS {
+        // The fallback is a const flip, not a redesign: the old path is still in this file,
+        // byte for byte, as text_pump_by_compare.
+        text_pump_by_compare(ui, gw, pump);
+        return;
+    }
+    let (flag, due) = {
+        let mut p = pump.borrow_mut();
+        p.invocations += 1;
+        if !p.edited_flag {
+            return;
+        }
+        let entered = *p.pending_at.get_or_insert_with(Instant::now);
+        (true, entered.elapsed() >= AUTOSAVE_IDLE)
+    };
+    // The dot and the flush guard are witnesses of one fact, so the event feeds both: the same
+    // single source of truth the comparison used to be, unchanged in kind.
+    note_dot(pump, &ui.as_weak(), flag, "buffer");
+    if !due {
+        return;
+    }
+    let text = lf(&ui.get_buffer());
+    let identical = {
+        let p = pump.borrow();
+        text == p.last_sent
+    };
+    if identical {
+        let mut p = pump.borrow_mut();
+        p.edited_flag = false;
+        p.pending_at = None;
+        drop(p);
+        note_dot(pump, &ui.as_weak(), false, "compare");
+        report("flush[skipped]: edited and edited back - the bytes are identical, nothing sent");
+        return;
+    }
+    let mut pump = pump.borrow_mut();
+    pump.edits += 1;
+    let (revision, epoch) = (pump.edits, pump.epoch);
+    pump.last_sent = text.clone();
+    let quiet = pump.pending_at.map_or_else(
+        || String::from("unknown"),
+        |at| format!("{:?}", at.elapsed()),
+    );
+    let cr = text.matches('\r').count();
+    pump.pending_at = None;
+    pump.edited_flag = false;
+    drop(pump);
+    report(&format!(
+        "flush: sent {} bytes rev={revision} epoch={epoch} edit-to-flush={quiet} CR-in-buffer={cr} (witness=edited)",
+        text.len()
+    ));
+    send(
+        gw,
+        Command::Flush {
+            text,
+            revision,
+            epoch,
+        },
+    );
+}
+
+/// The pre-S10 path, kept whole and reachable: if the edited event ever proves unreliable (a
+/// keystroke that does not fire it, or a programmatic set that does), flipping
+/// EDITED_IS_DIRTY_WITNESS back to false restores the old behaviour with no other edit. The
+/// brief asked for the comparison to survive only as a fallback, and a fallback you have to
+/// re-write from memory is not a fallback.
+pub(crate) fn text_pump_by_compare(
+    ui: &Spike,
+    gw: &Rc<RefCell<Option<Gateway>>>,
+    pump: &RefCell<Pump>,
+) {
+    let text = lf(&ui.get_buffer());
+    // The dot's dirty input, by the same comparison the guard below makes - one source
+    // of truth for "unsaved", so the dot and the Flush can never disagree.
+    // A let, not an inline call: the temporary borrow would still be alive inside
+    // note_dot's own borrow_mut and the RefCell would panic (measured on a live run).
+    let dirty_now = {
+        let p = pump.borrow();
+        text != p.last_sent
+    };
+    note_dot(pump, &ui.as_weak(), dirty_now, "buffer");
+    pump.borrow_mut().invocations += 1;
+    let mut pump = pump.borrow_mut();
+    if text == pump.last_sent {
+        pump.pending_at = None;
+        return;
+    }
+    let entered = *pump.pending_at.get_or_insert_with(Instant::now);
+    if entered.elapsed() < AUTOSAVE_IDLE {
+        return;
+    }
+    pump.edits += 1;
+    let (revision, epoch) = (pump.edits, pump.epoch);
+    pump.last_sent = text.clone();
+    pump.pending_at = None;
+    let quiet = entered.elapsed();
+    let cr = text.matches('\r').count();
+    drop(pump);
+    report(&format!(
+        "flush: sent {} bytes rev={revision} epoch={epoch} edit-to-flush={quiet:?} CR-in-buffer={cr}",
+        text.len()
+    ));
+    send(
+        gw,
+        Command::Flush {
+            text,
+            revision,
+            epoch,
+        },
+    );
+}
+
 #[cfg(test)]
 pub(crate) fn undo_quarantined(
     generation: i32,
@@ -943,14 +1131,11 @@ mod tests {
         // exclude.
         let whole = include_str!("../src/surface.rs");
         let src = &whole[..whole.find("mod tests").expect("the tests module")];
-        // The refusal half of the same invariant lives in the OTHER file, because this move took the
-        // adoptions and left text_pump with the acts it is called from. A guard that spans the
-        // boundary has to read across it - and each slice cuts at its own file's test module,
-        // `mod tests` here and `mod chords` in the probe.
-        let whole_probe = include_str!("../src/probe.rs");
-        let probe = &whole_probe[..whole_probe
-            .find("mod chords")
-            .expect("the probe's test module")];
+        // STRIP-2b: the refusal half used to live in probe.rs, which is why this guard read TWO
+        // files and cut each at its own test module. The flush machinery has since moved in here,
+        // so both halves of the invariant are audited in one file, at one anchor. If they ever
+        // part again, the two-file read has to come back: a single-file slice that quietly stops
+        // covering one half is the failure mode this crate's guard law names.
         assert_eq!(
             src.matches("lock_verdict(meta.read_only, meta.oversize)")
                 .count(),
@@ -967,7 +1152,7 @@ mod tests {
             2,
             "armed is printed at both sites: dropping the field is the bug, even unread"
         );
-        let guard = &probe[probe.find("S8b: THE REFUSAL").expect("the guard")..];
+        let guard = &src[src.find("S8b: THE REFUSAL").expect("the guard")..];
         let guard = &guard[..guard
             .find("if !EDITED_IS_DIRTY_WITNESS")
             .expect("the dispatch")];

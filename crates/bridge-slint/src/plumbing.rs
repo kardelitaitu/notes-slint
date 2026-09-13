@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-use notes_api::{Command, Event, Gateway, Rect};
+use notes_api::{Command, DropGuard, Event, Gateway, Rect, WindowHandle, arm_file_drop};
 
 use crate::Spike;
 use crate::surface::Pump;
@@ -189,4 +189,73 @@ pub(crate) struct Fingerprint {
     /// api.rs:608 is_minimized, :613 set_minimized): no winit workaround, no window-handle FFI,
     /// one call each way.
     pub(crate) minimized: bool,
+}
+
+/// S6b: THE DROP TARGET, armed the only way the port allows it to be armed.
+///
+/// WHY HERE AND NOT IN THE ENGINE. `arm_file_drop` executes on the calling thread, and the
+/// contract that comes back with it is blunt: the caller must be the thread that pumps the
+/// window, because `OleInitialize` builds the COM apartment of whoever calls it and
+/// `RegisterDragDrop` binds the target to the window's owner. The engine looks like its natural
+/// home - `Command::RegisterWindow` already receives this exact handle - and arming there would
+/// register from a thread that pumps nothing. The callbacks would then wait for a pump inside the
+/// drag loop Windows drives for the SENDER: somebody else's Explorer frozen mid-drag, with no
+/// error returned anywhere in this process. A wrong thread here is not a degraded window, so the
+/// bridge arms it, on the thread that owns the window, at the moment it already holds the handle.
+///
+/// WHAT A DROP WILL MEAN, the semantics this call buys. The engine turns a dropped path into
+/// `Command::Open`, so a drop is BIT-IDENTICAL to every other way this app opens a file: the same
+/// unsaved-buffer policy, the same autosave arming rules (ADR-0001 - a drop does not arm
+/// autosave on a foreign file any more than Ctrl+O does), the same recents, the same epoch and
+/// generation bookkeeping, the same undo quarantine. That is consistency, not an oversight:
+/// §4.4 promised a drop opens a note, and an open that behaved differently depending on which
+/// door it came in through is the bug a user would call us for. Nothing in this file decides what
+/// a path means - the port deliberately has no Event and no PathBuf in this signature, so it
+/// could not decide even by accident.
+///
+/// NO ENV GATE, unlike the dialog: an `IDropTarget` nobody drags onto costs one registration and
+/// says nothing, so arming is harmless headless - and gating it would mean the code path that
+/// matters in production is not the code path any run ever exercises.
+pub(crate) fn arm_drop_target(hwnd: i64, holder: &Rc<RefCell<Option<DropGuard>>>) {
+    if holder.borrow().is_some() {
+        // Both registration sites can fire in one run (first-visible, then appeared-in-the-loop).
+        // A second arm would install a new guard while the old one is still held, and the old
+        // guard's drop calls the platform's disarm on the SAME hwnd - revoking the target the
+        // second arm had just registered. So the second site reports instead of unwinding.
+        report(&format!(
+            "drop: already armed (hwnd {hwnd:#x} was named twice; a second arm would have disarmed the first)"
+        ));
+        return;
+    }
+    match arm_file_drop(WindowHandle(hwnd)) {
+        Ok(guard) => {
+            // S4 (bridge side): WHOSE TARGET IT TOOK, read off the live guard before it moves
+            // into the holder. The bool is the platform's answer, and the bridge does not
+            // interpret it: `false` covers two different worlds - nothing was registered at all,
+            // and we displaced our own target on a re-arm (file_drop.rs:321 says so, and calls
+            // that stealing rather than taking over) - so the word below is the port's wording,
+            // chosen to stay true under either reading rather than to claim a cause we cannot
+            // see. `true` is the interesting case for THIS bridge: winit registers its own
+            // OLE target first, so taking it over means our copy of the cursor rules from here
+            // on, and a drag that once did nothing now arrives as Command::Open.
+            let took_over = guard.took_over();
+            *holder.borrow_mut() = Some(guard);
+            let whose = if took_over {
+                "took the toolkit drop target; our copy cursor is the law now"
+            } else {
+                "quiet - nothing was registered"
+            };
+            report(&format!(
+                "drop: armed hwnd={hwnd:#x} ({whose}) - a file dragged onto this window now arrives as Command::Open, exactly like a menu Open"
+            ));
+        }
+        Err(e) => {
+            // Rendered honestly, never silence. A window that cannot receive drops is one missing
+            // convenience, not a broken app, so the answer is a line the reader can act on - and
+            // the guard stays None, which is what makes the exit needle say so too.
+            report(&format!(
+                "drop: ARM FAILED - {e}, dragging files onto the window will do nothing"
+            ));
+        }
+    }
 }

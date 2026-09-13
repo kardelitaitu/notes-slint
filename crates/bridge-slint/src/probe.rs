@@ -30,14 +30,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use notes_api::{
-    Command, DropGuard, Exit, Gateway, Rect, Settings, StateDir, WindowHandle, arm_file_drop,
-    resolve_state_dir,
+    Command, DropGuard, Exit, Gateway, Rect, Settings, StateDir, WindowHandle, resolve_state_dir,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, LogicalPosition, LogicalSize, Timer, TimerMode};
 mod plumbing;
 pub(crate) use plumbing::{
-    Fingerprint, do_no_harm, fnv1a, lf, note_dot, publish_title, report, send,
+    Fingerprint, arm_drop_target, do_no_harm, fnv1a, lf, note_dot, publish_title, report, send,
 };
 mod surface;
 mod title_contract;
@@ -49,9 +48,9 @@ use surface::undo_quarantined;
 // them rather than becoming a permanent fixture.
 #[allow(unused_imports)]
 pub(crate) use surface::{
-    DialogKind, DialogReply, Pump, Route, SHORTCUTS, answer_dialog, ask_dialog, caption_glyph,
-    dialog_starting_dir, dialog_words, drain, legend, lock_verdict, next_generation, note_adoption,
-    route_of, suggested_name,
+    DialogKind, DialogReply, EDITED_IS_DIRTY_WITNESS, Pump, Route, SHORTCUTS, answer_dialog,
+    ask_dialog, caption_glyph, dialog_starting_dir, dialog_words, drain, legend, lock_verdict,
+    next_generation, note_adoption, route_of, suggested_name, text_pump, text_pump_by_compare,
 };
 
 mod ui_gen;
@@ -183,75 +182,6 @@ fn hwnd_of(window: &slint::Window) -> Option<i64> {
     }
 }
 
-/// S6b: THE DROP TARGET, armed the only way the port allows it to be armed.
-///
-/// WHY HERE AND NOT IN THE ENGINE. `arm_file_drop` executes on the calling thread, and the
-/// contract that comes back with it is blunt: the caller must be the thread that pumps the
-/// window, because `OleInitialize` builds the COM apartment of whoever calls it and
-/// `RegisterDragDrop` binds the target to the window's owner. The engine looks like its natural
-/// home - `Command::RegisterWindow` already receives this exact handle - and arming there would
-/// register from a thread that pumps nothing. The callbacks would then wait for a pump inside the
-/// drag loop Windows drives for the SENDER: somebody else's Explorer frozen mid-drag, with no
-/// error returned anywhere in this process. A wrong thread here is not a degraded window, so the
-/// bridge arms it, on the thread that owns the window, at the moment it already holds the handle.
-///
-/// WHAT A DROP WILL MEAN, the semantics this call buys. The engine turns a dropped path into
-/// `Command::Open`, so a drop is BIT-IDENTICAL to every other way this app opens a file: the same
-/// unsaved-buffer policy, the same autosave arming rules (ADR-0001 - a drop does not arm
-/// autosave on a foreign file any more than Ctrl+O does), the same recents, the same epoch and
-/// generation bookkeeping, the same undo quarantine. That is consistency, not an oversight:
-/// §4.4 promised a drop opens a note, and an open that behaved differently depending on which
-/// door it came in through is the bug a user would call us for. Nothing in this file decides what
-/// a path means - the port deliberately has no Event and no PathBuf in this signature, so it
-/// could not decide even by accident.
-///
-/// NO ENV GATE, unlike the dialog: an `IDropTarget` nobody drags onto costs one registration and
-/// says nothing, so arming is harmless headless - and gating it would mean the code path that
-/// matters in production is not the code path any run ever exercises.
-fn arm_drop_target(hwnd: i64, holder: &Rc<RefCell<Option<DropGuard>>>) {
-    if holder.borrow().is_some() {
-        // Both registration sites can fire in one run (first-visible, then appeared-in-the-loop).
-        // A second arm would install a new guard while the old one is still held, and the old
-        // guard's drop calls the platform's disarm on the SAME hwnd - revoking the target the
-        // second arm had just registered. So the second site reports instead of unwinding.
-        report(&format!(
-            "drop: already armed (hwnd {hwnd:#x} was named twice; a second arm would have disarmed the first)"
-        ));
-        return;
-    }
-    match arm_file_drop(WindowHandle(hwnd)) {
-        Ok(guard) => {
-            // S4 (bridge side): WHOSE TARGET IT TOOK, read off the live guard before it moves
-            // into the holder. The bool is the platform's answer, and the bridge does not
-            // interpret it: `false` covers two different worlds - nothing was registered at all,
-            // and we displaced our own target on a re-arm (file_drop.rs:321 says so, and calls
-            // that stealing rather than taking over) - so the word below is the port's wording,
-            // chosen to stay true under either reading rather than to claim a cause we cannot
-            // see. `true` is the interesting case for THIS bridge: winit registers its own
-            // OLE target first, so taking it over means our copy of the cursor rules from here
-            // on, and a drag that once did nothing now arrives as Command::Open.
-            let took_over = guard.took_over();
-            *holder.borrow_mut() = Some(guard);
-            let whose = if took_over {
-                "took the toolkit drop target; our copy cursor is the law now"
-            } else {
-                "quiet - nothing was registered"
-            };
-            report(&format!(
-                "drop: armed hwnd={hwnd:#x} ({whose}) - a file dragged onto this window now arrives as Command::Open, exactly like a menu Open"
-            ));
-        }
-        Err(e) => {
-            // Rendered honestly, never silence. A window that cannot receive drops is one missing
-            // convenience, not a broken app, so the answer is a line the reader can act on - and
-            // the guard stays None, which is what makes the exit needle say so too.
-            report(&format!(
-                "drop: ARM FAILED - {e}, dragging files onto the window will do nothing"
-            ));
-        }
-    }
-}
-
 /// S4d: the LOCKED fixture - small, and read-only on disk - and the story of why the lever
 /// changed twice. The 9 MiB version this replaces could never have worked: D9 is a REFUSAL, not a
 /// verdict attached to a load. `Engine::open` stats the bytes and answers
@@ -316,21 +246,6 @@ fn fingerprint_of(window: &slint::Window) -> Fingerprint {
         minimized: window.is_minimized(),
     }
 }
-
-/// S10: the dirty-witness switch. True means TextEdit.edited is the authority and a tick costs
-/// one borrow; false means the pre-S10 full-buffer compare runs. Both paths compile and
-/// neither is dead code, deliberately.
-// MEASURED, not assumed: with this TRUE a live run printed ZERO flush lines. TextEdit.edited is
-// a USER-input signal, and this bridge writes the buffer programmatically (set_buffer) for its
-// keystroke acts - which is exactly what a person typing does not do - so the flag never set
-// and autosave quietly stopped. That answers item 3: the event is a fine ADDITION (it stamps
-// the debounce clock the moment a real key arrives, and the handler stays wired for that) and a
-// broken REPLACEMENT, because anything the bridge writes itself - a dialog-suggested body, a
-// future insert, a restore into the buffer - would never be saved. So the compare remains the
-// authority and the cost item 3 asked about is UNPAID: about 125 buffer reads a second, in
-// exchange for a witness that cannot lie about programmatic writes. The way to pay it later is
-// a flag the bridge sets wherever it writes the buffer itself, not one the widget withholds.
-const EDITED_IS_DIRTY_WITNESS: bool = false;
 
 /// The quiet window before a change is reported, in the spirit of the gpui bridge's
 /// debounce. Shortened so the probe fits inside its own lifetime.
@@ -445,11 +360,6 @@ const SEED_KEY_AT: Duration = Duration::from_millis(20200);
 const LATE_KEY: Duration = Duration::from_millis(9000);
 /// Print one tick needle per this-many milliseconds, from inside the Timer callback.
 const TICK_MS: u64 = 2000;
-
-/// The bridge's declared autosave cadence, the same 750 ms `bridge-gpui` states
-/// (its main.rs:122) rather than reading core's - and the same rule with it: a
-/// Flush only goes out when the buffer actually changed.
-const AUTOSAVE_IDLE: Duration = Duration::from_millis(750);
 
 /// When the probe drives a recent row by itself: after the seed's open, so the list
 /// holds more than one file and the click has something to aim at.
@@ -1772,163 +1682,6 @@ fn text_probe(ui: &Spike) {
             .into(),
     );
     report("keystroke: buffer written by the probe at t=0, waiting on the debounce");
-}
-
-/// THE TEXT LOOP. The buffer lives in the bridge and no keystroke crosses the port
-/// (architecture §5.5), so what crosses is one debounced Flush: only when the content
-/// actually differs from what was last sent, and only after AUTOSAVE_IDLE of quiet.
-/// The revision counts those observed changes; the epoch is echoed, never invented.
-/// S10, ITEM 3: the per-tick cost, fixed. Until now the pump read the WHOLE buffer out of the
-/// widget, re-allocated it through lf(), and compared it against last_sent - on every 8 ms
-/// tick, about 125 reads a second, including the ~99.9% where nothing had happened. TextEdit
-/// has been saying so all along: the edited callback fires on every keystroke, and main.slint
-/// now forwards it. So a keystroke sets one bool and stamps the debounce clock, and a tick that
-/// finds the flag clear does ONE borrow and returns. The string is read once, when a flush is
-/// due, and that read is where the comparison keeps the one job an event cannot do. Text
-/// edited and then edited back to identical must not produce a save, and only the bytes can
-/// say so.
-fn text_pump(ui: &Spike, gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>) {
-    // S8b: THE REFUSAL, deliberately ABOVE the witness dispatch so neither path can escape it.
-    // A locked document is one the port has already decided it will not save - the disk flag or
-    // D9's 8 MiB verdict - so sending is not merely useless: the log would print a flush for a
-    // save whose only possible answer is `SaveError::ReadOnly`, which is a record of an attempt
-    // the engine refuses to make. `last_sent` is kept IN SYNC and the edited witness and debounce
-    // clock cleared, so no phantom dirty survives the refusal; the buffer is remembered as what
-    // the pump WOULD have sent, and the dot is forced clean once, because LOCK beats DIRTY - a
-    // file that can never be saved has no unsaved state to advertise. Printed once per lock, not
-    // 125 times a second, because noise is how a finding stops being read. The honest cost: this
-    // branch reads the buffer every tick while locked, which is exactly the per-tick cost S10
-    // removed. Rare by definition, and it buys the no-phantom-dirty property the refusal needs;
-    // a locked document that later unlocks must not come back 300 edits behind.
-    let locked = {
-        let p = pump.borrow();
-        p.locked
-    };
-    if locked {
-        let first = {
-            let mut p = pump.borrow_mut();
-            let first = !p.lock_needled;
-            p.lock_needled = true;
-            p.last_sent = lf(&ui.get_buffer());
-            p.edited_flag = false;
-            p.pending_at = None;
-            first
-        };
-        if first {
-            note_dot(pump, &ui.as_weak(), false, "locked");
-            let word = pump.borrow().lock_word.clone();
-            report(&format!(
-                "flush[refused]: {word} - the port will not save this document; the buffer is tracked as sent, the dot is clean, and autosave never fires while it is locked"
-            ));
-        }
-        return;
-    }
-    if !EDITED_IS_DIRTY_WITNESS {
-        // The fallback is a const flip, not a redesign: the old path is still in this file,
-        // byte for byte, as text_pump_by_compare.
-        text_pump_by_compare(ui, gw, pump);
-        return;
-    }
-    let (flag, due) = {
-        let mut p = pump.borrow_mut();
-        p.invocations += 1;
-        if !p.edited_flag {
-            return;
-        }
-        let entered = *p.pending_at.get_or_insert_with(Instant::now);
-        (true, entered.elapsed() >= AUTOSAVE_IDLE)
-    };
-    // The dot and the flush guard are witnesses of one fact, so the event feeds both: the same
-    // single source of truth the comparison used to be, unchanged in kind.
-    note_dot(pump, &ui.as_weak(), flag, "buffer");
-    if !due {
-        return;
-    }
-    let text = lf(&ui.get_buffer());
-    let identical = {
-        let p = pump.borrow();
-        text == p.last_sent
-    };
-    if identical {
-        let mut p = pump.borrow_mut();
-        p.edited_flag = false;
-        p.pending_at = None;
-        drop(p);
-        note_dot(pump, &ui.as_weak(), false, "compare");
-        report("flush[skipped]: edited and edited back - the bytes are identical, nothing sent");
-        return;
-    }
-    let mut pump = pump.borrow_mut();
-    pump.edits += 1;
-    let (revision, epoch) = (pump.edits, pump.epoch);
-    pump.last_sent = text.clone();
-    let quiet = pump.pending_at.map_or_else(
-        || String::from("unknown"),
-        |at| format!("{:?}", at.elapsed()),
-    );
-    let cr = text.matches('\r').count();
-    pump.pending_at = None;
-    pump.edited_flag = false;
-    drop(pump);
-    report(&format!(
-        "flush: sent {} bytes rev={revision} epoch={epoch} edit-to-flush={quiet} CR-in-buffer={cr} (witness=edited)",
-        text.len()
-    ));
-    send(
-        gw,
-        Command::Flush {
-            text,
-            revision,
-            epoch,
-        },
-    );
-}
-
-/// The pre-S10 path, kept whole and reachable: if the edited event ever proves unreliable (a
-/// keystroke that does not fire it, or a programmatic set that does), flipping
-/// EDITED_IS_DIRTY_WITNESS back to false restores the old behaviour with no other edit. The
-/// brief asked for the comparison to survive only as a fallback, and a fallback you have to
-/// re-write from memory is not a fallback.
-fn text_pump_by_compare(ui: &Spike, gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>) {
-    let text = lf(&ui.get_buffer());
-    // The dot's dirty input, by the same comparison the guard below makes - one source
-    // of truth for "unsaved", so the dot and the Flush can never disagree.
-    // A let, not an inline call: the temporary borrow would still be alive inside
-    // note_dot's own borrow_mut and the RefCell would panic (measured on a live run).
-    let dirty_now = {
-        let p = pump.borrow();
-        text != p.last_sent
-    };
-    note_dot(pump, &ui.as_weak(), dirty_now, "buffer");
-    pump.borrow_mut().invocations += 1;
-    let mut pump = pump.borrow_mut();
-    if text == pump.last_sent {
-        pump.pending_at = None;
-        return;
-    }
-    let entered = *pump.pending_at.get_or_insert_with(Instant::now);
-    if entered.elapsed() < AUTOSAVE_IDLE {
-        return;
-    }
-    pump.edits += 1;
-    let (revision, epoch) = (pump.edits, pump.epoch);
-    pump.last_sent = text.clone();
-    pump.pending_at = None;
-    let quiet = entered.elapsed();
-    let cr = text.matches('\r').count();
-    drop(pump);
-    report(&format!(
-        "flush: sent {} bytes rev={revision} epoch={epoch} edit-to-flush={quiet:?} CR-in-buffer={cr}",
-        text.len()
-    ));
-    send(
-        gw,
-        Command::Flush {
-            text,
-            revision,
-            epoch,
-        },
-    );
 }
 
 /// R1: the double-click act, shared by the markup's `double-clicked` handler and by
