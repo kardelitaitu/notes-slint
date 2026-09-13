@@ -24,6 +24,16 @@ all. The bridge's two test binaries (`ime_seam.rs`, `paint_cost.rs`) are also
 windowless — the crate has no lib target, so they compile `editor.rs` by path and
 measure its logic with no window and no GPU. They run on any machine.
 
+The Slint bridge is **two bins over one package**, so `cargo test -p
+notes-bridge-slint` runs **two test roots** and prints two totals: the probe root
+(`src/probe.rs`) reported `34 passed`, and the product root (`src/product.rs`) reported
+`14 passed`. The arithmetic that matters: those are not 48 facts about the crate.
+`surface.rs` (4 tests) and `title_contract.rs` (8) are shared modules compiled into both
+bins, so 12 of the 34 run twice; the 22 `chords::*` guards exist only in the probe root,
+and only 2 (`the_drag…`, `the_panic_note…`) are the product's own. 34 + 14 executions =
+36 distinct tests. A green probe root therefore says nothing about the product root, and a
+contributor reading one number has read half the crate.
+
 CI wraps a bounded variant, the `cargo gate` alias:
 `cargo test --locked --workspace --exclude notes-bridge-gpui`, 15-minute timeout.
 `--locked` makes a stale `Cargo.lock` an error before compilation instead of a
@@ -67,6 +77,80 @@ hand-written `extern` block is invisible; the backstop for that is
 
 Checks the byte-exact round-trip fixture corpus against its sha256 manifest (exits 1
 on any difference; the generator comparison is always on).
+
+## The smoke harness: one flag, three artifacts
+
+Everything above is headless. `cargo xtask smoke` is the one end-to-end GUI check: it
+launches a real exe, waits for a real window, closes it with `WM_CLOSE` the way the
+title-bar X does, and proves the process exits by itself. It is **advisory** — a
+headless runner may have no desktop at all — so `cargo xtask check` reports its verdict
+and `--quick` skips it; it is never a blocking gate step.
+
+`--binary` names which artifact the harness resolves, builds, staleness-checks and, where
+a leg is wired, judges. Both shapes parse (`--binary=slint`, `--binary slint`); the
+default is `gpui`, which is what CI and `cargo xtask check` run (`crates/xtask/src/smoke.rs`,
+`BINARY_NAMES`). One package, two bins, two contracts: which is why the flag picks an
+**artifact**, not a package.
+
+| `--binary` | exe | what the harness does with it |
+|---|---|---|
+| `gpui` | `target\debug\notes-gpui.exe` | judged — the needle schedule (`Leg::GpuiSchedule`) |
+| `slint` | `target\debug\notes-slint.exe` | judged — the product contract (`Leg::Product`) |
+| `slint-probe` | `target\debug\notes-slint-probe.exe` | resolved, built, **not judged** (`Leg::NotWired`) |
+
+An unlisted value is refused, naming the legal list, before anything is built.
+
+### The Product leg, and what its green does not buy
+
+`--binary=slint` runs a **different contract**, not a shorter version of the gpui one. It
+reads the startup lines off the product's own piped stderr, asserts the window is still
+there at 45 s (nothing in the product self-hides, so "alive" is assertable rather than
+inferred), and sends a `WM_CLOSE` the app must answer by exiting 0 on its own. The pass
+line is the disclaimer, in the same breath:
+
+> `smoke:   what this proves: notes-slint said its startup lines, was still on screen at
+> 45s, took a WM_CLOSE, said the close and the joined shutdown, and left with 0 by
+> itself. What it does NOT prove: the rect, the pin, the recents trace, or the maximised
+> cycle - those are the needle schedule's claims, and this leg does not run it.`
+
+So a green `--binary=slint` is proof of **launch, presence and an honest shutdown** for the
+shipping exe — and it says so rather than leaving the reader to assume the M3/M4 promises
+came with it. The leg deliberately does not move the user's `session.json`, seed a recent,
+read a rect or poll a pin.
+
+### `slint-probe` declines, out loud
+
+The instrumented build is resolved and built but never judged, and the harness prints why
+instead of leaving a blank to be read as a pass. The reason lives in one function,
+`not_wired_reason`, and is printed verbatim:
+
+> `the only schedule this harness speaks is the gpui one, and pointing it at the
+> instrumented probe bytes is a port, not a flag: its needles are the same lines
+> the probe leg would have to re-decide, so that leg is its own slice of work`
+
+(The runs of spaces are the string's own — it is a continued literal, pasted as printed.)
+Alongside it the run prints `legs wired today: [gpui, slint]` and states that it launched
+nothing, so there is **no verdict about `slint-probe` in either direction**.
+
+### 2 is the harness; 3 is the machine
+
+Both of those exits stop short of a verdict, and the difference is what a reader acts on.
+
+* **2 — the harness could not run.** No PowerShell to post `WM_CLOSE`, no exe, the probe
+  script could not be written, freshness could not be read, the outer deadline fired, a bad
+  invocation of the flag — and the `slint-probe` decline above. The missing leg is this
+  repo's, not the desktop's; a box with a perfect window station answers the same 2. That is
+  exactly why an unwired leg is **not** a 3: 3 claims something about the machine that 2 is
+  not entitled to claim. Nothing was launched either way, so no verdict about the app exists.
+* **3 — this machine cannot host the run.** No interactive desktop, no window handle even
+  though the app kept running, or foreign state sitting on the session path. It is not the
+  app's fault and never becomes a red against it; `cargo xtask check` reports a 3 as
+  declined, never as passed.
+
+The full roster is 0, 1, 2, 3, 4, 5, 6, 7 and 9 — each run prints it as its first line,
+`smoke: contract 0 1 2 3 4 5 6 7 9`, built from the same `CONTRACT` table `check-ci`
+asserts `ci.yml` branches on. 4 (the target did not compile) and 5 (the exe is older than
+its sources) are the two that mean "nothing about the app was measured today".
 
 ## The six architecture invariants, as enforced checks
 
