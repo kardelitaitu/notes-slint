@@ -119,6 +119,27 @@ const OS_FFI: &[&str] = &[
     "web-sys",
 ];
 
+/// The same family, minus the ONE name a bridge must be able to name: the port's
+/// `Command::RegisterWindow` takes a window handle, and `raw-window-handle` is the
+/// portable type for it. It reaches no Win32 item - it is a struct with two enums -
+/// so exempting it costs nothing the invariant was there to prevent, while
+/// forbidding it would forbid the sanctioned way to satisfy the port. That first
+/// run of this rule said exactly that: two violations, both this name, on bridges
+/// that import no OS FFI at all.
+///
+/// Its absence from the platform-facing list is pinned by a test rather than left
+/// to reading; the two lists are otherwise identical, and a name added to OS_FFI
+/// and forgotten here would be an unpoliced hole in the bridges.
+const BRIDGE_OS_FFI: &[&str] = &[
+    "windows",
+    "windows-sys",
+    "windows-core",
+    "windows-targets",
+    "windows-implement",
+    "windows-interface",
+    "web-sys",
+];
+
 /// Is NAME part of the family rooted at any of ROOTS? True for the root itself,
 /// and for root-something or root_something. Deliberately NOT a substring test:
 /// notes-bridge-gpui contains gpui and must not match the gpui family, and a
@@ -274,6 +295,30 @@ pub const RULES: &[Rule] = &[
             allowed: &[NOTES_API],
             also: &[],
         },
+    },
+    // THE OS IS NOT A TOOLKIT, and until this row that was convention, not
+    // instrument. bridge-sees-only-api is structural - Forbidden::Members - and
+    // cargo metadata calls an external crate not-a-member, so a windows line in a
+    // bridge Cargo.toml passed the gate as neatly as it passed everything else.
+    //
+    // DIRECT-ONLY, mirroring the port's own DirectOnly OS-FFI row above, and that
+    // choice is the rule. The sanctioned toolkits each carry an OS lineage inside
+    // themselves: gpui's file dialog rides gpui-pre-windows own windows dep, and
+    // slint's rfd will ride windows-sys. The invariant is that the BRIDGE never
+    // reaches for the OS itself - not that no such crate exists below the toolkit.
+    // A transitive scope here would red the app for what its toolkit depends on,
+    // the same false-fail the bridge row already refuses for members.
+    Rule {
+        id: "bridge-names-no-ffi",
+        package: NOTES_BRIDGE,
+        scope: Scope::DirectOnly,
+        forbidden: Forbidden::Names(BRIDGE_OS_FFI),
+    },
+    Rule {
+        id: "bridge-names-no-ffi",
+        package: NOTES_BRIDGE_SLINT,
+        scope: Scope::DirectOnly,
+        forbidden: Forbidden::Names(BRIDGE_OS_FFI),
     },
     // The checker must not depend on what it checks: no member, and gpui
     // besides (gpui is not a workspace member, so it is named explicitly).
@@ -1059,7 +1104,14 @@ mod tests {
                 ),
                 ("notes-api", &["notes-core", "notes-platform", "gpui"]),
                 ("notes-platform", &["windows", "raw-window-handle"]),
-                ("notes-bridge-gpui", &["notes-api", "gpui", "notes-core"]),
+                (
+                    "notes-bridge-gpui",
+                    &["notes-api", "gpui", "notes-core", "windows"],
+                ),
+                // The last name is the NEW poison: a direct OS-FFI edge on a bridge,
+                // which the corridor rule cannot see (windows is not a member) and
+                // which must therefore arrive as exactly one finding under
+                // bridge-names-no-ffi, not as a second bridge-sees-only-api.
                 // Clean on purpose. The poison fixture is where a NEW row is proved NOT
                 // to misfire: with a second bridge under the same rule id, a row that
                 // flagged its sanctioned edges would add a ninth finding here and the
@@ -1103,6 +1155,7 @@ mod tests {
         assert_eq!(
             ids,
             [
+                "bridge-names-no-ffi",
                 "bridge-sees-only-api",
                 "checker-is-independent",
                 "core-is-pure",
@@ -1119,13 +1172,15 @@ mod tests {
         );
         assert_eq!(
             violations.len(),
-            8,
-            "one finding per poison, the reach-around it enables, and the second lineage: {violations:?}"
+            9,
+            "one finding per poison, the reach-around it enables, the second lineage, and \
+             the direct OS-FFI edge: {violations:?}"
         );
         let direct = violations.iter().filter(|v| v.via == Via::Direct).count();
         assert_eq!(
-            direct, 6,
-            "core-no-os is poisoned transitively, the lineage finding is direct: {violations:?}"
+            direct, 7,
+            "core-no-os is poisoned transitively; the lineage finding and the bridge \
+             OS-FFI edge are direct: {violations:?}"
         );
     }
 
@@ -1224,6 +1279,71 @@ mod tests {
         assert_eq!(violations[0].via, Via::Direct);
     }
 
+    /// The two OS-FFI lists, kept honest: the bridge view is the platform view minus
+    /// exactly one name. A fifth family member added to OS_FFI and forgotten here
+    /// would be a hole in the bridges that nothing else would notice, and a name
+    /// dropped from OS_FFI altogether is the platforms problem, not this rows.
+    #[test]
+    fn the_bridge_exemption_is_one_name_and_not_a_mood() {
+        for name in BRIDGE_OS_FFI {
+            assert!(
+                OS_FFI.contains(name),
+                "{name} is forbidden to bridges but is not even in the OS family"
+            );
+        }
+        let exempt: Vec<&&str> = OS_FFI
+            .iter()
+            .filter(|n| !BRIDGE_OS_FFI.contains(n))
+            .collect();
+        assert_eq!(
+            exempt,
+            vec![&"raw-window-handle"],
+            "the only OS-FFI name a bridge may name is the handle the port asks for"
+        );
+    }
+
+    /// THE POSITIVE HALF of bridge-names-no-ffi, and the whole reason its scope is
+    /// DirectOnly. A bridge may name a file-dialog toolkit whose own payload contains
+    /// the OS - gpui's dialog does that today through gpui-pre-windows, and rfd will
+    /// do it through windows-sys. Same graph, same table: the only thing that changes
+    /// is WHICH SIDE of the toolkit boundary the windows edge sits on. Both halves in
+    /// one test on purpose - a row that only ever fires is as useless as one that
+    /// never fires.
+    #[test]
+    fn a_bridges_dialog_toolkit_os_lineage_stays_legal_while_a_direct_name_does_not() {
+        let mut g = clean_graph();
+        // `direct`, not `normal_build`: the DirectOnly scope reads the
+        // package's own edge map, which is the point of the row.
+        g.direct
+            .get_mut("notes-bridge-slint")
+            .expect("fixture has the slint bridge")
+            .insert("rfd".to_string());
+        g.closure
+            .entry("notes-bridge-slint".to_string())
+            .or_default()
+            .extend(
+                ["rfd", "windows-sys", "windows"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+            );
+        let below = evaluate(&g);
+        assert!(
+            below.is_empty(),
+            "rfd carrying windows underneath: {below:?}"
+        );
+
+        let mut bad = clean_graph();
+        bad.direct
+            .get_mut("notes-bridge-slint")
+            .expect("fixture has the slint bridge")
+            .insert("windows".to_string());
+        let v = evaluate(&bad);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].rule, "bridge-names-no-ffi");
+        assert_eq!(v[0].via, Via::Direct);
+    }
+
     #[test]
     fn transitive_poisoning_is_caught_and_not_duplicated() {
         let g = graph(
@@ -1261,8 +1381,11 @@ mod tests {
     /// would leave this green while the new crate sat outside the gate entirely: every
     /// other rule is either about the first four members or keyed on a name this crate
     /// does not have, so nothing else in the file would notice. `checked_packages()` is
-    /// derived from RULES, so the only way to move the count is to add or remove a row -
-    /// which is the property this assertion exists to keep.
+    /// derived from RULES, so a SIXTH member nobody added a row for is what this catches.
+    /// Note what it does NOT count: ROWS. bridge-names-no-ffi added two rows for two
+    /// packages already in the table and this number did not move - correct for a
+    /// per-package tally, and the reason the row itself is asserted where it lives
+    /// instead of being trusted to this figure.
     #[test]
     fn rule_table_covers_six_packages() {
         assert_eq!(checked_packages().len(), 6);
@@ -1279,8 +1402,9 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["bridge-sees-only-api"],
-            "the slint bridge is policed by the bridge invariant, under the same id"
+            vec!["bridge-sees-only-api", "bridge-names-no-ffi"],
+            "both bridges carry the same two invariants: no reach-around to a member, and no
+             direct name for the OS"
         );
         let gpui_row = RULES
             .iter()
@@ -1452,7 +1576,11 @@ mod tests {
         // in particular the structural member rules stay quiet: api's only
         // member deps are notes-core (allowed) and bridge's is notes-api.
         let violations = evaluate(&g);
-        assert_eq!(violations.len(), 2, "{violations:?}");
+        // THREE, and the third is the new row doing its job on a PARSED
+        // cargo-metadata shape rather than a hand-built graph: this fixture's bridge
+        // carries a direct windows-sys edge - the line that used to be convention and
+        // is now instrument.
+        assert_eq!(violations.len(), 3, "{violations:?}");
         assert_eq!(violations[0].rule, "core-is-pure");
         assert_eq!(violations[0].via, Via::Transitive);
         assert_eq!(violations[1].rule, "port-is-ui-agnostic");
