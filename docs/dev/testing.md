@@ -149,10 +149,12 @@ Both of those exits stop short of a verdict, and the difference is what a reader
   app's fault and never becomes a red against it; `cargo xtask check` reports a 3 as
   declined, never as passed.
 
-The full roster is 0, 1, 2, 3, 4, 5, 6, 7 and 9 — each run prints it as its first line,
+The verdict roster is 0, 1, 2, 3, 4, 5, 6, 7 and 9 — each run prints it as its first line,
 `smoke: contract 0 1 2 3 4 5 6 7 9`, built from the same `CONTRACT` table `check-ci`
 asserts `ci.yml` branches on. 4 (the target did not compile) and 5 (the exe is older than
-its sources) are the two that mean "nothing about the app was measured today".
+its sources) are the two that mean "nothing about the app was measured today". One code is
+deliberately **not** in that table: 8, the foreign-win32-manifest verdict, which exists only
+behind the opt-in `--require-ours` and stays a WARN line without the flag.
 
 ## The six architecture invariants, as enforced checks
 
