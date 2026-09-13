@@ -545,10 +545,10 @@ impl Engine {
                 self.window = Some(handle);
                 if first {
                     // F3's rule, applied to the show streak: a streak was a
-                    // measurement of THAT window. A recreate settles all over again -
-                    // which is exactly the transient the 1.92 s repro was - so the
-                    // count starts from nothing, not from whatever the window that
-                    // died was answering.
+                    // measurement of THAT window, so on a recreate it starts from
+                    // nothing rather than carrying over whatever the window that
+                    // died was answering. A new window is where a first sample is
+                    // least trustworthy, whatever it turns out to answer.
                     self.show_streak = None;
                 }
                 // MAJOR 4: the shutdown drain re-runs this arm for any
@@ -1265,8 +1265,9 @@ impl Engine {
     const MIN_VISIBLE: u32 = 32;
 
     /// How many CONSECUTIVE answering measures a CHANGE to `session.maximized`
-    /// must be seen by before it is applied. Two - because one is exactly what
-    /// the 1.92 s repro was; see [`Engine::note_show_sample`].
+    /// must be seen by before it is applied. Two, because one sample is the only
+    /// evidence a wrong answer needs today; see [`Engine::note_show_sample`] for
+    /// what that defends and for what it pointedly does NOT claim.
     const SHOW_CONFIRMATIONS: u32 = 2;
 
     /// Places the window and applies the pin, through the host seams (D46, D48).
@@ -1617,33 +1618,48 @@ impl Engine {
                     // MEASUREMENT, not a decision - and, like the rect's, ONE
                     // SAMPLE OF IT IS A MEASUREMENT IN PROGRESS:
                     //
-                    // THE 1.92 s REPRO, WHICH THIS IS THE FIX FOR. A window that
-                    // had NEVER been maximised reported showCmd == 3 (Maximized)
-                    // on exactly one measure: the real HWND appeared +94 ms after
-                    // launch, the first measure the MAJOR-5 guard allows is two
-                    // idle periods later (t~1.59 s), and the port persisted
-                    // `maximized: true` at t~1.92 s while the rect
-                    // (800x600@120,90) never moved. Every answer after the
-                    // transient was Unknown - which this code reads as "leave the
-                    // bit alone", so the stale true SURVIVED - and because the
-                    // show half of that write was never COMPLETE the pending bit
-                    // stayed armed and re-persisted the lie for the life of the
-                    // process. A never-maximised app came back maximised from a
-                    // state no user ever chose, and no lane asserted otherwise.
+                    // WHY TWO SAMPLES - AND WHAT IS NOT THE REASON. Nothing has
+                    // ever OBSERVED this go wrong, and the story that motivated
+                    // it is VOID: the "1.92 s maximized: true on a never-maximised
+                    // window" was a probe artifact. RC2 read the file and it never
+                    // said true; the slint spike's 40-byte needle parsed
+                    // `pinned: true` as `maximized: true`. Neither this write site,
+                    // nor the MAJOR-5 guard, nor the Unknown branch below was ever
+                    // exercised by that repro, and showCmd == 3 has been measured
+                    // NEVER in the plain orderings and NEVER on the live slint
+                    // hwnd - so NO CLAIM is made here, or may be read into this
+                    // code, about Windows or any bridge ever having produced a
+                    // transient maximised sample.
                     //
-                    // So a CHANGE now gets the discipline the rect has always
-                    // had: [`Engine::note_show_sample`] applies it only after
+                    // What the latch defends is a property of the seam rather than
+                    // an incident: GetWindowPlacement answers what the window says
+                    // at the instant it is asked, and that one answer is the ONLY
+                    // input this field has ever had on its way to disk. Any single
+                    // wrong answer - a settle, a minimise, an un-maximise in
+                    // flight, a toolkit mid-recreate - would persist a state no
+                    // user chose, and nothing downstream could contradict it,
+                    // because the next launch reads `maximized` and places the
+                    // window from it. Two consecutive agreeing samples is the
+                    // cheapest rule that makes a wrong answer have to repeat
+                    // itself before it is believed. The evidence for THAT is the
+                    // headless red-proof
+                    // `a_single_transient_maximised_sample_never_persists_the_bit`,
+                    // and it is MOCK-PROVEN on purpose: the fake answers Maximized
+                    // once and Unknown afterwards, and pre-latch the file said
+                    // true. That is a claim about what the port does with one
+                    // sample - the whole claim - and not about Windows.
+                    //
+                    // So a CHANGE gets the discipline the rect has always had:
+                    // [`Engine::note_show_sample`] applies it only after
                     // [`Engine::SHOW_CONFIRMATIONS`] consecutive answering
-                    // samples, SYMMETRIC for true AND false (one transient
-                    // Normal on a genuinely maximised window loses the state the
-                    // user left, which is the same bug pointed the other way),
-                    // and the terminal flush keeps single-sample authority for
-                    // the reason [`Engine::final_flush`] already gives for
-                    // lifting the move-in-flight guard. Unknown is not a No and
-                    // not a Yes either: it is the absence of a sample, so it
-                    // neither confirms a change nor breaks a streak mid-measure.
-                    // The repro is pinned headless by
-                    // `a_single_transient_maximised_sample_never_persists_the_bit`.
+                    // samples, SYMMETRIC for true AND false (one transient Normal
+                    // would otherwise cost a maximised window the state its user
+                    // left: the same exposure pointed the other way), and the
+                    // terminal flush keeps single-sample authority for the reason
+                    // [`Engine::final_flush`] already gives for lifting the
+                    // move-in-flight guard. Unknown is not a No and not a Yes
+                    // either: it is the absence of a sample, so it neither
+                    // confirms a change nor breaks a streak mid-measure.
                     match placement.show {
                         ShowState::Maximized => {
                             show_settled = self.note_show_sample(true, terminal);
@@ -1708,13 +1724,14 @@ impl Engine {
     ///   (Without this, a healthy maximised launch would re-arm the write
     ///   forever on a bit that already says what the window says.)
     /// * A sample that CONTRADICTS it proposes a change, and a change is applied
-    ///   only on the SHOW_CONFIRMATIONS-th consecutive agreeing sample. One
-    ///   transient reading - the settling window of the 1.92 s repro, which
-    ///   persisted `maximized: true` from a single Maximized measure while its
-    ///   rect never moved, and kept it because every later answer was Unknown
-    ///   and the incomplete write stayed armed - therefore never reaches the
-    ///   file at all. Symmetric: a single transient Normal does not clear a
-    ///   maximised window's bit either.
+    ///   only on the SHOW_CONFIRMATIONS-th consecutive agreeing sample, so a
+    ///   single reading never reaches the file at all - proven headlessly, by a
+    ///   MOCK answering Maximized once and Unknown afterwards (pre-latch the file
+    ///   said `maximized: true`). No OS or bridge has ever been observed giving
+    ///   that single wrong answer: see the write site in [`Engine::measure_rect`]
+    ///   for why the latch is still worth having, and for the void "1.92 s
+    ///   repro" that must not be quoted as evidence. Symmetric: a single
+    ///   transient Normal does not clear a maximised window's bit either.
     /// * Unknown never reaches this function. It is the absence of a sample, so
     ///   it neither confirms a change nor breaks the streak: a window minimised
     ///   on one tick is the same window on the next, and resetting the count
