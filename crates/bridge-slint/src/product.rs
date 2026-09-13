@@ -645,4 +645,48 @@ mod tests {
             (Duration::from_millis(250), Duration::from_millis(1000))
         );
     }
+
+    #[test]
+    fn the_register_latch_closes_on_success_and_on_the_second_same_refusal() {
+        // P1b fix 1's latch, pure: a success ends it on the first wake; the SAME handle refused
+        // twice ends it too (the storm was one refusal retried ~125 times a second); a NEW handle
+        // is a different window and owes its own budget, so the give-up line can fire once only.
+        let armed = register_says(Register::default(), 0x10, true);
+        assert!(armed.done && armed.tries == 1, "a success is not retried");
+        let first = register_says(Register::default(), 0x20, false);
+        assert!(
+            !first.done,
+            "one refusal is the late-HWND race, so one retry is owed"
+        );
+        let second = register_says(first, 0x20, false);
+        assert!(
+            second.done && second.tries == 2,
+            "the same refusal twice closes the latch"
+        );
+        let fresh = register_says(second, 0x30, false);
+        assert!(
+            !fresh.done && fresh.tries == 1,
+            "a new handle is a new window, not a repeat"
+        );
+    }
+
+    #[test]
+    fn an_answered_flush_ends_the_close_wait_even_when_nothing_saved() {
+        // P1b fix 3's verdict, pure: the states a reader must not confuse. Autosave OFF answers
+        // AutosaveSkipped and no Saved ever comes - that used to be a guaranteed 2.0 s per close.
+        assert!(flush_verdict(true, true, "Saved", true).starts_with("landed"));
+        assert!(
+            flush_verdict(false, true, "AutosaveSkipped", true)
+                .contains("ANSWERED with AutosaveSkipped"),
+            "skipped must read as an answer, not as a loss"
+        );
+        assert!(
+            flush_verdict(false, true, "SaveFailed", true).contains("ANSWERED with SaveFailed")
+        );
+        assert!(flush_verdict(false, false, "", false).contains("was not needed"));
+        assert!(
+            flush_verdict(false, false, "", true).contains("DID NOT land"),
+            "the silent case keeps its alarming words - that is the one that can cost bytes"
+        );
+    }
 }
