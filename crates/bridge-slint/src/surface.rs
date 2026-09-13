@@ -1166,6 +1166,114 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
     }
 }
 
+/// STEP A OF THE PRODUCT WIRING, dated 2026-09-15: the toolkit's asks, hooked in ONE
+/// place, so the product root can call a single function instead of re-implementing a menu.
+///
+/// Every body below is the probe's body (`probe.rs:1313-1442`), LESS the lines that exist only to
+/// grade a measurement run - the ask counters, the post-act property reads, the visible /
+/// close-allowed witnesses. What remains is the contract a product needs and nothing else: a row or
+/// a chord is an ASK, an ask sends ONE command or moves ONE bit, and the answer comes back through
+/// `drain` - never from the click. `report()` stays, because stderr is this binary's only voice
+/// (product.rs:26-36); what left are the prints whose subject was the probe.
+///
+/// Three absences are named here rather than quietly omitted, because each is a finding for step B:
+///
+/// 1. `toggle-menu-asked` has NO Rust body anywhere, and must not gain one. Chrome answers its own
+///    ask (chrome.slint:601 flips `menu-open`), and S7's measured finding is that a component
+///    callback cannot be invoked from Rust through the parent forward (chrome.slint:113-119) - so a
+///    handler here would be a second writer of a bit with exactly one owner. The menu opens fine
+///    without this function.
+/// 2. The recent row is the ONE body that is not a verbatim move. `open_recent` still lives in
+///    probe.rs, and a module may not reach up to a root the product binary does not have - so the
+///    row's three lines are restated here WITHOUT the probe's two witnesses: `click_pending` (which
+///    exists only so a synthetic click can be credited to a later `Loaded`) and the per-row print.
+///    Step B's fix is to move `open_recent` into this file and have BOTH roots call it; this
+///    duplication is the price of fencing step A to one file, and it is written down so it cannot be
+///    mistaken for the design.
+/// 3. `autosave_asks` is not bumped. The counter exists so a run can name which ask #N it watched,
+///    nothing renders it, and the bit the menu binds to is `autosave`, which this handler does write.
+#[allow(dead_code)] // product wiring lands in step B, 2026-09-14 - delete this allow then
+pub(crate) fn wire_callbacks(
+    ui: &Spike,
+    gw: &Rc<RefCell<Option<Gateway>>>,
+    pump: &Rc<RefCell<Pump>>,
+    dialog_tx: &std::sync::mpsc::Sender<DialogReply>,
+) {
+    // Open: the row, the Ctrl+O chord and any future native menu land HERE, and this handler means
+    // ask a person. What comes back goes out through Command::Open - the same door the recents rows
+    // use, which is the only reason a picked file keeps the epoch, the buffer adoption and the title.
+    {
+        let weak = ui.as_weak();
+        let pump = Rc::clone(pump);
+        let tx = dialog_tx.clone();
+        ui.on_open_asked(move || {
+            ask_dialog(DialogKind::Open, &weak, &pump, &tx);
+        });
+    }
+    // Save As: the same ask with a different verb, answering through the door that already exists -
+    // with the buffer read when the ANSWER arrives, not when the user was asked (see answer_dialog).
+    {
+        let weak = ui.as_weak();
+        let pump = Rc::clone(pump);
+        let tx = dialog_tx.clone();
+        ui.on_save_as_asked(move || {
+            ask_dialog(DialogKind::SaveAs, &weak, &pump, &tx);
+        });
+    }
+    // Auto-save: toggle the local mirror, send ONE command, repaint the dot. The port echoes no
+    // autosave event, so the menu's check can only follow the ask - printed as `menu:` for that reason.
+    {
+        let gw = Rc::clone(gw);
+        let pump = Rc::clone(pump);
+        let weak = ui.as_weak();
+        ui.on_autosave_asked(move || {
+            let was = {
+                let mut p = pump.borrow_mut();
+                let was = p.autosave;
+                p.autosave = !was;
+                was
+            };
+            report(&format!(
+                "menu: autosave-row toggled {was}->{} - MIRROR, not a report: the port echoes no autosave event",
+                !was
+            ));
+            send(&gw, Command::SetAutosave(!was));
+            let dirty = pump.borrow().dirty;
+            note_dot(&pump, &weak, dirty, "autosave-row");
+        });
+    }
+    // A recent row is an ask, the same shape as the pin strip: index in, Command out, and the text
+    // comes back through Loaded - never from the click itself.
+    {
+        let gw = Rc::clone(gw);
+        let pump = Rc::clone(pump);
+        ui.on_open_at_index(move |index| {
+            let Some(path) = pump.borrow().recent_paths.get(index as usize).cloned() else {
+                return;
+            };
+            send(&gw, Command::Open { path });
+        });
+    }
+    // THE POLICY, at the door: reached by the menu's Quit row AND by the caption X, and both set the
+    // granted bit. Quit hides nothing and calls no gateway - it bumps close-arm, which runs
+    // Window::close() in markup, which lands on the same on_close_requested an OS close reaches,
+    // where the final flush and the joined shutdown live. One door, and one extra fact in front of it.
+    {
+        let pump = Rc::clone(pump);
+        let weak = ui.as_weak();
+        ui.on_quit_asked(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let arm = {
+                let mut p = pump.borrow_mut();
+                p.quit_requested = true;
+                p.closes + 1
+            };
+            report(&format!("menu: Quit -> close-arm {arm} (single door)"));
+            ui.set_close_arm(arm as i32);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
