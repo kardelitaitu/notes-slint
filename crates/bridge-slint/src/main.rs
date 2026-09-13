@@ -185,6 +185,15 @@ fn hwnd_of(window: &slint::Window) -> Option<i64> {
 struct Fingerprint {
     rect: Rect,
     maximized: bool,
+    /// S8: the third thing a window can be doing to itself, measured not assumed: minimizing
+    /// moves the rect to Windows' parking place (-32000,-32000) AND shrinks the reported size
+    /// to 160x28, so a minimized window is visible in the rect after all - but as an OS
+    /// convention nobody documented to us, one that a restore-later or a different DPI could
+    /// change. The bit is explicit, free, and the thing the caption button needs to be provable
+    /// from the log, which is this spike's only eye. 1.17 has both calls (i-slint-core
+    /// api.rs:608 is_minimized, :613 set_minimized): no winit workaround, no window-handle FFI,
+    /// one call each way.
+    minimized: bool,
 }
 
 fn fingerprint_of(window: &slint::Window) -> Fingerprint {
@@ -193,6 +202,7 @@ fn fingerprint_of(window: &slint::Window) -> Fingerprint {
     Fingerprint {
         rect: Rect::new(position.x, position.y, size.width, size.height),
         maximized: window.is_maximized(),
+        minimized: window.is_minimized(),
     }
 }
 
@@ -278,7 +288,13 @@ const CHORD_EVERY: Duration = Duration::from_millis(500);
 /// Quit closes the sequence and has no chord, which is the table's own absence, not an
 /// oversight.
 const CHORD_DRIVE: &[usize] = &[0, 5, 2, 1, 3];
-const CHORD_QUIT_AT: Duration = Duration::from_millis(23900);
+/// S8: the caption acts, and they close the run. Nine steps from here: minimize, observe,
+/// un-minimize, maximize THROUGH THE BUTTON'S OWN DOOR, a drag attempt on a maximised window,
+/// observe, restore, observe, close. The last replaces the Quit row's act - same callback,
+/// different door - because that is the point of the slice: the app gains a pointer way to
+/// reach what the chords and the rows already reached.
+const CAPTION_AT: Duration = Duration::from_millis(23700);
+const CAPTION_EVERY: Duration = Duration::from_millis(350);
 
 /// S9 follow-up: one keystroke AFTER the Open row made the seed the current document, so
 /// an autosave lands ON THE SEED and the do-no-harm rule is tested where it can actually
@@ -351,7 +367,7 @@ const DRAG_AT: Duration = Duration::from_millis(7000);
 /// maximised frame origin. When the frame act stands down, this is just another move.
 const DRAG2_AT: Duration = Duration::from_millis(16000);
 
-const END: Duration = Duration::from_millis(25000);
+const END: Duration = Duration::from_millis(28000);
 
 fn main() {
     let dir = state_dir();
@@ -603,6 +619,16 @@ fn main() {
             let Some(ui) = weak.upgrade() else { return };
             let now = started.elapsed();
             let seen = fingerprint_of(ui.window());
+            // S8: NOTHING to feed here, and that is the finding. Window's own 'maximized'
+            // builtin (builtins.slint:1524) is what Chrome's caption cell binds to, so the
+            // glyph follows a state change from any source - double-click, the button, the
+            // taskbar, Win+Up - without this pump remembering it. A mirror written from the
+            // poll would have been a second copy of a fact the window can change behind our
+            // back, which is the bug class this spike keeps finding.
+            // One limit, measured: the builtin is visible to MARKUP bindings but has no generated Rust
+            // getter (no Spike::get_maximized exists), so these needles read the same fact imperatively
+            // via window().is_maximized(). Bar and bridge agree because they ask the same window, not
+            // because either of them remembers.
             // ---- THE TICK NEEDLE: does this callback actually run during ui.run()? ----
             // `drains` is how many times the pump has polled the channel from this callback,
             // `seen` counts what the pump has taken so far. Their combination settles
@@ -933,12 +959,61 @@ fn main() {
                     // keeps the needle and its consequence adjacent in the log.
                     drain(&third_events, &third_pump, &ui.as_weak());
                 }
-            } else if driven == total && now >= CHORD_QUIT_AT {
-                third_pump.borrow_mut().menu_act = driven + 1;
-                report(&format!(
-                    "menu: firing the Quit row's callback at t+{now:?} (no chord, by the table)"
-                ));
-                ui.invoke_quit_asked();
+            }
+            // ---- S8: the caption buttons, driven through the doors the markup uses ----
+            let cstep = third_pump.borrow().caption_step;
+            if driven == total && cstep < 9 && now >= CAPTION_AT + CAPTION_EVERY * (cstep as u32) {
+                third_pump.borrow_mut().caption_step = cstep + 1;
+                let w = ui.window();
+                match cstep {
+                    0 => {
+                        report("caption[minimize]: invoking the BUTTON's door (minimize-requested)");
+                        ui.invoke_minimize_requested();
+                        let _ = w;
+                    }
+                    1 => report(&format!(
+                        "caption[minimized]: fingerprint {found:?}",
+                        found = fingerprint_of(w)
+                    )),
+                    2 => {
+                        w.set_minimized(false);
+                        report(&format!(
+                            "caption[un-minimized]: is_minimized()={}",
+                            w.is_minimized()
+                        ));
+                    }
+                    3 => {
+                        report(&format!(
+                            "caption[maximize]: the SAME door as the double-click (toggle-max); glyph was {}",
+                            caption_glyph(w.is_maximized())
+                        ));
+                        ui.invoke_toggle_max();
+                    }
+                    4 => {
+                        report("caption[drag on a maximised window]: expect the refusal next");
+                        ui.invoke_drag_delta(40.0, 30.0);
+                    }
+                    5 => report(&format!(
+                        "caption[maximised]: glyph={} window-bit={} fingerprint {:?}",
+                        caption_glyph(w.is_maximized()),
+                        w.is_maximized(),
+                        fingerprint_of(w)
+                    )),
+                    6 => {
+                        report("caption[restore]: the same door again, state-aware on the Rust side");
+                        ui.invoke_toggle_max();
+                    }
+                    7 => report(&format!(
+                        "caption[restored]: glyph={} window-bit={} fingerprint {:?}",
+                        caption_glyph(w.is_maximized()),
+                        w.is_maximized(),
+                        fingerprint_of(w)
+                    )),
+                    _ => {
+                        report("caption[close]: the X door, quit-asked - policy note at the handler");
+                        ui.invoke_quit_asked();
+                    }
+                }
             }
             // (2) THE SYNTHETIC CLICK. Aim at the first row that is NOT the file this
             // probe seeded, so what lands is a RECENT file the port listed.
@@ -1139,6 +1214,13 @@ fn main() {
     {
         let pump = Rc::clone(&pump);
         let weak = ui.as_weak();
+        // THE POLICY, at the door: this handler is now reached by the menu's Quit row AND by
+        // the S8 caption X, and both set the granted bit, which is what lets the FIRST close
+        // request through instead of declining it. Decline-then-confirm was the alternative and
+        // it is worse here twice over: a silent first refusal on a button is indistinguishable
+        // from a broken button, and a "save changes?" dialog is the one prompt the README
+        // promises this app never shows. So the spike is confirm-free on purpose, exactly like
+        // Alt+F4, and the flush-before-close path is what makes that safe rather than careless.
         ui.on_quit_asked(move || {
             // THE SINGLE DOOR. Quit hides nothing and calls no gateway: it bumps
             // close-arm, which runs Window::close() in markup, which lands on the same
@@ -1166,6 +1248,11 @@ fn main() {
         let gw = Rc::clone(&gateway);
         let weak = ui.as_weak();
         ui.on_toggle_max(move || toggle_max(&weak, &gw, "double-click"));
+    }
+    // S8: the caption minimize button's handler - the far end of the ask the bar makes.
+    {
+        let weak = ui.as_weak();
+        ui.on_minimize_requested(move || minimize(&weak, "minimize button"));
     }
     // S5: THE DRAG WIRES, closed by the four approved markup lines. Chrome's band emits a
     // delta per frame and one release, and both land on the SAME two functions the synthetic
@@ -1627,6 +1714,31 @@ fn fire(ui: &Spike, route: Route, display: &str, what: &str) {
 /// The clamp's three answers as one string, all READ from Chrome through the mirror
 /// bindings in main.slint. Reading is not writing: the single-writer rule is about the
 /// menu-open bit, and this function only reports what Chrome computed from host-width.
+/// Which asset the maximize cell shows. The markup carries the same ternary; this exists so a
+/// test can hold the two together. The risk is not that the condition is wrong, it is that
+/// someone renames a file or flips one branch and the button starts lying about the state.
+fn caption_glyph(maximized: bool) -> &'static str {
+    if maximized {
+        "icons/restore.svg"
+    } else {
+        "icons/maximize.svg"
+    }
+}
+
+/// The caption minimize door, shaped exactly like toggle_max: take the weak handle, ask the
+/// window, report the ANSWER rather than the wish. There is no un-minimize here on purpose:
+/// minimize has no two states to toggle, and restoring a minimized window is the taskbar's
+/// job, not this bar's - so the button is one-way and so is the door.
+fn minimize(weak: &slint::Weak<Spike>, via: &str) {
+    let Some(ui) = weak.upgrade() else { return };
+    let window = ui.window();
+    window.set_minimized(true);
+    report(&format!(
+        "caption: {via} -> set_minimized(true), is_minimized()={}",
+        window.is_minimized()
+    ));
+}
+
 fn popup_words(ui: &Spike) -> String {
     format!(
         "popup-x={}px floored={} overflow={}",
@@ -1757,6 +1869,8 @@ struct Pump {
     loop_path: Option<PathBuf>,
     /// S6c: the seed's explicit SaveAs (the arming act), once.
     seed_armed: bool,
+    /// S8: which caption step has run (nine of them, see CAPTION_AT).
+    caption_step: u64,
     /// S7: which overlay step has run - eight of them, each observing the previous act and
     /// then performing its own (open, 400px, 180px, restore, backdrop, reopen, escape, and one
     /// final observation).
@@ -2101,6 +2215,86 @@ mod chords {
             .split("capture-key-pressed(event)")
             .nth(1)
             .expect("the FocusScope has a capture-key-pressed handler")
+    }
+
+    #[test]
+    fn the_maximize_cell_shows_the_other_asset_not_a_different_shade() {
+        assert_eq!(caption_glyph(false), "icons/maximize.svg");
+        assert_eq!(caption_glyph(true), "icons/restore.svg");
+        for glyph in [caption_glyph(false), caption_glyph(true)] {
+            assert!(
+                POPUP.contains(glyph),
+                "chrome.slint no longer names {glyph}"
+            );
+        }
+        assert!(POPUP.contains("root.maximized ? @image-url"));
+    }
+
+    #[test]
+    fn every_glyph_the_bar_names_exists_on_disk() {
+        // A typo inside @image-url is legal Slint that renders nothing: --check passes, the
+        // build passes, and the button is blank until a human looks at it. This is the only
+        // gate that can see it, and it names what it found before it asserts anything.
+        let q = 34u8 as char;
+        let mut named = Vec::new();
+        for word in POPUP.split(q) {
+            if word.starts_with("icons/") && word.ends_with(".svg") {
+                named.push(word.to_string());
+            }
+        }
+        assert!(
+            named.len() >= 6,
+            "expected the pin pair and four caption glyphs, found {named:?}"
+        );
+        let mut missing = Vec::new();
+        for name in &named {
+            let path = format!("ui/{name}");
+            if !std::path::Path::new(&path).exists() {
+                missing.push(path);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "referenced glyphs that do not exist on disk: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_caption_buttons_reuse_the_existing_doors() {
+        // Bounded at BOTH ends: the caption region is not the end of the file, and slicing to
+        // EOF reaches the popup, whose five rows legitimately DO write menu-open - the first
+        // draft of this test failed on exactly that, which is the assertion working as a
+        // question about scope rather than about behaviour.
+        let start = POPUP
+            .find("---- RIGHT: the caption slot")
+            .expect("the caption region");
+        let end = POPUP
+            .find("---- CENTRE")
+            .expect("the centre region, which follows the caption");
+        assert!(start < end, "the caption region must precede the centre");
+        let cap = &POPUP[start..end];
+        assert!(
+            cap.contains("root.toggle-max-requested()"),
+            "maximize must go through the double-click's door"
+        );
+        assert!(
+            cap.contains("root.quit-asked()"),
+            "close must go through the Quit row's door"
+        );
+        assert!(cap.contains("root.minimize-requested()"));
+        assert!(
+            !cap.contains("menu-open ="),
+            "a caption cell must not touch popup state"
+        );
+        assert!(
+            cap.contains("background: Theme.red"),
+            "close keeps the red hover rule"
+        );
+        assert_eq!(
+            SHORTCUTS.len(),
+            14,
+            "caption buttons are pointer acts, not commands: the chord table stays at fourteen"
+        );
     }
 
     #[test]

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    close.svg - the caption CLOSE glyph: an X as two polygons, because a rotated rect needs a
+    transform and slint's svg path is documented here (pin.svg, unpin.svg) to be geometry
+    only. Each band is the diagonal from (6,6) to (18,18) offset by half a 1.8 unit thickness
+    along its normal, so the two strokes cross cleanly at the centre without a join.
+    Colour: colorize paints it, and chrome.slint flips it to white on hover, when the cell
+    behind it goes to Theme.red - the one hover rule Windows users already expect.
+  -->
+  <polygon fill="#000000" points="6.64,5.36 18.64,17.36 17.36,18.64 5.36,6.64"/>
+  <polygon fill="#000000" points="5.36,17.36 17.36,5.36 18.64,6.64 6.64,18.64"/>
+</svg>

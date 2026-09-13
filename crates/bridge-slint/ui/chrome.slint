@@ -84,6 +84,20 @@ export component Chrome inherits Rectangle {
     in property <int> toggle-asks: 0;
     in property <int> close-asks: 0;
 
+    // S8: the caption button's ONE state input, and it is an answer, not a wish. The bar
+    // cannot ask the window whether it is maximised - a component may not reach its window,
+    // the same rule that keeps 'pinned' an in-property - so the mounter tells it. One-way by
+    // construction ('in', never 'in-out'): a bar that could flip the bit would be a second
+    // writer of a state the window owns. Until main.slint feeds it, this reads false and the
+    // button shows the maximize glyph; caption_glyph() in src/main.rs is what pins the two
+    // filenames to each other so the swap cannot drift from the condition.
+    in property <bool> maximized: false;
+
+    // The caption slot's measure: three cells of Theme.icon-size, i.e. one and a half of the
+    // left slot. Deliberately NOT equal to the left slot, and that asymmetry has a cost - see
+    // the CENTRE note, where it is paid out loud instead of being smoothed over.
+    property <length> caption-width: Theme.slot-width * 1.5;
+
     in property <length> host-width: 0px;
     in property <length> host-height: 0px;
 
@@ -134,6 +148,14 @@ export component Chrome inherits Rectangle {
     /// The hamburger's ask, as a callback so the real click and the synthetic act run one
     /// line of code, which is the whole point of the drag/toggle/close precedent.
     callback toggle-menu-asked();
+
+    /// S8: minimize - the only one of the three caption buttons with no door to reuse.
+    /// Maximize takes the double-click's 'toggle-max-requested' and close takes the Quit
+    /// row's 'quit-asked', both already single doors; this has to be new. Which means it also
+    /// needs one forward line in main.slint, outside this slice's fence: until that lands the
+    /// glyph is an honest placeholder that does nothing, and the report says so rather than
+    /// the code being the only place that knows.
+    callback minimize-requested();
     /// Quit is not a command: it closes this window, which is the one shutdown route that
     /// flushes and joins the engine (titlebar.rs:226-232). Its own callback so the bridge
     /// cannot mistake it for a fifth command.
@@ -275,13 +297,139 @@ export component Chrome inherits Rectangle {
         }
     }
 
+    // ---- RIGHT: the caption slot - minimize, maximize/restore, close ----------------
+    // THE FRAMELESS HOLE this fills: no-frame is on, so the OS draws no buttons at all and
+    // minimize/maximize were reachable only by a keyboard chord nobody can see. And there is
+    // NOTHING to port: titlebar.rs:5 and :293-294 say the first bridge's caption buttons are
+    // painted by the KIT, outside its children row, and that its own right slot is empty ON
+    // PURPOSE. So this region is authored, under the two rules the left slot already follows:
+    // hover is an opacity fade on a derived tint, and a glyph is an Image asset the theme
+    // colorizes rather than a shape drawn here (icons-and-theming.md: geometry you compute or
+    // animate is a Path, an icon SET is an svg).
+    // Three cells of slot-width/2 = 30px on a 28px bar, which is SMALLER than Windows' own
+    // 46x32 caption button. Said out loud rather than measured off: the bar height is this
+    // bridge's 28px (the divergence at the top of this file), and a hit target below the
+    // pin's own cell is the thing to flag now, before anyone calls this shipped.
+    HorizontalLayout {
+        x: parent.width - root.caption-width;
+        y: 0px;
+        width: root.caption-width;
+        height: parent.height;
+        alignment: center;
+
+        cap-min := Rectangle {
+            width: Theme.slot-width / 2;
+            height: parent.height;
+            hover-min := Rectangle {
+                width: parent.width;
+                height: parent.height;
+                background: Theme.hover-bg;
+                opacity: min-touch.has-hover ? 1 : 0;
+                animate opacity { duration: 180ms; }
+            }
+            Image {
+                x: (parent.width - Theme.icon-size) / 2;
+                y: (parent.height - Theme.icon-size) / 2;
+                width: Theme.icon-size;
+                height: Theme.icon-size;
+                source: @image-url("icons/minimize.svg");
+                colorize: Theme.icon-muted;
+            }
+            min-touch := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    // The only caption button with a new ask, and the reason is that there is
+                    // no existing door to reuse: nothing in this bar minimized the window
+                    // before. It asks; it does not call the window.
+                    root.minimize-requested();
+                }
+            }
+        }
+
+        cap-max := Rectangle {
+            width: Theme.slot-width / 2;
+            height: parent.height;
+            hover-max := Rectangle {
+                width: parent.width;
+                height: parent.height;
+                background: Theme.hover-bg;
+                opacity: max-touch.has-hover ? 1 : 0;
+                animate opacity { duration: 180ms; }
+            }
+            Image {
+                x: (parent.width - Theme.icon-size) / 2;
+                y: (parent.height - Theme.icon-size) / 2;
+                width: Theme.icon-size;
+                height: Theme.icon-size;
+                // STATE-AWARE: the button pictures the state it will cause, and it swaps for
+                // a second asset rather than rotating or restyling one - the pin's argument
+                // (titlebar.rs:106-116), applied to the button users press most.
+                source: root.maximized ? @image-url("icons/restore.svg") : @image-url("icons/maximize.svg");
+                colorize: Theme.icon-muted;
+            }
+            max-touch := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    // THE SAME DOOR as the title band's double-click: toggle-max-requested,
+                    // one way in, state-aware on the Rust side because only the window knows
+                    // whether it is maximised. A second maximize path would be a second
+                    // answer to the same question.
+                    root.toggle-max-requested();
+                }
+            }
+        }
+
+        cap-close := Rectangle {
+            width: Theme.slot-width / 2;
+            height: parent.height;
+            // The one hover rule Windows users already expect, and the only cell that does
+            // NOT use the derived tint: close is red on hover. Theme.red rather than
+            // Windows' #e81123, because this file's own rule is that exactly one line owns
+            // hex digits and that line is in theme.slint, which is not in this slice's fence.
+            hover-close := Rectangle {
+                width: parent.width;
+                height: parent.height;
+                background: Theme.red;
+                opacity: close-touch.has-hover ? 1 : 0;
+                animate opacity { duration: 180ms; }
+            }
+            Image {
+                x: (parent.width - Theme.icon-size) / 2;
+                y: (parent.height - Theme.icon-size) / 2;
+                width: Theme.icon-size;
+                height: Theme.icon-size;
+                source: @image-url("icons/close.svg");
+                // The glyph flips with its ground, or the X disappears into the red.
+                colorize: close-touch.has-hover ? white : Theme.icon-muted;
+            }
+            close-touch := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    // THE SAME DOOR as the menu's Quit row, deliberately: quit-asked is what
+                    // sets the spike's quit-granted bit, which is what lets the first close
+                    // request through instead of declining it. Policy decided in src/main.rs
+                    // and repeated in the caption comment there - this button neither asks
+                    // "save changes?" nor declines silently, both of which the app promised.
+                    root.quit-asked();
+                }
+            }
+        }
+    }
+
     // ---- CENTRE: dot + title, centred in the WHOLE band -------------------------
-    // Both ends are the same fixed width, so this alignment is centring rather than
-    // "whatever the buttons left over" (titlebar.rs:50-53).
+    // Both ends are FIXED widths, so this alignment is centring rather than "whatever the
+    // buttons left over" (titlebar.rs:50-53). S8 costs this its symmetry: the left slot is
+    // two cells and the caption slot is three, so the band is no longer the same width from
+    // each edge and the centred group now sits half the difference - 15px - left of the
+    // window's true centre. The model's argument was about a fixed measure beating a flex
+    // leftover, not about the two ends being equal, so the rule holds and the offset is the
+    // price of real caption buttons. Equalising the slots (four left cells, or narrower
+    // caption cells) is the way to buy the symmetry back; not done here because it would
+    // move the pin and hamburger off every screenshot this slice is being compared against.
     centre := HorizontalLayout {
         x: Theme.slot-width;
         y: 0px;
-        width: parent.width - Theme.slot-width * 2;
+        width: parent.width - Theme.slot-width - root.caption-width;
         height: parent.height;
         alignment: center;
 
@@ -307,7 +455,7 @@ export component Chrome inherits Rectangle {
             // items_center gives [dot][title] as ONE centred group, which is what this is.
             // The clamp is what keeps a long title from pushing the group out of the band;
             // elide then does the truncation ADR-0003 allows (see the tooltip caveat above).
-            max-width: root.width - Theme.slot-width * 2 - Theme.dot-size - Theme.dot-gap;
+            max-width: root.width - Theme.slot-width - root.caption-width - Theme.dot-size - Theme.dot-gap;
             // ADR-0003 permits centre truncation only because a tooltip exists to give the
             // whole path back. That tooltip is still owed in the FIRST bridge too
             // (titlebar.rs:16-27), and it is owed here: eliding without it is the honest

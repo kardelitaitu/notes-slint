@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    restore.svg - the SAME button while the window is maximised: the square the window would
+    go back to, in FRONT, with the edge of the maximised frame behind it. Only the front
+    square's two hidden edges are omitted; what is left is four bars for the front square and
+    two for the back one. The swap is the whole point: a button whose glyph does not change
+    when the state does is a button the user has to click to understand, which is the same
+    argument the pin glyph carries (titlebar.rs:106-116, and pin.svg/unpin.svg beside this
+    file). Driven by Chrome's 'maximized' in-property, one-way, so it can never disagree with
+    the window - see the caption_glyph() test in src/main.rs.
+  -->
+  <!-- back square: the two edges that stick out top and right -->
+  <path fill="#000000" d="M8 3.5h12.5V5H8z"/>
+  <path fill="#000000" d="M18.9 3.5H20.5v12h-1.6z"/>
+  <!-- front square: four bars, covering the lower-left -->
+  <path fill="#000000" d="M3.5 8h14v1.6h-14z"/>
+  <path fill="#000000" d="M3.5 18.4h14V20h-14z"/>
+  <path fill="#000000" d="M3.5 8H5.1v12H3.5z"/>
+  <path fill="#000000" d="M15.9 8h1.6v12h-1.6z"/>
+</svg>

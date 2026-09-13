@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    minimize.svg - the caption MINIMIZE glyph, authored for this repo (no third-party asset,
+    no download; see unpin.svg for the sizing rules). Monochrome on purpose: slint's
+    Image.colorize repaints the whole glyph from the theme, so one file serves both schemes
+    and both hover states. Geometry is paths and polygons only - no mask, filter, transform
+    or gradient - because slint renders SVG through its own parser and those are what survive
+    it, which is also why the X in close.svg is two polygons instead of two rotated rects.
+  -->
+  <!-- the flat bar the window collapses to, centred low the way the taskbar sits -->
+  <path fill="#000000" d="M5 16h14v1.6H5z"/>
+</svg>

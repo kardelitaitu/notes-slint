@@ -107,6 +107,10 @@ export component Spike inherits Window {
     callback backdrop-asked();
     callback escape-asked();
 
+    /// S8: the caption minimize ask, carried up so Rust can answer it. Every other caption
+    /// cell reused a door that already existed; this is the one that had to be added.
+    callback minimize-requested();
+
     // ---- S5: recents, as delivered ----
     // `Event::RecentsUpdated(Vec<RecentEntry>)` has been arriving, unused, since S4.
     // `core` already decided the label (`display`), the cap and the missing-file mark,
@@ -283,6 +287,15 @@ export component Spike inherits Window {
         close-asks: root.close-asks;
         host-width: root.width;
         host-height: root.height;
+        // S8, and this line is worth more than the property it replaces: I declared a property
+        // for exactly this, and slint refused it with a WARNING - Window already owns
+        // 'maximized' (builtins.slint:1524, in-out, and setting it maximizes the window). So
+        // the bar's state input is ONE BINDING to the window's own bit: no pump field, no poll
+        // feeding a mirror, no second copy of a fact the window can change behind our back
+        // (taskbar, Win+Up, a drag to the screen edge) - which is the bug class this spike keeps
+        // finding. Declaring my own was worse than redundant: the shadow takes the generated
+        // setter with it, so ui.set_maximized() would have written my copy and stopped
+        // maximizing anything at all.
         title: root.title-words;
         pinned: root.pinned;
         dirty: root.dirty;
@@ -334,6 +347,9 @@ export component Spike inherits Window {
         }
         escape-asked => {
             root.escape-asked();
+        }
+        minimize-requested => {
+            root.minimize-requested();
         }
     }
 

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!--
+    maximize.svg - the caption MAXIMIZE glyph: an empty square, drawn as four bars rather
+    than one stroked rect, because slint's svg parser is given geometry, not paint ordering.
+    Same authoring rules as minimize.svg. Paired with restore.svg: the button that offers the
+    state change must PICTURE the state it will cause (see restore.svg for the other half).
+  -->
+  <path fill="#000000" d="M5 5h14v1.6H5z"/>
+  <path fill="#000000" d="M5 17.4h14V19H5z"/>
+  <path fill="#000000" d="M5 5h1.6v14H5z"/>
+  <path fill="#000000" d="M17.4 5H19v14h-1.6z"/>
+</svg>
