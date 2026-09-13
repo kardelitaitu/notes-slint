@@ -238,6 +238,14 @@ const WRITE_BACK_AT: Duration = Duration::from_millis(17000);
 /// What it still does NOT prove is the near half - a physical key reaching
 /// capture-key-pressed and matching there. That half is on the manual list, and the
 /// compile-time witness for it is `slint-viewer --check` on the capture tree.
+/// S7: the overlay acts - open, clamp at three host widths, click-away, Escape. Spaced, not
+/// instantaneous: a resize only reaches Chrome's clamp after the next layout pass, so reading
+/// popup-x in the same statement that asked for the new size would print the old one. The
+/// window is put back to its starting size before the act ends, because the NEXT launch
+/// restores whatever size this one persisted.
+const OVERLAY_AT: Duration = Duration::from_millis(15000);
+const OVERLAY_EVERY: Duration = Duration::from_millis(260);
+
 const CHORD_AT: Duration = Duration::from_millis(18500);
 
 /// Where steps 1..n of the walk start, and why the first step is alone: the audit needs a
@@ -849,6 +857,57 @@ fn main() {
                         let base = lf(&ui.get_buffer());
                         report("save-fail: path restored, typed 6 bytes, expecting Saved then dot clears");
                         ui.set_buffer(format!("{base}+back1").into());
+                    }
+                }
+            }
+            // ---- S7: the popup's backdrop, its clamp, and Escape ----
+            // OBSERVE-THEN-ACT, one pair per step, because both halves of this lag and the
+            // first draft of the act proved it by printing menu-shown=false immediately after
+            // opening the popup: a resize is not applied until the window comes back from the
+            // OS, and a mirrored property is not recomputed until the next traversal. Reading
+            // in the same step as writing measures the world before the act, so every needle
+            // here is labelled with what it is looking at: the state AFTER the previous act.
+            let ostep = third_pump.borrow().overlay_step;
+            if ostep < 8 {
+                let at = OVERLAY_AT + OVERLAY_EVERY * (ostep as u32);
+                if now >= at {
+                    third_pump.borrow_mut().overlay_step = ostep + 1;
+                    let w = ui.window();
+                    if ostep > 0 {
+                        let seen = match ostep - 1 {
+                            0 => "after open",
+                            1 => "after 400px",
+                            2 => "after 180px",
+                            3 => "after restore",
+                            4 => "after backdrop",
+                            5 => "after reopen",
+                            _ => "after escape",
+                        };
+                        report(&format!(
+                            "overlay[{seen}]: menu-shown={} {}",
+                            ui.get_menu_shown(),
+                            popup_words(&ui)
+                        ));
+                    }
+                    match ostep {
+                        0 => {
+                            let size = w.size();
+                            third_pump.borrow_mut().start_size = Some((size.width, size.height));
+                            report(&format!("overlay: host is {}x{}", size.width, size.height));
+                            ui.set_toggle_asks(ui.get_toggle_asks() + 1);
+                        }
+                        1 => w.set_size(LogicalSize::new(400.0, 600.0)),
+                        2 => w.set_size(LogicalSize::new(180.0, 600.0)),
+                        3 => {
+                            let (sw, sh) = third_pump
+                                .borrow()
+                                .start_size
+                                .unwrap_or((800, 600));
+                            w.set_size(LogicalSize::new(sw as f32, sh as f32));
+                        }
+                        4 => ui.set_close_asks(ui.get_close_asks() + 1),
+                        5 => ui.set_toggle_asks(ui.get_toggle_asks() + 1),
+                        _ => ui.set_close_asks(ui.get_close_asks() + 1),
                     }
                 }
             }
@@ -1565,6 +1624,18 @@ fn fire(ui: &Spike, route: Route, display: &str, what: &str) {
     }
 }
 
+/// The clamp's three answers as one string, all READ from Chrome through the mirror
+/// bindings in main.slint. Reading is not writing: the single-writer rule is about the
+/// menu-open bit, and this function only reports what Chrome computed from host-width.
+fn popup_words(ui: &Spike) -> String {
+    format!(
+        "popup-x={}px floored={} overflow={}",
+        ui.get_popup_x().round(),
+        ui.get_popup_floored(),
+        ui.get_popup_overflow()
+    )
+}
+
 /// The x,y the PORT last wrote - the coordinates the NEXT launch restores from, which is
 /// the only place a walk can hide where the toolkit's own read cannot see it.
 fn stored_xy(dir: &StateDir) -> Option<(i64, i64)> {
@@ -1686,6 +1757,12 @@ struct Pump {
     loop_path: Option<PathBuf>,
     /// S6c: the seed's explicit SaveAs (the arming act), once.
     seed_armed: bool,
+    /// S7: which overlay step has run - eight of them, each observing the previous act and
+    /// then performing its own (open, 400px, 180px, restore, backdrop, reopen, escape, and one
+    /// final observation).
+    overlay_step: u64,
+    /// The window's own size on entry to the overlay act, to be restored at the end.
+    start_size: Option<(u32, u32)>,
     /// The three acts, each once.
     ro_done: bool,
     key2_done: bool,
@@ -2027,6 +2104,48 @@ mod chords {
     }
 
     #[test]
+    fn menu_open_has_exactly_one_writing_file() {
+        // The single-writer proof, as two greps. Chrome owns its in-out bit; the mounter may
+        // read it (the mirrors and the backdrop's visible binding do) but may not assign it,
+        // and every dismissal route - hamburger, five rows, backdrop, Escape - ends inside
+        // chrome.slint.
+        let chrome_writes = POPUP.lines().filter(|l| l.contains("menu-open =")).count();
+        assert!(
+            chrome_writes >= 8,
+            "Chrome should own every write; found {chrome_writes}"
+        );
+        let outside_writes = MARKUP.matches("menu-open =").count();
+        assert_eq!(
+            outside_writes, 0,
+            "main.slint must never assign Chrome's state, only forward asks"
+        );
+        assert!(POPUP.contains("backdrop-asked =>"));
+        assert!(POPUP.contains("escape-asked =>"));
+        assert!(POPUP.contains("toggle-menu-asked =>"));
+        assert!(MARKUP.contains("chrome.backdrop-asked()"));
+        assert!(MARKUP.contains("chrome.escape-asked()"));
+    }
+
+    #[test]
+    fn the_popup_is_mounted_last_and_the_backdrop_sits_under_it() {
+        // Sibling order IS the z-order in Slint, and the measurement that found it: a popup
+        // painted by a bar declared BEFORE a TextEdit was covered by that editor's pixels
+        // (histogram: #2a2a2a only in the 6 px strip above the text). So the mount declares
+        // backdrop, then Chrome, and the catcher can be above the text without being above
+        // the menu.
+        let editor = MARKUP.find("editor := TextEdit").expect("the editor");
+        let backdrop = MARKUP.find("backdrop := TouchArea").expect("the backdrop");
+        let chrome = MARKUP.find("chrome := Chrome").expect("Chrome");
+        assert!(editor < backdrop, "the editor must be below the catcher");
+        assert!(backdrop < chrome, "the catcher must be below the popup");
+        assert!(
+            MARKUP.contains("visible: chrome.menu-open")
+                && MARKUP.contains("enabled: chrome.menu-open"),
+            "a closed popup must leave every pixel to the editor"
+        );
+    }
+
+    #[test]
     fn every_chord_routes_somewhere() {
         for row in SHORTCUTS {
             assert!(
@@ -2168,8 +2287,8 @@ mod chords {
         let body = capture_body();
         assert_eq!(
             body.matches("EventResult.accept").count(),
-            14,
-            "one accept per bound chord"
+            SHORTCUTS.len() + 1,
+            "one accept per bound chord, plus Escape: fourteen commands in the table and ONE              dismissal, which is not a command and so is not in the legend (menu.rs has no              Escape row either - see the parity warning in main.slint)"
         );
         assert_eq!(
             body.matches("EventResult.reject").count(),

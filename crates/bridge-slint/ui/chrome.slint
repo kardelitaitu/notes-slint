@@ -13,11 +13,14 @@
 //     buttons and owns the drag (titlebar.rs:5-9). Here no-frame is on and the caption area
 //     is not ours, so the right slot keeps its PURPOSE - the centring argument needs both
 //     ends to be the same fixed width - without duplicating a caption.
-//   * Click-away. The kit has a window-level on_mouse_down_out; a slint TouchArea has no
-//     "outside" event, and the nearest equivalent (a full-window forward-touch layer) has to
-//     be installed by whoever mounts Chrome, not by a component inside it. So dismissal here
-//     is the model's other two routes: the hamburger's own second click, and a row picking
-//     itself. Escape is unwired in BOTH bridges and named as the gap (titlebar.rs:244-246).
+//   * Click-away - PORTED AT S7, AND IT COSTS A MOUNTING RULE. A slint TouchArea has no
+//     "outside" event, so the full-window catcher is installed by whoever mounts Chrome,
+//     exactly as the note above said it would have to be: main.slint declares a backdrop
+//     between the editor and this bar, because that is the only sibling position where it is
+//     above the text and below the popup. It forwards a click to backdrop-asked() and closes
+//     nothing itself. Escape is now wired HERE, and that is a deliberate divergence from the
+//     model, which leaves the key to the editor (titlebar.rs:244-246, main.rs:1499): this
+//     bridge takes Escape only while the popup is open, so an editor Escape is untouched.
 //   * The popup as "last child of the window's root element" (titlebar.rs:236-240). A
 //     component cannot choose its own sibling order, so painting above the editor is decided
 //     wherever Chrome is mounted. The frame is OPAQUE for that reason: a translucent menu
@@ -66,6 +69,38 @@ export component Chrome inherits Rectangle {
     // knows how to do, so unlike the pin it asks the port nothing and expects no answer.
     in-out property <bool> menu-open: false;
 
+    // ---- the host's size, told to the bar because a bar cannot see its own window ------
+    // S7: the popup's clamp is a question about the WINDOW, and a component may not reach out
+    // to ask it (the same reason this file never reads a window level). So the mounter states
+    // both numbers. 0px means "not told yet", and the clamp reads that as "no information,
+    // keep the inset" rather than clamping against a zero-width host.
+    // S7, LEARNED THE HARD WAY: a component callback CANNOT be invoked from Rust through
+    // the parent forward. ui.invoke_toggle_menu_asked() reached Spike own callback - whose
+    // only handler is whatever Rust attaches - and Chrome handler never ran, so the popup sat
+    // closed and the needle printed menu-shown=false while every line of the wiring was
+    // correct. The fix is the pattern this bar already uses to close a window: the ask
+    // travels as a NUMBER (main close-arm), and Chrome reacts to the change. menu-open still
+    // has exactly one writer, and a probe can drive it without hands.
+    in property <int> toggle-asks: 0;
+    in property <int> close-asks: 0;
+
+    in property <length> host-width: 0px;
+    in property <length> host-height: 0px;
+
+    /// THE CLAMPED POSITION: floor on the left, ceiling on the right, 8px each side, and
+    /// width-aware - the ceiling only exists because the host has a width at all. The FLOOR
+    /// binds first on any window that can hold the popup, because the raw inset is 4px, so
+    /// the interesting case is a narrow host where the ceiling takes over. `popup-overflow`
+    /// says the remainder out loud instead of letting the menu hang off an edge in silence:
+    /// no pair of 8px margins fits a 190px menu into a 198px window, and a flag that admits
+    /// that beats a screenshot that hides it.
+    in property <length> popup-x: root.host-width <= 0px
+        ? Theme.menu-inset
+        : Math.max(8px, Math.min(Theme.menu-inset, root.host-width - Theme.menu-width - 8px));
+    in property <bool> popup-floored: root.host-width > 0px && root.popup-x > Theme.menu-inset;
+    in property <bool> popup-overflow: root.host-width > 0px
+        && root.popup-x + Theme.menu-width > root.host-width - 4px;
+
     // ---- the asks ---------------------------------------------------------------
     // toggled-pin carries the state to ASK for, because this closure cannot see the wire and
     // the bridge must not keep a second copy of the bit (titlebar.rs:310-311).
@@ -79,6 +114,26 @@ export component Chrome inherits Rectangle {
     /// whose chord (Ctrl+Shift+R) takes two modifiers, which is why the chord table in
     /// main.rs routes by name instead of by a hand-copied string.
     callback clear-recents-asked();
+
+    // ---- S7: the three ways a popup closes, and all three are ASKS ----------------------
+    // Every one lands on a handler inside THIS component, because menu-open has exactly one
+    // writing component. A backdrop cannot see the popup and the keyboard cannot see the bar,
+    // so both ask. The S7 proof is two greps: every 'menu-open =' in this file is Chrome's,
+    // and main.slint contains none at all.
+
+    /// Click-away - the route the first bridge got free from the kit's window-level
+    /// on_mouse_down_out (titlebar.rs:244-246), which a TouchArea has no equivalent of. The
+    /// mounter lays a full-window catcher UNDER this bar and forwards its click here.
+    callback backdrop-asked();
+
+    /// Escape, same shape: captured at the window's outer focus scope, routed here only when
+    /// the popup is actually open. See main.slint for the parity warning - the first bridge
+    /// deliberately leaves Escape to the editor.
+    callback escape-asked();
+
+    /// The hamburger's ask, as a callback so the real click and the synthetic act run one
+    /// line of code, which is the whole point of the drag/toggle/close precedent.
+    callback toggle-menu-asked();
     /// Quit is not a command: it closes this window, which is the one shutdown route that
     /// flushes and joins the engine (titlebar.rs:226-232). Its own callback so the bridge
     /// cannot mistake it for a fifth command.
@@ -184,7 +239,7 @@ export component Chrome inherits Rectangle {
             menu-touch := TouchArea {
                 mouse-cursor: MouseCursor.pointer;
                 clicked => {
-                    root.menu-open = !root.menu-open;
+                    root.toggle-menu-asked();
                 }
             }
         }
@@ -336,8 +391,26 @@ export component Chrome inherits Rectangle {
     // 2, and a full-row cell per row for the tint and the click. Quit's chord is the empty
     // string because the model returns None there (titlebar.rs:211-218) - an invented chord
     // is exactly the drift the table exists to prevent.
+    // THE DISMISSAL HANDLERS. Alongside the hamburger's ask below and the five rows, these
+    // are the only writes to menu-open anywhere, and every one of them is in this file.
+    backdrop-asked => {
+        root.menu-open = false;
+    }
+    escape-asked => {
+        root.menu-open = false;
+    }
+    toggle-menu-asked => {
+        root.menu-open = !root.menu-open;
+    }
+    changed toggle-asks => {
+        root.menu-open = !root.menu-open;
+    }
+    changed close-asks => {
+        root.menu-open = false;
+    }
+
     menu := Rectangle {
-        x: Theme.menu-inset;
+        x: root.popup-x;
         y: parent.height;
         width: Theme.menu-width;
         height: Theme.menu-pad * 2 + 5 * Theme.menu-row-height + 4 * Theme.menu-gap;

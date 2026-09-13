@@ -100,11 +100,31 @@ export component Spike inherits Window {
     callback drag-delta(length, length);
     callback drag-ended();
 
+    // S7: the popup's three dismissal routes, exposed so an unattended run can drive the very
+    // callbacks a hamburger click, a backdrop click and an Escape press reach. Chrome still
+    // writes the state - these only carry the ask, and the mirrors above only read it.
+    callback toggle-menu-asked();
+    callback backdrop-asked();
+    callback escape-asked();
+
     // ---- S5: recents, as delivered ----
     // `Event::RecentsUpdated(Vec<RecentEntry>)` has been arriving, unused, since S4.
     // `core` already decided the label (`display`), the cap and the missing-file mark,
     // so the bridge renders exactly what it was handed and keeps the paths in Rust -
     // a row is a row, and a path never needs to travel through the markup.
+    // S7: READ-ONLY mirrors of what Chrome decided, so a live run can print it. Rust cannot
+    // reach an element inside a component by id - that limitation has shaped every slice here -
+    // but a property binding is not an access: these read Chrome's outputs and write nothing.
+    // The single-writer claim survives precisely because the direction is one-way.
+    in property <bool> menu-shown: chrome.menu-open;
+    // S7: the probe two doors. Bumping a number is not writing Chrome state - Chrome
+    // reacts to the change in its own handler, so menu-open keeps exactly one writer.
+    in-out property <int> toggle-asks: 0;
+    in-out property <int> close-asks: 0;
+    in property <length> popup-x: chrome.popup-x;
+    in property <bool> popup-floored: chrome.popup-floored;
+    in property <bool> popup-overflow: chrome.popup-overflow;
+
     in property <[string]> recents;
     callback open-at-index(int);
     // Row height is a constant, and the layout is deliberately crude: this is a
@@ -137,6 +157,19 @@ export component Spike inherits Window {
         capture-key-pressed(event) => {
             // Shift first: Ctrl+Shift+R is a different act from a hypothetical Ctrl+R, and a
             // shift-letter arrives as the UPPER-case glyph, hence to_lowercase everywhere.
+            // S7: ESCAPE, and the parity question is answered by a WARNING, not by silence.
+            // menu.rs has NO Escape row in its legend because Escape is not a command there -
+            // and titlebar.rs:244-246 goes further: the first bridge deliberately leaves the
+            // key to the editor (main.rs:1499 binds it to editor::EscapeSelection, clearing a
+            // selection) and never dismisses its popup with it. This bridge takes the key ONLY
+            // while the popup is open, so an editor Escape is untouched - but that IS a
+            // behavioural divergence from the model, made visible here rather than smoothed
+            // over, and it is why the chord table in main.rs stays at fourteen rows: a
+            // dismissal is not a command and does not belong in a legend of commands.
+            if (event.text == Key.Escape && chrome.menu-open) {
+                chrome.escape-asked();
+                return EventResult.accept;
+            }
             if (event.modifiers.control && event.modifiers.shift
                     && event.text.to_lowercase() == "r") {
                 root.clear-recents-asked();
@@ -177,6 +210,64 @@ export component Spike inherits Window {
             return EventResult.reject;
         }
 
+    // --- what the port last said, and the editor (S4 wires its text) ---
+    status-line := Text {
+        x: 8px;
+        y: chrome.height + 2px;
+        text: root.status;
+        color: Theme.text-secondary;
+        font-size: 11px;
+    }
+
+    // One row per entry, `for` over the array the port sent.
+    for name[index] in root.recents: Rectangle {
+        x: 0px;
+        y: status-line.y + 18px + index * root.row-h;
+        width: parent.width;
+        height: root.row-h;
+        Text {
+            x: 6px;
+            vertical-alignment: center;
+            text: name;
+            color: Theme.text-row;
+            font-size: 11px;
+        }
+        TouchArea {
+            clicked => {
+                root.open-at-index(index);
+            }
+        }
+    }
+
+    editor := TextEdit {
+        x: 0px;
+        y: status-line.y + 18px + root.stack-h;
+        width: parent.width;
+        height: parent.height - status-line.y - 18px - root.stack-h;
+        font-size: 14px;
+        // Two-way binding: `set_buffer` repaints the widget, typing refills the
+        // property, and the pump reads only the property.
+        text <=> root.buffer;
+    }
+    // S7, THE BACKDROP: the click-away the first bridge got from the kit's window-level
+    // on_mouse_down_out and that a TouchArea cannot express from inside a component. It covers
+    // the WHOLE window, it exists only while the popup is open (visible AND enabled both follow
+    // chrome.menu-open, so a closed menu cannot swallow a click - the editor keeps every pixel
+    // the instant the popup is gone), and it is declared between the editor and the bar, which
+    // is the only position in the sibling order where it is above the text and below the popup.
+    // It forwards the click; it does not close anything. Chrome owns that.
+    backdrop := TouchArea {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        visible: chrome.menu-open;
+        enabled: chrome.menu-open;
+        clicked => {
+            chrome.backdrop-asked();
+        }
+    }
+
     // --- THE TITLE STRIP: S2's Chrome, mounted, not re-implemented ---
     // Chrome owns the look, the drag and the caption. It is handed facts and returns
     // asks; everything it shows arrives from an Event.
@@ -185,6 +276,13 @@ export component Spike inherits Window {
         y: 0px;
         width: parent.width;
         height: 28px;
+        // S7: the two numbers Chrome cannot see for itself. Geometry RESTORE is bridge work
+        // and geometry STORAGE is core work (AGENTS.md); a popup's clamp is neither - it is
+        // Chrome's own layout - so the host states its size instead of the bar reaching out.
+        toggle-asks: root.toggle-asks;
+        close-asks: root.close-asks;
+        host-width: root.width;
+        host-height: root.height;
         title: root.title-words;
         pinned: root.pinned;
         dirty: root.dirty;
@@ -228,46 +326,16 @@ export component Spike inherits Window {
         quit-asked => {
             root.quit-asked();
         }
-    }
-
-    // --- what the port last said, and the editor (S4 wires its text) ---
-    status-line := Text {
-        x: 8px;
-        y: chrome.height + 2px;
-        text: root.status;
-        color: Theme.text-secondary;
-        font-size: 11px;
-    }
-
-    // One row per entry, `for` over the array the port sent.
-    for name[index] in root.recents: Rectangle {
-        x: 0px;
-        y: status-line.y + 18px + index * root.row-h;
-        width: parent.width;
-        height: root.row-h;
-        Text {
-            x: 6px;
-            vertical-alignment: center;
-            text: name;
-            color: Theme.text-row;
-            font-size: 11px;
+        toggle-menu-asked => {
+            root.toggle-menu-asked();
         }
-        TouchArea {
-            clicked => {
-                root.open-at-index(index);
-            }
+        backdrop-asked => {
+            root.backdrop-asked();
+        }
+        escape-asked => {
+            root.escape-asked();
         }
     }
 
-    editor := TextEdit {
-        x: 0px;
-        y: status-line.y + 18px + root.stack-h;
-        width: parent.width;
-        height: parent.height - status-line.y - 18px - root.stack-h;
-        font-size: 14px;
-        // Two-way binding: `set_buffer` repaints the widget, typing refills the
-        // property, and the pump reads only the property.
-        text <=> root.buffer;
-    }
     } // keys := FocusScope - closes the S6 chord wrap (see its comment above)
 }
