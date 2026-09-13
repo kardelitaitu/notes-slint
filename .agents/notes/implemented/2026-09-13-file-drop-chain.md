@@ -3,7 +3,7 @@ title: File drop onto the window, the whole chain
 status: implemented
 id: 2026-09-13-file-drop-chain
 created: 2026-09-13
-updated: 2026-09-13
+updated: 2026-09-14
 relates: [§4.4, §5.4, §5.5]
 decision: docs/decisions/0004-the-port-grows-a-second-synchronous-thread-affine-surface.md
 ---
@@ -218,3 +218,16 @@ the OS's own utility through a process — `attrib +R`, `attrib -R` on the way o
 a silent failure there is indistinguishable from a port that never answers, which is the exact
 mistake this act was replacing. The 9 MiB fixture survives only as a witness for the `LoadFailed`
 arm above (`:273-277`), where it belongs.
+
+---
+
+**5. Amendment, 2026-09-14 — the slint half of this note is no longer probe-only, and its paths moved.**
+`crates/bridge-slint/src/main.rs` no longer exists: STRIP-0 renamed it to `src/probe.rs` (two bin names,
+one source) and STRIP-2b gave the product its own root (`ec5904b0`, `c1591cd3`). Every line number in
+this note therefore points at the *instrumented* build — `notes-slint-probe.exe` — while the shipped
+`notes-slint.exe` now arms the same target through `plumbing::arm_drop_target` from
+`src/product.rs` (at startup and again on the first wake that can read an HWND, `product.rs:235-252`,
+`:291-303`), and disarms on the honest shutdown after `ui.run()` returns. What the strip added to the
+finding above, and what still stands: **there is no HWND after `show()`** on this toolkit, so a root
+that armed once, before the event loop, would arm nothing. The record is
+`.agents/notes/implemented/2026-09-14-strip-program.md`. The `bridge-gpui` citations are unaffected.
