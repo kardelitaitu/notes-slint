@@ -676,6 +676,17 @@ pub(crate) struct Pump {
     /// `Saved` count, so the first one (the answer to this probe's own `SaveAs`) can
     /// be told apart from a later one, which only the autosave path could have sent.
     pub(crate) saves: u64,
+    /// HYGIENE (P1b, the close-burn fix): a terminal ANSWER to a flush, whatever it was. The
+    /// close wait used to watch `saves` alone - and with autosave OFF the port does not go
+    /// silent, it answers `AutosaveSkipped` (engine.rs:1233-1285), after which no `Saved` ever
+    /// comes. So every close of an autosave-off session paid the whole SAVE_WAIT for an event
+    /// that cannot exist. This counts the ANSWERED family: `Saved`, `SaveFailed`,
+    /// `AutosaveSkipped`. A COUNT, not a bool, because the waiter has to see the answer that
+    /// arrived after ITS OWN flush and not one left over from a save cycle earlier in the run.
+    pub(crate) saves_settled: u64,
+    /// Which of the three settled the last cycle, in the bridge's own words, so the close line
+    /// can name what it exited on rather than let a reader infer it from the absence of a save.
+    pub(crate) saves_answer: &'static str,
     // ---- S10 ----
     /// The dirty witness, set by `TextEdit.edited` and cleared when a flush goes out (or when the
     /// bytes turn out to be identical). True is not a claim about WHAT changed - the callback
@@ -1085,6 +1096,8 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 let which = {
                     let mut p = pump.borrow_mut();
                     p.saves += 1;
+                    p.saves_settled += 1;
+                    p.saves_answer = "Saved";
                     p.saves
                 };
                 // The bytes landed, so the failure is over - cleared here and nowhere
@@ -1116,6 +1129,22 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                     do_no_harm(pump, "saved");
                 }
             }
+            // HYGIENE (P1b): THE ANSWER THAT IS NOT A SAVE. Autosave OFF was never silence -
+            // the port answers this event, and it was falling through to the catch-all below,
+            // which set the status line and settled NOTHING. That is why the close wait could
+            // not see it and burned 2.0 s on every session with autosave off. The arm keeps the
+            // catch-all's status line (still one writer of the words, `describe`) and adds the
+            // settle, which is the only fact the root is waiting for.
+            Event::AutosaveSkipped { .. } => {
+                {
+                    let mut p = pump.borrow_mut();
+                    p.saves_settled += 1;
+                    p.saves_answer = "AutosaveSkipped";
+                }
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_status(describe(event).into());
+                }
+            }
             Event::SaveFailed { reason, .. } => {
                 pump.borrow_mut().save_failed = true;
                 let dirty = pump.borrow().dirty;
@@ -1138,6 +1167,10 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                     p.last_sent.clear();
                     p.edited_flag = true;
                     p.retries += 1;
+                    // HYGIENE (P1b): a refusal is an ANSWER too - the close wait must not
+                    // sit out its deadline because the bytes it waited for are never coming.
+                    p.saves_settled += 1;
+                    p.saves_answer = "SaveFailed";
                     report(&format!(
                         "retry: a failed save restored the send witness (retry #{})",
                         p.retries

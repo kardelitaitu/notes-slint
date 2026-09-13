@@ -108,6 +108,65 @@ const GEOMETRY_FORCE: Duration = Duration::from_millis(1000);
 const SAVE_WAIT: Duration = Duration::from_millis(2000);
 const EXIT_REWAIT: Duration = Duration::from_secs(10);
 
+/// HYGIENE (P1b fix 1): the LATE-REGISTRATION LATCH. The guard this replaced was
+/// "is the drop lease still empty", and plumbing.rs:255-262 deliberately leaves that lease empty
+/// when `arm_file_drop` refuses - so one refusing handle re-sent `RegisterWindow`, re-ran the arm
+/// and reprinted both of its lines every 8 ms tick: about 125 attempts a second, forever, in a
+/// product that had already been told no. The latch is a bool plus the two facts that make
+/// "the same Err twice" decidable at all: WHICH handle was refused, and how many times.
+#[derive(Clone, Copy, Default)]
+struct Register {
+    /// The handle the last attempt named. None until there has been an attempt.
+    last: Option<i64>,
+    /// Attempts made against `last`, so a NEW handle is not punished for the old one's refusal.
+    tries: u8,
+    /// THE LATCH: the arm landed, or this same handle was refused twice. Either way the wake
+    /// stops asking and stops printing.
+    done: bool,
+}
+
+/// One attempt's outcome, as a pure decision so it can be tested without a window: armed ends it
+/// (the ordinary case, first wake that can read an HWND); the same handle refused twice ends it;
+/// a different handle restarts the count, because that is a different window and the old verdict
+/// says nothing about it.
+fn register_says(previous: Register, hwnd: i64, armed: bool) -> Register {
+    if armed {
+        return Register {
+            last: Some(hwnd),
+            tries: previous.tries.saturating_add(1),
+            done: true,
+        };
+    }
+    let tries = if previous.last == Some(hwnd) {
+        previous.tries.saturating_add(1)
+    } else {
+        1
+    };
+    Register {
+        last: Some(hwnd),
+        tries,
+        done: tries >= 2,
+    }
+}
+
+/// HYGIENE (P1b fix 3): the close wait's verdict, as words this file owns. A save that landed is
+/// still the best answer, but it is no longer the ONLY answer the wait accepts, and a reader of
+/// the line must be able to tell "autosave is off, the port said so" from "the disk never
+/// answered" - the second is the one that costs a person bytes.
+fn flush_verdict(saves_moved: bool, settled_moved: bool, answer: &str, dirty: bool) -> String {
+    if saves_moved {
+        "landed".to_string()
+    } else if settled_moved {
+        format!(
+            "was ANSWERED with {answer} - the port is done with this flush, nothing more was coming"
+        )
+    } else if !dirty {
+        "was not needed - the buffer matched what was sent".to_string()
+    } else {
+        "DID NOT land in the wait, closing anyway".to_string()
+    }
+}
+
 /// What the watch remembers: the rect last seen, when it last differed from what the port was
 /// told, and when the port was last told.
 #[derive(Default)]
@@ -308,6 +367,7 @@ fn main() {
     let tick_events = Rc::clone(&events);
     let tick_pump = Rc::clone(&pump);
     let tick_drops = Rc::clone(&drop_guard);
+    let tick_register = Rc::new(RefCell::new(Register::default()));
     let tick_dialog_rx = Rc::clone(&dialog_rx);
     let tick_settle = Rc::new(RefCell::new(Settle::default()));
     let weak = ui.as_weak();
@@ -323,11 +383,20 @@ fn main() {
         // guard being held is the flag). If the handle never appears, no drag lands and no pin
         // applies, and the startup print above is the evidence - which is the contract failing
         // loudly rather than quietly, the only acceptable form of a risk.
-        if tick_drops.borrow().is_none() {
+        // HYGIENE (P1b fix 1): THE STORM, latched. The guard used to be
+        // `tick_drops.borrow().is_none()` alone, and plumbing's arm leaves that Option EMPTY WHEN
+        // IT REFUSES (plumbing.rs:255-262) - so a handle the platform would not take was
+        // re-registered, re-armed and re-printed on every 8 ms wake: ~125 tries a second, forever.
+        // The latch says NO MORE after a success (the ordinary ending) or after the same handle
+        // has been refused twice, and the second refusal is where the one warn line goes.
+        let latched = tick_register.borrow().done;
+        if !latched && tick_drops.borrow().is_none() {
             if let Some(hwnd) = hwnd_of(ui.window()) {
-                report(&format!(
-                    "hwnd = {hwnd:#x} on the first wake that could read it"
-                ));
+                if tick_register.borrow().last.is_none() {
+                    report(&format!(
+                        "hwnd = {hwnd:#x} on the first wake that could read it"
+                    ));
+                }
                 send(
                     &tick_gw,
                     Command::RegisterWindow {
@@ -335,6 +404,16 @@ fn main() {
                     },
                 );
                 arm_drop_target(hwnd, &tick_drops);
+                // The lease is what plumbing can leave behind; still-empty is its "no".
+                let armed = tick_drops.borrow().is_some();
+                let next = register_says(*tick_register.borrow(), hwnd, armed);
+                *tick_register.borrow_mut() = next;
+                if next.done && !armed {
+                    report(&format!(
+                        "hwnd: registration refused for {hwnd:#x} {} times - NOT asking again this run; no drag lands and no pin applies until a handle does take the arm",
+                        next.tries
+                    ));
+                }
             }
         }
         // STRIP-4a row 2: measure, then ask the pure decision. Two things are deliberately NOT
@@ -343,7 +422,17 @@ fn main() {
         // and no cap on how many sends one session may make.
         {
             let now = Instant::now();
-            let measured = fingerprint_of(ui.window()).rect;
+            let print = fingerprint_of(ui.window());
+            let measured = print.rect;
+            // HYGIENE (P1b fix 2): MINIMISED IS NOT A PLACE. Windows parks the window at
+            // -32000,-32000 at 160x28 (plumbing.rs:186-194 measures it), so a rect read while
+            // minimised is a fact about the OS's parking lot, not about where a person put the
+            // note - and the port measures the LIVE window when GeometryChanged lands, so telling
+            // it about a park is how a park gets persisted. plumbing's Fingerprint already
+            // carries the bit; this root only ever read `.rect`. Skipping while minimised means
+            // the park is never seen, never compared and never told, and the pending episode
+            // fires on the wake after a restore, on the real rect.
+            let parked = print.minimized;
             let mut st = tick_settle.borrow_mut();
             let same = st.seen.as_ref().is_some_and(|previous| {
                 previous.x == measured.x
@@ -351,11 +440,11 @@ fn main() {
                     && previous.w == measured.w
                     && previous.h == measured.h
             });
-            if !same {
+            if !same && !parked {
                 st.changed_at = Some(now);
                 st.seen = Some(measured);
             }
-            if let Some(changed) = st.changed_at {
+            if let Some(changed) = st.changed_at.filter(|_| !parked) {
                 let moved_for = now.saturating_duration_since(changed);
                 let since_send = st.sent_at.map(|at| now.saturating_duration_since(at));
                 if settle_says(moved_for, since_send) {
@@ -419,25 +508,37 @@ fn main() {
         "shutdown: gateway clones still alive after the timer died: {} (1 = the wake closure is really gone)",
         Rc::strong_count(&gateway)
     ));
+    // HYGIENE (P1b fix 3): THE AUTOSAVE-OFF TAX. Both counters are read BEFORE the last flush
+    // goes out, and the wait now exits on EITHER of them moving: `saves` is a save that landed,
+    // `saves_settled` is ANY terminal answer (Saved / AutosaveSkipped / SaveFailed). Watching
+    // only the first guaranteed the whole 2.0 s to a session with autosave OFF, because that
+    // session's answer is AutosaveSkipped and a Saved is never coming. The line says which.
+    let saves_at_entry = pump.borrow().saves;
+    let settled_at_entry = pump.borrow().saves_settled;
     text_pump(&ui, &gateway, &pump);
     drain(&events, &pump, &ui.as_weak());
     let dirty_at_exit = pump.borrow().dirty;
-    let saves_at_entry = pump.borrow().saves;
     let asked = Instant::now();
-    while dirty_at_exit && pump.borrow().saves == saves_at_entry && asked.elapsed() < SAVE_WAIT {
+    while dirty_at_exit
+        && pump.borrow().saves == saves_at_entry
+        && pump.borrow().saves_settled == settled_at_entry
+        && asked.elapsed() < SAVE_WAIT
+    {
         std::thread::sleep(Duration::from_millis(10));
         text_pump(&ui, &gateway, &pump);
         drain(&events, &pump, &ui.as_weak());
     }
+    let verdict = {
+        let p = pump.borrow();
+        flush_verdict(
+            p.saves != saves_at_entry,
+            p.saves_settled != settled_at_entry,
+            p.saves_answer,
+            dirty_at_exit,
+        )
+    };
     report(&format!(
-        "shutdown: the last flush {} (dirty at exit: {}, waited {:?})",
-        if pump.borrow().saves != saves_at_entry {
-            "landed"
-        } else if !dirty_at_exit {
-            "was not needed - the buffer matched what was sent"
-        } else {
-            "DID NOT land in the wait, closing anyway"
-        },
+        "shutdown: the last flush {verdict} (dirty at exit: {}, waited {:?})",
         dirty_at_exit,
         asked.elapsed()
     ));
