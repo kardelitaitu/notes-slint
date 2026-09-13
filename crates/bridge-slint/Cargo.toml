@@ -1,5 +1,6 @@
 # SLINT SPIKE, slice 0: the skeleton only. There is NO Slint UI in here yet - see
-# src/main.rs for what this crate is for and what slice 1 starts from.
+# src/probe.rs (STRIP-0: it is src/main.rs until 2026-09-15, same bytes) for what this crate is
+# for and what slice 1 starts from.
 #
 # It is a BRIDGE, so the layering instrument holds it to the same rule as bridge-gpui:
 # it may import notes-api and its OWN toolkit, nothing else in this repo (arch.rs,
@@ -31,9 +32,24 @@ unused_crate_dependencies = "warn"
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 
+# STRIP-0, dated 2026-09-15: TWO names, ONE source. This is the honest transitional lie, and it
+# is a lie about the future, not about the present: the product IS the probe for exactly this
+# commit. `notes-slint` is the name every downstream owner fences against - the icon and version
+# resource, the application manifest, the portable folder, the %APPDATA% identity, the smoke leg
+# (xtask/src/smoke.rs: bin "notes-slint" -> notes-slint.exe), and check.rs's slint-build row - so
+# it is declared FIRST and keeps compiling the probe until STRIP-1..n land a real product source
+# beside it. `notes-slint-probe` is the same bytes under the name the spike deserves, so the two
+# identities are already separable in the build graph before anyone has to decide, mid-slice,
+# which exe a check was ever talking about. Both targets share every dependency today; the day a
+# dependency binds only one of them is a strip-slice problem (and `unused_crate_dependencies`
+# above will say so loudly), not a reason to delay this table-setting.
 [[bin]]
 name = "notes-slint"
-path = "src/main.rs"
+path = "src/probe.rs"
+
+[[bin]]
+name = "notes-slint-probe"
+path = "src/probe.rs"
 
 [dependencies]
 notes-api = { workspace = true }

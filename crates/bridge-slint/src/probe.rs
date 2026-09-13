@@ -3502,7 +3502,7 @@ mod chords {
         // would otherwise match the counting line too - the trap this test walked into on its
         // first run, reporting 3 for 2 real sites. Self-referential greps must say what they
         // exclude.
-        let whole = include_str!("../src/main.rs");
+        let whole = include_str!("../src/probe.rs");
         let src = &whole[..whole.find("mod tests").expect("the tests module")];
         assert_eq!(
             src.matches("lock_verdict(meta.read_only, meta.oversize)")
@@ -3554,7 +3554,7 @@ mod chords {
         // touches NOTHING - a refusal that adopted state would be the data-loss bug this event
         // exists to prevent. Cut at `mod tests` for the reason the S8b test learned: this file
         // greps ITSELF, so the counting lines are inside it.
-        let whole = include_str!("../src/main.rs");
+        let whole = include_str!("../src/probe.rs");
         let src = &whole[..whole.find("mod tests").expect("the tests module")];
         assert!(
             src.contains("Event::LoadFailed { path, reason } =>"),
