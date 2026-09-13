@@ -3,7 +3,10 @@
 // The model is crates/bridge-gpui/src/titlebar.rs - the only shipped implementation of
 // ADR-0003's band, and the one where these decisions were already argued out: the 60px slot
 // at either end of the centre (:57 + the slot() helper at :296), what the centre may say
-// (:124), the four rows the popup may offer and why two plausible ones are absent (:183),
+// (:124), the rows the popup may offer - the model's five and why two plausible ones are
+// absent from it (:183) - plus a sixth that the model has no cell for, because the model never
+// owed Slint anything and the licence does: About, the section 2(a) door, spelled out in the
+// ABOUTSLINT block below.
 // and the dot's three states with their precedence (:67-104). This file re-states their
 // SHAPE in slint. It does not re-decide them, and every place the shape could not cross the
 // bridge is said out loud below instead of being smoothed over.
@@ -37,6 +40,30 @@
 
 import { Theme } from "theme.slint";
 
+// ABOUTSLINT: the licence's live obligation, not a courtesy. The Slint royalty-free licence
+// (LicenseRef-Slint-Royalty-free-2.0.md, §2) is granted "provided that You do EITHER of the
+// following", and of its two doors only one is open to this project: (b) is a badge on a download
+// page, and there is no download page - so (a) is the obligation: "Display the AboutSlint widget in
+// an About screen or dialog accessible from the top level menu". That is precisely the row and the
+// panel below. The widget itself is std: it is exported by EVERY style's std-widgets.slint
+// (i-slint-compiler-1.17.1/widgets/fluent/std-widgets.slint:6 re-exports ../common/about-slint.slint)
+// and SLINT_STYLE is unset here, so the fluent default is what compiles - and the import door is
+// the one this file's sibling already uses for TextEdit: "std-widgets.slint".
+// Its own Platform.open-url MAY silently no-op under winit, which is why the panel is a box with
+// the widget INSIDE it rather than a link: §2(a) asks for the ATTRIBUTION, and the text is the
+// compliance; a clickable logo would be a nice extra nobody should rely on.
+// PLACEMENT is not the implementer's call, so it is recorded exactly as it was given:
+// placement chosen 2026-09-14: About lives in the hamburger menu, which is also the license clause door.
+//
+// THE DOOR, and this one line is the whole of the earlier failure. The element EXISTS (its
+// source is i-slint-compiler-1.17.1/widgets/common/about-slint.slint) and every style's
+// std-widgets.slint RE-EXPORTS it, but a name in the style library is reachable ONLY through
+// that re-export - which is exactly how ui/main.slint:11 gets its TextEdit. Without this import
+// the compiler says "Unknown element 'AboutSlint'", ui_gen.rs then exports no Spike, and every
+// Rust user of the generated module dies with E0432 - which is what a broken markup tree looks
+// like from the inside, and why the error you see is never the error you have.
+import { AboutSlint } from "std-widgets.slint";
+
 /// The dot's three states as a value, not as a color, so the precedence is one readable
 /// expression and only one line owns hex digits - the same separation Dot / dot_state() /
 /// Dot::color() keep in the model (titlebar.rs:67-104).
@@ -68,6 +95,15 @@ export component Chrome inherits Rectangle {
     // finding 3), and the menu is local state - it opens a list of things the app already
     // knows how to do, so unlike the pin it asks the port nothing and expects no answer.
     in-out property <bool> menu-open: false;
+
+    /// The About screen's own bit, and it is deliberately SEPARATE from menu-open: the licence
+    /// asks for a screen reachable from the top level menu, and a widget that only exists while a
+    /// popup is open is not a screen. Chrome owns both bits, and both are written in this file.
+    in-out property <bool> about-open: false;
+    /// Forwarded by the mount so a synthetic act and a real row click go through ONE door (the same
+    /// counter pattern as toggle-asks above, which cost a build to learn - a component callback
+    /// cannot be invoked from Rust through the parent).
+    in property <int> about-asks: 0;
 
     // ---- the host's size, told to the bar because a bar cannot see its own window ------
     // S7: the popup's clamp is a question about the WINDOW, and a component may not reach out
@@ -522,10 +558,13 @@ export component Chrome inherits Rectangle {
         height: parent.height;
     }
 
-    // ---- THE POPUP: five rows, the port's vocabulary -------------------------------
+    // ---- THE POPUP: six rows - the port's vocabulary, then the licence's ------------
     // Open / Save As / Auto-save / Clear recents / Quit (titlebar.rs:183, with Clear under
-    // the recents it acts on and Quit last). Two plausible rows are absent BECAUSE THE LIST
-    // SAYS SO, not because they were forgotten: no New and no plain Save.
+    // the recents it acts on and Quit last), and a SIXTH row the model does not have: About
+    // Slint - there because the royalty-free licence's section 2(a) asks for an About screen
+    // reachable from the top level menu, and this menu IS this app's top level menu.
+    // Two plausible rows are STILL absent BECAUSE THE LIST SAYS SO, not because they were
+    // forgotten: no New and no plain Save.
     //
     // THE DIVERGENCE, recorded instead of invented: the first bridge's table binds Ctrl+T to
     // ToggleAutosave (menu.rs binding_for), NOT to a new note - and "new note" has no port
@@ -539,29 +578,52 @@ export component Chrome inherits Rectangle {
     // 2, and a full-row cell per row for the tint and the click. Quit's chord is the empty
     // string because the model returns None there (titlebar.rs:211-218) - an invented chord
     // is exactly the drift the table exists to prevent.
-    // THE DISMISSAL HANDLERS. Alongside the hamburger's ask below and the five rows, these
-    // are the only writes to menu-open anywhere, and every one of them is in this file.
+    // THE DISMISSAL HANDLERS. Alongside the hamburger's ask below and the six rows, these
+    // are the only writes to menu-open anywhere, and every one of them is in this file. Each
+    // dismissal clears about-open in the same breath: ONE click-away discipline, two surfaces,
+    // so nobody has to learn a second close gesture for the licence screen.
     backdrop-asked => {
         root.menu-open = false;
+        // One click-away discipline, two surfaces: the About panel dismisses exactly like the
+        // popup, because a licence screen nobody can close is a worse product than no screen.
+        root.about-open = false;
     }
     escape-asked => {
+        root.menu-open = false;
+        root.about-open = false;
+    }
+    changed about-asks => {
+        // The act's door. It opens About AND closes the popup, which is what the row does, so the
+        // needle measures the same path a pointer takes.
+        root.about-open = true;
         root.menu-open = false;
     }
     toggle-menu-asked => {
         root.menu-open = !root.menu-open;
+        root.about-open = false;
     }
     changed toggle-asks => {
         root.menu-open = !root.menu-open;
+        root.about-open = false;
     }
+    // The unattended door for "dismiss whatever is open". Rust cannot invoke a component
+    // callback (S7 above), so the probe bumps this number and Chrome closes BOTH surfaces -
+    // the same two lines a backdrop click or an Escape reaches, entered through the other
+    // trigger. One number, one rule: no surface outlives the gesture that opened it.
     changed close-asks => {
         root.menu-open = false;
+        root.about-open = false;
     }
 
     menu := Rectangle {
         x: root.popup-x;
         y: parent.height;
         width: Theme.menu-width;
-        height: Theme.menu-pad * 2 + 5 * Theme.menu-row-height + 4 * Theme.menu-gap;
+        // SIX rows now (the 6th is About, and it is the licence's row - see the import above), so
+        // both numbers move together: the count of rows and the count of gaps between them. One
+        // constant per row, one less gap, and the test that counts writes to menu-open moves with
+        // this line rather than after it.
+        height: Theme.menu-pad * 2 + 6 * Theme.menu-row-height + 5 * Theme.menu-gap;
         visible: root.menu-open;
         background: Theme.menu-bg;
         border-radius: Theme.menu-radius;
@@ -608,6 +670,57 @@ export component Chrome inherits Rectangle {
             Text { col: 0; row: 4; text: "Quit"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
             Text { col: 1; row: 4; text: ""; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
             row-quit := TouchArea { col: 0; row: 4; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.quit-asked(); root.menu-open = false; } }
+
+            // Row 5 - About Slint. NO CHORD, and the empty cell is the same honest shape as
+            // Quit's: the chord table has no row for it (SHORTCUTS stays at fourteen), so the
+            // legend cannot claim one either - a key printed beside an act that has no key is the
+            // drift the table exists to prevent.
+            Rectangle { col: 0; row: 5; colspan: 2; background: Theme.hover-bg; opacity: row-about.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 5; text: "About Slint"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            Text { col: 1; row: 5; text: ""; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            row-about := TouchArea { col: 0; row: 5; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.about-open = true; root.menu-open = false; } }
         }
+    }
+
+    // ---- THE ABOUT PANEL: §2(a)'s "About screen or dialog" --------------------------------
+    // Declared AFTER the popup, so it paints above it (sibling order IS z-order here, the
+    // measurement that set the backdrop's mount). It is a BOX WITH A SIZE, which is not a style
+    // choice: about-slint.slint opens with `preferred-height: 100%; preferred-width: 100%`, so the
+    // widget asks to fill whatever it is given and its only real demand is its layout MINIMUM -
+    // hand it no box and the honest outcome is nothing visible, which would satisfy nobody, least
+    // of all the licence.
+    about := Rectangle {
+        x: root.popup-x;
+        y: parent.height;
+        width: 340px;
+        height: 260px;
+        visible: root.about-open;
+        background: Theme.menu-bg;
+        border-radius: Theme.menu-radius;
+        border-width: 1px;
+        border-color: Theme.bar-edge;
+
+        Text {
+            x: Theme.menu-pad;
+            y: Theme.menu-pad;
+            width: parent.width - Theme.menu-pad * 2;
+            text: "About";
+            color: Theme.menu-fg;
+            font-size: 1rem * Theme.font-scale-menu;
+        }
+
+        Rectangle {
+            x: Theme.menu-pad;
+            y: Theme.menu-pad * 2 + Theme.menu-row-height;
+            width: parent.width - Theme.menu-pad * 2;
+            height: parent.height - Theme.menu-pad * 2 - Theme.menu-row-height;
+            // THE INSTANTIATION - exactly one in this file, and a guard in probe.rs counts it, so
+            // the obligation cannot quietly evaporate in a refactor that reads as cosmetic.
+            // AboutSlint takes no input and needs none: it fills the box it is given.
+            AboutSlint { }
+        }
+
+        // The panel is not a modal and owns no button: click-away and Escape dismiss it, which is
+        // the same discipline the popup proved (S7), so a person never learns two close gestures.
     }
 }

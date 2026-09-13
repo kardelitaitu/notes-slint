@@ -257,11 +257,16 @@ const WRITE_BACK_AT: Duration = Duration::from_millis(17000);
 /// What it still does NOT prove is the near half - a physical key reaching
 /// capture-key-pressed and matching there. That half is on the manual list, and the
 /// compile-time witness for it is `slint-viewer --check` on the capture tree.
-/// S7: the overlay acts - open, clamp at three host widths, click-away, Escape. Spaced, not
+/// S7: the overlay acts - open, clamp at three host widths, click-away, Escape - and then
+/// ABOUTSLINT's three: open the licence screen through the row's own door, read it back, and
+/// dismiss it through the same dismissal door the popup uses. Spaced, not
 /// instantaneous: a resize only reaches Chrome's clamp after the next layout pass, so reading
 /// popup-x in the same statement that asked for the new size would print the old one. The
 /// window is put back to its starting size before the act ends, because the NEXT launch
 /// restores whatever size this one persisted.
+/// ELEVEN steps now, the last of them an observation with no act behind it: the eight that were
+/// here before are untouched in both order and output, so every old tally still means what it
+/// meant, and the two About needles sit after them.
 const OVERLAY_AT: Duration = Duration::from_millis(15000);
 const OVERLAY_EVERY: Duration = Duration::from_millis(260);
 
@@ -982,12 +987,30 @@ fn main() {
             // in the same step as writing measures the world before the act, so every needle
             // here is labelled with what it is looking at: the state AFTER the previous act.
             let ostep = third_pump.borrow().overlay_step;
-            if ostep < 8 {
+            if ostep < 11 {
                 let at = OVERLAY_AT + OVERLAY_EVERY * (ostep as u32);
                 if now >= at {
                     third_pump.borrow_mut().overlay_step = ostep + 1;
                     let w = ui.window();
-                    if ostep > 0 {
+                    // ABOUTSLINT: the licence screen's two needles, and they keep the rule the
+                    // seven above were built on - each prints what the PREVIOUS act left, never
+                    // what this one is about to do. Separate format string, so no old needle
+                    // changes wording or count: "overlay[about]: shown=true" is printed once,
+                    // after the row's door was bumped, and "overlay[about]: dismissed" once,
+                    // after the dismissal door was.
+                    if ostep == 9 || ostep == 10 {
+                        report(&format!(
+                            "overlay[about]: {} about-shown={} menu-shown={}",
+                            if ostep == 9 {
+                                "shown=true"
+                            } else {
+                                "dismissed"
+                            },
+                            ui.get_about_shown(),
+                            ui.get_menu_shown()
+                        ));
+                    }
+                    if ostep > 0 && ostep < 8 {
                         let seen = match ostep - 1 {
                             0 => "after open",
                             1 => "after 400px",
@@ -1021,7 +1044,15 @@ fn main() {
                         }
                         4 => ui.set_close_asks(ui.get_close_asks() + 1),
                         5 => ui.set_toggle_asks(ui.get_toggle_asks() + 1),
-                        _ => ui.set_close_asks(ui.get_close_asks() + 1),
+                        6 | 7 => ui.set_close_asks(ui.get_close_asks() + 1),
+                        // ABOUTSLINT: the 6th row, driven the way a pointer drives it - through
+                        // the ONE door the mount has (about-asks), which is the same handler the
+                        // TouchArea's clicked reaches, so the needle measures the row and not a
+                        // Rust-side shortcut. Then the dismissal, through the door the backdrop
+                        // and Escape reach. Step 10 observes and acts on nothing.
+                        8 => ui.set_about_asks(ui.get_about_asks() + 1),
+                        9 => ui.set_close_asks(ui.get_close_asks() + 1),
+                        _ => {}
                     }
                 }
             }
@@ -1910,7 +1941,7 @@ mod chords {
     #[test]
     fn the_caption_buttons_reuse_the_existing_doors() {
         // Bounded at BOTH ends: the caption region is not the end of the file, and slicing to
-        // EOF reaches the popup, whose five rows legitimately DO write menu-open - the first
+        // EOF reaches the popup, whose six rows legitimately DO write menu-open - the first
         // draft of this test failed on exactly that, which is the assertion working as a
         // question about scope rather than about behaviour.
         let start = POPUP
@@ -1949,9 +1980,22 @@ mod chords {
     fn menu_open_has_exactly_one_writing_file() {
         // The single-writer proof, as two greps. Chrome owns its in-out bit; the mounter may
         // read it (the mirrors and the backdrop's visible binding do) but may not assign it,
-        // and every dismissal route - hamburger, five rows, backdrop, Escape - ends inside
-        // chrome.slint.
+        // and every dismissal route - hamburger, six rows, backdrop, Escape - ends inside
+        // chrome.slint. ABOUTSLINT: the same proof now covers TWO bits, and it is exact about
+        // the new one - Chrome owns all seven writes to about-open (two opens: the row's click
+        // and the about-asks door; five closes: backdrop, Escape, the hamburger twice, and the
+        // probe's dismissal bump), while the mount assigns none.
         let chrome_writes = POPUP.lines().filter(|l| l.contains("menu-open =")).count();
+        let about_writes = POPUP.lines().filter(|l| l.contains("about-open =")).count();
+        assert_eq!(
+            about_writes, 7,
+            "exactly two opens and five closes may write about-open, all inside Chrome; found {about_writes}"
+        );
+        assert_eq!(
+            MARKUP.matches("about-open =").count(),
+            0,
+            "the mount reads Chrome's About bit through a binding and never assigns it"
+        );
         assert!(
             chrome_writes >= 8,
             "Chrome should own every write; found {chrome_writes}"
@@ -1981,9 +2025,81 @@ mod chords {
         assert!(editor < backdrop, "the editor must be below the catcher");
         assert!(backdrop < chrome, "the catcher must be below the popup");
         assert!(
-            MARKUP.contains("visible: chrome.menu-open")
-                && MARKUP.contains("enabled: chrome.menu-open"),
-            "a closed popup must leave every pixel to the editor"
+            MARKUP.contains("visible: chrome.menu-open || chrome.about-open")
+                && MARKUP.contains("enabled: chrome.menu-open || chrome.about-open"),
+            "the catcher exists for both dismissible surfaces - and for neither when both are shut"
+        );
+        // ABOUTSLINT: the panel is declared AFTER the popup inside Chrome, so sibling order
+        // puts the licence screen above the menu that opens it, which is the same z-order rule
+        // that decided where the backdrop is mounted.
+        let menu = POPUP.find("menu := Rectangle").expect("the popup");
+        let about = POPUP.find("about := Rectangle").expect("the About panel");
+        assert!(
+            menu < about,
+            "About must be declared after the popup, not before"
+        );
+        assert!(POPUP.contains("visible: root.about-open"));
+    }
+
+    #[test]
+    fn aboutslint_is_instantiated_exactly_once_in_markup_that_paints() {
+        // THE LICENCE GUARD, grep-grade on purpose: royalty-free §2(a) is discharged by
+        // DISPLAYING the widget, so the one fact that must not rot in a refactor that reads as
+        // cosmetic is that the std component is instantiated - once, in markup, through the
+        // style library's door. Comment lines are sliced out FIRST, because the obligation is
+        // argued in prose at the top of this very file: counting prose would count nothing that
+        // paints. (/// lines go with // lines - trim_start, then the same prefix test.)
+        let code: String = POPUP
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code.matches("AboutSlint {").count(),
+            1,
+            "the licence screen is ONE instantiation of the std widget, not a drawing of one"
+        );
+        assert!(
+            code.contains("import { AboutSlint } from \"std-widgets.slint\";"),
+            "the element must arrive through the style library's re-export - without it the\n             compiler says Unknown element and the crate stops building"
+        );
+        // The negative half, and it is the reason a hand-drawn badge cannot pass this test by
+        // accident: the artwork belongs to the widget, not to us. Copying the logo into markup
+        // would look like compliance and be none of it.
+        assert!(
+            !code.contains("MadeWithSlint"),
+            "AboutSlint's own asset must not be re-drawn here - display THEIR widget"
+        );
+        // THE ROW: sixth of six, and it keeps an EMPTY chord cell, because SHORTCUTS is a
+        // legend of commands and About is not one. Same shape as Quit's absence, same reason.
+        assert!(
+            code.contains("text: \"About Slint\""),
+            "the popup lost its 6th row"
+        );
+        assert!(
+            code.contains("row-about := TouchArea { col: 0; row: 5;"),
+            "the 6th row must be clickable and Chrome's own"
+        );
+        assert_eq!(
+            code.matches("col: 1; row: 5; text: \"\"").count(),
+            1,
+            "the About row's chord cell stays empty - a key beside an act with no key is drift"
+        );
+        assert_eq!(
+            code.matches("col: 0; row: 5; colspan: 2").count(),
+            2,
+            "the tint and the catcher occupy the 6th row, and nothing else does"
+        );
+        // THE BOX: the widget reports preferred-width/height of 100%, so it fills whatever it is
+        // handed and demands only its layout minimum back - a panel with no size would show
+        // nothing at all, which discharges nothing.
+        assert!(
+            code.contains("width: 340px;"),
+            "the About panel has no fixed box to fill"
+        );
+        assert!(
+            code.contains("height: 260px;"),
+            "the About panel has no fixed box to fill"
         );
     }
 
@@ -2376,6 +2492,13 @@ mod chords {
             );
         }
         assert_eq!(words.matches("  |  ").count(), SHORTCUTS.len() - 1);
+        // ABOUTSLINT: the legend is a legend of CHORDS, and the About row has none - it is a
+        // pointer act with no Command behind it, so it must not appear here even though it now
+        // appears in the popup. The row's own chord cell is empty for exactly this reason.
+        assert!(
+            !words.to_lowercase().contains("about"),
+            "the chord legend advertised the About row, which has no key and no command"
+        );
     }
 
     #[test]
@@ -2440,7 +2563,7 @@ mod chords {
         assert_eq!(
             body.matches("EventResult.accept").count(),
             SHORTCUTS.len() + 2,
-            "one accept per bound chord, plus Escape: fourteen commands in the table and ONE              dismissal, which is not a command and so is not in the legend (menu.rs has no              Escape row either - see the parity warning in main.slint)"
+            "one accept per bound chord, plus Escape: fourteen commands in the table and ONE              dismissal branch, which is not a command and so is not in the legend (menu.rs has no              Escape row either - see the parity warning in main.slint). ABOUTSLINT moved the              CONDITION, not the count: that one branch now closes whatever is open, popup or licence              screen, so sixteen accepts still means fourteen + Escape + the undo quarantine."
         );
         assert_eq!(
             body.matches("EventResult.reject").count(),

@@ -804,7 +804,8 @@ pub(crate) struct Pump {
     pub(crate) caption_step: u64,
     /// S7: which overlay step has run - eight of them, each observing the previous act and
     /// then performing its own (open, 400px, 180px, restore, backdrop, reopen, escape, and one
-    /// final observation).
+    /// final observation) - plus ABOUTSLINT's three (open the licence screen through the 6th
+    /// row's door, read it back, dismiss it), so eleven, the last one an observation only.
     pub(crate) overlay_step: u64,
     /// The window's own size on entry to the overlay act, to be restored at the end.
     pub(crate) start_size: Option<(u32, u32)>,

@@ -146,10 +146,17 @@ export component Spike inherits Window {
     // but a property binding is not an access: these read Chrome's outputs and write nothing.
     // The single-writer claim survives precisely because the direction is one-way.
     in property <bool> menu-shown: chrome.menu-open;
+    /// The About panel's state, read the same one-way way (out of Chrome, never back in).
+    in property <bool> about-shown: chrome.about-open;
     // S7: the probe two doors. Bumping a number is not writing Chrome state - Chrome
     // reacts to the change in its own handler, so menu-open keeps exactly one writer.
     in-out property <int> toggle-asks: 0;
     in-out property <int> close-asks: 0;
+    /// ABOUTSLINT: the licence screen's own door and its own read-back, same two shapes -
+    /// bumping a number is not writing Chrome's state (Chrome reacts in its own handler), and
+    /// the mirror is a binding, not an access. About lives in the hamburger menu, which is also
+    /// the license clause door; this pair is how an unattended run proves the row works.
+    in-out property <int> about-asks: 0;
     in property <length> popup-x: chrome.popup-x;
     in property <bool> popup-floored: chrome.popup-floored;
     in property <bool> popup-overflow: chrome.popup-overflow;
@@ -197,7 +204,11 @@ export component Spike inherits Window {
             // behavioural divergence from the model, made visible here rather than smoothed
             // over, and it is why the chord table in main.rs stays at fourteen rows: a
             // dismissal is not a command and does not belong in a legend of commands.
-            if (event.text == Key.Escape && chrome.menu-open) {
+            // ABOUTSLINT widens the CONDITION, not the count: one branch, one accept, and it
+            // now covers two surfaces - whatever is open on top is what the key closes. The
+            // accept-count test in probe.rs is pinned to this shape on purpose, and the number
+            // did not move when the About row landed.
+            if (event.text == Key.Escape && (chrome.menu-open || chrome.about-open)) {
                 chrome.escape-asked();
                 return EventResult.accept;
             }
@@ -336,8 +347,12 @@ export component Spike inherits Window {
         y: 0px;
         width: 100%;
         height: 100%;
-        visible: chrome.menu-open;
-        enabled: chrome.menu-open;
+        // ABOUTSLINT: the catcher exists for BOTH dismissible surfaces, so it is enabled while
+        // either is open - and still not one pixel sooner. A licence screen you cannot click away
+        // from would be a worse product than no licence screen, and an always-on catcher would
+        // eat every click in the window.
+        visible: chrome.menu-open || chrome.about-open;
+        enabled: chrome.menu-open || chrome.about-open;
         clicked => {
             chrome.backdrop-asked();
         }
@@ -356,6 +371,7 @@ export component Spike inherits Window {
         // Chrome's own layout - so the host states its size instead of the bar reaching out.
         toggle-asks: root.toggle-asks;
         close-asks: root.close-asks;
+        about-asks: root.about-asks;
         host-width: root.width;
         host-height: root.height;
         // S8, and this line is worth more than the property it replaces: I declared a property
