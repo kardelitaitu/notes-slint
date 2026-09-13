@@ -36,7 +36,14 @@ use notes_api::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, LogicalPosition, LogicalSize, Timer, TimerMode};
+mod surface;
 mod title_contract;
+#[cfg(test)]
+use surface::undo_quarantined;
+use surface::{
+    DialogKind, Route, SHORTCUTS, caption_glyph, dialog_starting_dir, dialog_words, legend,
+    lock_verdict, next_generation, route_of, suggested_name,
+};
 
 // The UI lives in ui/main.slint, imported rather than inlined: that file is one of
 // xtask smoke's freshness roots, so editing the markup behind a built binary makes the
@@ -450,21 +457,6 @@ const CHORD_EVERY: Duration = Duration::from_millis(500);
 // rule, and it names where the fix belongs: notes-platform already holds the HWND it was given by
 // Command::RegisterWindow, so a Send-able owned-handle answer is a port-and-platform conversation,
 // not a line in this file. Until then: unparented, on purpose, out loud.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DialogKind {
-    Open,
-    SaveAs,
-}
-
-impl DialogKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::SaveAs => "save as",
-        }
-    }
-}
-
 /// What the picker thread sends back: a path, or the absence of one. The absence IS the
 /// cancel - rfd returns None for it, and the rule below is that it must never be silence.
 struct DialogReply {
@@ -481,55 +473,6 @@ const DIALOG_ALLOWED_BY_DEFAULT: bool = true;
 
 fn dialog_allowed() -> bool {
     DIALOG_ALLOWED_BY_DEFAULT && std::env::var_os("SLINT_NO_DIALOG").is_none()
-}
-
-/// Where the picker starts. The current file's directory first - the port's recents list is
-/// ordered most-recent-first, so recents[0] IS the file in the window, and after a Clear it is
-/// the next best thing - then nothing, which leaves rfd on its own default.
-fn dialog_starting_dir(current: Option<&PathBuf>, recents: &[PathBuf]) -> Option<PathBuf> {
-    let from = current.or_else(|| recents.first());
-    let dir = from.and_then(|path| path.parent())?;
-    (!dir.as_os_str().is_empty()).then(|| dir.to_path_buf())
-}
-
-/// The name the save dialog offers. The bridge already computes the title's words for the OS
-/// title and the strip, so the dialog asks for the same thing the user can already read rather
-/// than inventing a third name; an extension is added only when the word has none, because
-/// rfd's suggestion is a whole file name on Windows.
-fn suggested_name(title_words: &str) -> String {
-    let trimmed = title_words.trim();
-    let base = if trimmed.is_empty() {
-        "Untitled".to_string()
-    } else {
-        // The path type knows both separators on Windows; a hand-rolled split by one of them
-        // is the kind of bug that only shows up on the other machine. A full path in, a bare
-        // file name out, and words that are not a path come back as they were.
-        std::path::Path::new(trimmed)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| trimmed.to_string())
-    };
-    if base.contains(".") {
-        base.to_string()
-    } else {
-        format!("{base}.notes")
-    }
-}
-
-/// The one place the wording of a dialog answer lives, so the status line and the log cannot
-/// disagree about whether the user picked or cancelled.
-fn dialog_words(kind: DialogKind, path: &Option<PathBuf>) -> String {
-    match path {
-        Some(chosen) => format!(
-            "{}: {}",
-            kind.label(),
-            chosen
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| chosen.display().to_string())
-        ),
-        None => format!("{}: cancelled", kind.label()),
-    }
 }
 
 /// Which table rows to drive, by index into SHORTCUTS: Open, Alt+2, Auto-save, Save As,
@@ -2230,75 +2173,6 @@ fn drag_release(gw: &Rc<RefCell<Option<Gateway>>>, via: &str) {
     send(gw, Command::GeometryChanged);
 }
 
-/// THE CHORD TABLE, ported row for row from the first bridge's menu.rs SHORTCUTS - the same
-/// four commands, the same ten recents, the same alt-0 -> "recent 10" quirk. The table is
-/// LOAD-BEARING, not a comment: the synthetic driver walks it to decide what to fire and
-/// prints the needle from its own display string, the legend is generated from it, and the
-/// tests below fail if a row names an act nothing routes to. That is menu.rs's trick ported
-/// - a dead key becomes a test failure instead of a key that does nothing on a machine.
-///
-/// (binding, display, what, act) - the act is a stable name, resolved by route_of().
-const SHORTCUTS: &[(&str, &str, &str, &str)] = &[
-    ("ctrl-o", "Ctrl+O", "Open", "open"),
-    ("ctrl-s", "Ctrl+S", "Save As", "save-as"),
-    ("ctrl-t", "Ctrl+T", "toggle auto-save", "autosave"),
-    (
-        "ctrl-shift-r",
-        "Ctrl+Shift+R",
-        "clear recent files",
-        "clear-recents",
-    ),
-    ("alt-1", "Alt+1", "recent 1", "recent-0"),
-    ("alt-2", "Alt+2", "recent 2", "recent-1"),
-    ("alt-3", "Alt+3", "recent 3", "recent-2"),
-    ("alt-4", "Alt+4", "recent 4", "recent-3"),
-    ("alt-5", "Alt+5", "recent 5", "recent-4"),
-    ("alt-6", "Alt+6", "recent 6", "recent-5"),
-    ("alt-7", "Alt+7", "recent 7", "recent-6"),
-    ("alt-8", "Alt+8", "recent 8", "recent-7"),
-    ("alt-9", "Alt+9", "recent 9", "recent-8"),
-    ("alt-0", "Alt+0", "recent 10", "recent-9"),
-];
-
-/// What a chord resolves to. The reason this is an enum and not a closure is the rule the
-/// whole spike runs on: a key press and a row click must reach the SAME function, so a
-/// Route is fired by invoking the callback the row invokes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Route {
-    Open,
-    SaveAs,
-    Autosave,
-    ClearRecents,
-    Recent(usize),
-}
-
-/// A table act name to a Route. None means the table gained a row nothing implements, which
-/// every_chord_routes_somewhere turns into a failing test.
-fn route_of(act: &str) -> Option<Route> {
-    match act {
-        "open" => Some(Route::Open),
-        "save-as" => Some(Route::SaveAs),
-        "autosave" => Some(Route::Autosave),
-        "clear-recents" => Some(Route::ClearRecents),
-        other => other
-            .strip_prefix("recent-")
-            .and_then(|n| n.parse::<usize>().ok())
-            .map(Route::Recent),
-    }
-}
-
-/// THE LEGEND, generated from the same rows (menu.rs::legend() in shape), because on a
-/// frameless window with no menu bar there is nothing else that can tell a user the commands
-/// exist. Filtered by route_of, so an unbound row cannot advertise itself.
-fn legend() -> String {
-    SHORTCUTS
-        .iter()
-        .filter(|(.., act)| route_of(act).is_some())
-        .map(|(_, display, what, ..)| format!("{display} {what}"))
-        .collect::<Vec<_>>()
-        .join("  |  ")
-}
-
 /// The 5th row's act and Ctrl+Shift+R's, one function for both triggers. Nothing to
 /// translate: the port owns the list, the cap and the dedupe, so the bridge only asks - and
 /// the Event::RecentsUpdated that comes back is both the redraw AND the witness that the
@@ -2501,59 +2375,6 @@ fn note_adoption(pump: &RefCell<Pump>, path: &Path) -> i32 {
     }
     p.adopted_path = Some(path.to_path_buf());
     p.generation
-}
-
-/// S8b: the port's verdict, put into a word. Empty means not locked. The two causes stay
-/// distinct because they explain differently to a person: `read_only` is the disk, which the user
-/// set (or a file server did), while `oversize` is D9 - the 8 MiB guard opens a big file READ-ONLY
-/// instead of refusing it, because a refused open is a lost document. Returning the word rather
-/// than a bool is deliberate: the UI must not re-derive a reason the port already gave, and a bare
-/// bool invites a status line that says "read-only" about a file that is merely huge.
-fn lock_verdict(read_only: bool, oversize: bool) -> &'static str {
-    match (read_only, oversize) {
-        (false, false) => "",
-        (true, false) => "read-only on disk",
-        (false, true) => "read-only: too big to edit safely (8 MiB guard)",
-        (true, true) => "read-only on disk, and too big to edit safely (8 MiB guard)",
-    }
-}
-/// a toggle would collide after two adoptions. The PARITY is what a conditional recreation would
-/// key on, so this makes the parity a fact a test can hold rather than an expression written
-/// twice in two languages.
-fn next_generation(previous: i32) -> i32 {
-    previous + 1
-}
-
-/// S10b: THE UNDO QUARANTINE, as a decision a test can hold. The capture handler in
-/// main.slint implements the same rule in markup (this file cannot call into it and markup
-/// cannot call into here, so the pair is held together by `the_quarantine_is_a_state_rule`,
-/// which greps every piece of the condition out of the mount).
-///
-/// Why a STATE rule and not two more table rows: SHORTCUTS is the legend of *commands*, each
-/// with a port Command behind it, and it is held at fourteen rows by tests that mirror
-/// menu.rs. Undo and redo are not commands - the port has no Command for them and never will -
-/// so rows for them would print them in a legend of commands and break the parity guard the
-/// table exists to keep. What is different here is that the rule is armed by generation, not
-/// by the key alone: the same keystroke is native undo on the first document and a swallowed
-/// hazard on the second, which is precisely the shape a table cannot express.
-/// Test-only on purpose, and dead-code-clean because of it: there is no Rust-side key path to
-/// call this from - the implementation is the markup branch, and this is the oracle the branch is
-/// grepped against. Wiring it into the binary would mean inventing a call site that lies.
-#[cfg(test)]
-fn undo_quarantined(generation: i32, text: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
-    let _ = shift; // allowed, on purpose - see the doc comment above and the Ctrl+Shift+Z hole.
-    generation > 0
-        && ctrl
-        && !alt
-        && (text.eq_ignore_ascii_case("z") || text.eq_ignore_ascii_case("y"))
-}
-
-fn caption_glyph(maximized: bool) -> &'static str {
-    if maximized {
-        "icons/restore.svg"
-    } else {
-        "icons/maximize.svg"
-    }
 }
 
 /// The caption minimize door, shaped exactly like toggle_max: take the weak handle, ask the
