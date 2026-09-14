@@ -57,21 +57,33 @@ Three judgements worth keeping:
 toggles `menu-open` on. The two strings arrive through the same properties Rust writes. Pixels are
 sampled, because this session cannot see images.
 
-| capture | popup height | amber glyph core, footer band | reading |
-|---|---|---|---|
-| committed `47b14241` (footer only) | 184px — grew the predicted 46px | **137,105,50** | that is amber composited over the **editor** `#171717`, not over `menu-bg` `#2a2a2a` → the block was hanging **outside the box that paints its background** |
-| working tree at the time, recents block + both fixes (now `79d11e86`) | 294px | **218,158,57** | amber over menu-bg ✓ inside the box |
+| capture | popup height | brightest amber in the footer band |
+|---|---|---|
+| committed `47b14241` (footer only) | 184px — grew the predicted 46px | 137,105,50 |
+| working tree at the time, recents block + both fixes (now `79d11e86`) | 294px | 218,158,57 |
 
-What made the difference is that the rows region stopped being "whatever height is left". The
-`GridLayout` is now sized by the row arithmetic itself rather than `parent.height - pad*2` (which,
-once the popup grew for a footer, stretched six rows into the space the footer needed), the seam
-below it reads that geometry — `rows-bottom: rows.y + rows.height`, the layout's own measure rather
-than a re-derivation — and the footer anchors to the bottom edge its tail reserves,
-`y: parent.height - root.footer-height`, instead of computing a position from nominal numbers.
+**What those two numbers do and do not say.** I first read the 137 as amber composited over the
+editor rather than over `menu-bg`, and from that concluded the footer was hanging outside its box.
+That reading is withdrawn, and the reason is worth keeping: a later live capture showed the product
+paints its body at `#292929` and its popup at `#2a2a2a` — **one unit apart** — so in the real window
+that comparison cannot distinguish inside from outside at all; it only worked in the viewer because
+an unpainted root window is darker than either. What 137 vs 218 actually measures is ink *coverage*
+(thin antialiased caption strokes may contain no fully covered pixel), which is a weaker thing.
 
-The one remaining editor-coloured row inside the popup (y=301) is the **divider, not a hole**:
-dyeing `background` on the temp copy turned exactly that row magenta, 21px above the popup's
-bottom edge.
+What does support the two layout changes:
+
+- `GridLayout` is no longer sized by leftover height (`parent.height - pad*2`), so it cannot
+  stretch six rows into whatever room the popup happens to have; it is sized by the row arithmetic
+  itself, the seam below reads that geometry (`rows-bottom: rows.y + rows.height`, the layout's own
+  measure, not a re-derivation), and the footer anchors to the bottom edge its tail reserves
+  (`y: parent.height - root.footer-height`). The footer's position is now structural instead of
+  agreeing with the box by coincidence at one particular content height.
+- The one editor-coloured row inside the popup (y=301) is the **divider, not a hole**: dyeing
+  `background` on the temp copy turned exactly that row magenta, 21px above the popup's bottom edge.
+  It reads near `#171717` because `Theme.bar-edge` is **`Palette.border`** — a platform brush, not a
+  literal — which is also why "a hairline and a see-through hole look identical" is true here for a
+  reason I had wrong: the hairline is the OS's own border colour, and the body is one unit from the
+  popup's fill.
 
 Unit level: 3 new tests in `plumbing.rs` (the copy's exhaustive skip list, the file line's exact
 sentences, and grep guards for "no `TouchArea` in the footer / one writer per setter / both users
@@ -82,11 +94,13 @@ spend the same row arithmetic"). `cargo test -p notes-bridge-slint` → 38 + 56 
 
 Three things, in the order they cost least:
 
-1. **Do not let the two geometry terms disappear.** They are the difference between the footer
-   painting inside its box and outside it, and nothing in the test suite can see that — the unit
-   guards check strings, not compositing. Whoever lands the next `chrome.slint` commit should
-   re-run the one-number check: a screenshot of the open popup, brightest amber pixel in the
-   footer band, **~218 means inside, ~137 means the grid is stretching again.**
+1. **Do not let `GridLayout.height` go back to leftover height.** Nothing in the test suite can see
+   it — the unit guards check strings, not geometry — and nothing in a screenshot can either,
+   because the popup's `#2a2a2a` and the body's `#292929` are one unit apart, so a footer that
+   escapes its box does not look like it escaped. The check that survives that fact is structural:
+   the popup's measured height equals the sum of its declared parts (`pad*2 + 6*row + 5*gap`, plus
+   the recents term, plus the footer term), and the hairline sits `footer-height` above the box's
+   bottom edge. If those two agree, the footer is in the box.
 2. **Anything else that hangs under the grid should read `menu.rows-bottom`**, the measured seam,
    and never re-derive a position from `6 * row + 5 * gap`. The first version of this footer did,
    and it is the reason the seam exists now.
@@ -103,17 +117,31 @@ answered here.
 
 ## What is still not proven
 
-- **The geometry is proven on a synthetic field, not a live one.** The two fixes landed in
-  `79d11e86` (the recents commit that grew the same popup), so the box, the seam and the footer are
-  committed — but the only render that shows them correct is a `--load-data` screenshot. If the
-  grid is ever sized by leftover height again, nothing fails: the footer simply paints outside its
-  background, and the tell is the amber core dropping from ~218 to ~137.
+- **The footer's pixels are proven in a preview, not in a live window.** The fixes are committed in
+  `79d11e86`, and the render that shows them correct came from `--load-data`. A real window can be
+  photographed here, but its menu cannot be opened from this session: `SetForegroundWindow` is
+  refused even with the `AttachThreadInput` dance, and without the foreground a synthetic press is
+  swallowed as an activation click — and any keystroke sent anyway goes to whoever *is* focused,
+  which is why the harness must read that gate's answer rather than ignore it. `cargo xtask smoke`
+  declines this class of run as **exit 3, "not the app's fault"**, and says in its own header that
+  "the CLICK half STAYS MANUAL". So "a person can open this menu and read the footer" is a manual
+  check, and it is still owed.
+- **What a live run here cannot do, it can still feed.** Seeding the private profile's
+  `session.json` with `"path"` makes the product restore the file through its own startup door, and
+  a real window of a throwaway copy came up on a real foreign `.md`:
+  `load: path=…\scratch.md … meta(read_only=false oversize=false armed=false)` — the disarmed
+  verdict the footer exists to render, arriving as a real `Event::Loaded` in a real window, next to
+  `corners: round (the window is normal)` and `recents: rendered 1 row - slots 1..=1`. So the
+  footer's **inputs** are live-proven; only its on-screen placement in a live window is not.
 - `file-words` says "lines" nowhere: `FileMeta` carries no line count, so the manager's commit
   message that promises "lines" overstates what this renders. What it renders is encoding, BOM,
   line endings, trailing newline, writability, the size guard, and the arming verdict.
-- No live end-to-end: the footer was rendered through `--load-data`, not by dragging a real `.md`
-  into a real window and watching `AutosaveSkipped` arrive. The arm that words it is reached by
-  probe-era synthetic runs, which do exist, but nobody has re-run one against this markup.
+- **The reason line has no live witness yet.** The file line above is proven by a real `Loaded`. The
+  other half needs an edit: typing into a disarmed file is what makes the bridge send `Flush` and
+  the engine answer `AutosaveSkipped(ForeignFileNotArmed)`, and this session cannot put characters
+  into the product's caret without first winning the foreground it cannot win. So that sentence in
+  the menu is currently evidenced by unit tests and by the frozen probe's needles, not by a window
+  anybody watched.
 - The popup can now outgrow a short window: the recents cap of five exists precisely because
   `Chrome` cannot ask the window how tall it is. With both blocks the popup wants ~294px against a
   minimum window height — unmeasured, and the same open fit question the width clamp already
