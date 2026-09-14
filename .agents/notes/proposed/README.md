@@ -13,11 +13,11 @@ Ideas on the table. Not decided, or decided but not yet built.
 - Before proposing anything, grep [`../rejected/`](../rejected/) — relitigating a settled
   rejection wastes the reader's time and yours.
 
-## What is on the table (eleven, as of 2026-09-15)
+## What is on the table (twelve, as of 2026-09-15)
 
 Grouped by what each note is waiting on — one line each; the note holds the argument, this is the map.
 
-**The save path — five.** What a write may do, and to which file.
+**The save path — six.** What a write may do, to which file, and on which channel.
 
 - [`2026-09-12-arm-on-explicit-save-path`](2026-09-12-arm-on-explicit-save-path.md) — was the
   `ctrl-s` keybinding the arming act ADR-0001 names, or was a rule missing? **Overtaken by**
@@ -27,12 +27,19 @@ Grouped by what each note is waiting on — one line each; the note holds the ar
   deserve a `Command::New`, or is quit-and-relaunch the correct shape of a single-document app?
 - [`2026-09-14-autosave-retry-ownership`](2026-09-14-autosave-retry-ownership.md) — after a
   failed save, who owns the retry cadence — the two shipped bridges answer it differently today.
+  Its 2026-09-15 addendum is now the heavier half of the file: it carries the channel law, **a retry
+  is a Save, never a Flush**, and it is the neighbour of the held-switch note below.
 - [`2026-09-14-note-switch-must-not-lose-text`](2026-09-14-note-switch-must-not-lose-text.md)
   — opening another note replaces the buffer and §4.4's unsaved-changes guard has no code;
   pre-existing, not a cost of the new Save.
 - [`2026-09-15-flush-shares-the-refused-load-guard`](2026-09-15-flush-shares-the-refused-load-guard.md)
   — `Engine::save` and `Engine::save_as` both refuse to write a file whose open was
   refused; `Engine::flush` does not, and this note makes that deferred call an artifact first.
+- [`2026-09-15-held-switch-waits-for-answer`](2026-09-15-held-switch-waits-for-answer.md)
+  — a held toggle must release on the answer the funnel **sent**, never on a counter, and on a
+  refusal it holds and tells until a second press confirms. Filed under the save path rather than
+  the menu because its three rules are about which command travels on which channel — the same
+  law the retry addendum carries — with the menu row only where the user meets it.
 
 **The menu, and how a user reaches it — three.**
 
@@ -46,13 +53,13 @@ Grouped by what each note is waiting on — one line each; the note holds the ar
   — ADR-0003's bar wants popup and tooltip, and M2 is deliberately `Root`-free. Which
   gives?
 
-**The window's own surface — two.**
+**The window's own surface — one.**
 
 - [`2026-09-14-window-gets-a-floor`](2026-09-14-window-gets-a-floor.md) — who owns a minimum
   size — markup, product, or platform: a small window clips the About panel, and one clipped line is
   the reason a file is not being saved.
 
-**The record itself — where prose is stronger than the machine check.**
+**The record itself — two, where prose is stronger than the machine check.**
 
 - [`2026-09-14-external-change-event-is-never-emitted`](2026-09-14-external-change-event-is-never-emitted.md)
   — `Event::ExternalChange` is declared and rendered and produced by nothing, while §4.2
@@ -61,7 +68,7 @@ Grouped by what each note is waiting on — one line each; the note holds the ar
   — no instrument has ever pressed a pixel, the four press legs have no recorded green run, and the
   honest sentence is exactly `M2 pointer interaction is untested`.
 
-The two notes filed 2026-09-15 do **not** belong together, and the grouping above says why: the flush
-note is a save-path question about which write is allowed, while the pointer note is an evidence note
-about what the instruments can see — so it sits beside `ExternalChange`, not beside the menu
-notes it is often quoted with. Dates are filing dates, not categories.
+The three notes filed 2026-09-15 do **not** share a group, and the grouping above says why: the flush
+note and the held-switch note are both about which command may travel and on which channel, while the
+pointer note is an evidence note about what the instruments can see — so it sits beside `ExternalChange`,
+not beside the menu notes it is often quoted with. Dates are filing dates, not categories.

@@ -3,8 +3,8 @@ title: Who owns the autosave retry cadence?
 status: proposed
 id: 2026-09-14-autosave-retry-ownership
 created: 2026-09-14
-updated: 2026-09-14
-relates: [§4.2, §5.2, §5.5]
+updated: 2026-09-15
+relates: [§4.2, §5.2, §5.5, §4.4]
 decision: null
 ---
 
@@ -121,3 +121,166 @@ Nothing closes this note; it is open. What would force a decision:
 - A disk-full or sync-client incident where retrying every 750 ms is itself the damage: an
   unbounded loop against a failing volume is a resource leak, which argues for C's cap.
 - Choosing A anyway — it contradicts §5.2 rule 5, so it needs an ADR, not a commit message.
+
+---
+
+## Addendum, 2026-09-15: the channel law, found by review rather than by design
+
+A review of the shipped `Ctrl+S` found that this note's question has already been
+answered by accident, and answered wrongly. The cadence debate above survives it; one of
+its consequences does not, and the wrong sentence is named below rather than edited away,
+so a reader of the original finds the correction where the error was.
+
+`59de9c59` made A5 real: `save_now` sends `Command::Save` and adopts the send witness at
+the moment of the ask, in ADR-0007's own words - "it sends Save with the pair it would
+have flushed and ADOPTS that pair as its send witness (bump `edits`, resync `last_sent`,
+clear the pending debounce)". The comment gives the reason the pairing is taken at the
+ask: "the epoch stamp exists precisely so the SENDER owns the pairing."
+
+On failure the bridge does what this note already documented: clears `last_sent`, sets the
+edited flag, and the retry that follows is **the ordinary debounce pump sending
+`Command::Flush`**.
+
+**That loop is structurally incapable in the DEFAULT case.** The path the review walked:
+
+1. A foreign file is open. `armed` is set only on write success - core's `mark_saved` is
+   the one site that sets it - so a file whose FIRST save failed stays un-armed
+   permanently.
+2. The pump re-sends a `Flush`, and `should_flush` refuses it on `ForeignFileNotArmed`.
+3. With auto-save off it refuses on `AutosaveDisabled` instead. Same silence, other gate.
+4. The skip arm restores nothing - it settles, words the reason, and leaves `last_sent`
+   alone.
+5. And the send already re-synced `last_sent`, so the comparison lane early-returns
+   forever.
+
+Four independent ways to lose a person's newest text, in the ordinary case of one failed
+`Ctrl+S` on a file the app did not create - against a README whose first sentence promises
+an app that "never asks you to save". Each of the four is a gate that exists for a reason,
+which is what makes the composition a design error rather than a bug in one place.
+
+### The law
+
+> **A retry is a Save, never a Flush.**
+
+The reason is the pair of gates above, and why passing them is not a loophole.
+`Document::should_save_manual` differs from the debounced rule by exactly two gates BY
+DESIGN and says so: `AutosaveDisabled` is bypassed because the toggle is a standing
+instruction about unattended writes, and `ForeignFileNotArmed` is bypassed because
+ADR-0001 arms a foreign file on an explicit save - "An explicit Save IS the arming act."
+A gate that refused the retry until the file was armed "would make its own arming act
+unreachable - the deadlock ADR-0007 exists to avoid." So a retry routed through `Flush`
+is a retry routed through the gate the retry exists to pass. The channel is not a detail
+of the cadence; it decides whether the cadence can ever fire.
+
+This also honours what A5's own comment conceded about refusals: "the refused-load guard,
+the Clean refusal and the read-only verdict belong to the engine's ANSWER and not to
+anything decided here." The answer lane is where a retry's fate is decided, and `Save` is
+the command that has one.
+
+### The shape, with its end
+
+- The bridge's back-off re-sends `Command::Save`: **750 ms, doubling, to a cap**.
+- **At the cap it falls to a terminal state**, and the terminal state is not silence: the
+  witness stays dirty, the next user act carries the text, and the status line keeps
+  saying what failed. Retrying a doomed `Save` forever would be the resource leak this
+  note's own reopening conditions warned about, now with a write attempt attached to it.
+
+### Where the cadence does NOT go, said plainly
+
+Not into `api`: it has no clock for this and `AGENTS.md` forbids the rule - "A rule living
+in `api/engine.rs` instead of `core/` is a silent architecture change" - and
+`crates/api/src/lib.rs` still states that `SaveError` "carries the copy for a failure, not
+a retry policy." Not into `core` either, as a timer: core has no clock, and this note
+already wrote the sentence that settles the split - core decides *what* to do and something
+else decides *when* to wake up. Option **C** survives this addendum unchanged for the
+**curve**, because a pure `attempt -> delay -> stop` decision is exactly the rule core can
+own and test headless. What the addendum changes is the **payload**, and the payload was
+never in dispute.
+
+**Two sentences in the body above are now wrong, and are named rather than rewritten.**
+"Adopting C changes gpui: its present 'quiet until the next keystroke' is the weaker
+promise, so it must gain the loop" - it must gain a **Save** loop, not a Flush loop; a gpui
+retry that sends `Flush` inherits the same four gates and stays just as dead. And "a cap
+makes a permanent failure quieter and makes recovery slower" - under the channel law a cap
+no longer trades against recovery, because the terminal state hands the write to the next
+act instead of parking forever.
+
+### Three repairs, one root cause in three faces
+
+All three are the same mistake wearing different clothes: **"unsaved" is encoded as a
+string comparison and as a side effect of whichever event arrived last.**
+
+1. **Stop encoding "unsaved" as a string comparison.** Clearing `last_sent` cannot make an
+   *empty* buffer differ - the pump's `identical` test is `text == p.last_sent`, and ""
+   equals "" - so the branch clears the edited flag, prints "edited and edited back - the
+   bytes are identical, nothing sent", and early-returns on a buffer that never went
+   anywhere. Carry an explicit **pending** field instead: one bit meaning "bytes exist that
+   the disk does not have", independent of what any string looks like. The same field fixes
+   the stranded deletion, where deleting everything leaves the witness equal to the buffer
+   and the deletion with no way to be noticed. A lane that must compare less text than it
+   stores has already lost.
+2. **`why` needs a PRECEDENCE rule, not another unconditional overwrite.** Both lanes write
+   `p.why` with no order between them: the failure lane writes "save failed: <reason>" and
+   the next skip writes `skip_words(reason)` over it. The result tells a person to perform
+   the act that just failed - the menu explains that the file needs one explicit save, over
+   the sound of that save being refused by the disk. The rule: **a verdict about the disk
+   outranks a verdict about a setting**, and a setting's sentence may be dropped, never
+   allowed to overwrite a disk's. This is not a wording task: the two lanes disagree about
+   reality and one of them is being allowed to shout.
+3. **The grep-grade pin was the bug, not the test.** The present guarantee that the witness
+   comes back on failure is a source-text lookup, which is why wrapping the restore in `if
+   autosave_on` would keep the suite green while making case 3 above the normal path.
+   Extract a pure `retry_says(...)` decision in the house `*_says` idiom - the precedent is
+   in the same crate: `settle_says` for the close wait and `floored_says` for geometry - and
+   assert on the function. A pure predicate is testable without a window, and it cannot be
+   silently wrapped.
+
+### One thing this addendum explicitly does NOT propose
+
+**Do not move arming to a failed ask.** It is the tempting fix: it would make the retry's
+`Flush` pass `should_flush`, and it costs one line. It also arms a file whose bytes never
+landed, which turns the promise into its opposite - `api`'s own save documentation names
+that exact state, "rendering `save once and it keeps saving` about a file that has just
+been saved once", and it is why the `Rebound` announcement exists at all. Arming is a claim
+about bytes on disk. A retry that needs arming to work has the wrong channel.
+
+### Plumbing authority, because a code slice depends on it
+
+- **Neither the retry nor a held switch can send from inside `drain`.** Its signature is
+  `drain(events, pump, weak)` - there is **no gateway** between that signature and the wire
+  block - and its callers are the product tick, once per wake, and the probe, all the way
+  through its arm walk. Anything that must send has to be handed the gateway, and `drain`
+  deliberately is not: it is the one place both binaries share, and a send inside it would
+  be a product decision made on the instrument's account.
+- **The door is ONE post-drain step in the product tick**, which already holds a gateway:
+  the tick calls `drain(&tick_events, &tick_pump, &ui.as_weak())` and then
+  `text_pump(&tick_gw, ...)` on the same wake, so a step placed after the drain sees both
+  the answered events and the wire. That is the only place in the product where a retry can
+  be issued without inventing a second route to the port.
+- **That step must NOT sit between the panic-hook take and `Gateway::start`.** The region is
+  sliced by file index and asserted against - `product.rs`'s own module header enumerates
+  what is paid for it, including `smoke.rs`'s `PRODUCT_CLOSE_NEEDLES` - so inserting there
+  moves a slice a test already counts, for no behavioural reason whatever.
+- **The probe must not gain the behaviour.** The funnel the retry and the switch share is
+  **opt-in data installed only by product wiring**; a probe that never installs one has
+  nothing to release, so it releases nothing and its report cannot move. That is the
+  guarantee in the shape of the code rather than in a comment - the same
+  instrument-preservation rule that keeps `notes-slint-probe.exe` mounting the very same
+  `Spike` while owning none of the product's doors.
+
+### What this addendum changes in the recommendation
+
+The Recommendation section above stands: **C**, core owns the curve, the bridge keeps the
+clock, and the rule becomes an obligation of "a bridge" so a third toolkit inherits it
+instead of inventing it. Add to it, in this order: the retry's **channel** is `Save`
+(the channel law); the retry needs the **pending** field and the `why` precedence to be honest
+about itself; and the guarantee must move from a grep to `retry_says`. The
+"Consequences" bullet that has gpui gain "the loop" is read as the Save loop for the reason
+above - a Flush loop there would be a second implementation of a dead design.
+
+### The neighbour this addendum creates
+
+The retry stays this note's. **What a switch may do while it waits for an answer is not** -
+that law lives in
+`.agents/notes/proposed/2026-09-15-held-switch-waits-for-answer.md`, which shares the
+funnel, the plumbing constraint above, and the discipline of answering rather than waiting.

@@ -79,13 +79,14 @@ Detail: [docs/roadmap.md](docs/roadmap.md) §9. Ship targets: `win-install`, `wi
 ## Questions we have not answered
 
 Tracked in §10 ([docs/open-questions.md](docs/open-questions.md)), and worked through one
-at a time in [`.agents/notes/proposed/`](.agents/notes/proposed/), which holds **eleven open
+at a time in [`.agents/notes/proposed/`](.agents/notes/proposed/), which holds **twelve open
 notes** as of 2026-09-15. The count and the one-line summaries live in that folder's own
-[index](.agents/notes/proposed/README.md), so this sentence is never patched again; the short
-version is four groups — what the save path still owes (five notes), what the menu and its
-keyboards and pointers still owe (three), what the window's own surface still owes (two), and
-one gap in the record itself: an `Event::ExternalChange` every bridge can render and no code
-emits.
+[index](.agents/notes/proposed/README.md) — read them there, because a sentence like this one goes
+stale the day a note is filed. The shape, in four groups: six notes about what the save path still
+owes (which write may happen, to which file, on which channel), three about the menu and how a user
+reaches it, one about the window's own floor, and two about the record itself — an
+`Event::ExternalChange` every bridge can render and no code emits, and a pointer no
+instrument has ever pressed.
 
 Two questions left this list by being decided, not by being dropped. Autosave on a file the app
 did not create is settled: [ADR-0001](docs/decisions/0001-autosave-arms-on-explicit-save.md)
