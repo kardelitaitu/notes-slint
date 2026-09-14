@@ -122,15 +122,42 @@ answered here.
   photographed here, but its menu cannot be opened from this session, and `069018ef`'s menu legs now
   say so with numbers rather than with my failure: the whole harness passes (`product=PASS
   alive=PASS close=PASS exit=0` at 800x600, where the popup stays at rest so the clamp is not
-  implicated) while `menu-click` reports `hamburger 2018,94,1 | row 2052,166,1 | toggle lines=0
-  active=1` and is **NOT JUDGED (advisory)**. The reason is now measured directly rather than
+  implicated; and one row's wall time has been quoted two ways for this one leg — `100.2s`, which is
+  the run `check.rs:273` costs its 180s budget against, and `100.5s` from a second reading of the same
+  leg — so it is normalised here to **~100s**. That is the honest form: the four logs this round left
+  behind read 99.4s, 100.0s, 100.2s and 100.3s, no `100.5s` record was found in the tree to cite and
+  date, and the decimal is run-to-run drift while what is load-bearing is the margin under the
+  180s budget) while `menu-click` reports
+  `hamburger 2018,94,1 | row 2052,166,1 | toggle lines=0 active=1` and is
+  **NOT JUDGED (advisory)**. The reason is now measured directly rather than
   inferred from the keyboard leg: `SendInput` posts a 1px move and returns 1, and the cursor does not
-  move — and when the test ran, the cursor was sitting at **2052,122**, the exact Open-row pixel the
-  leg had pressed. So in this session `SetCursorPos` works and the button events do not, which is
-  what makes `presses landed on our window=3/3` (a hit-test at the right pixel) and "Rust heard
-  nothing" both true at once. That exonerates the row geometry for now, and it means **the live check
-  is still owed** — by a machine with a desktop this session can actuate, or by a harness that can
-  reach the TouchArea without an OS pointer.
+  move.
+
+  **Which pixel is whose — a correction, because the first draft of this paragraph had it wrong.**
+  It read the parked cursor as "`2052,122`, the exact Open-row pixel the leg had pressed", and that
+  attributes one leg's press to another leg's target. The quoted line is `menu-click`, which is
+  **LEG A** — `product_menu_click`, whose doc comment is `LEG A: hamburger, then the Auto-save row`
+  (`smoke.rs:5678-5679`) — and the row it presses is therefore the **Auto-save** row: grid row 2, and
+  `122 + 2 × 22 = 166`, which is the `row 2052,166` in the quoted line. `2052,122` is grid row 0,
+  **Open**, and it belongs to **LEG B**, `product_dialog_asked_leg` — `LEG B: the Open row, modal
+  stood down` (`smoke.rs:5716-5717`) — which the same log prints two lines later as
+  `dialog-asked: INFO - row 2052,122` and again as `native-dialog: … row=2052,122`. LEG A never
+  pressed 122, so "the exact pixel the leg had pressed" was a story about the wrong leg.
+
+  **The finding survives the story, and it is wider than the story.** The cursor never moved at
+  **either** pixel: 166 for the click leg, and 122 for the three legs that press the Open row —
+  `dialog-asked`, `native-dialog`, and `drag-closes-menu`, whose own refusal message is "the Open-row
+  pixel was pressed twice". Every one of them reports the press and none reports a cursor that
+  travelled. That is the exoneration, and it does not
+  need a per-leg match to hold: in this session `SetCursorPos` works and the button events do
+  not, which is what makes `presses landed on our window=3/3` (a hit-test at the right pixel) and
+  "Rust heard nothing" both true at once. If no press arrived at *any* row pixel, no row's placement
+  is implicated — so the geometry `chrome.slint` computes is still un-judged, not cleared, and
+  **the live check is still owed**: by a machine with a desktop this session can actuate, or by a
+  harness that can reach the `TouchArea` without an OS pointer. The harness has since grown exactly
+  the reading this note needed — each leg's INFO line now carries its own `| cursor moved -> …`
+  (`smoke.rs:5703`, `:5821`), so which pixel a given leg parked on is printed per leg instead of
+  being inferred from a neighbour's.
 - **What a live run here cannot do, it can still feed.** Seeding the private profile's
   `session.json` with `"path"` makes the product restore the file through its own startup door, and
   a real window of a throwaway copy came up on a real foreign `.md`:
@@ -149,7 +176,15 @@ answered here.
   anybody watched.
 - **The popup can no longer outgrow the window it hangs in — and the follow-up is owned elsewhere.**
   The recents clamp (`519df1c7`) makes the list yield to the window before the footer can be cut,
-  measured at 294→184px across eight heights with the footer intact at each. The next slice carried
+  measured at 294→184px across eight heights with the footer intact at each. **That re-quote is
+  confirmed, and it is arithmetic, not a sample:** 294 = 184 + 22·5 is the cap of five recents and
+  184 = 8 (pad) + 130 (six rows and five gaps) + 46 (the footer's tail) is the popup with none, so
+  the two ends are what `chrome.slint:837-839` must say, and the eight rungs between them are
+  22px apart. Re-checking it also caught a wrong rung in the ladder's own table — the `300` host row
+  read 250px / three recents, which is the `280` answer, and it is repaired to 272px / four recents
+  in [`2026-09-14-popup-stays-inside-its-window`](2026-09-14-popup-stays-inside-its-window.md), where
+  the whole ladder is now re-derived from the constants; the endpoints quoted here do not move.
+  The next slice carried
   that through: when even the irreducible menu does not fit below the bar, the popup **rises** and
   pays with the bar's lower pixels instead of losing its own bottom
   ([`2026-09-14-popup-stays-inside-its-window`](2026-09-14-popup-stays-inside-its-window.md)) —

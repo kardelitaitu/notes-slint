@@ -45,7 +45,9 @@ function popup-top(needed: length) -> length {
 - `host-height <= 0px` stands the rule down, so a harness that never tells the bar its window's
   height — including anything that instantiates `Chrome` bare — keeps the old constant behaviour.
 - `menu-raised` / `about-raised` say out loud when the popup had to rise, in the same voice as
-  `popup-floored`: a flag that admits beats a screenshot that hides.
+  `popup-floored`: a flag that admits beats a screenshot that hides. The flag admits and the system
+  does not listen — none of the four new flags is bound in `main.slint` or printed anywhere, which
+  is recorded under *Known limits of this ladder* rather than smoothed over here.
 
 **The order in which things give way** is the whole design, and it is now three deep: the recents
 yield rows first (a row that isn't drawn is still reachable by `Alt+1..0`); then the popup rises and
@@ -62,7 +64,26 @@ verdict left it — including the known gap that About is 340px wide while `popu
 than quietly fixed, and `the_popup_keeps_its_bottom_inside_its_window` now pins the formula so a
 future edit has to mean it.
 
-## What was measured, not asserted
+## What was read off the code, and what was sampled
+
+The heading used to say *measured, not asserted*. That overstated it in one direction and hid the
+other: most of the ladder is arithmetic read off `chrome.slint`, and arithmetic is the better
+evidence here because it can be re-checked without a render. Re-derived from the file for this
+repair — `Theme.bar-height` 28px, `Theme.menu-pad` 4px, `Theme.menu-gap` 2px,
+`Theme.menu-row-height` 20px (`theme.slint:126, 183-184, 199`), and `menu.rows-bottom` =
+`rows.y + rows.height` = 4 + (6·20 + 5·2) = **134** (`chrome.slint:822, 855`):
+
+- `recents-budget` (`:786-790`) = H − 28 − (134 + 4) − footer − 2 − 2 = **H − 214**;
+- `recents-fit` (`:791-792`) = ⌊(budget + 2) / 22⌋ = **⌊(H − 212) / 22⌋**, and `recents-shown`
+  (`:796-798`) is that capped at 5 and by the length of the list;
+- `menu.height` (`:837-839`) = 8 + 130 + 46 + 22n = **184 + 22px per shown recent**;
+- `popup-top` (`:198-202`) = max(0, min(28, H − needed − 2)), and `menu-raised` is that value
+  being **strictly** below 28.
+
+One term is not a constant: the footer's 44px is `1px + menu-gap + notes.min-height` (`:756-758`),
+and `notes.min-height` is the layout's own demand for the three caption lines this harness feeds it.
+That is the single number a render supplies, and it is exactly why the caveat at the end of this
+section says the table's rows are not invariants.
 
 The preview harness (`slint-viewer --screenshot --backend software --load-data`), with the root
 `Window`'s height patched and `host-height` fed `root.height` exactly as `main.slint:371` feeds it
@@ -71,8 +92,8 @@ in the product. Ten recents seeded, the footer carrying a two-line reason plus t
 | window | menu: top → bottom | menu height | state |
 |---|---|---|---|
 | 640 | 29 → 322 | 294 | whole, five recents |
-| 300 | 29 → 278 | 250 | whole, three recents |
-| 258 | 27 → 254 | 228 | whole, two recents, risen 2px |
+| 300 | 26 → 297 | 272 | whole, four recents, risen 2px (re-derived, not re-sampled) |
+| 258 | 27 → 254 | 228 | whole, two recents — at rest, see below |
 | 236 | 27 → 232 | 206 | whole, one recent |
 | 220 / 214 | 29 / 27 → 212 / 210 | 184 | whole, no recents |
 | 200 | **13** → 196 | 184 | whole — the popup now overlaps the bar |
@@ -87,6 +108,20 @@ in the product. Ten recents seeded, the footer carrying a two-line reason plus t
 | 262 | **1** → 258 | whole — the last height that can hold it |
 | 240 / 200 | — | clipped (258 and 199 measured of 260) |
 
+**Two cells were wrong, and both are repaired against the arithmetic above rather than against a
+render.** The `300` row read `29 → 278 | 250 | whole, three recents`, which is the **280** host's
+answer pasted one row up. At H=300 the budget is 86px, the fit is ⌊88 / 22⌋ = **four** recents,
+`menu.height` is 184 + 88 = **272**, and `popup-top` = min(28, 300 − 272 − 2) = **26**: risen by 2px,
+bottom at 298 of 300, whole — so the row now reads 272 / four recents, and `250 / three` belongs to
+280 and 299 alike, not to 300. The `258` row is the mirror-image error, a sampled pixel read as a
+state: `popup-top(228)` = min(28, 258 − 228 − 2) = min(28, 28) = **28 exactly**, so the popup is
+*at rest* there with 2px of slack to spare and `menu-raised` is **false**, because the flag asks for
+strictly below the bar. Every reading in the top column carries ±1 (29 for a computed 28, 13 for a
+computed 14) — the border the sample reads from inside — so that column cannot resolve a 2px rise at
+all. Where a row says "risen" and the arithmetic does not say it too, it is not evidence; the rows
+that survive this are the ones whose height and recents count solve exactly, and the 640 / 236 /
+220 / 214 / 200 / 190 / 170 cells do.
+
 The arithmetic is exact rather than approximate: at H=200 the measured top is **13**, which is
 `200 − 184 − 2 = 14` plus the 1px border the sample reads from inside. And the cost was checked
 where it was paid — sampling the bar's stroke rows inside the popup's x-range found popup colour
@@ -99,6 +134,38 @@ Renders are at `%TEMP%\clamp-menu-*.png` and `%TEMP%\clamp-about-*.png`. This ag
 image input, so every check above is numeric pixel sampling rather than a look — which for geometry
 is the stronger claim, but it is not a substitute for a person seeing whether a risen popup reads as
 a rescue or as a glitch.
+
+### Known limits of this ladder
+
+**The two tiers do not know about each other, and 26px of window is lost in the gap.** The recents
+clamp budgets as if the popup will always sit at rest under the bar — the first term it subtracts
+*is* `Theme.bar-height` — while the rise tier may spend up to all twenty-eight of those pixels,
+holding back only `menu-gap`. Showing n recents costs **H ≥ 212 + 22n** to the clamp, while the same
+n rows stay whole from **H ≥ 186 + 22n** once the popup may rise: a **26px band at every tier** in
+which the list has already given up rows the rise would have kept. The un-costed band is therefore
+hosts 186 + 22n through 211 + 22n: **296–321** for the fifth recent, 274–299 for the fourth, and the
+same 26px all the way down. Inside each of
+them the list is one row shorter than the window could have carried, and the top of the ladder makes
+it concrete: at H=300 the shipped arithmetic draws four recents (272px, risen 2px), while five would
+have been whole — 294px of menu at `popup-top(294)` = 300 − 294 − 2 = 4px, bottom at 298 of 300. The
+fifth recent is refused below 322 and the rise would have held it from 296, so 26 pixels of window
+are spent on nothing. Nothing in the repo costs this: no test asks what the rise tier would have
+spared. Whether the band *should* be spent is a decision rather than a bug to fix quietly — a whole
+menu bought with the bar, against one fewer recent bought with nothing — and it belongs with the
+minimum-height question in Recommendation 1.
+
+**The raise is invisible from outside.** Four flags exist to admit it — `menu-raised`
+(`chrome.slint:203`), `about-raised` (`:205`), `about-floored` (`:235`) and `about-overflow` (`:240`)
+— and not one of them leaves the file that declares it. `main.slint` forwards only the older x-axis
+pair (`popup-floored`, `popup-overflow`, `:169-170`), and the instrument prints only those
+(`probe.rs:1837`), so no needle, log line or status string can see a risen popup or a floored
+licence panel. Three of the four are guarded, and guarded against *declaration* rather than
+behaviour: `plumbing.rs:703-704` asks only that the markup still contains the two
+`property<bool>…-raised` lines, and `:893-896` that `about-overflow`'s expression still reads
+`root.host-width<about.width`. `about-floored` is guarded by nothing at all. So the line in *What was
+built* — "a flag that admits beats a screenshot that hides" — is true of the flag and false of the
+system: the admission is unread, and wiring it needs a voice that is not the frozen instrument's,
+which is the same re-earning `2026-09-14-menu-keyboard-traversal` is waiting on.
 
 ## Recommendation
 

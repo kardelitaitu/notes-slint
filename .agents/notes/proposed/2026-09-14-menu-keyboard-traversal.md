@@ -11,8 +11,14 @@ decision: null
 ## Question
 
 The popup has six command rows and a list of recents. A pointer reaches all of them; the keyboard
-reaches all of them **one at a time, by memorised chord** — fourteen in the legend plus `Alt+1..0`
-for the recents. There is no way to move a visible current row with `Up`/`Down` and press `Return`,
+reaches all of them **one at a time, by memorised chord** — and the count of those chords is
+fourteen, not fourteen-plus-ten: `SHORTCUTS` (`surface.rs:121-141`) is **four command chords**
+(Ctrl+O, Ctrl+S, Ctrl+T, Ctrl+Shift+R) **and the ten `Alt+1..0` recents doors**, which are rows 5
+through 14 of the same table. So `Alt+1..0` is inside the fourteen, not an addition to them. What
+the popup itself prints is narrower again — four chord cells, because a recents row carries its slot
+number in its label instead of an `Alt+n` (`plumbing.rs:803-807`, `:851-854`) — and it is the status
+line's legend that prints all fourteen. There is no way to move a visible current row with
+`Up`/`Down` and press `Return`,
 and `docs/features.md` §4.4's menu has never promised one, so this is not a regression: it is the
 gap the previous slice found when it went looking for what the hand-rolled popup costs.
 
@@ -46,14 +52,21 @@ Two facts came out of doing it rather than reasoning about it.
    one accept per bound chord, plus Escape: fourteen commands in the table and ONE dismissal branch
    ```
 
-   The row is `matches("EventResult.accept").count() == 16` in `src/probe.rs:2572`. So traversal is
+   The row is `assert_eq!(body.matches("EventResult.accept").count(), SHORTCUTS.len() + 2, …)` at
+   `probe.rs:2571-2575`, and the right-hand side is a **formula at `:2573`, not a literal 16**: the
+   fourteen bound chords, plus Escape, plus the ONE branch that covers both replay keys in a single
+   return (`:2566-2569` says so, and it is why S10b moved the count by one statement and not two).
+   It *evaluates* to 16 while the table holds fourteen rows, which is what the failure printed as
+   `right: 16` — and `left: 17` is this leg's one added accept against that formula. So traversal is
    not blocked by anything about the menu: it is blocked because **the instrument counts the
    markup's accepts, and the instrument is frozen** (ADR-0006 §4). `main.slint` was restored
    immediately; the working tree is clean and the count is 16 again.
 
 ## The workarounds, and why each is refused
 
-- **Edit the count in `probe.rs`.** Forbidden, and it is the same law this repo applied to
+- **Edit the count in `probe.rs`.** There is no `16` to edit — the row is `SHORTCUTS.len() + 2`, so
+  the edit is to the `+ 2`, or a row smuggled into the table to move it. Forbidden either way, and
+  it is the same law this repo applied to
   `popup-x` one slice ago: an instrument that acquires assertions after its verdict is a wish, not
   evidence.
 - **Widen the Escape branch's condition to also accept the arrows.** Keeps 16 and would pass. It is
@@ -91,7 +104,8 @@ Two facts came out of doing it rather than reasoning about it.
 - `reset to -1` in the existing `changed toggle-asks` / `close-asks` handlers, so reopening starts
   unpointed rather than pointing at a row the clamp may have just un-drawn.
 - In `main.slint`, three branches beside Escape, wrapped in the same condition shape Escape uses,
-  and **accepted** — the count goes 16 → 19.
+  and **accepted** — the accepts in the markup go 16 → 19 while `SHORTCUTS.len() + 2` still says 16,
+  which is the exact shape of the failure recorded above.
 - Guards: traversal never exceeds what is drawn; `activate` covers every cell the probe names; the
   select band is not the hover band; and `Up`/`Down`/`Return` are named by their real constants.
 
@@ -101,8 +115,9 @@ Two facts came out of doing it rather than reasoning about it.
 
 1. The number should move **deliberately and with its reason written down** — a line in
    `docs/decisions/` (an ADR amending ADR-0006's frozen rows, or a dated paragraph in the strip
-   record, whichever `doc-management` says owns it) naming that the row counted "fourteen chords +
-   one dismissal", that a menu now has three more swallowing branches, and that the count is a
+   record, whichever `doc-management` says owns it) naming that the row counts
+   `SHORTCUTS.len() + 2` — fourteen chords, Escape, and the one replay branch that answers for both
+   `z` and `y` — that a menu now has three more swallowing branches, and that the count is a
    *factual claim about markup* rather than a verdict about behaviour. The alternative — leaving it
    frozen forever — silently converts the freeze from "don't re-judge the past" into "this menu can
    never have a keyboard", which is not what ADR-0006 argued for.
