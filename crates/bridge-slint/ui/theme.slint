@@ -40,7 +40,12 @@ export global Theme {
         : Palette.color-scheme == ColorScheme.dark;
 
     // ---- palette ------------------------------------------------------
-    // Six colors, all of them already on screen today.
+    // Five colors, all of them already on screen today - the count is every `in
+    // property <color>` between this header and the type scale below (bar-bg, bar-bg-pinned,
+    // text-primary, text-secondary, text-muted); `text-faded` under them is derived, not
+    // picked, so it never was in the six. It was six until 79d11e86 moved the recents into
+    // the popup and deleted the only `Theme.text-row` in the tree, orphaning a sixth hex that
+    // no markup, no probe guard and no Rust accessor names anymore - it is gone with them here.
 
     /// The title strip while the port has NOT confirmed always-on-top.
     /// `ui/main.slint:58`, the unpinned branch of `background`.
@@ -59,10 +64,6 @@ export global Theme {
     /// that ladder is the whole argument for naming these.
     /// `ui/main.slint:90`.
     in property <color> text-secondary: #bbbbbb;
-
-    /// A recents row, i.e. text the user may act on but that is not a status.
-    /// `ui/main.slint:104`.
-    in property <color> text-row: #d0d0d0;
 
     /// Text the UI decided about itself (the tap counter) - deliberately the
     /// weakest, because it reports the click, not the world.
