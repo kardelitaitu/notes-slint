@@ -120,7 +120,12 @@ pub(crate) fn dialog_words(kind: DialogKind, path: &Option<PathBuf>) -> String {
 /// (binding, display, what, act) - the act is a stable name, resolved by route_of().
 pub(crate) const SHORTCUTS: &[(&str, &str, &str, &str)] = &[
     ("ctrl-o", "Ctrl+O", "Open", "open"),
-    ("ctrl-s", "Ctrl+S", "Save As", "save-as"),
+    // A5 / ADR-0007, docs/features.md §4.4 adopted unchanged: the unshifted key writes the path the
+    // document already has; the shifted one is the variant that asks where. Order is load bearing -
+    // this table's order IS the legend's order, and plumbing.rs's crossing census zips the popup's
+    // chord cells against it row by row.
+    ("ctrl-s", "Ctrl+S", "Save", "save"),
+    ("ctrl-shift-s", "Ctrl+Shift+S", "Save As", "save-as"),
     ("ctrl-t", "Ctrl+T", "toggle auto-save", "autosave"),
     (
         "ctrl-shift-r",
@@ -146,6 +151,7 @@ pub(crate) const SHORTCUTS: &[(&str, &str, &str, &str)] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Route {
     Open,
+    Save,
     SaveAs,
     Autosave,
     ClearRecents,
@@ -157,6 +163,7 @@ pub(crate) enum Route {
 pub(crate) fn route_of(act: &str) -> Option<Route> {
     match act {
         "open" => Some(Route::Open),
+        "save" => Some(Route::Save),
         "save-as" => Some(Route::SaveAs),
         "autosave" => Some(Route::Autosave),
         "clear-recents" => Some(Route::ClearRecents),
@@ -177,6 +184,51 @@ pub(crate) fn legend() -> String {
         .map(|(_, display, what, ..)| format!("{display} {what}"))
         .collect::<Vec<_>>()
         .join("  |  ")
+}
+
+/// A5: THE PLAIN SAVE, the write to the path the document already has, in the shape ADR-0007's
+/// send-witness clause dictates: on send the bridge RETIRES the flush that Save replaces - it sends
+/// Save with the pair it would have flushed and ADOPTS that pair as its send witness (bump edits,
+/// resync last_sent, clear the pending debounce), exactly as the SaveAs dialog answer already does,
+/// because should_flush absorbing the duplicate today is an accident of the Clean rule, not a design,
+/// and the epoch stamp exists precisely so the SENDER owns the pairing.
+///
+/// Read at the moment of the ask, never earlier: buffer and revision are taken in one statement pair,
+/// the discipline answer_dialog's SaveAs arm uses for the same reason - a snapshot taken when the user
+/// was asked is a save of text that has already gone.
+///
+/// No path argument and no dialog: Save As stays the only act that names a file, which is also why the
+/// refused-load guard, the Clean refusal and the read-only verdict belong to the engine's ANSWER and
+/// not to anything decided here.
+pub(crate) fn save_now(
+    weak: &slint::Weak<Spike>,
+    gw: &Rc<RefCell<Option<Gateway>>>,
+    pump: &RefCell<Pump>,
+) {
+    let Some(ui) = weak.upgrade() else {
+        report("menu: save asked - the window is gone, nothing sent");
+        return;
+    };
+    let text = lf(&ui.get_buffer());
+    let (revision, epoch, bytes) = {
+        let mut p = pump.borrow_mut();
+        p.edits += 1;
+        p.last_sent = text.clone();
+        p.pending_at = None;
+        p.edited_flag = false;
+        (p.edits, p.epoch, text.len())
+    };
+    report(&format!(
+        "menu: save asked -> Command::Save rev={revision} epoch={epoch} ({bytes} bytes) - WITNESS ADOPTED: edits bumped, last_sent resynced, debounce cleared",
+    ));
+    send(
+        gw,
+        Command::Save {
+            text,
+            revision,
+            epoch,
+        },
+    );
 }
 
 /// S8b: the port's verdict, put into a word. Empty means not locked. The two causes stay
@@ -1460,6 +1512,17 @@ pub(crate) fn wire_callbacks(
         let tx = dialog_tx.clone();
         ui.on_save_as_asked(move || {
             ask_dialog(DialogKind::SaveAs, &weak, &pump, &tx);
+        });
+    }
+    // A5: the plain Save's own door. The keyboard (main.slint's matcher) and the popup's Save row
+    // both end at this one callback, so the act has a single implementation for both routes, and
+    // 0007's witness adoption lives HERE rather than in either caller.
+    {
+        let weak = ui.as_weak();
+        let gw = Rc::clone(gw);
+        let pump = Rc::clone(pump);
+        ui.on_save_asked(move || {
+            save_now(&weak, &gw, &pump);
         });
     }
     // Auto-save: toggle the local mirror, send ONE command, repaint the dot. The port echoes no

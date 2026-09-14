@@ -144,13 +144,23 @@ pub(crate) fn dot_word(save_failed: bool, dirty: bool) -> &'static str {
 /// (ADR-0006 §4: "never as probe edits"). The menu is not an instrument. docs/features.md §4.4 asks
 /// for "the reason in the menu", on a surface a person reads, and `api` assigns that wording to the
 /// UI on purpose: SkipReason carries no Display so the bridge owns the sentence. The strings below
-/// are the SAME ones bridge-gpui's `skip_words` chose, deliberately: two bridges explaining one skip
-/// two different ways is the drift that is not allowed, and gpui's copy was argued out first.
+/// started as the SAME ones bridge-gpui's `skip_words` chose, and ADR-0007 replaced that written-but-
+/// unenforced parity law with a CLASS rule, which is what governs them now: a sentence describing a
+/// VERDICT (read-only, oversize, clean, superseded, no-path) is identical on both bridges, because the
+/// port gave the same verdict; a sentence naming an ACT is each bridge's own, checked against that
+/// bridge's own chord table - because after A5 this bridge's Ctrl+S is Save and frozen gpui's is still
+/// Save As, and both readings are true of their own keymap. No test compares the two strings; the
+/// cross-check below reads THIS table, and a cross-bridge equality here would be a parity law wearing
+/// a sentence.
 pub(crate) fn skip_words(reason: SkipReason) -> &'static str {
     match reason {
         SkipReason::AutosaveDisabled => "auto-save is off",
         SkipReason::ForeignFileNotArmed => {
-            "a file this app did not create: Save As once (Ctrl+S) and it keeps saving"
+            // D30, folded into A5 because the rebind made the old words FALSE: Ctrl+S is the plain
+            // Save now, so a footer telling a reader to press it to Save As orders them to write the
+            // file they are already in. 0007's Consequences names this line, and the arming act it
+            // names is 0001's own: "one explicit save (Ctrl+S or the Save menu item)".
+            "a file this app did not create: Save once (Ctrl+S) and it keeps saving"
         }
         SkipReason::Clean => "nothing changed since the last write",
         SkipReason::Superseded => {
@@ -446,22 +456,27 @@ mod tests {
             );
         }
         // THE CROSS-CHECK, and the reason this test exists. ForeignFileNotArmed is the only skip
-        // that tells the user to DO something, and what it tells them is the chord table's own
-        // display string for save-as. Rebind Ctrl+S in SHORTCUTS and this fails, because the menu
-        // would then be ordering people to press a key that saves something else.
+        // that tells the user to DO something, and what it tells them is the chord table's OWN row
+        // for that act - read as a constant, in both halves, so neither the key nor the label is
+        // spelled here a second time. A5 moved the target from save-as to save because the sentence
+        // now names the act that arms (ADR-0001's own words, ADR-0007's chord); the guard's purpose
+        // is unchanged and so is what it can catch: retarget the row, rename the act, or re-edit the
+        // sentence, and one of these two lines goes red because the menu would be ordering people to
+        // press a key that does something else.
         let unarmed = skip_words(SkipReason::ForeignFileNotArmed);
-        let chord = SHORTCUTS
+        let arming = SHORTCUTS
             .iter()
-            .find(|(_, _, _, act)| *act == "save-as")
-            .expect("the table still has a save-as row")
-            .1;
+            .find(|(_, _, _, act)| *act == "save")
+            .expect("the table still has a save row - ADR-0007's chord is not optional");
         assert!(
-            unarmed.contains(chord),
-            "the reason offers {chord} as the act, and says: {unarmed}"
+            unarmed.contains(arming.1),
+            "the reason offers {} as the act, and says: {unarmed}",
+            arming.1
         );
         assert!(
-            unarmed.contains("Save As"),
-            "and it names the row by the name the row paints: {unarmed}"
+            unarmed.contains(arming.2),
+            "and it names the row by the name the row paints ({}): {unarmed}",
+            arming.2
         );
         // The two sentences that must never be confused, because confusing them is the difference
         // between "nothing to do" and "this file will never be saved unless you say so".
@@ -561,16 +576,18 @@ mod tests {
                 && footer.contains("if root.file-words != \"\":"),
             "each line exists only when the port said the thing behind it"
         );
-        // ONE ARITHMETIC, TWO USERS: the popup's height and the rows region both spend the six rows
-        // and their five gaps. Written twice, they must agree, and the only test that can tell is a
-        // count of the shared expression. The footer was once the second user and now anchors to
-        // `parent.height - footer-height`, reading nothing; the recents clamp reads the grid's own
-        // measure (`menu.rows-bottom`) rather than copying it - so the count is still two, and a
-        // third copy anywhere is what this fails on.
+        // ONE ARITHMETIC, TWO USERS: the popup's height and the rows region both spend the command
+        // rows and the gaps between them. Written twice, they must agree, and the only test that can
+        // tell is a count of the shared expression. The footer was once the second user and now anchors
+        // to `parent.height - footer-height`, reading nothing; the recents clamp reads the grid's own
+        // measure (`menu.rows-bottom`) rather than copying it - so the count is still two, and a third
+        // copy anywhere is what this fails on. A5's Save row moved the NUMBERS in the expression (six
+        // rows and five gaps became seven and six, in both users at once); the count, which is the
+        // thing this guard is about, is untouched.
         let whole = chrome.replace(['\n', ' '], "");
         assert_eq!(
             whole
-                .matches("6*Theme.menu-row-height+5*Theme.menu-gap")
+                .matches("7*Theme.menu-row-height+6*Theme.menu-gap")
                 .count(),
             2,
             "the popup's height and the rows region are the same row arithmetic, twice written"
@@ -781,18 +798,18 @@ mod tests {
         cells.sort_by_key(|(row, _)| *row);
         assert_eq!(
             cells.len(),
-            6,
-            "six rows, six chord cells - a seventh would mean the grid grew past the popup's height"
+            7,
+            "seven command rows since A5's Save row, seven chord cells - an eighth would mean the grid              grew past the popup's own height arithmetic, which is the accident this count watches for"
         );
-        // And the six rows are the six rows: 0 through 5, once each. A hole or a duplicate would
+        // And the seven rows are the seven rows: 0 through 6, once each. A hole or a duplicate would
         // mean the popup is drawing something this census reads as something else - two cells on one
         // row is an overlap, and a row with no cell is a label that advertises nothing.
         let printed: Vec<usize> = cells.iter().map(|(row, _)| *row).collect();
         assert_eq!(
             printed,
-            (0..6).collect::<Vec<usize>>(),
-            "the chord cells occupy rows 0..=5 once each - the render order the table is zipped \
-             against is only real if these are six distinct places in one grid"
+            (0..7).collect::<Vec<usize>>(),
+            "the chord cells occupy rows 0..=6 once each - the render order the table is zipped \
+             against is only real if these are seven distinct places in one grid"
         );
 
         let advertised: Vec<(usize, &str)> = cells

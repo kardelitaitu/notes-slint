@@ -294,6 +294,11 @@ export component Chrome inherits Rectangle {
     /// deliberately leaves Escape to the editor.
     callback escape-asked();
 
+    /// A5: the plain Save, the same one-callback shape as save-as-asked - the key matcher in
+    /// main.slint and the row in this file both end at THIS callback, so a write to the current path
+    /// has one route out of the markup. It is not a dialog: Save As keeps that to itself.
+    callback save-asked();
+
     /// The hamburger's ask, as a callback, so the click handler on menu-touch and the synthetic act
     /// share ONE body - but only FROM THE CALLBACK INWARD, and that limit is the honest wording.
     /// Both routes arrive here (the press at menu-touch's clicked arm, the counter the `changed` arm
@@ -860,7 +865,7 @@ export component Chrome inherits Rectangle {
         // costs the bar's lower pixels, never the bottom of the menu.
         y: root.popup-top(menu.height);
         width: Theme.menu-width;
-        // SIX command rows (the 6th is About, and it is the licence's row - see the import above),
+        // SEVEN command rows (the 7th is About, and it is the licence's row - see the import above),
         // so both numbers move together: the count of rows and the count of gaps between them. One
         // constant per row, one less gap, and the test that counts writes to menu-open moves with
         // this line rather than after it. Then TWO things hang below that arithmetic and grow it:
@@ -868,7 +873,7 @@ export component Chrome inherits Rectangle {
         // rows inside it - the recents because they are a list and not vocabulary, the footer
         // because it asks nothing. Both terms are zero when there is nothing to say or nothing to
         // open, which is the no-dangling-separator rule paying rent in a height formula.
-        height: Theme.menu-pad * 2 + 6 * Theme.menu-row-height + 5 * Theme.menu-gap
+        height: Theme.menu-pad * 2 + 7 * Theme.menu-row-height + 6 * Theme.menu-gap
             + (root.recents-shown > 0 ? Theme.menu-gap + root.recents-height : 0px)
             + (root.note-lines > 0 ? Theme.menu-gap + root.footer-height : 0px);
         visible: root.menu-open;
@@ -886,7 +891,7 @@ export component Chrome inherits Rectangle {
             // popup it would have stretched six rows to fill a box grown for a seventh thing. An
             // explicit height keeps the rows the size the constants say and leaves the footer's
             // reserved tail alone.
-            height: 6 * Theme.menu-row-height + 5 * Theme.menu-gap;
+            height: 7 * Theme.menu-row-height + 6 * Theme.menu-gap;
             spacing-vertical: Theme.menu-gap;
             spacing-horizontal: Theme.gap;
 
@@ -896,41 +901,51 @@ export component Chrome inherits Rectangle {
             Text { col: 1; row: 0; text: "Ctrl+O"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
             row-open := TouchArea { col: 0; row: 0; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.open-asked(); root.menu-open = false; } }
 
-            // Row 1 - Save As: the ONLY save this app has, and the act ADR-0001 arms
-            // autosave after on a foreign file.
-            Rectangle { col: 0; row: 1; colspan: 2; background: Theme.hover-bg; opacity: row-save.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
-            Text { col: 0; row: 1; text: "Save As"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            // Row 1 - Save: the write to the CURRENT path, no dialog and no rebind. ADR-0007
+            // conformed this act into the port ("the wording was never wrong, the affordance was
+            // missing"), and ADR-0001's arming sentence has named it from the start - "one explicit
+            // save (Ctrl+S or the Save menu item)". §4.4 tables it with this chord. Save As below
+            // stays the ONLY act that names a file.
+            Rectangle { col: 0; row: 1; colspan: 2; background: Theme.hover-bg; opacity: row-save-plain.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 1; text: "Save"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
             Text { col: 1; row: 1; text: "Ctrl+S"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
-            row-save := TouchArea { col: 0; row: 1; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.save-as-asked(); root.menu-open = false; } }
+            row-save-plain := TouchArea { col: 0; row: 1; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.save-asked(); root.menu-open = false; } }
 
-            // Row 2 - Auto-save, labelled with the state it will TOGGLE
-            Rectangle { col: 0; row: 2; colspan: 2; background: Theme.hover-bg; opacity: row-autosave.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
-            Text { col: 0; row: 2; text: root.autosave ? "Auto-save (on)" : "Auto-save (off)"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
-            Text { col: 1; row: 2; text: "Ctrl+T"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
-            row-autosave := TouchArea { col: 0; row: 2; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.autosave-asked(); root.menu-open = false; } }
+            // Row 2 - Save As: the act that NAMES a file, and the one that rebinds the generation
+            // (Wire::rebind), which is why plain Save carries the epoch stamp and this one does not.
+            Rectangle { col: 0; row: 2; colspan: 2; background: Theme.hover-bg; opacity: row-save.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 2; text: "Save As"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            Text { col: 1; row: 2; text: "Ctrl+Shift+S"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            row-save := TouchArea { col: 0; row: 2; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.save-as-asked(); root.menu-open = false; } }
 
-            // Row 3 - Clear recents: the 5th row, and the chord parity rule is why it is a
+            // Row 3 - Auto-save, labelled with the state it will TOGGLE
+            Rectangle { col: 0; row: 3; colspan: 2; background: Theme.hover-bg; opacity: row-autosave.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 3; text: root.autosave ? "Auto-save (on)" : "Auto-save (off)"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            Text { col: 1; row: 3; text: "Ctrl+T"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            row-autosave := TouchArea { col: 0; row: 3; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.autosave-asked(); root.menu-open = false; } }
+
+            // Row 4 - Clear recents: the 5th commanded row, and the chord parity rule is why it is a
             // ROW and not only a key (menu.rs: a label names a key the map binds, or the
             // legend lies). It sits above Quit because Quit is the different kind of act.
-            Rectangle { col: 0; row: 3; colspan: 2; background: Theme.hover-bg; opacity: row-clear.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
-            Text { col: 0; row: 3; text: "Clear recents"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
-            Text { col: 1; row: 3; text: "Ctrl+Shift+R"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
-            row-clear := TouchArea { col: 0; row: 3; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.clear-recents-asked(); root.menu-open = false; } }
+            Rectangle { col: 0; row: 4; colspan: 2; background: Theme.hover-bg; opacity: row-clear.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 4; text: "Clear recents"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            Text { col: 1; row: 4; text: "Ctrl+Shift+R"; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            row-clear := TouchArea { col: 0; row: 4; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.clear-recents-asked(); root.menu-open = false; } }
 
-            // Row 4 - Quit: no chord, and a different kind of act (close, not command)
-            Rectangle { col: 0; row: 4; colspan: 2; background: Theme.hover-bg; opacity: row-quit.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
-            Text { col: 0; row: 4; text: "Quit"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
-            Text { col: 1; row: 4; text: ""; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
-            row-quit := TouchArea { col: 0; row: 4; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.quit-asked(); root.menu-open = false; } }
-
-            // Row 5 - About Slint. NO CHORD, and the empty cell is the same honest shape as
-            // Quit's: the chord table has no row for it (SHORTCUTS stays at fourteen), so the
-            // legend cannot claim one either - a key printed beside an act that has no key is the
-            // drift the table exists to prevent.
-            Rectangle { col: 0; row: 5; colspan: 2; background: Theme.hover-bg; opacity: row-about.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
-            Text { col: 0; row: 5; text: "About Slint"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            // Row 5 - Quit: no chord, and a different kind of act (close, not command)
+            Rectangle { col: 0; row: 5; colspan: 2; background: Theme.hover-bg; opacity: row-quit.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 5; text: "Quit"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
             Text { col: 1; row: 5; text: ""; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
-            row-about := TouchArea { col: 0; row: 5; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { if root.about-fits { root.about-open = true; } root.menu-open = false; } }
+            row-quit := TouchArea { col: 0; row: 5; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.quit-asked(); root.menu-open = false; } }
+
+            // Row 6 - About Slint. NO CHORD, and the empty cell is the same honest shape as
+            // Quit's: the chord table has no row for it (SHORTCUTS is five commands plus ten slots),
+            // so the legend cannot claim one either - a key printed beside an act that has no key is
+            // the drift the table exists to prevent.
+            Rectangle { col: 0; row: 6; colspan: 2; background: Theme.hover-bg; opacity: row-about.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { col: 0; row: 6; text: "About Slint"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            Text { col: 1; row: 6; text: ""; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
+            row-about := TouchArea { col: 0; row: 6; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { if root.about-fits { root.about-open = true; } root.menu-open = false; } }
         }
 
         // ---- ROWS 6.. : THE RECENTS, home at last ------------------------------------------------

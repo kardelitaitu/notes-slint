@@ -289,20 +289,30 @@ const CHORD_EVERY: Duration = Duration::from_millis(500);
 
 /// Which table rows to drive, each named by its ACT and resolved against SHORTCUTS at the
 /// step - never by row index, because an index is a position and a position is not a promise:
-/// the moment this table grows a row (a plain Save is coming), a drive of [0, 5, 2, 1, 3]
-/// would keep running and quietly re-point every step after the insertion, printing needles
-/// about the rows that are no longer the ones this comment describes. Open, Alt+2, Auto-save,
-/// Save As, Clear recents. The order is a constraint, not a preference, and it cost a run to
-/// learn:
-///  * Alt+2 before Clear - clearing first empties the list the recents act reads, so the Alt
-///    needle would prove nothing.
-///  * Save As AFTER the seed keystroke (SEED_KEY_AT, 19.2 s). Ctrl+S re-points the engine at
-///    s4-loop.notes, and the seed's own flush lands ~750 ms after that keystroke; driving
-///    Save As first meant no Event::Saved ever carried the seed path, so the do-no-harm[saved]
-///    audit silently vanished from the run - the §4.5 line-ending question went UNTESTED,
-///    twice, and nothing complained because the needle was simply absent. This order keeps
-///    the seed current across its own save: Open makes it current, Alt+2 re-selects the same
-///    file, and only then does Save As move on.
+/// the moment this table grows a row - and A5 grew it, the plain Save arrived - a drive of
+/// [0, 5, 2, 1, 3] would keep running and quietly re-point every step after the insertion,
+/// printing needles about the rows that are no longer the ones this comment describes. That is
+/// why the list below reads `open, recent-1, autosave, save-as, clear-recents` and this prose
+/// names ACTS. It used to name KEYS, and A5 is the reason it may not: the same keystroke
+/// changed what it does, so chord-phrased prose went false on a walk that still passed.
+///
+/// The order is a constraint, not a preference, and it cost a run to learn:
+///  * `recent-1` before `clear-recents` - clearing first empties the list the recents act reads,
+///    so the recent needle would prove nothing.
+///  * `save-as` AFTER the seed keystroke (SEED_KEY_AT, 19.2 s). `save-as` re-points the engine at
+///    another file - it always has, whatever key reaches it - and the seed's own flush lands
+///    ~750 ms after that keystroke; driving `save-as` first meant no Event::Saved ever carried
+///    the seed path, so the do-no-harm[saved] audit silently vanished from the run - the §4.5
+///    line-ending question went UNTESTED, twice, and nothing complained because the needle was
+///    simply absent. This order keeps the seed current across its own save: `open` makes it
+///    current, `recent-1` re-selects the same file, and only then does `save-as` move on.
+///  * `autosave` LAST of the three that touch the write path, because it disarms saving: after it
+///    fires, nothing else in the walk can produce a flush to audit.
+///
+/// The `save` row A5 added is NOT driven, deliberately: D53 holds the five acts at five, because
+/// adding a sixth step re-times everything after it and the seed's window is the thing that pays.
+/// The plain Save is exercised as a consequence of that window (the seed's own flush is the same
+/// command shape) and by the table's own needles, not by a step.
 ///
 /// Quit closes the sequence and has no chord, which is the table's own absence, not an
 /// oversight.
@@ -1837,6 +1847,7 @@ fn fire(ui: &Spike, route: Route, display: &str, what: &str) {
     report(&format!("chord: {display} -> {what}"));
     match route {
         Route::Open => ui.invoke_open_asked(),
+        Route::Save => ui.invoke_save_asked(),
         Route::SaveAs => ui.invoke_save_as_asked(),
         Route::Autosave => ui.invoke_autosave_asked(),
         Route::ClearRecents => ui.invoke_clear_recents_asked(),
@@ -1998,8 +2009,8 @@ mod chords {
         );
         assert_eq!(
             SHORTCUTS.len(),
-            14,
-            "caption buttons are pointer acts, not commands: the chord table stays at fourteen"
+            15,
+            "caption buttons are pointer acts, not commands: the table grew ONLY by ADR-0007's Save row; the caption trio is still not in it"
         );
     }
 
@@ -2007,11 +2018,12 @@ mod chords {
     fn menu_open_has_exactly_one_writing_file() {
         // The single-writer proof, as two greps. Chrome owns its in-out bit; the mounter may
         // read it (the mirrors and the backdrop's visible binding do) but may not assign it,
-        // and every dismissal route - hamburger, the six command rows, the recent rows, backdrop,
+        // and every dismissal route - hamburger, the command rows, the recent rows, backdrop,
         // Escape - ends inside chrome.slint. THE COUNT MOVED 13 -> 14 LINES when the recents came
-        // home, and it moved by ONE line because a capped `for` is one static write, not ten runtime
-        // ones: thirteen write statements (the six handlers, the six command rows, the recent rows)
-        // plus the one line of prose at chrome.slint:171 that quotes the grep - the off-by-one is
+        // home (a capped `for` is one static write, not ten runtime ones), and 14 -> 15 when A5 gave
+        // the popup its Save row: fourteen write statements (the six handlers, the SEVEN command
+        // rows, the recent rows) plus the one line of prose at chrome.slint:171 that quotes the grep.
+        // The off-by-one is
         // documented where it is counted, and the assertion below is exact rather than the loose
         // floor it used to be, because a floor is exactly what lets a fifth writer in quietly.
         // ABOUTSLINT: the same proof now covers TWO bits, and it is exact about
@@ -2030,7 +2042,7 @@ mod chords {
             "the mount reads Chrome's About bit through a binding and never assigns it"
         );
         assert_eq!(
-            chrome_writes, 14,
+            chrome_writes, 15,
             "Chrome owns every write to menu-open, and there are exactly thirteen of them plus one
              comment that quotes the grep; found {chrome_writes}"
         );
@@ -2104,25 +2116,27 @@ mod chords {
             !code.contains("MadeWithSlint"),
             "AboutSlint's own asset must not be re-drawn here - display THEIR widget"
         );
-        // THE ROW: sixth of six, and it keeps an EMPTY chord cell, because SHORTCUTS is a
-        // legend of commands and About is not one. Same shape as Quit's absence, same reason.
+        // THE ROW: last of the seven since A5's Save row pushed it down, and it keeps an EMPTY
+        // chord cell, because SHORTCUTS is a legend of commands and About is not one. Same shape as
+        // Quit's absence, same reason. The row NUMBER is part of the claim: About is the row the
+        // height arithmetic reserves last, and a census that read row 5 now reads Quit's.
         assert!(
             code.contains("text: \"About Slint\""),
-            "the popup lost its 6th row"
+            "the popup lost its last row"
         );
         assert!(
-            code.contains("row-about := TouchArea { col: 0; row: 5;"),
-            "the 6th row must be clickable and Chrome's own"
+            code.contains("row-about := TouchArea { col: 0; row: 6;"),
+            "the 7th row must be clickable and Chrome's own"
         );
         assert_eq!(
-            code.matches("col: 1; row: 5; text: \"\"").count(),
+            code.matches("col: 1; row: 6; text: \"\"").count(),
             1,
             "the About row's chord cell stays empty - a key beside an act with no key is drift"
         );
         assert_eq!(
-            code.matches("col: 0; row: 5; colspan: 2").count(),
+            code.matches("col: 0; row: 6; colspan: 2").count(),
             2,
-            "the tint and the catcher occupy the 6th row, and nothing else does"
+            "the tint and the catcher occupy the 7th row, and nothing else does"
         );
         // THE BOX: the widget reports preferred-width/height of 100%, so it fills whatever it is
         // handed and demands only its layout minimum back - a panel with no size would show
@@ -2299,10 +2313,12 @@ mod chords {
         );
         assert!(MARKUP.contains("root.undo-swallowed();"));
         assert!(MARKUP.contains("callback undo-swallowed();"));
-        // And the table stays a legend of commands: fourteen, untouched, no undo row invented.
+        // And the table stays a legend of commands: fifteen since A5 added the Save row ADR-0007
+        // decided, and the UNDO quarantine is still not in it - the count moved because a command
+        // arrived, not because a swallowed keystroke got advertised.
         assert_eq!(
             SHORTCUTS.len(),
-            14,
+            15,
             "the quarantine must not join the chord table"
         );
         assert!(
@@ -2367,6 +2383,44 @@ mod chords {
             1,
             "a different path is the switch"
         );
+        // A5 / rule 5, same door so same test: plain Save answers Saved then a Rebound carrying the
+        // UNCHANGED path and the UNCHANGED epoch, which means Ctrl+S runs this arm on every press.
+        // If that rebind re-read the file, repainted the buffer, or reset the undo history, the act
+        // would eat whatever the user typed since the last flush - the one failure mode in this
+        // slice that costs a person their work. Pinned structurally (the crate's admitted idiom: a
+        // grep-quality proof, since the behavioural half needs a real key), on the SOURCE of the arm
+        // rather than on a comment about it: from the arm's own opening to the next arm at the same
+        // indentation, the Rebound handler must contain no door back into the buffer, no command
+        // back to the port, and no word about undo.
+        {
+            let src = include_str!("surface.rs");
+            let arm = src
+                .split_once("Event::Rebound {")
+                .expect("surface.rs no longer answers Rebound at all")
+                .1
+                .split_once("\n            Event::")
+                .map(|(body, _)| body)
+                .expect("the Rebound arm never ends - it runs into the next arm without a brace");
+            for door in [
+                "set_buffer(",
+                "send(",
+                "Command::Open",
+                "Command::Save",
+                "undo",
+                "restart",
+            ] {
+                assert!(
+                    !arm.contains(door),
+                    "the Rebound arm now mentions {door}: a rebind that re-reads, re-sends or resets                      the history will destroy text on the FIRST plain Save (ADR-0007 answers Saved                      then Rebound with the path and epoch unchanged)"
+                );
+            }
+            // And the positive half: identity is decided by the ONE policy function Loaded uses, so
+            // "unchanged path" cannot mean different things to the two events.
+            assert!(
+                arm.contains("note_adoption(pump, path)"),
+                "Rebound stopped routing through note_adoption, so a Save's rebind can arm the                  quarantine or repaint the buffer on its own rules"
+            );
+        }
         assert_eq!(
             note_adoption(&pump, &a),
             2,
@@ -2457,7 +2511,7 @@ mod chords {
 
     #[test]
     fn table_shape_matches_the_first_bridge() {
-        assert_eq!(SHORTCUTS.len(), 14, "four commands plus ten recents");
+        assert_eq!(SHORTCUTS.len(), 15, "five commands plus ten recents");
         assert_eq!(
             SHORTCUTS.iter().filter(|r| r.0.starts_with("alt-")).count(),
             10
@@ -2467,7 +2521,7 @@ mod chords {
                 .iter()
                 .filter(|r| r.0.starts_with("ctrl-"))
                 .count(),
-            4
+            5
         );
         let mut displays: Vec<&str> = SHORTCUTS.iter().map(|r| r.1).collect();
         displays.sort();
@@ -2546,7 +2600,11 @@ mod chords {
                 ("Ctrl+O", "Open", Route::Open),
                 ("Alt+2", "recent 2", Route::Recent(1)),
                 ("Ctrl+T", "toggle auto-save", Route::Autosave),
-                ("Ctrl+S", "Save As", Route::SaveAs),
+                // A5's rebind in the table's own words: the unshifted key is Save now, so the row
+                // this walk drives for save-as spells Ctrl+Shift+S. Hand-written ON PURPOSE - this is
+                // the second spelling the by-id walk is checked against; deriving it from the table
+                // would leave the assertion comparing a list to itself.
+                ("Ctrl+Shift+S", "Save As", Route::SaveAs),
                 ("Ctrl+Shift+R", "clear recent files", Route::ClearRecents),
             ],
             "the chord walk now drives different rows than the index walk drove"
@@ -2582,30 +2640,33 @@ mod chords {
 
     #[test]
     fn a_fifteenth_row_moves_an_index_drive_and_not_an_act_drive() {
-        // Why this slice exists: a plain Save row is coming. Insert a 15th row at EVERY
-        // position the next slice might put it, and the act-addressed walk must still name the
-        // same five chords in the same order.
+        // A5's Save row IS the fifteenth, so this simulation moved on to the next one the menu
+        // asks for - a hypothetical sixteenth, named for the door the six-rows note parks rather
+        // than for a duplicate of a row that now exists. Insert it at EVERY position the next slice
+        // might pick, and the act-addressed walk must still name the same five chords in the same
+        // order. The expectations are the table's CURRENT spellings, which is what the rebind
+        // changed: the drive's save-as step now answers to Ctrl+Shift+S, not Ctrl+S.
         for at in 0..=SHORTCUTS.len() {
             let mut table = SHORTCUTS.to_vec();
-            table.insert(at, ("ctrl-s", "Ctrl+S", "Save", "save"));
+            table.insert(at, ("ctrl-e", "Ctrl+E", "New note", "new-note"));
             let walked: Vec<&str> = CHORD_DRIVE
                 .iter()
                 .map(|act| row_for_act(&table, act).map_or("<MISSING ACT>", |row| row.1))
                 .collect();
             assert_eq!(
                 walked,
-                ["Ctrl+O", "Alt+2", "Ctrl+T", "Ctrl+S", "Ctrl+Shift+R"],
+                ["Ctrl+O", "Alt+2", "Ctrl+T", "Ctrl+Shift+S", "Ctrl+Shift+R"],
                 "a row inserted at {at} moved the act-addressed walk"
             );
         }
         // And the control: the retired index walk really would have re-pointed. Without this
         // line the test above could pass on a driver that ignores the table entirely.
         let mut table = SHORTCUTS.to_vec();
-        table.insert(1, ("ctrl-s", "Ctrl+S", "Save", "save"));
+        table.insert(1, ("ctrl-e", "Ctrl+E", "New note", "new-note"));
         let by_index: Vec<&str> = [0usize, 5, 2, 1, 3].iter().map(|i| table[*i].1).collect();
         assert_ne!(
             by_index,
-            vec!["Ctrl+O", "Alt+2", "Ctrl+T", "Ctrl+S", "Ctrl+Shift+R"],
+            vec!["Ctrl+O", "Alt+2", "Ctrl+T", "Ctrl+Shift+S", "Ctrl+Shift+R"],
             "the index walk this replaces would NOT have moved - the test is guarding nothing"
         );
     }

@@ -113,6 +113,11 @@ export component Spike inherits Window {
     // click cannot grow a second set of rules about when the engine gets to write. The
     // names match Chrome's one-for-one for the same reason: a mapping, not a translation.
     callback open-asked();
+    // A5 / ADR-0007: the plain Save - write the current buffer to the path the document already
+    // has, no dialog and no rebind. Its own callback, named Chrome's one-for-one like the rest of
+    // this block, because a chord that exists in the table and not in the markup is the defect the
+    // crossing census was written to catch. Save As below stays the only act that names a file.
+    callback save-asked();
     callback save-as-asked();
     callback autosave-asked();
     // S6: the 5th row, forwarded like the other four.
@@ -295,13 +300,25 @@ export component Spike inherits Window {
                 root.clear-recents-asked();
                 return EventResult.accept;
             }
+            // A5 / ADR-0007's chord, matched HERE because the table is the only chord authority:
+            // Ctrl+S is Save, Ctrl+Shift+S is Save As - docs/features.md §4.4's pair, adopted
+            // unchanged, and the shifted chord is "the variant that asks where". Matched BEFORE the
+            // block below, which requires !shift, so the two cannot both answer one press.
+            if (event.modifiers.control && event.modifiers.shift && !event.modifiers.alt
+                    && event.text.to_lowercase() == "s") {
+                root.save-as-asked();
+                return EventResult.accept;
+            }
             if (event.modifiers.control && !event.modifiers.alt && !event.modifiers.shift) {
                 if (event.text.to_lowercase() == "o") {
                     root.open-asked();
                     return EventResult.accept;
                 }
                 if (event.text.to_lowercase() == "s") {
-                    root.save-as-asked();
+                    // A5: plain Save, the current path, no dialog. The unshifted key is the act
+                    // ADR-0001 named as the arming one ("one explicit save (Ctrl+S or the Save menu
+                    // item)"), so the sentence in the footer and this line now agree.
+                    root.save-asked();
                     return EventResult.accept;
                 }
                 // menu.rs binds Ctrl+T to ToggleAutosave, NOT to a new note; see the popup
@@ -456,6 +473,9 @@ export component Spike inherits Window {
         }
         open-asked => {
             root.open-asked();
+        }
+        save-asked => {
+            root.save-asked();
         }
         save-as-asked => {
             root.save-as-asked();
