@@ -3506,4 +3506,247 @@ mod tests {
         assert!(!corner_says_ask(Some(true), false, true, false, true));
         assert!(corner_says_ask(Some(true), false, false, false, true));
     }
+
+    // ================= THE PIN'S ROUND TRIP (ADR-0006 item 6, last sub-claim) ==========
+    //
+    // The claim owed is "the pin check mark's round trip": the strip asks, the port applies,
+    // the answer flips the model, the model is what the glyph is painted FROM, and the bit
+    // survives a restart. Every link a machine WITHOUT INPUT can prove is proven in these two
+    // tests plus crates/api/tests/pin_roundtrip.rs. The chain, by leg:
+    //   ask   -> Command::SetPinned(next)   [pin_roundtrip.rs leg 1 - a real Gateway, real cmd]
+    //   apply -> Event::Pinned(next)        [pin_roundtrip.rs legs 0-3 - the recording host]
+    //   model -> ui.set_pinned(answer)      [TEST 1 BELOW: the real Spike, the real `drain`]
+    //   bind  -> the caption cell reads it  [TEST 2 BELOW: census over both markup files]
+    //   paint -> the glyph on a real bar    [NOT PROVEN - the one half left, named just below]
+    //
+    // WHICH HALF OF THE ROUND TRIP REMAINS WINDOW-BOUND, exactly: the LAST ARROW. Everything
+    // up to and including the model flip is proven here on the product's own objects; that a
+    // live window turns those 24 px of icons/unpin.svg into icons/pin.svg in amber, inside a
+    // caption cell that is actually where the strip draws it and actually hit-testable (and no
+    // input means no press can even reach the cell) is a pixel claim, not a bit claim. A human
+    // eye owes three things and nothing else: (a) the cell is where the caption draws it and
+    // the click lands, (b) the glyph swaps AND colourises amber, (c) the bar's ground follows
+    // to Theme.bar-bg-pinned. All three are asserted below as BINDINGS on the very bit the
+    // model carries - so the eye confirms a painting, never a wiring.
+    //
+    // WHY `Spike::new()` IS LEGAL HERE, which is what makes test 1 more than a twin:
+    // it is the same constructor `product.rs:313` calls, and Slint builds the component and its
+    // property storage without ever materialising a platform window until something asks to
+    // show it. Nothing below shows, renders or pumps a loop: no window, no taskbar entry, no
+    // flake - and no re-implementation either. `set_pinned` / `get_pinned` are the GENERATED
+    // accessors the answer arm itself calls, and `drain` is the function the wake calls, so the
+    // code under test is the shipped code. Unlike editor_roundtrip.rs (whose header admits the
+    // Spike-copy weakness because a test target cannot reach bin internals), NOTHING here
+    // re-implements a production function, and no production code was edited to be testable.
+
+    #[test]
+    fn the_answer_leg_of_the_pins_round_trip_flips_the_real_model_the_check_mark_reads() {
+        use super::{Spike, drain};
+        use notes_api::Event;
+        use slint::ComponentHandle;
+
+        let ui = Spike::new().expect("the product's own constructor, windowless");
+        let pump = RefCell::new(Pump::default());
+        let (tx, rx) = std::sync::mpsc::channel::<Event>();
+        let weak = ui.as_weak();
+
+        // START: the painted bit is false, and the pump has NOT guessed anything yet.
+        assert!(!ui.get_pinned(), "a fresh strip is unpinned");
+        assert_eq!(pump.borrow().confirmed, None, "and the fact is not guessed");
+
+        // LEG ON. `drain` is the product function the wake runs; the arm inside it is the
+        // only thing in this crate allowed to write the rendered bit (test 2 fails the day a
+        // second writer appears).
+        tx.send(Event::Pinned(true)).expect("into the channel");
+        drain(&rx, &pump, &weak);
+        assert!(ui.get_pinned(), "the model flipped");
+        assert_eq!(
+            pump.borrow().confirmed,
+            Some(true),
+            "and the pump latched it"
+        );
+        assert!(
+            pump.borrow().applied_at.is_some(),
+            "a confirmed pin stamps t0"
+        );
+        assert!(
+            ui.get_status().as_str().contains("port-reported"),
+            "the status line names where the fact came from: {}",
+            ui.get_status()
+        );
+
+        // LEG OFF: a refusal is an answer too, and it un-flips the SAME bit - never silently.
+        tx.send(Event::PinFailed {
+            reason: "the pin did not stick".into(),
+        })
+        .expect("into the channel");
+        drain(&rx, &pump, &weak);
+        assert!(!ui.get_pinned(), "a refused apply paints OFF");
+        assert_eq!(pump.borrow().confirmed, Some(false));
+        assert!(
+            ui.get_status().as_str().contains("pin refused"),
+            "and it says why: {}",
+            ui.get_status()
+        );
+        // The field the ask reads, right now, means the NEXT click asks for true. That is
+        // the arithmetic `on_toggled_pin` holds, and test 2 censitises it word for word.
+        assert!(
+            !pump.borrow().confirmed.unwrap_or(false),
+            "so the strip's next ask is the opposite of the last fact"
+        );
+
+        // AND THE BIT FOLLOWS EVERY ANSWER, both ways, on the same object.
+        tx.send(Event::Pinned(true)).expect("into the channel");
+        drain(&rx, &pump, &weak);
+        assert!(ui.get_pinned(), "the model follows the port, not the wish");
+        assert!(
+            pump.borrow().confirmed.unwrap_or(false),
+            "and the next ask is therefore false - the toggle is the port's answer, twice over"
+        );
+
+        // Three answers in, one windowless model, ZERO platform calls: the leg that needed a
+        // window is exactly the leg that stayed out, and the leg that needed input is the leg a
+        // person still owns.
+        assert_eq!(pump.borrow().seen, 3, "three answers were taken");
+        assert_eq!(pump.borrow().drains, 3, "each wake drained once");
+    }
+
+    #[test]
+    fn the_caption_pin_cell_binds_the_very_bit_the_answer_writes() {
+        // THE BIND CENSUS, which is what makes the pixel half a PAINTING claim and not a
+        // wiring claim: the property the answer writes is the only thing the cell's glyph,
+        // colour and bar background read, the click writes nothing, and the names are counted
+        // so a second writer or a re-bound cell fails HERE. Cut at `mod tests` for the law this
+        // file already states: a self-referential grep excludes its own counting lines.
+        let whole = include_str!("../src/surface.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        let chrome = include_str!("../ui/chrome.slint");
+
+        // (1) ONE WRITER, and it is the answer rather than the ask.
+        assert_eq!(
+            src.matches("ui.set_pinned(").count(),
+            2,
+            "Pinned and PinFailed only - a third writer is the click-believes-itself bug"
+        );
+        assert_eq!(
+            src.matches("confirmed = ").count(),
+            2,
+            "and those same two arms are the only writers of the fact the ask reads"
+        );
+        let on = &src[src.find("Event::Pinned(on) =>").expect("the Pinned arm")
+            ..src
+                .find("Event::PinFailed { reason } =>")
+                .expect("the PinFailed arm")];
+        assert!(on.contains("let applied = *on;"), "the bit is the port's");
+        assert!(on.contains("pump.confirmed = Some(*on);"), "latched...");
+        assert!(
+            on.contains("ui.set_pinned(applied);"),
+            "...and painted from the latch"
+        );
+        assert!(
+            !on.contains("Command::SetPinned"),
+            "an answer sends nothing back"
+        );
+        let off = &src[src
+            .find("Event::PinFailed { reason } =>")
+            .expect("the PinFailed arm")
+            ..src
+                .find("Event::CornerRoundingFailed")
+                .expect("the next arm")];
+        assert!(
+            off.contains("ui.set_pinned(false);"),
+            "a refusal paints off"
+        );
+        assert!(
+            off.contains("pump.confirmed = Some(false);"),
+            "and latches the refusal"
+        );
+
+        // (2) THE ASK: one closure, the opposite of the last fact, one command out, and not
+        // one local write - which is what leaves (1) as the only painter in the crate.
+        let ask = &src[src
+            .find("ui.on_toggled_pin(move || {")
+            .expect("the pin handler")
+            ..src.find("// C2 (2)").expect("the next handler")];
+        assert!(
+            ask.contains("let next = !pump.borrow().confirmed.unwrap_or(false);"),
+            "the ask is the negation of the port's last fact, read from the pump"
+        );
+        assert!(
+            ask.contains("send(&gw, Command::SetPinned(next));"),
+            "one command out, and it asks for `next`, never for a wish"
+        );
+        assert!(!ask.contains("set_pinned"), "the click paints NOTHING");
+
+        // (3) THE CELL: glyph, colour and bar ground all read `root.pinned` - the caption's
+        // in-property - and the click asks instead of flipping.
+        assert!(
+            chrome.contains("in property <bool> pinned: false;"),
+            "in-only, so the UI cannot write it outward"
+        );
+        assert!(
+            chrome.contains("source: root.pinned ? @image-url(\"icons/pin.svg\") : @image-url(\"icons/unpin.svg\");"),
+            "THE CHECK MARK itself: one image, then the other, on that bit"
+        );
+        assert!(
+            chrome.contains("colorize: root.pinned ? Theme.amber : Theme.icon-muted;"),
+            "and its colour rides the same bit"
+        );
+        assert!(
+            chrome.contains("background: root.pinned ? Theme.bar-bg-pinned : Theme.bar-bg;"),
+            "and the bar's ground"
+        );
+        assert!(
+            chrome.contains("root.toggled-pin(!root.pinned);"),
+            "the cell asks"
+        );
+        assert_eq!(
+            chrome.matches("root.pinned").count(),
+            4,
+            "four reads, no fifth"
+        );
+        assert_eq!(
+            chrome.matches("root.pinned =").count(),
+            0,
+            "and zero writes in markup"
+        );
+
+        // (4) THE WIRE from the root property test 1 flips to the cell that reads it: exactly
+        // two mentions at the root - the declaration and the one-way mount, no expression.
+        assert!(
+            MARKUP.contains("in property <bool> pinned: false;"),
+            "the root's bit"
+        );
+        assert!(
+            MARKUP.contains("pinned: root.pinned;"),
+            "mounted into the caption, unchanged"
+        );
+        assert_eq!(
+            MARKUP.matches("pinned:").count(),
+            2,
+            "declaration + binding only"
+        );
+        assert!(
+            MARKUP.contains("callback toggled-pin();"),
+            "the ask leaves the root"
+        );
+        assert!(
+            MARKUP.contains("toggled-pin(asked) => {"),
+            "and the caption's ask is forwarded"
+        );
+        assert!(
+            !MARKUP.contains("set_pinned"),
+            "the root's markup never writes the bit"
+        );
+
+        // (5) BOTH GLYPHS SHIP: a binding to a missing image is a paint bug no assertion here
+        // can see, so the two files the cell swaps between are checked on disk.
+        let icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/icons");
+        for icon in ["pin.svg", "unpin.svg"] {
+            assert!(
+                icons.join(icon).is_file(),
+                "{icon} must ship for the cell to swap it",
+            );
+        }
+    }
 }
