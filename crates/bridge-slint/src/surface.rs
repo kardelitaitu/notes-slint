@@ -33,7 +33,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use notes_api::{Command, Event, Gateway};
+use notes_api::{Command, Event, Gateway, RecentEntry};
 // C3: the drag writes a PHYSICAL target, so the physical type is named here rather than routed
 // through a logical one and converted twice (see `drag_destination` for why once is the whole rule).
 use slint::{ComponentHandle, PhysicalPosition};
@@ -191,6 +191,77 @@ pub(crate) fn lock_verdict(read_only: bool, oversize: bool) -> &'static str {
         (false, true) => "read-only: too big to edit safely (8 MiB guard)",
         (true, true) => "read-only on disk, and too big to edit safely (8 MiB guard)",
     }
+}
+
+/// THE RECENT ROWS, BUILT IN ONE PLACE. ADR-0006 item 1: the label trio this bridge may cite as
+/// a Slint-side proof has to live HERE, on the rows the product renders, and not inside the event
+/// arm that hands them to the model.
+///
+/// The cap is restated on this side of the seam for the same reason bridge-gpui/src/menu.rs:58
+/// states it: not because core's list is distrusted, but because a row past the last slot cannot
+/// be reached by a chord at all. main.slint binds Alt+1..9 and then Alt+0, which is TEN doors, so
+/// an eleventh row would be text a person can read and nothing can open. Taking the first ten is
+/// what keeps "slot N" a meaning that survives from the label all the way to the
+/// open-at-index(N-1) the row's TouchArea fires.
+pub(crate) const MAX_RECENTS: usize = 10;
+
+/// One rendered row of the recents stack: the facts a row carries, built together so no two of
+/// them can be about different files. The first bridge has the same property by construction -
+/// "the label is built FIRST and then handed to the slot, so the number a user reads and the
+/// index the action carries are the same expression" (menu.rs:88-90) - and here it is the same
+/// idea spread over a struct instead of a menu item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecentRow {
+    /// The slot a person READS, 1-based: "3." is the row Alt+3 opens, and slot 10 is Alt+0's -
+    /// the same quirk the chord table carries as ("alt-0", "Alt+0", "recent 10", "recent-9").
+    pub(crate) slot: usize,
+    /// The whole text of the row: the slot, core's pre-formatted display UNEDITED, and the mark
+    /// when the path went away.
+    pub(crate) label: String,
+    /// The port's fact, kept as a bit so the print and the tests can name WHY a row reads
+    /// "missing" without parsing its own words back.
+    pub(crate) missing: bool,
+    /// The path behind the row, which never crosses into the markup: a row is a label, and an
+    /// index is what maps back to a file.
+    pub(crate) path: PathBuf,
+}
+
+/// THE ROWS BEHIND A RECENTS LIST. Three rules, and every one of them is the port's or the first
+/// bridge's - none invented here:
+///
+/// 1. THE LABEL is core's "display" verbatim behind the slot number. That string is already
+///    core/src/recent.rs "visible_label" output - parent folders, basename, escaping and the
+///    64-char hard cap included - so a bridge that composed its own from "path" would be a second
+///    owner of a truncation rule, which is exactly what menu.rs:80-83 refuses to be.
+/// 2. THE MARK. A vanished path STAYS in the list (D13: "a greyed-out entry that tells the truth
+///    beats one that quietly disappeared"), it still counts toward the cap, and it says so. GPUI
+///    renders this as per-item disabled; these rows are plain strings in a Slint for-loop with no
+///    per-row colour hook, so the honest form is the word - APPENDED to the label, never
+///    substituted for it. That asymmetry is the parity claim rather than a failure of it: a grey
+///    needs a widget that can be greyed, and where the toolkit has no such door the row still has
+///    to tell the truth.
+/// 3. THE CAP, taken with take() and not filtered, so the first ten ARE the ten slots.
+pub(crate) fn recents_rows(entries: &[RecentEntry]) -> Vec<RecentRow> {
+    entries
+        .iter()
+        .take(MAX_RECENTS)
+        .enumerate()
+        .map(|(index, entry)| {
+            // 1-based: the number read and the index fired are one expression, born together.
+            let slot = index + 1;
+            let label = if entry.exists {
+                format!("{slot}. {}", entry.display)
+            } else {
+                format!("{slot}. {} (missing)", entry.display)
+            };
+            RecentRow {
+                slot,
+                label,
+                missing: !entry.exists,
+                path: entry.path.clone(),
+            }
+        })
+        .collect()
 }
 
 /// S10: the generation, one step. Plus one, not a toggle: the port epochs move one at a time and
@@ -1054,32 +1125,27 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 ));
             }
             Event::RecentsUpdated(list) => {
-                let rows = list.len();
-                let names: Vec<slint::SharedString> = list
-                    .iter()
-                    .map(|entry| {
-                        // STRIP-4b row 3: the port carries the bit (api/src/event.rs:182) and D13
-                        // says a vanished path STAYS in the list, greyed - "a greyed-out entry that
-                        // tells the truth beats one that quietly disappeared". bridge-gpui can
-                        // render disabled(!exists) because a real menu item has per-item state; the
-                        // rows here are plain text lines in main.slint with no per-row colour hook,
-                        // so the cheapest HONEST form is the word: " (missing)". The name stays
-                        // exactly as core formatted it, and the mark is appended, never substituted.
-                        if entry.exists {
-                            entry.display.clone().into()
-                        } else {
-                            format!("{} (missing)", entry.display).into()
-                        }
-                    })
-                    .collect();
+                // STRIP-4b row 3, ADR-0006 item 1: the words a row carries are built by
+                // `recents_rows` - the one place the slot number, core's own label and the
+                // missing-file mark are decided - so the product's rows and the tests below read
+                // the SAME builder the event arm feeds the model. Everything the arm used to do by
+                // hand is in that function, and the reason it is there is its doc comment.
+                let rows = recents_rows(&list[..]);
+                let shown = rows.len();
+                let dropped = list.len() - shown;
+                let greyed = rows.iter().filter(|row| row.missing).count();
+                let names: Vec<slint::SharedString> =
+                    rows.iter().map(|row| row.label.clone().into()).collect();
                 {
                     let mut p = pump.borrow_mut();
-                    p.recent_paths = list.iter().map(|entry| entry.path.clone()).collect();
+                    // Same builder, same order: the index main.slint fires for row N is the index
+                    // of slot N here, because both come out of one pass over the same ten.
+                    p.recent_paths = rows.iter().map(|row| row.path.clone()).collect();
                 }
-                // The label is core's (`display`, pre-formatted for the menu), the cap is core's,
-                // and the missing-file MARK is core's FACT (RecentEntry::exists) rendered by the
-                // bridge's own hand - see the map above. The bridge keeps the paths beside it for
-                // Alt+1..0, which routes by path and not by the words.
+                // The label is core's (`display`, pre-formatted for the menu), the slot is this
+                // bridge's, and the missing-file MARK is core's FACT (RecentEntry::exists) rendered
+                // by the bridge's own hand. The bridge keeps the paths beside the words for
+                // Alt+1..0, which routes by path and not by what a row says about itself.
                 if let Some(ui) = weak.upgrade() {
                     // 1.17 finding: `ModelRc` is built from a slice or an `Rc<dyn Model>` - not
                     // from a `Vec` (only `VecModel` takes a Vec), so the borrowed slice it is.
@@ -1088,14 +1154,34 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 // Print on a CHANGE only: three updates used to mean three needles.
                 let changed = {
                     let mut p = pump.borrow_mut();
-                    let changed = p.rows != rows;
-                    p.rows = rows;
+                    let changed = p.rows != shown;
+                    p.rows = shown;
                     changed
                 };
                 if changed {
+                    // The number line names the slots DRAWN, because "ten rows" and "rows 1..=10"
+                    // are different claims when a chord is what reaches a row; an empty list says
+                    // so in the same breath, which is the no-dangling-separator half - no rows, so
+                    // nothing for a gap to divide.
+                    let slots = match (rows.first(), rows.last()) {
+                        (Some(first), Some(last)) => {
+                            format!("slots {}..={}", first.slot, last.slot)
+                        }
+                        _ => String::from("no slots drawn, so no gap above them"),
+                    };
+                    let greyed = if greyed == 0 {
+                        String::new()
+                    } else {
+                        format!(", {greyed} marked (missing)")
+                    };
+                    let cap = if dropped == 0 {
+                        String::new()
+                    } else {
+                        format!(", {dropped} past slot {MAX_RECENTS} not drawn")
+                    };
                     report(&format!(
-                        "recents: rendered {rows} row{}",
-                        if rows == 1 { "" } else { "s" }
+                        "recents: rendered {shown} row{} - {slots}{greyed}{cap} - the words are core's, the number is the row's",
+                        if shown == 1 { "" } else { "s" }
                     ));
                 }
             }
@@ -1532,8 +1618,11 @@ fn drag_by(weak: &slint::Weak<Spike>, pump: &RefCell<Pump>, dx: f32, dy: f32) {
 mod tests {
     // The grep guards below need no parent names, so this module had no import until the drag's
     // arithmetic became testable without a window - which is the whole point of it being a
-    // separate function.
-    use super::drag_destination;
+    // separate function. The recents tests are the same argument one step on: a ROW BUILDER that
+    // touches no window can be driven by real files, so it is driven by real files.
+    use super::{MAX_RECENTS, RecentEntry, RecentRow, SHORTCUTS, drag_destination, recents_rows};
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     const MARKUP: &str = include_str!("../ui/main.slint");
 
@@ -1689,28 +1778,294 @@ mod tests {
 
     #[test]
     fn a_vanished_recent_says_so_and_keeps_cores_label() {
-        // STRIP-4b row 3. The bit is the port's (api/src/event.rs:182), the mark reaches the row,
-        // and core's pre-formatted label is preserved rather than rewritten by the bridge.
+        // STRIP-4b row 3, and ADR-0006 item 1's structural half. The claims are the three the
+        // first bridge's tests carry; where they are READ moved, because the labelling rule moved
+        // out of the event arm and into recents_rows() so the product's rows, the needle and the
+        // behavioural tests below are one pass over ONE builder. The bit is the port's
+        // (api/src/event.rs:182), the mark reaches the row, and core's pre-formatted label is
+        // preserved rather than rewritten by the bridge.
+        let whole = include_str!("../src/surface.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        let builder = &src[src.find("pub(crate) fn recents_rows").expect("the builder")..];
+        let builder = &builder[..builder
+            .find("pub(crate) fn next_generation")
+            .expect("the next fn")];
+        assert!(
+            builder.contains("if entry.exists"),
+            "the mark comes from the port's bit"
+        );
+        assert!(
+            builder.contains("(missing)"),
+            "and reaches the row a person reads"
+        );
+        assert!(
+            builder.contains("entry.display"),
+            "core's label survives unchanged"
+        );
+        assert!(
+            !builder.contains("path.display()"),
+            "a row never re-labels itself from the path - that is core's truncation rule, owned twice"
+        );
+        assert!(
+            !src.contains("mark is core's. The bridge renders"),
+            "a comment must not claim a mark the code never drew - the old wording did"
+        );
+        // THE ONE BUILDER CLAIM, grepped: the arm renders rows and does not label them again. A
+        // second copy in the arm is how two bridges drift; it is how this file would too.
+        let arm = &src[src.find("Event::RecentsUpdated(list) =>").expect("the arm")..];
+        let arm = &arm[..arm.find("Event::Saved").expect("the next arm")];
+        assert!(
+            arm.contains("let rows = recents_rows(&list[..]);"),
+            "the arm delegates to the builder these tests drive"
+        );
+        assert!(
+            !arm.contains("if entry.exists"),
+            "and holds no second copy of the labelling rule"
+        );
+    }
+
+    /// A directory of REAL files, because exists is a verdict about a disk and the missing-row
+    /// claim is only worth proving if the disk can change under it. No new dependency: std::fs, a
+    /// unique name per case, removed on drop - the same shape tests/editor_roundtrip.rs uses.
+    struct Scratch {
+        root: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let mut root = std::env::temp_dir();
+            root.push(format!(
+                "notes-bridge-slint-recents-{tag}-{}-{stamp}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root)
+                .unwrap_or_else(|e| panic!("cannot create {root:?}: {e}"));
+            Scratch { root }
+        }
+
+        /// Lays a real file down and returns its path.
+        fn touch(&self, name: &str) -> PathBuf {
+            let path = self.root.join(name);
+            std::fs::write(&path, b"body\n")
+                .unwrap_or_else(|e| panic!("cannot write {path:?}: {e}"));
+            path
+        }
+
+        /// What the port would send for this path: the basename as the display, and exists READ
+        /// FROM THE DISK rather than typed into a test. Deleting the file is what flips the row.
+        fn entry(&self, path: &Path) -> RecentEntry {
+            RecentEntry {
+                display: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string()),
+                exists: path.is_file(),
+                path: path.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn labels(rows: &[RecentRow]) -> Vec<String> {
+        rows.iter().map(|row| row.label.clone()).collect()
+    }
+
+    #[test]
+    fn a_recent_row_reads_the_ports_own_label_at_its_own_slot() {
+        // menu.rs:231's claim, over Slint rows: the number a person reads is the slot, and the
+        // words behind it are core's string untouched. If the two ever disagree, the list offers
+        // "2." and opens the third file.
+        let scratch = Scratch::new("labels");
+        let first = scratch.touch("alpha.notes");
+        let second = scratch.touch("beta.notes");
+        let entries = vec![scratch.entry(&first), scratch.entry(&second)];
+        let rows = recents_rows(&entries);
+        assert_eq!(labels(&rows), vec!["1. alpha.notes", "2. beta.notes"]);
+        assert_eq!(
+            rows.iter().map(|row| row.slot).collect::<Vec<_>>(),
+            vec![1, 2],
+            "1-based: slot 1 is Alt+1's row, and nothing in a label is zero-indexed"
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>(),
+            vec![first.clone(), second.clone()],
+            "row N still names the file slot N opens - the index main.slint fires is THIS order"
+        );
+        assert!(
+            rows.iter().all(|row| !row.missing),
+            "two live paths, no mark: the word is not decoration"
+        );
+        // VERBATIM, and provably so: a display core already cut - parent suffix, ellipsis, the
+        // works - comes back with only the number added in front of it.
+        let cut = RecentEntry {
+            path: second,
+            display: String::from("..") + "/work/" + "a-very-long-note-name.notes",
+            exists: true,
+        };
+        assert_eq!(
+            recents_rows(&[cut])[0].label,
+            "1. ../work/a-very-long-note-name.notes",
+            "the bridge adds a slot and edits nothing else"
+        );
+    }
+
+    #[test]
+    fn a_path_that_vanishes_keeps_its_row_and_says_why() {
+        // menu.rs:249's claim (D13 on the disk): the entry survives its own file, still counts
+        // toward the cap, and tells the truth about itself. THE FLIP IS REAL - one builder, run
+        // before and after a delete - so no bool in this file chose the outcome.
+        let scratch = Scratch::new("vanished");
+        let here = scratch.touch("here.notes");
+        let gone = scratch.touch("gone.notes");
+        let before = recents_rows(&[scratch.entry(&here), scratch.entry(&gone)]);
+        assert_eq!(labels(&before), vec!["1. here.notes", "2. gone.notes"]);
+
+        std::fs::remove_file(&gone).unwrap_or_else(|e| panic!("cannot delete {gone:?}: {e}"));
+        assert!(!gone.is_file(), "the disk really changed");
+
+        let after = recents_rows(&[scratch.entry(&here), scratch.entry(&gone)]);
+        assert_eq!(after.len(), 2, "a vanished path is not quietly dropped");
+        assert_eq!(
+            labels(&after),
+            vec!["1. here.notes", "2. gone.notes (missing)"],
+            "the mark is APPENDED to core's label, and the slot number does not move"
+        );
+        assert!(!after[0].missing, "only the vanished row is marked");
+        assert!(
+            after[1].missing,
+            "and the bit is carried beside the word, not inside it"
+        );
+        assert_eq!(
+            after[1].path, gone,
+            "the row still names its own path: greyed is not deleted, and a click on it reaches LoadFailed, which is a truth"
+        );
+        // A vanished entry still counts toward the cap: ten grey rows are still ten slots, and the
+        // eleventh - live or not - is the one that does not get a door.
+        let mut ten: Vec<RecentEntry> = (0..10)
+            .map(|i| RecentEntry {
+                path: scratch.root.join(format!("gone{i}.notes")),
+                display: format!("gone{i}.notes"),
+                exists: false,
+            })
+            .collect();
+        let rows = recents_rows(&ten);
+        assert_eq!(
+            rows.len(),
+            MAX_RECENTS,
+            "ten, even when all ten are missing"
+        );
+        assert_eq!(rows[9].label, "10. gone9.notes (missing)");
+        assert_eq!(
+            rows.iter().filter(|row| row.missing).count(),
+            MAX_RECENTS,
+            "the grey count is a fact about the rows, not about the disk"
+        );
+        ten.push(scratch.entry(&here));
+        let rows = recents_rows(&ten);
+        assert_eq!(
+            rows.len(),
+            MAX_RECENTS,
+            "and the eleventh live file does not push a row in"
+        );
+        assert_eq!(
+            labels(&rows).last().expect("row 10"),
+            "10. gone9.notes (missing)"
+        );
+    }
+
+    #[test]
+    fn the_rows_stop_where_the_slots_end() {
+        // menu.rs:264's claim, with ELEVEN real files - the cap is only interesting if the
+        // eleventh exists. Nothing past the tenth slot is built, drawn, or numbered, and every row
+        // that IS drawn has a chord that reaches it.
+        let scratch = Scratch::new("cap");
+        let entries: Vec<RecentEntry> = (1..=11)
+            .map(|i| {
+                let path = scratch.touch(&format!("note{i}.notes"));
+                scratch.entry(&path)
+            })
+            .collect();
+        assert_eq!(entries.len(), 11, "the port asked for eleven rows");
+        let rows = recents_rows(&entries);
+        assert_eq!(rows.len(), MAX_RECENTS, "ten, and never more");
+        assert_eq!(rows.first().expect("row 1").slot, 1);
+        assert_eq!(rows.last().expect("row 10").slot, 10);
+        assert_eq!(
+            labels(&rows).last().expect("row 10"),
+            "10. note10.notes",
+            "the tenth row reads TEN - Alt+0 is its door, and that quirk is the table's"
+        );
+        assert!(
+            labels(&rows).iter().all(|label| !label.starts_with("11.")),
+            "no eleventh slot may be labelled, even by an off-by-one"
+        );
+        assert_eq!(
+            rows[MAX_RECENTS - 1].path,
+            entries[MAX_RECENTS - 1].path,
+            "and the surviving ten are the port's FIRST ten, not some other ten"
+        );
+        // THE GUARD THE CAP BUYS, read from the other half of the contract: the chords in the
+        // table. A row with no chord is text nobody can open; a chord with no row is a dead key.
+        let chords = SHORTCUTS
+            .iter()
+            .filter(|(.., act)| act.starts_with("recent-"))
+            .count();
+        assert_eq!(rows.len(), chords, "ten rows, ten doors");
+        // The dropped one is counted, not hidden: the needle says so (see the arm's cap tail).
+        assert_eq!(
+            entries.len() - rows.len(),
+            1,
+            "one path was past the last slot"
+        );
+    }
+
+    #[test]
+    fn an_empty_recent_list_leaves_nothing_to_divide() {
+        // menu.rs:280's "no dangling separator", in the shape this toolkit has. There is no
+        // separator ELEMENT in these rows; the thing that would dangle is the STACK'S HEIGHT - the
+        // gap the rows push the editor down by - and main.slint computes it as row count times row
+        // height. Zero rows is zero gap, which is the same claim, and the builder must not invent
+        // a placeholder to fill it.
+        assert!(recents_rows(&[]).is_empty(), "no entries, no rows");
+        assert!(
+            recents_rows(&Vec::new()).is_empty(),
+            "and an empty list stays empty regardless of how it was spelled"
+        );
+        let scratch = Scratch::new("empty");
+        assert!(
+            recents_rows(&[]).is_empty(),
+            "a scratch dir being present changes nothing: the builder reads no disk, the CALLER decides what exists"
+        );
+        let live = scratch.touch("unused.notes");
+        assert_eq!(
+            recents_rows(&[scratch.entry(&live)]).len(),
+            1,
+            "one row, when there is one"
+        );
+        assert!(
+            MARKUP.contains("property <length> stack-h: root.recents.length * root.row-h"),
+            "the gap IS the row count, so an empty list cannot leave a rule hanging over the editor"
+        );
+        // The needle names the empty case as empty instead of printing a slot range that does not
+        // exist. "slots 1..=0" is the bug this line forbids.
         let whole = include_str!("../src/surface.rs");
         let src = &whole[..whole.find("mod tests").expect("the tests module")];
         let arm = &src[src.find("Event::RecentsUpdated(list) =>").expect("the arm")..];
         let arm = &arm[..arm.find("Event::Saved").expect("the next arm")];
         assert!(
-            arm.contains("if entry.exists"),
-            "the mark comes from the port's bit"
+            arm.contains("no slots drawn, so no gap above them"),
+            "the needle says so out loud"
         );
-        assert!(
-            arm.contains("(missing)"),
-            "and reaches the row a person reads"
-        );
-        assert!(
-            arm.contains("entry.display.clone()"),
-            "core's label survives unchanged"
-        );
-        assert!(
-            !arm.contains("mark is core's. The bridge renders"),
-            "a comment must not claim a mark the code never drew - the old wording did"
-        );
+        assert!(!arm.contains("slots 1..=0"), "and never numbers nothing");
     }
 
     #[test]
