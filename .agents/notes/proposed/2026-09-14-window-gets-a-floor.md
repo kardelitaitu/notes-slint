@@ -190,14 +190,16 @@ can read. Prefer the floor; D's surviving form is a sanctioned-needle-edit conve
 2. Set 340 x 262 in `product.rs` immediately before `window.set_size(want)` at `:355` - with the
    derivation and its **scope** (262 ends the clipping question, not the covered-bar one) in the
    comment beside it, not a claim of measurement.
-3. **Mirror the two About flags before claiming anything about them.** Today `about-floored`
-   (`chrome.slint:235-236`) and `about-overflow` (`:240-241`) are markup-internal bindings with no
-   mirror on `Spike`: `main.slint` mirrors out `menu-shown` (`:156`), `about-shown` (`:158`),
-   `popup-x` / `popup-floored` / `popup-overflow` (`:168-170`) and nothing else, so there is no
-   `get_about_overflow()` to call and **no needle can read them at all**. Repo-wide,
-   `about-overflow` occurs only in its own binding and in a static text guard
-   (`plumbing.rs:893-895`). Adding the mirrors is the substance of the proof step - it is new
-   plumbing, not an existing signal being wired to a new print.
+3. **Mirror the two About flags before claiming anything about them - PARTLY PAID with the floor**
+   (**measured today**). They existed as markup-internal bindings only: `about-floored`
+   (`chrome.slint:235-236`) and `about-overflow` (`:240-241`), while `main.slint` mirrored out
+   `menu-shown` (`:177`), `about-shown` (`:179`) and `popup-x` / `popup-floored` / `popup-overflow`
+   (`:189-191`) and nothing else. Both About flags now have mirrors, as `out property` on `Spike`
+   (`main.slint:209`, `:210`) - the direction is the point, since `main.slint:201` says a mirror Rust
+   can overwrite is not a mirror: Rust may read them and may not write them. What is still unpaid is
+   the second half of step 4: **nothing reads either flag** (no `about_overflow` anywhere in
+   `product.rs`), and a static text guard in `plumbing.rs:893-895` is not a reader. So the flag that
+   exists to admit defeat still admits it to nobody.
 4. Print them from the product, read them from the product. See "What ADR-0006 permits" for why the
    probe is out of bounds and `xtask` is out of scope.
 
@@ -226,7 +228,11 @@ can read. Prefer the floor; D's surviving form is a sanctioned-needle-edit conve
   satisfied by `popup-top`'s rise; the floor does not replace it.
 - **An honest wrinkle: 340 guarantees not-clipped, not the margin.** `about-floored` lights below
   **356** (= 8 + 340 + 8, from `popup-left`'s own arithmetic), and at any host ≤ 348 the panel sits
-  at x=0 with no left margin. A 340px floor therefore buys a whole licence and a flush-left licence.
+  at x=0 with no left margin. A 340px floor therefore buys a whole licence and a flush-left licence -
+  and measurement has since trimmed that "therefore" (**corrected by measurement today**): the floor
+  is non-retroactive, so a window that came back at 120x120 is still a 120-wide host and the licence is
+  still clipped there. What a 340 floor buys is that no person can *drag* it back under the demand; see
+  "Verdict, measured" below.
   If somebody wants the 8px too, the number is 356 and that is a bigger change to what a person can
   drag - so 340 is recommended as the floor, with the flush-left consequence stated rather than
   discovered. And a correction the revert's finding (b) does not cover: **`about-floored` stays
@@ -288,10 +294,13 @@ what the port stored and what the window is speaks in the run instead of being i
 
 **Why not the alternatives.** (ii) - keep the send, refuse the *write* - buys nothing over (i) except
 permanence: the live window is floored under every option, so (ii) only makes a write that no act
-asked for unrecoverable. (iii) - exempt the restore path from the floor - is not reachable, because
-Slint and winit clamp programmatic sizes at the toolkit (see unknown 1: `set_min_inner_size` plus
-`adjust_window_size_to_satisfy_constraints`); exempting restore would mean raising the floor late,
-which is a rubber band plus a second law about when a size is allowed to be true.
+asked for unrecoverable. (iii) - exempt the restore path from the floor - was refused on a premise
+measurement has since falsified (**corrected by measurement today**), and it survives only as a
+description of what already happens for free: Slint and winit do **not** clamp a programmatic size
+(`SetWindowPos` to 100x100, 300x200 and 1000x800 each landed exactly as asked), so the restore path
+needs no exemption - the floor is non-retroactive on that lane by itself, and no late raise is needed
+to get what (iii) was reaching for. What it still cannot buy is the other half of that option's name:
+a non-retroactive floor does nothing about the act that started this chain, a hand dragging the frame.
 
 **The order this imposes.** The watch fix is a **precondition** of the floor, not a sibling of it.
 `session.json` is a memory of an act; the floor is a policy applied at presentation. Overwriting a
@@ -371,6 +380,76 @@ the expected one. Present it as corroboration, not as a verdict, and record the 
 the same measurement with the hash taken over the rect object rather than the whole file, so recents
 and scratch noise cannot move it.
 
+## Verdict, measured: the floor is alive, and it is not retroactive
+
+The floor landed (`feat(bridge-slint): the product window gets its floor - 340 x 262`), and this
+note's open questions were settled by running the live window rather than by reading further. Recorded
+here, in the same artifact, because it is the same question and the ask is the thing that was owed.
+
+**The verdict: the four markup knobs are ALIVE, not dead.** A `WM_GETMINMAXINFO` sent to the live
+window returned `ptMinTrackSize = 340x262` - exactly `FLOOR_WIDTH` x `FLOOR_HEIGHT`
+(`product.rs:146-147`) at scale 1.0 - which proves the whole chain end to end:
+`min-width: root.floor-width` (`main.slint:48-51`) -> Slint's root layout constraint ->
+`min_max_size_for_layout_constraints` -> `set_min_inner_size` -> winit's stored minimum -> this
+window's min-max answer. So `WindowItem::layout_info` does **not** return `LayoutInfo::default()`
+for this root. The headline this note carried before the run was wrong about the mechanism and right
+about the user experience, and both halves of that sentence are worth keeping because they are
+different claims: a floor that does not bind the lane it was argued about is still a floor that binds
+the lane a person actually uses.
+
+**What the floor actually does.** It arms the OS constraint, so **a person dragging the frame cannot
+take it below 340x262** - which is the complaint this note opened with, and it is fixed. It is
+**non-retroactive**: a window created at 120x120 stays 120x120. And it does **not** bind programmatic
+sizing - `SetWindowPos` to 100x100, 300x200 and 1000x800 each landed exactly as asked. The About
+panel was still clipped in every state the experiment reached, because in each of them the host was
+smaller than the demand.
+
+**The experimental-desert fact, kept as its own bullet because it nearly produced the wrong
+engineering decision.** Windows enforces `ptMinTrackSize` on the **user-sizing** path (hit-test drag,
+`WM_SIZING`) and **not** on a programmatic `SetWindowPos`. So "asked 100x100, landed 100x100" reads
+identically whether the constraint is armed or was never computed at all: the test this note's own plan
+called for separated nothing, and reporting its result alone would have concluded that the knobs are
+dead - wrongly. The discriminating measurement was the direct `WM_GETMINMAXINFO` query. As a rule
+about instruments, since this will recur: **a test that cannot distinguish the hypotheses must not be
+allowed to choose between them.**
+
+**The decision: keep the knobs and the consts, and do NOT add a post-show
+`set_size(max(want, floor))`.** Shape A is rejected on both of its horns, and both are worth carrying
+rather than summarising: **persisting** the enlargement kills the remembered small rect on the first
+floored launch - the one-way door `4b92cef2` exists to prevent - while **suppressing** the report
+instead leaves `session.json` and the screen permanently disagreeing, which is a lie. The maximised
+flag survives exactly that fork, and only because the session carries a **second bit**:
+`session.maximized`, read at `product.rs:435` and applied at `:454-459`, with its own measure
+lane, so a reader of the trace knows which of the two numbers is intent. **The floor has no bit.** And
+the channel that could have carried the hint was removed deliberately - `Command::GeometryChanged` is
+a bare trigger because "the live drift bug was exactly such a hint winning the write"
+(`engine.rs:783-795`). What the run also confirms is the ordering law the code already states for
+itself: the floor goes up **before** the restored size is asked for (`product.rs:441-452`), so wake 1
+measures the already-floored rect and books it as the baseline instead of emitting a change - which is
+the difference between a policy at presentation and a policy that rewrites memory.
+
+**What we do instead, and it is the cheap form of B: do not offer what will not fit, and say why.**
+Gate the **act**, not the layout. The About row declines on a host smaller than the panel's demand and
+explains through the channel that already exists - and `about-overflow` (`chrome.slint:240-241`), which
+now has its `out` mirror (`main.slint:210`) but still no reader, finally gets one. Two constraints
+on the how, both from the frozen instrument,
+so nobody learns them from a red build: **wrap the two existing opens rather than adding a third
+line**, because `probe.rs:2023-2026` asserts `about_writes == 7` ("exactly two opens and five closes
+may write about-open, all inside Chrome") and `:2027-2031` asserts the mount assigns none; and the
+gate cannot move into Rust at all, because `surface.rs:3225-3229` asserts "Rust writes none of
+Chrome's state - no `set_about_open(`)". The two opens to wrap are `chrome.slint:718` (the
+about-asks door, which is also the path the needle takes) and `chrome.slint:899` (the row's
+`TouchArea`). **Reopen conditions** for abandoning the act-gate and building the wall instead: a Slint
+release that states a minimum before first paint; an agreed platform-side `WM_GETMINMAXINFO`
+subclass, which is architecture rather than a knob and is Windows-only, so §6 cannot express it; the
+day the About box is allowed to reflow; or the day the floor is given its own persisted bit.
+
+**One honest bonus for the trace section above.** The same run produced the first live sighting of the
+`GEOMETRY_FORCE` leg: a send at "0ns quiet (forced: true)", and **five** geometry sends against the
+800x600 control's **zero**. So the watch's move-detection is working; the thing that was wrong was never
+the clock. It is the size the OS was allowed to create the window at - which is what this section
+measures, and why the fix in "A second chain in the same file" and the floor are two different jobs.
+
 ## Why this is not the rejected drag-path visibility clamp
 
 `.agents/notes/rejected/2026-09-14-drag-path-visibility-clamp.md` exists, and this is not it. That
@@ -411,21 +490,21 @@ rejection covers this has to say which axis it applies to.
 
 ## Known unknowns, stated as unknowns
 
-1. **Does Slint honour markup `min-*` against a PROGRAMMATIC `set_size`? Mechanism named, outcome
-   still owed.** The mechanism is Slint's own constraint path: `i-slint-core` - the runtime crate
-   `slint` re-exports - keeps a window's minimum inner size, applies it to programmatic resizes
-   through `set_min_inner_size` plus `adjust_window_size_to_satisfy_constraints`, and on the creation
-   lane winit clamps the requested inner size against `min_inner_size` before the window exists. So
-   A-prime's knob is not fighting `set_size` at `product.rs:355`: it sits on the path that call
-   already travels. **That is a design claim read off the toolkit's architecture, not a measurement.**
-   The case that matters here is restoring a persisted rect of, say, 120x120 and seeing what the
-   window actually comes back as, and neither this note nor `6aafbe6b` has that run; until it lands,
-   item (2) is the same kind of claim and neither is evidence. Both names also sit behind a pinned
-   1.17.1, and this crate has already learned that a Slint bump can move a private door
-   (`product.rs:227` says it of the focus one) - so the mechanism is the shape to verify, not a
-   settled fact about future versions. If the seeded run shows the stored rect winning, the knob
-   bounds user drags only and the restore path stays open, and **that is a reopening trigger, to be
-   recorded as a new note, not quietly patched around.**
+1. **Does Slint honour markup `min-*`? ANSWERED BY MEASUREMENT today, and the answer is narrower than
+   the question.** The chain is alive: `min-width: root.floor-width` -> Slint's root layout constraint
+   -> `min_max_size_for_layout_constraints` -> `set_min_inner_size` -> winit's stored minimum -> this
+   window's `WM_GETMINMAXINFO` answer, which returned `ptMinTrackSize` = **340x262**, exactly
+   `FLOOR_WIDTH` x `FLOOR_HEIGHT` (`product.rs:146-147`) at scale 1.0. So
+   `WindowItem::layout_info` does **not** return `LayoutInfo::default()` for this root, and the
+   mechanism this item first named (`set_min_inner_size`, `adjust_window_size_to_satisfy_constraints`)
+   was the right mechanism. What that draft got wrong was the lane: the constraint binds the
+   **user-sizing** path and not the programmatic one, which is why the seeded-restore case this item
+   asked for - a persisted 120x120, and what the window comes back as - came back **at 120x120**. That
+   outcome is the reopening trigger this item itself named, and it fired; the amendment is recorded
+   here rather than in a new note because it is the same question and, per the revert's own rule, the
+   ask is the artifact. Both names still sit behind a pinned 1.17.1, and `product.rs:227` is this
+   crate's own warning that a Slint bump can move a private door - so "alive today" is not "alive after
+   an upgrade", and the `WM_GETMINMAXINFO` query above is the ten-minute check on any bump.
 2. **Is `min-width: 0px` the no-op its absence is?** The mechanism answer is that `i-slint-core`
    reports `min_size` as `None` unless the constraint is greater than zero - which is why a `0px`
    default should be inert rather than a zero-valued clamp, and inertness is the whole safety argument
@@ -458,5 +537,11 @@ rejection covers this has to say which axis it applies to.
 - **A-prime is wrong, and gets a new note, if** unknown (1) or (2) resolves against it - a knob that
   does not bind a programmatic size, or a zero that is not inert, leaves the bug open while the code
   looks fixed, which is the exact failure mode the revert was written about.
+  **Half of this condition has now fired** (measured today): the knob does not bind a programmatic
+  size. Against the complaint that opened this note - a hand dragging the frame until the app clips its
+  own licence - the bug is closed, because the drag is precisely the path the constraint governs.
+  Against the arithmetic in "The clip is arithmetic at HEAD", a host created below the demand still
+  clips. So "the code looks fixed while the bug is open" is neither true nor false about A-prime; it
+  depends on which clip a reader meant, and this note's own earlier draft meant the second one.
 - **The whole question goes away** if a frame returns: with an OS caption, the WM enforces a minimum
   whether or not this repo asks. §10.2 says it will not.
