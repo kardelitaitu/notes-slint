@@ -37,8 +37,10 @@ breaks something the product depends on.
 crates/core       pure Rust. No gpui, no windows crate, no platform, no unsafe.
 crates/platform   OS primitives that take a window handle and decide nothing.
 crates/api        the port. Commands in, Events out. No UI types, knows no bridge exists.
-crates/bridge-*   one adapter per UI toolkit. Two are built: bridge-gpui, and bridge-slint
-                  (two bins: notes-slint is the product, notes-slint-probe is the frozen instrument).
+crates/bridge-*   one adapter per UI toolkit. Two are built: bridge-slint (two bins:
+                  notes-slint is the product, notes-slint-probe is the frozen instrument), and
+                  bridge-gpui — FROZEN (ADR-0006): still builds, still cited, no new needles, rows may
+                  not loosen, and its terminal delete waits on the six re-earnings, not on a mood.
 ```
 
 ```sh
@@ -83,6 +85,10 @@ Rules that are easy to break politely:
 - **Do no harm.** Loading then saving a foreign file must be byte-identical: preserve
   encoding, BOM, line endings, trailing newline (whitepaper §4.5). Round-trip fixtures in
   `crates/core/tests/fixtures/` gate this; never "normalise" a file to be tidy.
+- **No M2 check's status moves on either bridge's account pre-CI** — not up on `bridge-slint`'s, because
+  `git remote -v` is empty and no workflow has ever run, and not down on `bridge-gpui`'s, because it is
+  frozen with its proofs still compiling (ADR-0006). The honesty gate is symmetric: a row that can only
+  travel one way is not a gate, it is a narrative.
 
 ## Deliberate non-goals
 
