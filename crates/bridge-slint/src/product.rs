@@ -1027,7 +1027,7 @@ mod tests {
 
     /// The number in the first `<prefix><digits>px` at or after `from`, read OUT of the markup.
     /// These literals are frozen evidence (chrome.slint:1001-1002) and copying them into a Rust
-    /// literal is how a number ends up owned twice - so nothing below contains 340 or 260.
+    /// literal is how a number ends up owned twice - so no panel size below is typed by hand.
     /// A missing or unparseable literal panics: that is the drift this is here to catch.
     fn px_after(text: &str, from: usize, prefix: &str) -> f64 {
         let hit = text[from..].find(prefix).unwrap_or_else(|| {
@@ -1145,10 +1145,22 @@ mod tests {
             );
         }
 
-        // The demand, read out of the frozen markup rather than written down twice. About is a
-        // fixed box; the horizontal clause is about-overflow's own predicate (host < about.width,
-        // margins spendable because popup-left's floor is zero), the vertical one is
-        // popup-top's (height + the gap it keeps below the panel), plus the box's own border.
+        // The demand, read out of the frozen markup rather than written down twice - and the
+        // DESIGNER'S RULING on what it is, since that ruling is the only reason a guard like this
+        // earns its keep. Read the two clauses separately, because they are not the same question.
+        //
+        //   * VERTICAL = about.height + exactly ONE Theme.menu-gap. popup-top subtracts one gap
+        //     below the panel (chrome.slint:198-202) and nothing else. NO border term, and that is
+        //     the correction: a Slint Rectangle draws its border CENTERED ON the geometry edge
+        //     (i-slint-core graphics/border_radius.rs:195-199, the inner/outer(half_border_width)
+        //     pair; item_rendering.rs:523,544 clip children by that same border_width INSIDE the
+        //     item box), so the box's `height: 260px` is already border-inclusive. Counting the
+        //     hair again was a demand made of half a pixel of antialiasing.
+        //   * HORIZONTAL = about.width with no padding at all, and the asymmetry between the two
+        //     clauses is the ruling, not an oversight: popup-left's floor is ZERO
+        //     (chrome.slint:230-234), so the 8px side margins are POLICY while the panel's own
+        //     width is OBLIGATION - below it no x places this panel at all, which is exactly what
+        //     about-overflow says (host-width < about.width, margins spent and all).
         let chrome = include_str!("../ui/chrome.slint");
         let about = chrome
             .find("about := Rectangle {")
@@ -1158,7 +1170,7 @@ mod tests {
         let border = px_after(chrome, about, "border-width: ");
         let gap = px_after(include_str!("../ui/theme.slint"), 0, "menu-gap: ");
         let demand_w = panel_w;
-        let demand_h = panel_h + border + gap;
+        let demand_h = panel_h + gap;
 
         // The contract, tested as a DIRECTION at the boundary rather than against a value: equal
         // clears, a hair under clips, more than enough never clips. The third case is what makes
@@ -1178,6 +1190,19 @@ mod tests {
         assert!(
             demand_w > 0.0 && demand_h > panel_h,
             "the padding has to actually pad, or the vertical clause is the width clause in a costume"
+        );
+        // The ONE place this test wants equality, because it is about the ARITHMETIC and not about
+        // a clip: the demand is the box plus one gap, and the border it reads here (a real number,
+        // deliberately not used) is drawn on the edge rather than beyond it. Re-add it as a term
+        // and this line is the one that says so.
+        assert_eq!(
+            demand_h,
+            panel_h + gap,
+            "the vertical demand grew a term - the border ({border}px) is centered on the box's own edge and is not extra"
+        );
+        assert_eq!(
+            demand_w, panel_w,
+            "the horizontal demand grew a term - popup-left's floor is zero, so its margins are policy while only the width is obligation"
         );
 
         // And the pending half, honestly: the Rust consts do not exist yet, so nothing here can
