@@ -100,6 +100,32 @@ makes proved, and what it does not, kept apart on purpose:
 - **Not judged, by design.** `--binary=slint-probe` returns `Leg::NotWired` and exit **2** — the
   harness's own "I did not judge" code, not a machine decline (that is 3) and not an app failure.
 
+**Freeze and re-earn (2026-09-14).** The framework question is decided: Slint is the product, and GPUI is
+dropped from its future. The ruling on *how* is [ADR-0006](decisions/0006-gpui-is-frozen-not-deleted.md) —
+freeze, then retarget, then delete behind a gate rather than on a mood. The freeze law in one line: **no
+new gpui features, no new needles, and no row above may loosen.** The retarget is about what the repo
+faces by default — `cargo xtask smoke`, the CI smoke rows, and the docs all point at Slint. The delete
+waits on **six re-earnings**, each an equivalent proof over Slint bytes rather than a ported file:
+
+- **the recents label trio on product rows** — Slint-side equivalents of the three
+  `crates/bridge-gpui/src/menu.rs:230-295` tests cited by check 5, over the product's own rendered rows;
+- **the §4.5 byte-identical bridge leg on Slint `TextEdit`** — a live round trip through the editor the
+  user types into, not core's fixtures alone;
+- **the M9 rect fixed point `(0, 0, 0, 0)` on product bytes** — `run_product_leg` names reading a rect as
+  something it deliberately does **not** do (`crates/xtask/src/smoke.rs:4203-4211`), so this is new
+  harness surface, not a flag flip;
+- **the dialog flows Open and Save As driven to text-in-window** — `rfd` is already live
+  (`crates/bridge-slint/src/surface.rs:541`); the gap is the assertion, not the code;
+- **the autosave toggle through the real menu** — check 6, closed on a product menu row;
+- **the STRIP-4 owes at `crates/bridge-slint/src/product.rs:52`** — the recents exists-mark, the legend
+  keys in a real bar, and the pin check mark's round trip.
+
+And the sentence this gate protects, stated plainly: **"3 of 7" stands only because the crates holding its
+proofs still compile and still run — it drops the day they are deleted without equivalents.**
+Git-can-recover is not proof-can-recover: a deleted test comes back from history, an unproven claim does
+not re-prove itself. So until all six are green the count moves neither way — not up on this bridge's
+account, for the CI reason above, nor down on gpui's, for this one.
+
 M2 therefore stays **in flight**. What is left is the CI evidence trail after a first push, plus the
 human eye-pass list no harness reaches: the popup, caption and About glyphs on a real screen, a real
 Explorer drag rather than a synthesised one, the over-8 MiB refusal as a user sees it, and the
