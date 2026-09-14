@@ -722,7 +722,19 @@ mod tests {
     /// rebind Ctrl+T to Ctrl+A in Rust and the legend prints the truth while the menu keeps saying
     /// Ctrl+T for as long as nobody looks. chrome.slint:843-845 states the law this enforces -
     /// "a label names a key the map binds, or the legend lies" - and until now nothing checked it
-    /// across the seam.
+    /// across the seam IN ORDER. The first version of this test compared sets: six cells, the same
+    /// chords, both counts agreeing - so transposing the Open and Save As cells passed it, the same
+    /// rot as the rebind above: legend and map disagreeing while every part reads true on its own.
+    /// Four chords printed in the wrong rows still tell the user to press the wrong key, and a census
+    /// that cannot see that is a census of a legend nobody reads top-to-bottom.
+    ///
+    /// THE NEIGHBOUR, AND WHY IT IS NOT THIS ONE: `probe.rs:2513
+    /// markup_agrees_with_the_table_on_every_spelling` is the other test that reads the popup against
+    /// the table, and it asks a PRESENCE question - for every ctrl row, does the display string
+    /// appear in the markup and does the key's own branch appear in the capture tree. This one asks
+    /// the sequence question the other cannot: is each printed CELL the table's row for the slot it
+    /// sits in. The two are complements, not duplicates - a swap leaves every spelling present, so
+    /// probe.rs:2513 stays green across it, and only the ordering below can see it.
     ///
     /// The table is read as a constant, not as text: `SHORTCUTS` is `pub(crate)`, so this compares
     /// against the same bytes `route_of` dispatches on rather than against a grep of a comment.
@@ -740,25 +752,55 @@ mod tests {
                 .map(|(inner, _)| inner.to_string())
                 .unwrap_or_else(|| panic!("a chord cell with no quoted text: {line}"))
         };
-        // The six rows' chord cells. `col: 1; row:` is the grid's own spelling and nothing else in
-        // the file uses it: the recents hang outside the grid, and their cell is placed by x.
-        let cells: Vec<String> = chrome
+        // The six rows' chord cells, EACH PAIRED WITH THE GRID ROW IT PRINTS IN, because the row is
+        // the half of the fact the old census threw away. `col: 1; row:` is the grid's own spelling
+        // and nothing else in the file uses it: the recents hang outside the grid - chrome.slint:917,
+        // `for name[index] in root.recents`, one block whose cells are placed by x and whose chord
+        // column does not exist - so this filter catches the hand-written chord column and nothing
+        // the popup builds from a model. The row NUMBER is the render order: a GridLayout places by
+        // `row:`, not by where the lines happen to sit in the file, so the census reads the number
+        // and sorts by it rather than trusting source order to have stayed in step.
+        let cell_at = |line: &str| -> (usize, String) {
+            let row = line
+                .split_once("col: 1; row:")
+                .unwrap_or_else(|| panic!("a chord cell with no row: {line}"))
+                .1
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("a chord cell whose row is not a number: {line}"));
+            (row, quoted(line))
+        };
+        let mut cells: Vec<(usize, String)> = chrome
             .lines()
             .filter(|line| line.contains("col: 1; row:"))
-            .map(quoted)
+            .map(cell_at)
             .collect();
+        cells.sort_by_key(|(row, _)| *row);
         assert_eq!(
             cells.len(),
             6,
             "six rows, six chord cells - a seventh would mean the grid grew past the popup's height"
         );
+        // And the six rows are the six rows: 0 through 5, once each. A hole or a duplicate would
+        // mean the popup is drawing something this census reads as something else - two cells on one
+        // row is an overlap, and a row with no cell is a label that advertises nothing.
+        let printed: Vec<usize> = cells.iter().map(|(row, _)| *row).collect();
+        assert_eq!(
+            printed,
+            (0..6).collect::<Vec<usize>>(),
+            "the chord cells occupy rows 0..=5 once each - the render order the table is zipped \
+             against is only real if these are six distinct places in one grid"
+        );
 
-        let advertised: Vec<&str> = cells
+        let advertised: Vec<(usize, &str)> = cells
             .iter()
-            .map(String::as_str)
-            .filter(|cell| !cell.is_empty())
+            .filter(|(_, cell)| !cell.is_empty())
+            .map(|(row, cell)| (*row, cell.as_str()))
             .collect();
-        let bound: Vec<&str> = crate::surface::SHORTCUTS
+        let bound: Vec<&str> = SHORTCUTS
             .iter()
             .map(|(_, display, _, _)| *display)
             .filter(|display| !display.starts_with("Alt+"))
@@ -767,19 +809,29 @@ mod tests {
         assert_eq!(
             advertised.len(),
             bound.len(),
-            "the menu advertises {advertised:?} while the table binds {bound:?}"
+            "the menu advertises {advertised:?} while the table binds {bound:?}: a bound chord with \
+             no cell is a key nobody finds, and a cell naming a chord nothing binds is the other \
+             half of the same lie"
         );
-        for cell in &advertised {
-            assert!(
-                bound.iter().any(|display| display == cell),
-                "the popup prints {cell}, which nothing binds: the legend would be lying"
+        // ORDER-AWARE, AND THAT IS THE TEST: the same four chords, printed in a different order, is
+        // not a passing legend. Row 0 says press Ctrl+S to Open, and the user gets the dialog they
+        // aimed at two rows down. Membership plus length - what this loop replaces - could not see
+        // that, because a swap moves cells without changing the set or the count. The zip is against
+        // `bound` in table order, which is also legend()'s order and the order the probe's own
+        // separators are counted in (probe.rs:2493), so a transposition anywhere in either list lands
+        // on the row it belongs to.
+        for (index, ((row, cell), display)) in advertised.iter().zip(&bound).enumerate() {
+            assert_eq!(
+                cell, display,
+                "row {row} prints {cell} where the table's {index}th bound chord is {display}: both \
+                 chords exist, they are in the wrong places - the legend would send the reader to the \
+                 key for somebody else's command"
             );
-        }
-        for display in &bound {
-            assert!(
-                advertised.contains(display),
-                "{display} is bound and routed but the menu has no cell for it - a chord with no row \
-                 is a key nobody finds, which is the other half of the same lie"
+            assert_eq!(
+                *row, index,
+                "the {index}th chord in the table's order is printed in grid row {row}: the popup's \
+                 order has drifted from the table's, which is how the two stop agreeing about which \
+                 row is 'the fourth one' when anything cites a row by number"
             );
         }
 
@@ -787,15 +839,17 @@ mod tests {
         // no Command and About has no chord (probe.rs:2082 names both absences). If a third row goes
         // quiet, or one of these gains a key it does not have, this is the line that asks why.
         assert_eq!(
-            cells.iter().filter(|cell| cell.is_empty()).count(),
+            cells.iter().filter(|(_, cell)| cell.is_empty()).count(),
             2,
-            "exactly Quit and About advertise no key"
+            "exactly Quit and About advertise no key, and they are the LAST two rows - the zip \
+             above only reaches the four bound cells because these two are the ones with nothing to \
+             advertise"
         );
         // And the recents' cell stays empty forever, which is not an omission but the binding:
         // recents_rows labels a row "3. <name>" so the number read and the slot fired are one
         // expression, and printing "Alt+3" beside it would hand-copy that fact a second time.
         assert!(
-            cells.iter().all(|cell| !cell.starts_with("Alt+")),
+            cells.iter().all(|(_, cell)| !cell.starts_with("Alt+")),
             "no chord cell in the popup names an Alt slot; the number lives in the label"
         );
     }
@@ -840,10 +894,26 @@ mod tests {
             flat.contains("root.host-width<about.width"),
             "about-overflow says so when no placement exists, against about.width and not a copy of 340"
         );
-        assert!(
-            !chrome.contains("width: Theme.menu-about-width"),
-            "the 340px literal stays, because probe.rs:2105 pins it and a token would put the number \
-             in two places with one of them frozen"
+        // THE PREDECESSOR'S GUARD, REPAIRED. This line used to read `!chrome.contains(
+        // "width: Theme.menu-about-width")`, and no token of that name has ever existed in any Theme
+        // in this crate - so nothing could fail it. A guard that can only pass is worse than no
+        // guard, because it reads like coverage. The regression it meant to block has a name, and it
+        // is not a token appearing under one spelling: probe.rs:2105 asserts this literal as evidence
+        // of a 340px panel, and `popup-left(needed)` was judged against that measure. Replace the
+        // number with a token, or the token with another number, and the frozen assertion keeps
+        // certifying a box the panel no longer is. So read the block's OWN width declaration and
+        // compare the text - which fails on a token, on a renamed token, and on 320px alike.
+        let about_width = chrome[chrome
+            .find("about := Rectangle {")
+            .expect("the About block")..]
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("width:"))
+            .expect("the About block declares its own width");
+        assert_eq!(
+            about_width, "width: 340px;",
+            "About's box is the literal probe.rs:2105 pins, in the place that pins it: a token or a \
+             different number leaves that frozen evidence describing a panel the markup does not draw"
         );
     }
 }
