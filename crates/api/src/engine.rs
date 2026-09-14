@@ -835,6 +835,22 @@ impl Engine {
                     }
                 }
             }
+            Command::SetCornerRounding(round) => {
+                // THE CORNER ASK, routed. Nothing here is stored: the request is derived
+                // from the window's own state by the bridge, so persisting it would create
+                // a second copy that can disagree - which is the reason this arm has no
+                // `self.session`/`self.settings` line and no `queue`, unlike the pin above
+                // (D10's "session.json is the one home of pin state" has no corner
+                // analogue, and inventing one is how a stale bit starts deciding looks).
+                //
+                // NO WINDOW: nothing is said. Not a refusal - there was no window to ask
+                // about, which is the same third-silent-case reasoning as
+                // [`Engine::apply_topmost`], stated once on that function and pointed at
+                // rather than repeated.
+                if let Some(handle) = self.window {
+                    self.apply_corner_rounding(handle, round);
+                }
+            }
             Command::ClearRecents => {
                 // core's own clear, so the cap and the entry type stay core's
                 // business even for the empty case.
@@ -1742,6 +1758,33 @@ impl Engine {
                     ),
                 });
             }
+        }
+    }
+
+    /// The corner half of the same shape as [`Engine::apply_topmost`], minus three things
+    /// that shape has, each one on purpose:
+    ///
+    /// - **No `confirmed` latch.** The pin's exists so a repeat of an already-applied bit
+    ///   costs nothing and a repeat after a failure retries. A corner has no state to be
+    ///   out of date about and no indicator to redraw: an identical repeat costs one
+    ///   attribute call, and the caller sends on transitions, not on ticks.
+    /// - **No success event.** `Pinned` exists because the title bar renders the port's
+    ///   answer. A round corner renders itself, and an event saying "round" would be a
+    ///   restatement of the ask - the pattern [`Event::Pinned`]'s doc forbids - with no
+    ///   surface to consume it.
+    /// - **A refusal, though.** `CornerRoundingFailed` is the one thing the bridge cannot
+    ///   derive: an OS that has never heard of the attribute answers the same way on every
+    ///   ask, and without this event the only trace of that is a log line nobody reads.
+    ///
+    /// NO SEAM (`backend: None`) stays silent for the reason `apply_topmost` documents.
+    fn apply_corner_rounding(&mut self, handle: WindowHandle, round: bool) {
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        if let Err(error) = backend.set_corner_rounding(handle.0 as isize, round) {
+            self.emit(Event::CornerRoundingFailed {
+                reason: error.to_string(),
+            });
         }
     }
 
@@ -2738,6 +2781,13 @@ mod tests {
             panic!("the pin fixture has no answer for frame_rect")
         }
 
+        /// A HOLE, deliberately: no pin test sends a corner ask, and a fixture that
+        /// answers a call its own path never makes hides a routing mistake behind a
+        /// permissive fake.
+        fn set_corner_rounding(&mut self, _handle: isize, _round: bool) -> PlatformResult<()> {
+            panic!("the pin fixture has no answer for set_corner_rounding")
+        }
+
         fn restore_frame_rect(&self, _handle: isize) -> PlatformResult<Placement> {
             panic!("the pin fixture has no answer for restore_frame_rect")
         }
@@ -2811,6 +2861,210 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // CORNERS: the second window attribute, and the refusal-only event.
+    // ------------------------------------------------------------------
+
+    /// Whether the fake OS knows the attribute at all (Windows 11 / Windows 10).
+    type CornerAnswer = std::sync::Arc<std::sync::atomic::AtomicBool>;
+    /// How many times the seam was driven. Separate from the answer because the
+    /// `DropTakes` reason applies here too: "no second event" is also what a call
+    /// that never happened looks like, and only the count tells them apart.
+    type CornerAsks = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+    /// A seam that answers the corner preference, plus the two calls a registration
+    /// already makes on the maximised branch (`PinOutcome` and the stored-rect
+    /// write-back), and panics at everything else.
+    struct CornerBackend {
+        ok: CornerAnswer,
+        asks: CornerAsks,
+        /// `usize::from(round)` of the most recent ask, so a test can assert the
+        /// engine forwarded the bridge's value rather than its own opinion.
+        last: CornerAsks,
+    }
+
+    impl WindowBackend for CornerBackend {
+        fn set_corner_rounding(&mut self, _handle: isize, round: bool) -> PlatformResult<()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.asks.fetch_add(1, SeqCst);
+            self.last.store(usize::from(round), SeqCst);
+            if self.ok.load(SeqCst) {
+                Ok(())
+            } else {
+                // The sentence Windows 10 produces: the attribute is unknown, so the
+                // call is refused rather than ignored.
+                Err(PlatformError::Win32 {
+                    api: "DwmSetWindowAttribute",
+                    message: "The parameter is incorrect. (os error 87)".to_string(),
+                })
+            }
+        }
+
+        fn set_topmost(&mut self, _handle: isize, _on: bool) -> PinOutcome {
+            PinOutcome::Applied
+        }
+
+        fn set_restore_frame_rect(
+            &mut self,
+            _handle: isize,
+            _rect: FrameRect,
+        ) -> PlatformResult<()> {
+            Ok(())
+        }
+
+        fn frame_rect(&self, _handle: isize) -> PlatformResult<FrameRect> {
+            panic!("the corner fixture has no answer for frame_rect")
+        }
+
+        fn restore_frame_rect(&self, _handle: isize) -> PlatformResult<Placement> {
+            panic!("the corner fixture has no answer for restore_frame_rect")
+        }
+
+        fn set_frame_rect(
+            &mut self,
+            _handle: isize,
+            _rect: FrameRect,
+            _scale: f32,
+        ) -> PlatformResult<()> {
+            panic!("the corner fixture has no answer for set_frame_rect")
+        }
+
+        fn primary_work_area(&self) -> PlatformResult<FrameRect> {
+            panic!("the corner fixture has no answer for primary_work_area")
+        }
+    }
+
+    /// A registered-window engine for the corner tests. `maximized: true` is not
+    /// about corners: it is the `pin_engine` trick that keeps a registration on the
+    /// no-move branch of `restore_and_pin`, so the fixture needs no host facts.
+    fn corner_engine(ok: bool) -> (Engine, mpsc::Receiver<Event>, CornerAsks, CornerAsks) {
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let asks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(9));
+        let engine = Engine::new(
+            cmd_rx,
+            event_tx,
+            StateDir(PathBuf::from("unused-in-these-tests")),
+            Session {
+                maximized: true,
+                pinned: false,
+                ..Session::default()
+            },
+            Settings::default(),
+            Some(Box::new(CornerBackend {
+                ok: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(ok)),
+                asks: std::sync::Arc::clone(&asks),
+                last: std::sync::Arc::clone(&last),
+            })),
+            None,
+        );
+        (engine, event_rx, asks, last)
+    }
+
+    /// THE ROUTING: one command, one call, and the VALUE forwarded. Success is
+    /// silent - that is the departure from the pin contract, asserted here rather
+    /// than only in prose, because "no event" is the thing a later reader will be
+    /// tempted to "fix" by echoing the ask.
+    #[test]
+    fn a_corner_ask_reaches_the_seam_and_answers_nothing_when_it_works() {
+        let (mut engine, events, asks, last) = corner_engine(true);
+        engine.handle(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        });
+        // Registration applies the pin and says nothing about corners: the port has no
+        // opinion about the shape of a window it was never asked to shape.
+        let after_register = drain(&events);
+        assert!(
+            !after_register
+                .iter()
+                .any(|event| matches!(event, Event::CornerRoundingFailed { .. })),
+            "registration must not invent a corner answer: {after_register:?}"
+        );
+        assert_eq!(
+            asks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "and must not ask the OS either"
+        );
+        let base_pending = pending(&engine);
+
+        for round in [true, false, true] {
+            engine.handle(Command::SetCornerRounding(round));
+            assert!(
+                drain(&events).is_empty(),
+                "an apply the OS accepted emits nothing (round={round})"
+            );
+            assert_eq!(
+                last.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(round),
+                "the bridge's value is the value the seam saw"
+            );
+        }
+        assert_eq!(
+            asks.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "one command, one call - no latch, no dedupe"
+        );
+        assert_eq!(
+            pending(&engine),
+            base_pending,
+            "a corner ask persists NOTHING: it is derived from the window, not state"
+        );
+    }
+
+    /// THE REFUSAL: an OS that has never heard of attribute 33 answers every ask,
+    /// and the bridge's only way to learn that is this event.
+    #[test]
+    fn a_refused_corner_ask_is_reported_every_time_it_is_refused() {
+        let (mut engine, events, _asks, _last) = corner_engine(false);
+        engine.handle(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        });
+        let _ = drain(&events);
+
+        engine.handle(Command::SetCornerRounding(true));
+        let got = drain(&events);
+        assert_eq!(got.len(), 1, "one refusal for one ask: {got:?}");
+        match &got[0] {
+            Event::CornerRoundingFailed { reason } => assert!(
+                reason.contains("DwmSetWindowAttribute"),
+                "the reason names the call that refused: {reason}"
+            ),
+            other => panic!("expected CornerRoundingFailed, got {other:?}"),
+        }
+
+        // No engine-side throttle, stated as a test because it is a design choice a
+        // reader would otherwise "correct": the bridge stops asking when it hears
+        // this, and a port that latched refusals would hide a window that grew a
+        // second one.
+        engine.handle(Command::SetCornerRounding(true));
+        assert_eq!(
+            drain(&events).len(),
+            1,
+            "a repeat refusal is still a refusal, reported"
+        );
+    }
+
+    /// NO WINDOW, NO CLAIM - the same discipline as the pin's silent case, with the
+    /// stronger half: the seam is not touched at all, so a stale handle can never be
+    /// handed an attribute (the recycled-HWND hazard `UnregisterWindow` exists for).
+    #[test]
+    fn a_corner_ask_with_no_window_registered_touches_nothing() {
+        // `ok: false` makes this bite: any call at all would emit a refusal, so an
+        // empty drain proves the arm stopped before the seam rather than succeeding.
+        let (mut engine, events, asks, _last) = corner_engine(false);
+        engine.handle(Command::SetCornerRounding(true));
+        assert!(
+            drain(&events).is_empty(),
+            "no window, no apply, no statement"
+        );
+        assert_eq!(
+            asks.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "and no handle was named to the OS"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // FILE DROP (S4): the second clock, and the door it opens.
     // ------------------------------------------------------------------
 
@@ -2843,6 +3097,9 @@ mod tests {
 
         fn set_topmost(&mut self, _handle: isize, _on: bool) -> PinOutcome {
             panic!("the drop fixture has no answer for set_topmost")
+        }
+        fn set_corner_rounding(&mut self, _handle: isize, _round: bool) -> PlatformResult<()> {
+            panic!("the drop fixture has no answer for set_corner_rounding")
         }
         fn frame_rect(&self, _handle: isize) -> PlatformResult<FrameRect> {
             panic!("the drop fixture has no answer for frame_rect")

@@ -1,6 +1,6 @@
 ---
 title: Rounded corners without an alpha channel
-status: proposed
+status: implemented
 id: 2026-09-14-rounded-corners-dwm
 created: 2026-09-14
 updated: 2026-09-14
@@ -117,10 +117,61 @@ wants the transparent-window route specifically — because a future radius, a r
 non-rectangular note is on the table — then the renderer question is the one being decided, and it
 deserves its own note.
 
+## What was built (same day, after the recommendation was accepted)
+
+The vertical slice, which is what made this a design change rather than a tweak:
+
+| Seam | What it gained |
+|---|---|
+| root `Cargo.toml` | `Win32_Graphics_Dwm` on the shared `windows` entry |
+| `platform` | `windows/corners.rs`: one attribute call, one read-back, `// SAFETY:` on both blocks; `WindowBackend::set_corner_rounding(handle, round) -> PlatformResult<()>`; the seam added to `all_handle_seams`, so a bad handle is refused by the same test that refuses it for the other four |
+| `api` | `Command::SetCornerRounding(bool)` (10 → 11) and `Event::CornerRoundingFailed { reason }` (14 → 15); `Engine::apply_corner_rounding`, the sole emitter |
+| `bridge-slint` | `surface::ask_corners`, the policy, called from the 8 ms wake that already reads the window's fingerprint and from the caption's own toggle; two Pump bits (`corners_asked`, `corners_refused`); the refusal arm in `drain` |
+| `bridge-gpui` | one `describe` arm (see below) |
+
+Three things the shape turned out to hinge on, none of them visible in the table:
+
+- **The read-back exists, the wait does not.** `set_topmost` polls for 25 ms because
+  `SWP_ASYNCWINDOWPOS` posts a reband that can never land. This call is neither, so a second read
+  is enough and a spin would be a loop copied for the look of diligence. Recorded on the function
+  because the next person to mirror `topmost.rs` will mirror the wrong half of it.
+- **The policy lives in the bridge and has to be polled, not hooked.** Win11 maximises through
+  paths no callback sees - `Win+Up`, a snap layout, a drag to a screen edge - so the ask rides the
+  wake that already measures the window, deduped by `corners_asked`. Hooking only the caption
+  button would have been correct for our own clicks and wrong for every other way to maximise.
+- **The frozen bridge grew an arm, and that is the freeze working.** `bridge-gpui::describe` is
+  deliberately wildcard-free so an unhandled `Event` is a compile error rather than an undelivered
+  fact; adding the corner arm is what that control was built to ask for. `notes-gpui` sends no
+  corner ask (ADR-0006), so the arm is unreachable - the test list covers it anyway, because an
+  unreachable arm is also where a copy typo hides.
+
+Measured on the live product, 2026-09-14, after the build (`DwmGetWindowAttribute` from outside
+the process, plus a screen capture of the window's own corner):
+
+| moment | preference reported | corner pixels |
+|---|---|---|
+| launched, normal | `2` ROUND | a 13×13 antialiased arc: the bar colour regresses leftward one column per row |
+| `SW_MAXIMIZE` (no caption click - the OS path) | `1` DONOTROUND | square |
+| `SW_RESTORE` | `2` ROUND | the arc again |
+
+and across two full cycles the app printed exactly **five** corner lines for five state changes,
+which is the dedupe: the wake ran hundreds of times in between and asked nothing.
+
+`cargo xtask smoke --binary=slint` passed on these bytes, and the same run now drives a real
+maximise through its M9 fixed-point leg - drift `(0,0,0,0)` - so the attribute call did not
+disturb the restore rect it sits beside.
+
+**What is still not proven.** No Windows 10 machine was touched: the `E_INVALIDARG`-then-quiet
+behaviour comes from the documented support floor and from the mock's refusal path, not from
+hardware. The 150 %-scale drag evidence is still unit-test-grade (the record in
+`2026-09-14-title-band-drag.md` says so). And "the corners look right" is an eye-pass, not a
+test - the arc above is a pixel mask read by a script, which can see a corner was clipped and
+cannot see whether it matches the strip's 6 px menu radius well enough to please anybody.
+
 ## Consequences
 
-- `Command` goes 10 → 11 and `Event` 14 → 15 or 16, each with its pinned count test, `rebuild()`
-  and `variant()` arms (`command.rs:154-227`, `event.rs:565-651`); `host_mock.rs` gains a
+- `Command` went 10 → 11 and `Event` 14 → 15, each with its pinned count test, `rebuild()`
+  and `variant()` arms (`command.rs:154-227`, `event.rs:565-651`); `host_mock.rs` gained a
   `WindowBackend` method, which is the point — the mock now has to answer the question too.
 - `crates/platform` becomes the first crate to call `dwmapi`. The unsafe ledger grows by one
   function with one `// SAFETY:` block, which `check_unsafe` counts.

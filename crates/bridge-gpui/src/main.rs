@@ -1269,9 +1269,10 @@ fn describe(event: &Event) -> String {
         }
         // Arrived in the same fold that collapsed the two state-write events into
         // one named one (D62), which is when the vocabulary stood at 13; `Pinned` came
-        // later, with the readback, and the count `describe`'s test now walks is 14. The
-        // reason is
-        // platform's own sentence for the refusal and passes through; the words
+        // later, with the readback, and the count `describe`'s test now walks is 15 - the
+        // corner refusal was the fifteenth variant, and this bridge grew an arm for it
+        // through the compile error rather than a wildcard.
+        // The reason is platform's own sentence for the refusal and passes through; the words
         // around it are the bridge's, because a pin that failed and is rendered as
         // a success is a lie in the title bar.
         Event::PinFailed { reason } => {
@@ -1280,6 +1281,17 @@ fn describe(event: &Event) -> String {
                 reason
             )
         }
+        // THE ARM THIS BRIDGE CANNOT REACH, and it is here anyway, which is the control working
+        // exactly as documented above: a new `Event` variant is a compile error in every bridge,
+        // not a fact that stops being delivered. `notes-gpui` never sends
+        // [`Command::SetCornerRounding`](notes_api::Command::SetCornerRounding) - ADR-0006 froze
+        // this bridge before the corner existed, and freezing it means no new asks, not a new
+        // wildcard - so the line below is unreachable by construction and still has to be true
+        // if the port ever answers a corner ask on a window this bridge owns.
+        Event::CornerRoundingFailed { reason } => format!(
+            "CornerRoundingFailed · the corners are still square · {}",
+            reason
+        ),
         // The readback twin of the PinFailed arm: the state the engine CONFIRMED off the
         // window's own style, as the port's bool - one emitter, `apply_topmost`. `apply`
         // stores it; this renders it, because a confirmed fact the status line never shows
@@ -2803,6 +2815,12 @@ mod tests {
             Event::PinFailed {
                 reason: "the topmost call was refused".to_string(),
             },
+            // The one arm this bridge can never render for itself (it sends no corner ask),
+            // built here anyway: the list is the proof the arm exists and says WHICH variant it
+            // rendered, and an unreachable arm with no case is how a copy typo survives.
+            Event::CornerRoundingFailed {
+                reason: "the corner attribute is Windows 11 only".to_string(),
+            },
             // BOTH directions of the readback, because they are different sentences and the
             // false one is the one a status line is tempted to skip: `Pinned(false)` is a
             // CONFIRMATION (an unpinned session's first registration answers it), not an
@@ -2814,7 +2832,7 @@ mod tests {
         // One name per variant, in the order above. A new variant without an arm in
         // `describe` never reaches this list, because the match is already a compile
         // error; this is the half that proves each arm says WHICH variant it rendered.
-        // The list is 16 rows for 14 variants: `StateWriteFailed` appears twice, once per
+        // The list is 17 rows for 15 variants: `StateWriteFailed` appears twice, once per
         // `StateFile`, and `Pinned` twice, once per confirmation - the two cases the
         // vocabulary count alone cannot see.
         let names = [
@@ -2832,6 +2850,7 @@ mod tests {
             "StateDirUnusable",
             "StateWriteFailed",
             "PinFailed",
+            "CornerRoundingFailed",
             "Pinned",
             "Pinned",
         ];

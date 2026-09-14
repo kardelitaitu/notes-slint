@@ -501,6 +501,28 @@ pub enum Event {
         /// The platform's own words for the refusal.
         reason: String,
     },
+    /// The window's corners could NOT be given the shape the bridge asked for. The
+    /// refusal-only twin of [`Command::SetCornerRounding`], and there is no success
+    /// counterpart because there is nothing to render: the corners are their own
+    /// evidence, and an event per request would only let a bridge paint a check mark
+    /// for a thing it cannot see.
+    ///
+    /// The case this exists for is an OS that does not know the attribute at all -
+    /// the corner preference is Windows 11+ and the support floor is Windows 10 -
+    /// where the refusal arrives once per ask and a bridge that hears it can stop
+    /// asking. A bridge that does not hear keeps sending the command on every
+    /// maximise, which is correct but noisy in the log, so this event is the only
+    /// difference between the two.
+    ///
+    /// `Ok` from the platform means the window REPORTS the preference; this event
+    /// does not mean the corners look square. A window the OS refuses to round while
+    /// still storing the preference (a session without composition) answers `Ok`, and
+    /// no event in this vocabulary can tell you that - which is what the eye-pass
+    /// list is for.
+    CornerRoundingFailed {
+        /// The platform's own words for the refusal.
+        reason: String,
+    },
     /// What the WINDOW is, not what was asked for: `true` = confirmed above
     /// every other window, read back out of the window's own style. The
     /// success twin of [`Event::PinFailed`] and its opposite number in one
@@ -623,6 +645,9 @@ mod tests {
             Event::PinFailed { reason } => Event::PinFailed {
                 reason: reason.clone(),
             },
+            Event::CornerRoundingFailed { reason } => Event::CornerRoundingFailed {
+                reason: reason.clone(),
+            },
             Event::Pinned(on) => Event::Pinned(*on),
         }
     }
@@ -644,6 +669,7 @@ mod tests {
             },
             Event::StateDirUnusable { .. } => "StateDirUnusable",
             Event::PinFailed { .. } => "PinFailed",
+            Event::CornerRoundingFailed { .. } => "CornerRoundingFailed",
             Event::Pinned(_) => "Pinned",
 
             Event::RecentsUpdated(_) => "RecentsUpdated",
@@ -712,6 +738,10 @@ mod tests {
             Event::PinFailed {
                 reason: "SetWindowPos refused: access denied".to_string(),
             },
+            Event::CornerRoundingFailed {
+                reason: "Win32 DwmSetWindowAttribute failed: E_INVALIDARG (os error 87)"
+                    .to_string(),
+            },
             Event::Pinned(true),
         ]
     }
@@ -739,8 +769,10 @@ mod tests {
         // the pin-readback wave added Pinned: 13 + 1 = 14. A bounded-join
         // timeout is reported through close()'s typed Err, not through an
         // Event: a Gateway-held Event sender would delay the Disconnected
-        // contract.)
-        assert_eq!(all.len(), 14, "Event gained or lost a variant");
+        // contract.) The corner roundness 14 -> 15: `CornerRoundingFailed` is the
+        // second refusal-only event (after PinFailed) and it has no success twin,
+        // because a corner has nothing to render - see its doc.
+        assert_eq!(all.len(), 15, "Event gained or lost a variant");
 
         for event in &all {
             assert_eq!(event, &event.clone(), "{event:?} clone is not equal");

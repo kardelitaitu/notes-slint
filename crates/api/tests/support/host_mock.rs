@@ -32,6 +32,13 @@ pub enum Call {
         handle: isize,
         on: bool,
     },
+    /// One corner-shape ask. Recorded for the same reason `TakeDropped` is: the
+    /// event stream is silent on a successful apply, so the call list is the only
+    /// proof the seam was driven at all - and with what value.
+    CornerRounding {
+        handle: isize,
+        round: bool,
+    },
     RestoreRect {
         handle: isize,
     },
@@ -78,6 +85,10 @@ pub struct Answers {
     /// Each [`Some`] is the OS message that call answers with.
     pub fail_move: Option<String>,
     pub fail_topmost: Option<String>,
+    /// What `set_corner_rounding` answers with [`Some`]: the Windows 10 case, where
+    /// the attribute does not exist. None (accepted) by default, because the OS this
+    /// product is developed on is the one that knows it.
+    pub fail_corner_rounding: Option<String>,
     pub fail_restore: Option<String>,
     /// What [`set_restore_frame_rect`] answers with [`Some`]. Separate from
     /// `fail_restore` because the READ and the WRITE are two calls: refusing one
@@ -120,6 +131,7 @@ impl Default for Answers {
             codepage: 1252,
             fail_move: None,
             fail_topmost: None,
+            fail_corner_rounding: None,
             fail_restore: None,
             fail_restore_set: None,
             placement_round_trip: false,
@@ -286,6 +298,17 @@ impl WindowBackend for Host {
         // answered anyway: a mock with a hole in it turns a typo into a panic.
         self.record(Call::FrameRect { handle });
         Ok(self.answers().work_area)
+    }
+
+    fn set_corner_rounding(&mut self, handle: isize, round: bool) -> PlatformResult<()> {
+        self.record(Call::CornerRounding { handle, round });
+        match self.answers().fail_corner_rounding.clone() {
+            Some(why) => Err(PlatformError::Win32 {
+                api: "DwmSetWindowAttribute",
+                message: why,
+            }),
+            None => Ok(()),
+        }
     }
 
     fn restore_frame_rect(&self, handle: isize) -> PlatformResult<Placement> {

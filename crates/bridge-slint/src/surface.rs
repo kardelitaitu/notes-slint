@@ -918,6 +918,17 @@ pub(crate) struct Pump {
     /// flood the instrument refused for its refusal print (`drag_refused_shown` above), for the
     /// same reason. Written by the product's drag handler; cleared when the band releases.
     pub(crate) drag_reported: bool,
+    /// C4: the corner shape this bridge last ASKED the port for, `None` before the first ask.
+    /// The wake that watches maximisation runs every 8 ms, so without this a held maximise
+    /// would name an attribute to the OS ~125 times a second; with it, a normal→maximised
+    /// transition costs exactly one command. `ask_corners` is the only writer.
+    pub(crate) corners_asked: Option<bool>,
+    /// C4: the OS said no, and this bridge believes it. The corner attribute is Windows 11+
+    /// and the support floor (R11) is Windows 10, where EVERY ask answers
+    /// `CornerRoundingFailed` - so the refusal has to retire the asking, not merely print.
+    /// Nothing else changes: the note stays square, which is what it was before corners were
+    /// a question, and the log says why. This is also the reason there is no retry.
+    pub(crate) corners_refused: bool,
     /// How many autosave toggles this bridge has sent. The port echoes NO autosave event,
     /// so the menu check can only follow the ask - printed as 'menu: ...' so the
     /// convention is visible instead of pretending to be a report.
@@ -1000,6 +1011,17 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 report(
                     "pinned: false WS_EX_TOPMOST=0 readback (PinFailed: the apply did not stick)",
                 );
+            }
+            // C4. The refusal-only event of the port's corner contract, and deliberately NOT
+            // rendered: the pin answers here because the strip DISPLAYS a pin, and a corner
+            // displays itself. What this arm does instead is retire the asking - see
+            // `Pump::corners_refused` - so a Windows 10 run prints once rather than once per
+            // maximise, which is the only reason the event exists at all.
+            Event::CornerRoundingFailed { reason } => {
+                pump.borrow_mut().corners_refused = true;
+                report(&format!(
+                    "corners: the OS refused the request ({reason}); not asking again this run"
+                ));
             }
             // (b) THE GENERATION, captured from the only two events that issue it.
             // grep of crates/api/src/event.rs: `Loaded { path, text, meta, epoch }`
@@ -1467,6 +1489,7 @@ pub(crate) fn wire_callbacks(
     {
         let gw = Rc::clone(gw);
         let weak = ui.as_weak();
+        let pump = Rc::clone(pump);
         ui.on_toggle_max(move || {
             let Some(ui) = weak.upgrade() else { return };
             let window = ui.window();
@@ -1477,6 +1500,12 @@ pub(crate) fn wire_callbacks(
                 window.is_maximized(),
                 caption_glyph(window.is_maximized())
             ));
+            // The corner follows the frame in the same act, from the same read-back: a
+            // maximise that keeps its rounded corners floats over the taskbar like a
+            // dialog, and the user watches it happen. Read BACK rather than `want`
+            // because this act is the toolkit's, not ours; if the read lags the ask, the
+            // dedupe in `ask_corners` lets the next wake correct it by one command.
+            ask_corners(&gw, &pump, !window.is_maximized(), false);
             send(&gw, Command::GeometryChanged);
         });
     }
@@ -1612,6 +1641,51 @@ fn drag_by(weak: &slint::Weak<Spike>, pump: &RefCell<Pump>, dx: f32, dy: f32) {
             here.x, here.y, want.0, want.1, back.x, back.y
         ));
     }
+}
+
+/// C4: the corner POLICY, in exactly one function so there is one place that says what a
+/// window's corners should be. The rule is the one Windows itself follows - round when the
+/// window has a shape of its own, square when it fills a monitor - and it lives HERE because
+/// this is the crate that can see the window: `api` routes the ask and `platform` makes the
+/// call, and neither of them decides anything.
+///
+/// Why square-when-maximised is not left to the OS: `DWMWCP_DEFAULT` would do that by itself,
+/// but this window is `no-frame`, and DWM's default policy does not round an undecorated
+/// window at all (measured 2026-09-14: the live note reported preference DEFAULT and a square
+/// corner pixel). Asking for `ROUND` is what gets the corner; asking `DONOTROUND` on the way
+/// to full-screen is what stops a maximised note from floating with rounded corners over the
+/// taskbar, which no decorated window on this OS does.
+///
+/// DEDUPED, because the caller is an 8 ms wake (`ask_corners` is called from the tick that
+/// already reads the window's fingerprint, and from the caption's own toggle). Two calls in a
+/// row for the same shape cost the second one nothing at all - not a command, not a print.
+///
+/// `parked` is the minimised bit: while the window is in the OS's parking lot its maximised
+/// bit reads false for a window that is maximised, so an ask made there would be a fact about
+/// the park. Skipping is safe because the wake after the restore sees the real state, and the
+/// same reasoning already governs the rect two lines from that call site.
+pub(crate) fn ask_corners(
+    gateway: &Rc<RefCell<Option<Gateway>>>,
+    pump: &RefCell<Pump>,
+    round: bool,
+    parked: bool,
+) {
+    if parked {
+        return;
+    }
+    {
+        let p = pump.borrow();
+        if p.corners_refused || p.corners_asked == Some(round) {
+            return;
+        }
+    }
+    pump.borrow_mut().corners_asked = Some(round);
+    report(&format!(
+        "corners: {} (the window is {})",
+        if round { "round" } else { "square" },
+        if round { "normal" } else { "maximised" }
+    ));
+    send(gateway, Command::SetCornerRounding(round));
 }
 
 #[cfg(test)]

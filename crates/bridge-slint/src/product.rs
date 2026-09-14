@@ -78,7 +78,7 @@ mod ui_gen;
 
 use plumbing::{arm_drop_target, fingerprint_of, hwnd_of, note_dot, publish_title, report, send};
 use surface::{
-    DialogReply, Pump, answer_dialog, drain, legend, restore_from_session, text_pump,
+    DialogReply, Pump, answer_dialog, ask_corners, drain, legend, restore_from_session, text_pump,
     wire_callbacks,
 };
 use ui_gen::Spike;
@@ -532,6 +532,14 @@ fn main() {
             // the park is never seen, never compared and never told, and the pending episode
             // fires on the wake after a restore, on the real rect.
             let parked = print.minimized;
+            // C4: THE CORNER POLICY, on the same read and deliberately NOT on the debounce
+            // below. A shape change is not a rect the port must persist quietly 250 ms later;
+            // it is the thing the user just did, and Win11's own decorations answer in the
+            // same frame. One comparison per wake, and `ask_corners` swallows every repeat,
+            // so this is the safety net for every way a maximisation happens that this root
+            // did not initiate: Win+Up, a snap layout, dragging the note to a screen edge,
+            // the caption button, or a restored maximised session.
+            ask_corners(&tick_gw, &tick_pump, !print.maximized, parked);
             let mut st = tick_settle.borrow_mut();
             let same = st.seen.as_ref().is_some_and(|previous| {
                 previous.x == measured.x

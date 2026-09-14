@@ -102,7 +102,10 @@ pub enum PlatformError {
     Win32 {
         /// The Win32 entry point that failed, e.g. `"SetWindowPos"`.
         api: &'static str,
-        /// The OS message and error code, as windows-rs reported them.
+        /// The OS message and error code, as windows-rs reported them. One seam writes
+        /// its own sentence here instead: the corner read-back can only contradict an
+        /// `S_OK`, and there is no OS text to pass through when the disagreement IS the
+        /// answer (`windows::corners`). `api` still names the call that exposed it.
         message: String,
     },
     /// The monitor lookup returned no monitor at all: a null handle for the request,
@@ -174,6 +177,24 @@ pub trait WindowBackend: Send {
     /// [`WindowBackend::set_frame_rect`] for the caller obligation that
     /// follows from that.
     fn set_topmost(&mut self, handle: isize, on: bool) -> PinOutcome;
+
+    /// Rounds `handle`'s corners (`round`) or squares them off. Moves nothing, resizes
+    /// nothing, draws nothing: on Windows this is a request to the component that already
+    /// owns the corner shape, and on an OS or version that has no such thing it is a refusal.
+    ///
+    /// Unlike [`WindowBackend::set_topmost`] this returns a plain
+    /// [`PlatformResult`], not a verdict enum, because there is nothing for a verdict to
+    /// distinguish: the request is synchronous, so the "the call succeeded and changed
+    /// nothing" case topmost has to poll for does not exist here. What the error DOES carry
+    /// is the unsupported-OS case - the corner attribute is Windows 11+, and R11's floor is
+    /// Windows 10 - which is why this is `Err` and not a silent `Ok`: a bridge that never
+    /// hears would keep asking on every maximise.
+    ///
+    /// `Ok(())` means the window REPORTS the requested preference. It does not mean the
+    /// corners are visibly round: DWM holds a preference it then declines to draw (a
+    /// maximised window asked to stay round, a session without composition). Deciding when to
+    /// ask for which is the bridge's, and the only proof of the visual fact is an eye-pass.
+    fn set_corner_rounding(&mut self, handle: isize, round: bool) -> PlatformResult<()>;
 
     /// The window frame rectangle, in the unit `FrameRect` documents.
     fn frame_rect(&self, handle: isize) -> PlatformResult<FrameRect>;
@@ -344,6 +365,12 @@ mod tests {
         fn set_topmost(&mut self, handle: isize, on: bool) -> PinOutcome {
             self.calls.push(format!("topmost {handle:#x} {on}"));
             PinOutcome::Applied
+        }
+
+        fn set_corner_rounding(&mut self, handle: isize, round: bool) -> PlatformResult<()> {
+            self.calls
+                .push(format!("corner rounding {handle:#x} {round}"));
+            Ok(())
         }
 
         fn frame_rect(&self, _handle: isize) -> PlatformResult<FrameRect> {

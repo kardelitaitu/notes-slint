@@ -11,6 +11,7 @@
 
 #![allow(unsafe_code)]
 
+pub mod corners;
 pub mod file_drop;
 pub mod monitors;
 pub mod paths;
@@ -34,6 +35,10 @@ pub struct Backend;
 impl WindowBackend for Backend {
     fn set_topmost(&mut self, handle: isize, on: bool) -> PinOutcome {
         topmost::set_topmost(handle, on)
+    }
+
+    fn set_corner_rounding(&mut self, handle: isize, round: bool) -> PlatformResult<()> {
+        corners::set_corner_rounding(handle, round)
     }
 
     fn frame_rect(&self, handle: isize) -> PlatformResult<FrameRect> {
@@ -159,6 +164,7 @@ mod tests {
         };
         vec![
             topmost,
+            backend.set_corner_rounding(handle, true),
             backend.frame_rect(handle).map(|_| ()),
             backend.restore_frame_rect(handle).map(|_| ()),
             backend.set_frame_rect(handle, FrameRect::new(0, 0, 10, 10), 1.0),

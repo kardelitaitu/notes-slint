@@ -112,6 +112,24 @@ pub enum Command {
     /// event, not here.
     SetPinned(bool),
 
+    /// Ask for the window's corners to be round (`true`) or square (`false`).
+    ///
+    /// NOT STATE, and deliberately not persisted: nothing is written to
+    /// `session.json`, because the answer is derived from a fact the bridge can see -
+    /// whether the window is maximised - and a stored bit would only be a second,
+    /// staler copy of it. This is the shape of [`Command::SetAutosave`]: apply it to
+    /// the live window and let the next startup derive it again.
+    ///
+    /// There is no success event, and that is a departure from [`Command::SetPinned`]
+    /// on purpose. The pin has one because the title bar RENDERS the port's answer;
+    /// a corner has nothing to render, and an echo of the ask would be the UI
+    /// believing itself for no benefit. A REFUSAL is answered -
+    /// [`Event::CornerRoundingFailed`] - because an OS that does not know the
+    /// attribute will say so every time, and a bridge that cannot hear keeps asking
+    /// on every maximise. With nothing registered the command does nothing at all:
+    /// no window, no attribute, no event.
+    SetCornerRounding(bool),
+
     /// Empty the recent-files list. Answers with
     /// [`Event::RecentsUpdated`](crate::Event::RecentsUpdated).
     ClearRecents,
@@ -174,6 +192,7 @@ mod tests {
             },
             Command::SetAutosave(on) => Command::SetAutosave(*on),
             Command::SetPinned(on) => Command::SetPinned(*on),
+            Command::SetCornerRounding(round) => Command::SetCornerRounding(*round),
             Command::ClearRecents => Command::ClearRecents,
             Command::Shutdown => Command::Shutdown,
             Command::RegisterWindow { handle } => Command::RegisterWindow { handle: *handle },
@@ -191,6 +210,7 @@ mod tests {
             Command::Flush { .. } => "Flush",
             Command::SetAutosave(_) => "SetAutosave",
             Command::SetPinned(_) => "SetPinned",
+            Command::SetCornerRounding(_) => "SetCornerRounding",
             Command::ClearRecents => "ClearRecents",
             Command::Shutdown => "Shutdown",
             Command::RegisterWindow { .. } => "RegisterWindow",
@@ -216,6 +236,7 @@ mod tests {
             },
             Command::SetAutosave(true),
             Command::SetPinned(false),
+            Command::SetCornerRounding(true),
             Command::ClearRecents,
             Command::Shutdown,
             Command::RegisterWindow {
@@ -241,9 +262,9 @@ mod tests {
             all.len(),
             "the fixture must cover each variant exactly once: {names:?}"
         );
-        // Open, SaveAs, Flush, SetAutosave, SetPinned, ClearRecents, Shutdown,
-        // RegisterWindow, GeometryChanged, UnregisterWindow.
-        assert_eq!(all.len(), 10, "Command gained or lost a variant");
+        // Open, SaveAs, Flush, SetAutosave, SetPinned, SetCornerRounding, ClearRecents,
+        // Shutdown, RegisterWindow, GeometryChanged, UnregisterWindow.
+        assert_eq!(all.len(), 11, "Command gained or lost a variant");
 
         for command in &all {
             assert_eq!(command, &command.clone(), "{command:?} clone is not equal");
