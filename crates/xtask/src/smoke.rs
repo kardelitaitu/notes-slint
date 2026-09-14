@@ -4754,6 +4754,11 @@ if ($exited) {
 exit 0
 "#;
 
+/// The outer deadline on ONE pre-flight pass: the listing is a Get-Process over a handful
+/// of processes and the kill pass waits at most 10s per pid, so 45s is the harness's own
+/// generosity, not the script's plan.
+const PREFLIGHT_OUTER_SECS: u64 = 45;
+
 /// How long the toggle launch sits on screen before it is driven: long enough that the
 /// app has claimed its focus item (a chord dies without one) and the caret click has
 /// landed. NOT [PRODUCT_ALIVE_SECS] - the 45s claim is one claim about the shipped app,
@@ -5364,6 +5369,27 @@ pub fn press_reading(text: Option<&str>) -> Option<PressReading> {
     ))
 }
 
+/// Whether the run's OWN control came back: the probe closes every launch by POSTING
+/// WM_CLOSE through CloseMainWindow, which needs no injected input at all. So the close is
+/// the pump's own test, and it is strictly stronger than the cursor - a window whose queue
+/// is not running answers no click, no chord, and not even the one message the harness can
+/// deliver without touching the input system. Three states, because this box has now shown
+/// all three: healthy, injection-filtered, and pump-stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pump {
+    /// The posted close was drained - the app exited by itself. The pump ran, so a silent
+    /// menu on this run is about the menu and may be judged as one.
+    Drained,
+    /// The posted close sat there until the harness force-killed the process. Nothing was
+    /// being pumped: not the injected press, not the close. This is the machine talking, not
+    /// the product, and the sentence below is the only verdict-shaped thing it is allowed
+    /// to say.
+    Stalled,
+    /// No close reading at all - no desktop, or a launch that never reported. Says nothing
+    /// in either direction, and is written that way.
+    Unread,
+}
+
 /// What the CURSOR itself said about a press, beside what the harness asked for. This is the
 /// distinction the dead-input run could not make: a menu that hears nothing and a session
 /// that never moved the pointer print the same silence, and only the landed pixel separates
@@ -5378,9 +5404,11 @@ pub enum CursorSaid {
         asked: (i32, i32),
         landed: (i32, i32),
     },
-    /// The pointer sat exactly where it was told. A leg that heard nothing AFTER this is
-    /// about the window, not about the OS.
-    Moved { at: (i32, i32) },
+    /// The pointer sat exactly where it was told, AND what the run's own posted close did.
+    /// A leg that heard nothing after a moved cursor is about the window ONLY while the pump
+    /// was draining; with [Pump::Stalled] even the control the harness can deliver without
+    /// injection went unanswered, and that is the third state of a machine.
+    Moved { at: (i32, i32), pump: Pump },
     /// Nothing was said: the branch never moved the cursor (the press was not over our
     /// window), GetCursorPos refused, or there was no reading at all. Silence about the
     /// cursor is evidence about nothing, and is written that way.
@@ -5396,6 +5424,18 @@ impl CursorSaid {
             CursorSaid::NeverMoved { .. } => Some(
                 "THE OS NEVER MOVED THE CURSOR (session locked/background?) - GetCursorPos still   reported the pointer where it already sat, so the pixel this leg pressed was never a   press at all and nothing here can accuse the menu of ignoring one",
             ),
+            // THE HARDER SENTENCE, and it is one arm wider rather than a new verdict class:
+            // the same run that could not deliver the injected input also could not drain its
+            // own posted WM_CLOSE, so what is broken is the message pump - below the menu,
+            // below the app, and on the box this was written for, below the machine. A dead
+            // machine must never read as a product failure, so this clause only ever rides an
+            // advisory line, exactly like the two beside it.
+            CursorSaid::Moved {
+                pump: Pump::Stalled,
+                ..
+            } => Some(
+                "INPUT NOT DELIVERED and the pump itself did not drain the close control -   environment or a stopped pump, not a verdict on the menu",
+            ),
             CursorSaid::Moved { .. } => Some("cursor moved, window ignored the press"),
             CursorSaid::Unknown => None,
         }
@@ -5407,7 +5447,7 @@ impl CursorSaid {
     /// `cursor moved -> not read` rather than as a missing field.
     pub fn shown(self) -> String {
         match self {
-            CursorSaid::Moved { at } => format!("{},{}", at.0, at.1),
+            CursorSaid::Moved { at, .. } => format!("{},{}", at.0, at.1),
             CursorSaid::NeverMoved { landed, .. } => {
                 format!("{},{} (NOT where it was asked)", landed.0, landed.1)
             }
@@ -5416,10 +5456,12 @@ impl CursorSaid {
     }
 }
 
-/// The cursor evidence of one press reading. `-1,-1` is the script's own "this branch never
-/// asked the OS to move" answer and reads as [CursorSaid::Unknown], never as a mismatch -
-/// an unread cursor must not become the exculpatory sentence either.
-pub fn cursor_said(press: PressReading) -> CursorSaid {
+/// The cursor evidence of one press reading, carried against the run's own pump reading.
+/// `-1,-1` is the script's own "this branch never asked the OS to move" answer and reads as
+/// [CursorSaid::Unknown], never as a mismatch - an unread cursor must not become the
+/// exculpatory sentence either. The pump rides the MOVED half only: a cursor that never
+/// arrived already indicts the session, whatever the queue did.
+pub fn cursor_said(press: PressReading, pump: Pump) -> CursorSaid {
     let (ask_x, ask_y, ours, _under, land_x, land_y) = press;
     if !ours || (land_x, land_y) == (-1, -1) {
         return CursorSaid::Unknown;
@@ -5427,6 +5469,7 @@ pub fn cursor_said(press: PressReading) -> CursorSaid {
     if (land_x, land_y) == (ask_x, ask_y) {
         CursorSaid::Moved {
             at: (land_x, land_y),
+            pump,
         }
     } else {
         CursorSaid::NeverMoved {
@@ -5439,8 +5482,8 @@ pub fn cursor_said(press: PressReading) -> CursorSaid {
 /// A leg that drove SEVERAL presses: the most exculpatory reading wins. One press whose
 /// cursor never moved is enough to say the gesture was never delivered, while a leg with no
 /// reading at all still says nothing.
-pub fn cursor_said_all(presses: impl IntoIterator<Item = PressReading>) -> CursorSaid {
-    let said: Vec<CursorSaid> = presses.into_iter().map(cursor_said).collect();
+pub fn cursor_said_all(presses: impl IntoIterator<Item = PressReading>, pump: Pump) -> CursorSaid {
+    let said: Vec<CursorSaid> = presses.into_iter().map(|p| cursor_said(p, pump)).collect();
     if let Some(never) = said
         .iter()
         .copied()
@@ -5482,8 +5525,22 @@ pub fn soften(verdict: Menu, input_live: bool, cursor: CursorSaid) -> Menu {
 }
 
 /// The reading a leg has on its wrist: no press line, no cursor opinion.
-pub fn cursor_of(press: Option<PressReading>) -> CursorSaid {
-    press.map_or(CursorSaid::Unknown, cursor_said)
+pub fn cursor_of(press: Option<PressReading>, pump: Pump) -> CursorSaid {
+    press.map_or(CursorSaid::Unknown, |p| cursor_said(p, pump))
+}
+
+/// THE PUMP READING, off the leg's own probe: the script force-kills ONLY when the posted
+/// WM_CLOSE was not answered, so FORCED is exactly "the control I could deliver was not
+/// drained". Absent - a launch that never reached its close, or no desktop - is
+/// [Pump::Unread], which buys no sentence in either direction.
+pub fn pump_of(probe: &Probe) -> Pump {
+    if probe.get("FORCED").is_none() {
+        Pump::Unread
+    } else if probe.flag("FORCED") {
+        Pump::Stalled
+    } else {
+        Pump::Drained
+    }
 }
 
 /// What a MENU leg said. Its own type and not [Toggle]: a toggle is about a draft file
@@ -5697,7 +5754,7 @@ fn product_menu_click(script: &Path, exe: &Path, session: &Path) -> (Menu, Curso
     }
     let press = press_reading(probe.get("ROW_AT"));
     let landed = press.map(|p| p.2).unwrap_or(false);
-    let cursor = cursor_of(press);
+    let cursor = cursor_of(press, pump_of(&probe));
     let asked = voice_count(&trace, PRODUCT_MENU_NEEDLES[0].0);
     println!(
         "smoke: menu-click: INFO - hamburger {} | row {} | toggle lines={} active={} | cursor moved -> {}",
@@ -5732,7 +5789,7 @@ fn product_dialog_asked_leg(script: &Path, exe: &Path, session: &Path) -> (Menu,
     }
     let press = press_reading(probe.get("ROW_AT"));
     let landed = press.map(|p| p.2).unwrap_or(false);
-    let cursor = cursor_of(press);
+    let cursor = cursor_of(press, pump_of(&probe));
     let skipped = voice_count(&trace, PRODUCT_MENU_NEEDLES[1].0);
     println!(
         "smoke: dialog-asked: INFO - row {} | refusal lines={} | cursor moved -> {}",
@@ -5763,7 +5820,7 @@ fn product_native_dialog_leg(script: &Path, exe: &Path, session: &Path) -> (Menu
             CursorSaid::Unknown,
         );
     }
-    let cursor = cursor_of(press_reading(probe.get("ROW_AT")));
+    let cursor = cursor_of(press_reading(probe.get("ROW_AT")), pump_of(&probe));
     let spawned = voice_count(&trace, PRODUCT_MENU_NEEDLES[2].0);
     let seen = probe.flag("DIALOG_SEEN");
     let gone = probe.flag("DIALOG_GONE");
@@ -5816,7 +5873,7 @@ fn product_drag_closes_menu(script: &Path, exe: &Path, session: &Path) -> (Menu,
         .filter_map(|k| press_reading(probe.get(k)))
         .collect();
     let landed = presses.iter().filter(|p| p.2).count();
-    let cursor = cursor_said_all(presses.iter().copied());
+    let cursor = cursor_said_all(presses.iter().copied(), pump_of(&probe));
     println!(
         "smoke: drag-closes-menu: INFO - band {} | presses landed on our window={}/3 |   refusal lines={} (want exactly 1) | cursor moved -> {}",
         probe.get("BAND_DRAG").unwrap_or("-"),
@@ -5825,6 +5882,202 @@ fn product_drag_closes_menu(script: &Path, exe: &Path, session: &Path) -> (Menu,
         cursor.shown()
     );
     (judge_drag_closes(asks, landed >= 2), cursor)
+}
+
+/// The PRE-FLIGHT script, run TWICE: with only -Name it reports who is already there, and
+/// with -Pids it kills THOSE pids and waits each one out. Read-only against the product's
+/// own files, as every other script in this file is - it touches processes, never bytes.
+const PREFLIGHT_PROBE: &str = r#"param([string]$Name = '', [string]$Pids = '', [int]$WaitSecs = 10)
+$ErrorActionPreference = 'SilentlyContinue'
+if ($Name -eq '') { 'PREFLIGHT_DONE=1'; exit 0 }
+if ($Pids -eq '') {
+    foreach ($x in (Get-Process -Name $Name)) {
+        $age = -1
+        try { $age = [int](((Get-Date) - $x.StartTime).TotalSeconds) } catch {}
+        Write-Output ("CORPSE=" + $x.Id + "," + $age)
+    }
+    'PREFLIGHT_DONE=1'
+    exit 0
+}
+foreach ($p in $Pids.Split(',')) {
+    if ($p -eq '') { continue }
+    $id = [int]$p
+    Stop-Process -Id $id -Force
+    $z = [Diagnostics.Stopwatch]::StartNew()
+    while ($z.ElapsedSeconds -lt $WaitSecs) {
+        if (-not (Get-Process -Id $id)) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    if (Get-Process -Id $id) { Write-Output ("STUCK=" + $p) } else { Write-Output ("GONE=" + $p) }
+}
+'LEFT=' + @(Get-Process -Name $Name).Count
+'PREFLIGHT_DONE=1'
+"#;
+
+/// One product instance the pre-flight found ALREADY on the desktop: its pid, and how long
+/// it has been alive in whole seconds. `-1` is the script's own "the age could not be read"
+/// answer, which is itself a reason not to trust the thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Corpse {
+    pub pid: u32,
+    pub age_secs: i64,
+}
+
+/// The list the guard reads: every `CORPSE=pid,age` line and nothing else. A line that will
+/// not parse is dropped, not guessed at - a pid invented from noise is a pid killed.
+pub fn corpse_readings(text: &str) -> Vec<Corpse> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("CORPSE="))
+        .filter_map(|rest| {
+            let (pid, age) = rest.split_once(',')?;
+            Some(Corpse {
+                pid: pid.trim().parse().ok()?,
+                age_secs: age.trim().parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// THE PRE-FLIGHT DECISION, pure, so the shape is testable without a desktop: an inherited
+/// instance is NEVER trusted, whatever its age. The age is reported, not judged - a two
+/// second-old one is somebody else's run in progress and an hour-old one is the corpse of a
+/// killed leg, and BOTH are a window this leg did not start. D40's concern is the second
+/// shape: a hung-but-visible instance is exactly what a smoke run misreads as "the product
+/// does not answer", and every reading after it would be about a window nobody here opened.
+/// So: name each pid and age out loud, refuse it, kill it BY PID (never by image - a guard
+/// that broadens its own kill list is a guard that eats the next leg's window), wait for the
+/// exit, and only then spawn.
+pub fn corpse_guard(corpses: &[Corpse]) -> (Vec<u32>, Option<String>) {
+    if corpses.is_empty() {
+        return (Vec::new(), None);
+    }
+    let pids: Vec<u32> = corpses.iter().map(|c| c.pid).collect();
+    let who: Vec<String> = corpses
+        .iter()
+        .map(|c| {
+            if c.age_secs < 0 {
+                format!("pid {} (age unread)", c.pid)
+            } else {
+                format!("pid {} ({}s old)", c.pid, c.age_secs)
+            }
+        })
+        .collect();
+    (
+        pids,
+        Some(format!(
+            "smoke: pre-flight: {} on this desktop BEFORE this leg started - {} - NOT TRUSTED,   and not inherited: its window is not this run's window and its silence is not this run's   verdict. Killing by pid and waiting for the exit before anything is spawned.",
+            if who.len() == 1 {
+                "one instance is already"
+            } else {
+                "instances are already"
+            },
+            who.join(", ")
+        )),
+    )
+}
+
+/// The pre-flight itself, at the START of the product leg. Bounded twice like every wait in
+/// this file, and it never fails the run: a desktop it could not read is REPORTED and the leg
+/// proceeds, because "could not look" is not a product verdict either.
+fn product_preflight_guard(target: &ArtifactTarget) {
+    let script = temp_path("preflight", "ps1");
+    let written =
+        fs::File::create(&script).and_then(|mut f| f.write_all(PREFLIGHT_PROBE.as_bytes()));
+    if written.is_err() {
+        println!("smoke: pre-flight: NOT RUN - the guard's own script could not be written");
+        return;
+    }
+    let run = |pids: &str| -> Option<String> {
+        for program in ["pwsh", "powershell"] {
+            let spawned = Command::new(program)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                ])
+                .arg(&script)
+                .arg("-Name")
+                .arg(target.bin)
+                .arg("-Pids")
+                .arg(pids)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn();
+            let mut child = match spawned {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            return match wait_bounded(&mut child, PREFLIGHT_OUTER_SECS) {
+                Ok(_) => Some(read_pipe(child.stdout.as_mut())),
+                Err(e) => {
+                    println!("smoke: pre-flight: the guard's own wait failed - {e}");
+                    None
+                }
+            };
+        }
+        None
+    };
+    let listed = run("");
+    let _ = fs::remove_file(&script);
+    let Some(listed) = listed else {
+        println!(
+            "smoke: pre-flight: NOT RUN - no PowerShell to ask the desktop who is already   running, so an inherited instance cannot be ruled out; the leg proceeds and says so"
+        );
+        return;
+    };
+    let corpses = corpse_readings(&listed);
+    let (pids, line) = corpse_guard(&corpses);
+    let Some(line) = line else {
+        println!(
+            "smoke: pre-flight: the desktop is clear of {} - nothing inherited",
+            target.bin
+        );
+        return;
+    };
+    println!("{line}");
+    let joined = pids
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<String>>()
+        .join(",");
+    let written =
+        fs::File::create(&script).and_then(|mut f| f.write_all(PREFLIGHT_PROBE.as_bytes()));
+    if written.is_err() {
+        println!("smoke: pre-flight: the kill pass could not be written - the corpses stay");
+        return;
+    }
+    let done = run(&joined);
+    let _ = fs::remove_file(&script);
+    match done {
+        Some(text) => {
+            let gone: Vec<&str> = text
+                .lines()
+                .filter(|l| l.starts_with("GONE="))
+                .map(|l| l.trim_start_matches("GONE="))
+                .collect();
+            let stuck: Vec<&str> = text
+                .lines()
+                .filter(|l| l.starts_with("STUCK="))
+                .map(|l| l.trim_start_matches("STUCK="))
+                .collect();
+            let left = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("LEFT="))
+                .unwrap_or("?");
+            println!(
+                "smoke: pre-flight: killed-by-pid=[{}] stuck=[{}] other {} instances still on   the desktop={} - every reading after this line is about the window this leg starts, and a   stuck pid is a fact about the machine, printed and not hidden",
+                gone.join(", "),
+                stuck.join(", "),
+                target.bin,
+                left,
+            );
+        }
+        None => println!(
+            "smoke: pre-flight: the kill pass could not run - the inherited instance(s) are   still there and EVERY later reading is suspect; said here so nobody has to guess"
+        ),
+    }
 }
 
 /// Kill anything the failed run left on screen. ONLY called on a failure path: on a
@@ -5860,6 +6113,9 @@ fn product_teardown(target: &ArtifactTarget) {
 /// 0, 1, 2, 3 and now 6 - and the table gains no row: 6 was already in CONTRACT and
 /// already armed in ci.yml; what it lacked was any default run able to produce it.
 fn run_product_leg(target: &ArtifactTarget, exe: &Path) -> i32 {
+    // BEFORE anything is spawned: an instance already on the desktop is inherited evidence,
+    // and a hung-but-visible one is the shape that makes a dead machine read as a dead menu.
+    product_preflight_guard(target);
     println!(
         "smoke: LEG=PRODUCT - {} is judged by the product contract: the startup lines on \
  its own captured stderr, still alive at {PRODUCT_ALIVE_SECS}s, and a WM_CLOSE it answers by \
@@ -8972,15 +9228,25 @@ notes-gpui: dialog[skipped]: SLINT_NO_DIALOG - (Open -> x)\n";
         let stuck = press_reading(Some("4299,228,1,197388,640,320"));
         let deaf = press_reading(Some("4299,228,1,197388,4299,228"));
         assert_eq!(
-            cursor_of(stuck),
+            cursor_of(stuck, Pump::Drained),
             CursorSaid::NeverMoved {
                 asked: (4299, 228),
                 landed: (640, 320)
             }
         );
-        assert_eq!(cursor_of(deaf), CursorSaid::Moved { at: (4299, 228) });
+        assert_eq!(
+            cursor_of(deaf, Pump::Drained),
+            CursorSaid::Moved {
+                at: (4299, 228),
+                pump: Pump::Drained
+            }
+        );
         // Zero prints, and the cursor never moved: the session is the honest suspect.
-        let stuck_said = soften(judge_click_toggle(0, false, true), false, cursor_of(stuck));
+        let stuck_said = soften(
+            judge_click_toggle(0, false, true),
+            false,
+            cursor_of(stuck, Pump::Drained),
+        );
         let text = format!("{stuck_said}");
         assert!(matches!(stuck_said, Menu::NotJudged(_)));
         assert!(
@@ -8990,7 +9256,11 @@ notes-gpui: dialog[skipped]: SLINT_NO_DIALOG - (Open -> x)\n";
         // Zero prints, and the cursor went exactly where it was told: the window is the
         // suspect, and the sentence says so - while the verdict itself stays NOT JUDGED,
         // because the chord leg still has not landed a keystroke on this run.
-        let moved_said = soften(judge_dialog_asked(0, true), false, cursor_of(deaf));
+        let moved_said = soften(
+            judge_dialog_asked(0, true),
+            false,
+            cursor_of(deaf, Pump::Drained),
+        );
         let text = format!("{moved_said}");
         assert!(matches!(moved_said, Menu::NotJudged(_)));
         assert!(
@@ -8999,22 +9269,105 @@ notes-gpui: dialog[skipped]: SLINT_NO_DIALOG - (Open -> x)\n";
         );
         // NEVER a promotion: a red leg with input live stays red even when the cursor read
         // is the sympathetic one, and the sentence is not bolted onto it.
-        let stays_red = soften(judge_click_toggle(0, false, true), true, cursor_of(stuck));
+        let stays_red = soften(
+            judge_click_toggle(0, false, true),
+            true,
+            cursor_of(stuck, Pump::Drained),
+        );
         assert!(matches!(stays_red, Menu::Broken(_)));
         assert!(!format!("{stays_red}").contains("NEVER MOVED THE CURSOR"));
         // A press whose cursor was never read says nothing about the cursor - the -1,-1 the
         // script writes when it declined to move is not a position, in either direction.
         let unread = press_reading(Some("4299,228,0,7,-1,-1"));
-        assert_eq!(cursor_of(unread), CursorSaid::Unknown);
-        let blind = soften(judge_click_toggle(3, true, false), true, cursor_of(unread));
+        assert_eq!(cursor_of(unread, Pump::Stalled), CursorSaid::Unknown);
+        let blind = soften(
+            judge_click_toggle(3, true, false),
+            true,
+            cursor_of(unread, Pump::Stalled),
+        );
         assert!(!format!("{blind}").contains("cursor"));
-        assert_eq!(cursor_of(None).shown(), "not read");
+        assert_eq!(cursor_of(None, Pump::Stalled).shown(), "not read");
         // And the gesture leg takes the worst of its three presses, not the last one.
-        let worst = cursor_said_all([
-            (4299, 228, true, 7, 4299, 228),
-            (4299, 268, true, 7, 640, 320),
-        ]);
+        let worst = cursor_said_all(
+            [
+                (4299, 228, true, 7, 4299, 228),
+                (4299, 268, true, 7, 640, 320),
+            ],
+            Pump::Drained,
+        );
         assert!(matches!(worst, CursorSaid::NeverMoved { .. }));
+    }
+
+    /// STATE THREE, and it is the one the posted-input experiment proved: the box was not
+    /// merely filter-deaf, it would not drain even the ONE message the harness can deliver
+    /// without touching the input system - the posted WM_CLOSE its own probe uses to end the
+    /// run. A leg whose cursor moved AND whose close control stalled is not reporting a
+    /// window that ignored a click; it is reporting a machine with no pump. Advisory, and it
+    /// stays advisory: the dead end is the environment, and a dead end is never a verdict.
+    #[test]
+    fn a_pump_that_drains_nothing_is_blamed_on_the_pump_and_stays_advisory() {
+        let deaf = press_reading(Some("4299,228,1,197388,4299,228"));
+        // The signature the lane already had: cursor moved, control drained, so the WINDOW
+        // is the suspect and the old sentence is the honest one.
+        let filtered = cursor_of(deaf, Pump::Drained);
+        assert_eq!(
+            filtered.clause(),
+            Some("cursor moved, window ignored the press")
+        );
+        // State three: the same moved cursor, and FORCED=1 - the posted close sat there
+        // until the harness killed the process.
+        let stalled = cursor_of(deaf, Pump::Stalled);
+        assert_eq!(
+            stalled.clause(),
+            Some(
+                "INPUT NOT DELIVERED and the pump itself did not drain the close control -   environment or a stopped pump, not a verdict on the menu"
+            )
+        );
+        assert_ne!(stalled.clause(), filtered.clause());
+        // Both readings on the same silent leg, and neither is allowed to leave advisory.
+        for cursor in [filtered, stalled, cursor_of(deaf, Pump::Unread)] {
+            let said = soften(judge_click_toggle(0, false, true), false, cursor);
+            assert!(
+                matches!(said, Menu::NotJudged(_)),
+                "a dead machine must not read as a product failure: {said}"
+            );
+        }
+        // And the harder one reaches the printed line, which is the whole point of the arm.
+        let printed = format!("{}", soften(judge_drag_closes(0, true), false, stalled));
+        assert!(printed.contains("INPUT NOT DELIVERED and the pump itself did not drain"));
+        assert!(printed.contains("not a verdict on the menu"));
+        // An UNREAD control buys the old sentence and never the harder one: claiming a
+        // stopped pump needs a reading of the pump, not the absence of one.
+        assert_eq!(cursor_of(deaf, Pump::Unread).clause(), filtered.clause());
+    }
+
+    /// D40, and it is a decision SHAPE rather than a desktop: the guard is allowed to find
+    /// nothing (the normal case), and when it finds something the answer is never "carry on
+    /// and hope the readings are mine".
+    #[test]
+    fn an_inherited_instance_is_reported_and_refused_never_inherited() {
+        // Nothing to parse is nothing to trust.
+        assert_eq!(corpse_readings("PREFLIGHT_DONE=1"), Vec::new());
+        assert_eq!(corpse_readings("CORPSE=junk"), Vec::new());
+        let found =
+            corpse_readings("CORPSE=4312,7\nCORPSE=991,-1\nsomebody else's line\nCORPSE=4312,7\n");
+        assert_eq!(
+            found.len(),
+            3,
+            "a repeated pid is the script answering per process, and the reading rule does   not silently drop one"
+        );
+        let (pids, line) = corpse_guard(&found[..2]);
+        assert_eq!(pids, vec![4312, 991]);
+        let line = line.expect("two corpses are never an empty report");
+        assert!(line.starts_with("smoke: pre-flight:"), "{line}");
+        assert!(line.contains("pid 4312 (7s old)"), "{line}");
+        // The age the script could not read is reported AS unread, not as zero seconds.
+        assert!(line.contains("pid 991 (age unread)"), "{line}");
+        assert!(line.contains("NOT TRUSTED"), "{line}");
+        // The clean desktop says so briefly and asks for no kills.
+        let (none, no_line) = corpse_guard(&[]);
+        assert!(none.is_empty());
+        assert!(no_line.is_none());
     }
 
     #[test]
