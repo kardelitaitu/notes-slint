@@ -30,7 +30,8 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use notes_api::{
-    Command, Event, FileMeta, Gateway, SaveError, Settings, SkipReason, StateDir, WindowHandle,
+    Command, Event, FileMeta, Gateway, LoadError, SaveError, Settings, SkipReason, StateDir,
+    WindowHandle,
 };
 
 // thiserror and notes-platform are dependencies of notes-api, not of this test
@@ -260,13 +261,27 @@ fn assert_saved<'a>(events: &'a [Event], path: &Path, revision: u64) -> &'a Even
         }
         other => panic!("expected exactly one Saved, got {other:?} in {events:?}"),
     }
+    let saved_at = events
+        .iter()
+        .position(|ev| matches!(ev, Event::Saved { .. }))
+        .expect("one_answer just matched a Saved");
     let mut rebounds = events
         .iter()
-        .filter(|ev| matches!(ev, Event::Rebound { .. }));
-    let reb = rebounds.next().expect(
+        .enumerate()
+        .filter(|(_, ev)| matches!(ev, Event::Rebound { .. }));
+    let (rebound_at, reb) = rebounds.next().expect(
         "a successful Save must also answer Rebound, or the arming never reaches the bridge",
     );
     assert!(rebounds.next().is_none(), "one Saved, one Rebound, no more");
+    // THE ORDER IS PART OF THE CONTRACT, not an artifact: engine.rs says the
+    // Rebound is emitted RIGHT AFTER the Saved and event.rs repeats it, and a
+    // bridge that reads the arming out of meta.armed needs the verdict to land
+    // first. Swapping the two emit calls in Engine::save leaves every kind
+    // assertion in this file green and fails on this line.
+    assert!(
+        saved_at < rebound_at,
+        "Saved BEFORE Rebound: positions {saved_at} and {rebound_at} in {events:?}"
+    );
     match reb {
         Event::Rebound {
             path: p,
@@ -369,13 +384,19 @@ fn a_read_only_note_refuses_an_explicit_save_by_name_and_changes_no_bytes() {
 }
 
 #[test]
-fn an_oversize_file_is_refused_at_open_so_no_save_can_rewrite_it() {
-    // Skip::Oversize is a refusal core keeps on this path too (its own test is
-    // an_oversize_document_refuses_even_an_explicit_save), and the port-level
-    // truth is the stronger one in front of it: an over-guard file never becomes
-    // a Document at all, so a Save cannot even be aimed at it. Asserted here
-    // because a Save that DID land on the refused name would be the measured
-    // 0-byte overwrite all over again.
+fn a_file_too_large_to_open_keeps_its_bytes_because_it_never_becomes_a_document() {
+    // WHAT THIS IS NOT: coverage of the Oversize verdict. Skip::Oversize is NOT
+    // REACHABLE through the port at all - every Document::open site in engine.rs
+    // hard-codes the oversize flag false (engine.rs:1013, engine.rs:1081), because
+    // a file past the D9 guard is refused at the stat before a Document exists, and
+    // document.rs:195-215 says so itself. So deleting that arm from
+    // should_save_manual leaves THIS green: the refusal it tests is cores, proven
+    // where it can be reached (core's own
+    // an_oversize_document_refuses_even_an_explicit_save), and anyone counting this
+    // case as api coverage of Oversize would be reading a name, not a scenario.
+    // WHAT IT IS: the consequence worth pinning at api level - an over-guard file
+    // is never opened, so no Save can ever be aimed at it, and the bytes the app
+    // declined to read are the bytes it must not overwrite.
     let mut app = Harness::new();
     let big = app.root.join("big.notes");
     let size = 8_usize * 1024 * 1024;
@@ -569,9 +590,10 @@ fn a_save_the_disk_refuses_answers_save_failed_naming_the_file_and_writes_nothin
                 *revision, 1,
                 "and the revision that write would have anchored"
             );
-            assert!(
-                !reason.to_string().is_empty(),
-                "with a reason the UI can render"
+            assert_eq!(
+                *reason,
+                SaveError::ReadOnly,
+                "the enum IS the explanation, so name the variant rather than"
             );
         }
         other => panic!("expected exactly one SaveFailed, got {other:?} in {events:?}"),
@@ -638,10 +660,16 @@ fn a_save_cannot_write_the_file_whose_open_was_just_refused() {
     let size = 8_usize * 1024 * 1024;
     fs::write(&note, vec![b'A'; size + 1]).expect("grow the file past the guard");
     app.send(Command::Open { path: note.clone() });
-    app.until(
-        "LoadFailed(TooLarge)",
-        |ev| matches!(ev, Event::LoadFailed { path, .. } if path == &note),
-    );
+    // Matched on the NAME AS TYPED, not only the path: a refusal that lost the
+    // spelling would put the wrong file name on the screen for one second, and
+    // session.rs found that bug in M2 by asserting exactly this pair.
+    // The refusal is waited for on its NAMED reason: LoadFailed{path} alone would
+    // also be satisfied by Missing (a wrong-guard path that no longer exists),
+    // which would not set the same load_refused_for state this test depends on.
+    app.until("LoadFailed(TooLarge) for that file", |ev| {
+        matches!(ev, Event::LoadFailed { path, reason: LoadError::TooLarge, .. }
+                if path == &note)
+    });
     assert_eq!(app.epoch, generation, "a refusal moves no generation");
     app.wait_a_tick();
 
@@ -675,4 +703,68 @@ fn a_save_cannot_write_the_file_whose_open_was_just_refused() {
         bytes.iter().all(|b| *b == b'A'),
         "and not one of them changed"
     );
+}
+
+/// THE GUARD RECOGNISES A FILE, NOT A STRING. AGENTS.md makes canonicalisation
+/// the identity rule ("case-insensitive but not case-preserving: canonicalise for
+/// identity, keep the original for display"), and the two names the guard
+/// compares reach the engine from DIFFERENT places - the refused one from a recents
+/// row, a shell open or a typed path, the live one from whatever spelling the last
+/// successful load used. A PathBuf compare would therefore hold only when the
+/// caller happened to repeat itself, which is the accident, not the rule.
+#[test]
+fn the_refused_load_guard_recognises_the_same_file_spelled_differently() {
+    let mut app = Harness::new();
+    let shown = app.file("growing.md", b"a small file");
+    app.open(&shown);
+    let first = app.save("a small file, edited by hand", 1);
+    assert_saved(&first, &shown, 1);
+    let size = 8_usize * 1024 * 1024;
+    fs::write(&shown, vec![b'A'; size + 1]).expect("grow the file past the guard");
+
+    let upper = app.root.join("GROWING.MD");
+    let slashes = PathBuf::from(
+        shown
+            .display()
+            .to_string()
+            .replace("\\", "/")
+            .replace("growing.md", "GROWING.MD"),
+    );
+    fs::write(&slashes, vec![b'A'; size + 1]).expect("a second oversize name");
+    for refused in [upper, slashes] {
+        app.send(Command::Open {
+            path: refused.clone(),
+        });
+        app.until(
+            "LoadFailed(TooLarge) for that spelling",
+            |ev| matches!(ev, Event::LoadFailed { path, .. } if path == &refused),
+        );
+        app.wait_a_tick();
+        let events = app.save("text that would replace bytes nobody was shown", 2);
+        match one_answer(&events) {
+            Event::SaveFailed {
+                path,
+                revision,
+                reason,
+            } => {
+                assert_eq!(
+                    path.as_path(),
+                    &shown,
+                    "refused on the name the buffer came from"
+                );
+                assert_eq!(
+                    *revision, 2,
+                    "and at the revision the write would have anchored"
+                );
+                assert_eq!(
+                    *reason,
+                    SaveError::NoTarget,
+                    "the same verdict, any spelling"
+                );
+            }
+            other => panic!("expected one SaveFailed, got {other:?} in {events:?}"),
+        }
+        let bytes = app.bytes(&shown);
+        assert_eq!(bytes.len(), size + 1, "a different spelling opened no door");
+    }
 }
