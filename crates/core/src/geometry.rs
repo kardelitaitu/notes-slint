@@ -93,6 +93,14 @@ impl Rect {
     ///   never move a fully visible rect, and the result is never empty for
     ///   a non-empty input.
     ///
+    /// WHAT THE NUMBER IS NOT: min_visible is PIXELS OF THE RECT (physical frame px,
+    /// the caller's 32), not a GRABBABLE BAND — the bar a user can catch is 28 LOGICAL
+    /// px here, ~42 physical at 150 %, so a bottom-edge park leaving 32 px of body on
+    /// screen passes untouched with its band off-screen. Reachable at RESTORE time only
+    /// (a saved rect, a changed monitor), never by a drag — a drag is cursor-bounded —
+    /// and the band-aware per-axis min_visible that would close that gap is NAMED, NOT
+    /// BUILT: see `.agents/notes/rejected/2026-09-14-drag-path-visibility-clamp.md`.
+    ///
     /// Callers: pass the work area of the monitor the rect belongs to (a
     /// nearest-monitor lookup by overlap), never blindly the primary — a
     /// rect sitting fully on a still-present SECONDARY monitor has zero

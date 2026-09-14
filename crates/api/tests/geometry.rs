@@ -132,6 +132,83 @@ fn the_first_registration_moves_the_window_once_at_the_clamped_frame_rect() {
     );
 }
 
+/// THE PAIRED NEGATIVE of the test above, and the half of the visibility law no
+/// other row states: a rect that is PARTIALLY off a monitor that still exists is
+/// restored VERBATIM - one move, the saved number, no correction, and not one
+/// word about it. x=1300 of a 1920-wide work area leaves 620 px on screen and
+/// hangs 180 px off the right edge, so the overlap is far above MIN_VISIBLE (32)
+/// and far below what would need rescuing. That boundary is deliberately a
+/// PIXELS-OF-THE-RECT boundary, not a grabbable-band boundary: see
+/// `Rect::clamped_to` and
+/// `.agents/notes/rejected/2026-09-14-drag-path-visibility-clamp.md` for why the
+/// band is named and not built. What this row owns is the cheaper half of the
+/// same claim - a launch that needs no rescue must not be moved somewhere else
+/// and must not be sentenced to a warning the user reads as "your note is lost".
+#[test]
+fn a_partially_off_rect_on_a_connected_monitor_is_restored_untouched_and_unreported() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let saved = Rect::new(1300, 100, 800, 600);
+    write_session(
+        dir.path(),
+        &Session {
+            rect: saved,
+            ..Session::default()
+        },
+    )
+    .expect("write the session fixture");
+    let (gateway, rx, host) = start_with(dir.path(), Answers::default());
+
+    gateway
+        .send(Command::RegisterWindow {
+            handle: WindowHandle(0x100),
+        })
+        .expect("queued");
+    wait_for_calls(&host, 1, "the registration's platform calls");
+    // close() joins the engine: everything the registration will ever say has
+    // been emitted by now, so an empty warning list below is a proven zero.
+    gateway.close().expect("shutdown joins the engine");
+
+    let moves = host.moves();
+    assert_eq!(
+        moves.len(),
+        1,
+        "one move - the restore, and nothing after it"
+    );
+    let (handle, rect, scale) = moves[0];
+    assert_eq!(handle, 0x100);
+    assert_eq!(
+        rect,
+        FrameRect::new(saved.x, saved.y, saved.w, saved.h),
+        "the SAVED rect, verbatim: a partially off window is not dragged back on screen"
+    );
+    assert_eq!(scale, 1.0);
+    // The same verdict from core's own rule on the same pair of numbers, so the
+    // fixture cannot quietly become a clamp case if MIN_VISIBLE is ever lowered:
+    // the clamp is core's judgement and here it declines to act.
+    assert_eq!(
+        saved.clamped_to(Rect::new(0, 0, 1920, 1032), 32),
+        saved,
+        "fixture: 620 of 800 px are inside the work area, so nothing is owed a correction"
+    );
+
+    let mut strays = Vec::new();
+    while let Ok(event) = rx.recv_timeout(Duration::from_millis(50)) {
+        strays.push(event);
+    }
+    assert!(
+        strays
+            .iter()
+            .all(|e| !matches!(e, Event::GeometryNotRestored { .. })),
+        "an untouched restore has nothing to report: {strays:?}"
+    );
+    // And the drain saw the stream, so the silence above is a fact and not an
+    // empty pipe: the pin verdict is the one thing this registration does say.
+    assert!(
+        strays.iter().any(|e| matches!(e, Event::Pinned(false))),
+        "the event stream was live and said only the pin: {strays:?}"
+    );
+}
+
 /// A maximized session is not yanked out of maximization to be moved - but the
 /// pin still applies, because it is orthogonal to placement, and the restore
 /// rect is still measured (D48): the NORMAL position is the number worth
