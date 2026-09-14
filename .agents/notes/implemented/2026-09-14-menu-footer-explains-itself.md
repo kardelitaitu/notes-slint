@@ -60,7 +60,7 @@ sampled, because this session cannot see images.
 | capture | popup height | amber glyph core, footer band | reading |
 |---|---|---|---|
 | committed `47b14241` (footer only) | 184px — grew the predicted 46px | **137,105,50** | that is amber composited over the **editor** `#171717`, not over `menu-bg` `#2a2a2a` → the block was hanging **outside the box that paints its background** |
-| working tree, recents block + both fixes | 294px | **218,158,57** | amber over menu-bg ✓ inside the box |
+| working tree at the time, recents block + both fixes (now `79d11e86`) | 294px | **218,158,57** | amber over menu-bg ✓ inside the box |
 
 What made the difference is that the rows region stopped being "whatever height is left". The
 `GridLayout` is now sized by the row arithmetic itself rather than `parent.height - pad*2` (which,
@@ -103,10 +103,11 @@ answered here.
 
 ## What is still not proven
 
-- **The geometry fixes are not committed.** They live in `crates/bridge-slint/ui/chrome.slint`
-  while another window is mid-edit in the same file (moving the recents into the popup). If they
-  are ever reverted, the footer goes back to painting outside its box — the test above is one
-  screenshot and one number: an amber core near **137** rather than **218**.
+- **The geometry is proven on a synthetic field, not a live one.** The two fixes landed in
+  `79d11e86` (the recents commit that grew the same popup), so the box, the seam and the footer are
+  committed — but the only render that shows them correct is a `--load-data` screenshot. If the
+  grid is ever sized by leftover height again, nothing fails: the footer simply paints outside its
+  background, and the tell is the amber core dropping from ~218 to ~137.
 - `file-words` says "lines" nowhere: `FileMeta` carries no line count, so the manager's commit
   message that promises "lines" overstates what this renders. What it renders is encoding, BOM,
   line endings, trailing newline, writability, the size guard, and the arming verdict.
