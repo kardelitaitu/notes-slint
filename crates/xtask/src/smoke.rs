@@ -4184,6 +4184,13 @@ public static class PROD {
   [DllImport("user32.dll")] public static extern bool DetachThreadInput(uint a, uint b);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  // GetCursorPos is the LIVENESS read, added the day this lane's mouse stopped arriving and
+  // nothing could say WHY. SetCursorPos answers a bool and nothing else, and a locked
+  // session - or a desktop this process does not belong to - can answer TRUE and move
+  // nothing at all. Reading the pointer back is the only way a leg can tell "this window is
+  // deaf" from "the OS never moved my cursor", and it buys an explanation, never a verdict:
+  // the reading is advisory in BOTH directions.
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(ref POINT p);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   // THE MENU LEGS' DOORS. A click is placed by the CLIENT area, not the frame: Chrome is
@@ -4323,22 +4330,32 @@ function Get-PopupX($h) {
     return [Math]::Max(8.0, [Math]::Min($MINSET, $c.lw - $MENUW - 8.0))
 }
 # One press, from the LOGICAL point the markup says the row occupies, delivered through
-# the OS the way a hand delivers it: move the cursor, press, release. Returns the pixel it
-# pressed at and whether our window was the thing under the cursor, as one string, so the
-# Rust side can print both without guessing which press answered.
+# the OS the way a hand delivers it: move the cursor, press, release. Returns ONE string of
+# six fields: the pixel it asked for, whether our window was the thing under that pixel, the
+# handle that was, and where GetCursorPos says the pointer ACTUALLY sat when the button went
+# down. That last pair is the sharpening - an asked-for pixel proves only what the harness
+# wanted, and on a machine where injected input never arrives it is the LANDED pixel that
+# says whether the press was ever a press at all.
 function Click-Logical($h, $lx, $ly) {
     $c = Get-Client $h
-    if ($null -eq $c) { return 'none,0,0' }
+    if ($null -eq $c) { return 'none,0,0,0,-1,-1' }
     $px = [int]($c.ox + $lx * $c.s); $py = [int]($c.oy + $ly * $c.s)
     $probe = New-Object PROD+POINT; $probe.X = $px; $probe.Y = $py
     $under = [PROD]::WindowFromPoint($probe)
     $ours = ([int64]$under -eq [int64]$h)
-    if (-not $ours) { return "$px,$py,0,$([int64]$under)" }
+    # -1,-1 is not a position and never will be: this branch never asked the OS to move the
+    # cursor, so it has no landing to report. A missing landing reads as "nothing was said",
+    # never as the damning "the cursor did not go where it was told".
+    if (-not $ours) { return "$px,$py,0,$([int64]$under),-1,-1" }
     [void][PROD]::SetCursorPos($px, $py)
     Start-Sleep -Milliseconds 180
+    # WHERE THE POINTER ACTUALLY IS - read after the settle, before the button. A press
+    # delivered while the cursor sits somewhere else is not the press this leg claims.
+    $land = New-Object PROD+POINT
+    if ([PROD]::GetCursorPos([ref]$land)) { $ax = [int]$land.X; $ay = [int]$land.Y } else { $ax = -1; $ay = -1 }
     [PROD]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 70
     [PROD]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 420
-    return "$px,$py,1,$([int64]$under)"
+    return "$px,$py,1,$([int64]$under),$ax,$ay"
 }
 # A title-band drag, the same door a hand uses: press, MOVE IN STEPS, release. The steps
 # matter - Slint's TouchArea has no 'dragged' callback, so a drag is its 'moved' handler
@@ -5323,12 +5340,18 @@ pub fn voice_toggled(trace: &str) -> bool {
     })
 }
 
-/// One press as the script answered it: "x,y,ours,hwnd-under-the-cursor". Malformed or
-/// absent is None, and None is never a pass - the shape of every reading rule in this
-/// file.
-pub fn press_reading(text: Option<&str>) -> Option<(i32, i32, bool, i64)> {
+/// One press as the script answered it: the pixel ASKED for, who was under it, and where the
+/// pointer actually landed.
+pub type PressReading = (i32, i32, bool, i64, i32, i32);
+
+/// "asked-x,asked-y,ours,hwnd-under,landed-x,landed-y" - the pixel the harness ASKED the OS
+/// for, who the OS said was under it, and where GetCursorPos says the pointer ACTUALLY sat
+/// when the button went down. Malformed or absent is None, and None is never a pass - the
+/// shape of every reading rule in this file. The two new fields are why the arity is six:
+/// an asked-for pixel describes the wish, the landed pixel is the act.
+pub fn press_reading(text: Option<&str>) -> Option<PressReading> {
     let parts: Vec<&str> = text?.split(',').map(|s| s.trim()).collect();
-    if parts.len() != 4 {
+    if parts.len() != 6 {
         return None;
     }
     Some((
@@ -5336,7 +5359,131 @@ pub fn press_reading(text: Option<&str>) -> Option<(i32, i32, bool, i64)> {
         parts[1].parse().ok()?,
         parts[2] == "1",
         parts[3].parse().ok()?,
+        parts[4].parse().ok()?,
+        parts[5].parse().ok()?,
     ))
+}
+
+/// What the CURSOR itself said about a press, beside what the harness asked for. This is the
+/// distinction the dead-input run could not make: a menu that hears nothing and a session
+/// that never moved the pointer print the same silence, and only the landed pixel separates
+/// them. Advisory in BOTH directions and by rule - it explains a NOT JUDGED, it never
+/// creates one and it never cancels one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorSaid {
+    /// SetCursorPos asked for one pixel and GetCursorPos found the pointer at another: no
+    /// press this leg counts was ever delivered. The likeliest cause is a session nobody is
+    /// sitting in front of - locked, or a desktop this process does not belong to.
+    NeverMoved {
+        asked: (i32, i32),
+        landed: (i32, i32),
+    },
+    /// The pointer sat exactly where it was told. A leg that heard nothing AFTER this is
+    /// about the window, not about the OS.
+    Moved { at: (i32, i32) },
+    /// Nothing was said: the branch never moved the cursor (the press was not over our
+    /// window), GetCursorPos refused, or there was no reading at all. Silence about the
+    /// cursor is evidence about nothing, and is written that way.
+    Unknown,
+}
+
+impl CursorSaid {
+    /// The one honest sentence this evidence buys, and the only thing it is allowed to say.
+    /// Note which way the exculpatory one points: it excuses the MENU and indicts the
+    /// session, which is why it may ride a NOT JUDGED and may not ride a FAIL.
+    pub fn clause(self) -> Option<&'static str> {
+        match self {
+            CursorSaid::NeverMoved { .. } => Some(
+                "THE OS NEVER MOVED THE CURSOR (session locked/background?) - GetCursorPos still   reported the pointer where it already sat, so the pixel this leg pressed was never a   press at all and nothing here can accuse the menu of ignoring one",
+            ),
+            CursorSaid::Moved { .. } => Some("cursor moved, window ignored the press"),
+            CursorSaid::Unknown => None,
+        }
+    }
+
+    /// The INFO field's VALUE: where the pointer ACTUALLY landed, as the OS answered it, so
+    /// a reader can check the sentence against the number instead of trusting it. The label
+    /// lives in the INFO line, which is always printed - an unread cursor shows up as
+    /// `cursor moved -> not read` rather than as a missing field.
+    pub fn shown(self) -> String {
+        match self {
+            CursorSaid::Moved { at } => format!("{},{}", at.0, at.1),
+            CursorSaid::NeverMoved { landed, .. } => {
+                format!("{},{} (NOT where it was asked)", landed.0, landed.1)
+            }
+            CursorSaid::Unknown => "not read".to_string(),
+        }
+    }
+}
+
+/// The cursor evidence of one press reading. `-1,-1` is the script's own "this branch never
+/// asked the OS to move" answer and reads as [CursorSaid::Unknown], never as a mismatch -
+/// an unread cursor must not become the exculpatory sentence either.
+pub fn cursor_said(press: PressReading) -> CursorSaid {
+    let (ask_x, ask_y, ours, _under, land_x, land_y) = press;
+    if !ours || (land_x, land_y) == (-1, -1) {
+        return CursorSaid::Unknown;
+    }
+    if (land_x, land_y) == (ask_x, ask_y) {
+        CursorSaid::Moved {
+            at: (land_x, land_y),
+        }
+    } else {
+        CursorSaid::NeverMoved {
+            asked: (ask_x, ask_y),
+            landed: (land_x, land_y),
+        }
+    }
+}
+
+/// A leg that drove SEVERAL presses: the most exculpatory reading wins. One press whose
+/// cursor never moved is enough to say the gesture was never delivered, while a leg with no
+/// reading at all still says nothing.
+pub fn cursor_said_all(presses: impl IntoIterator<Item = PressReading>) -> CursorSaid {
+    let said: Vec<CursorSaid> = presses.into_iter().map(cursor_said).collect();
+    if let Some(never) = said
+        .iter()
+        .copied()
+        .find(|s| matches!(s, CursorSaid::NeverMoved { .. }))
+    {
+        return never;
+    }
+    if let Some(moved) = said
+        .iter()
+        .copied()
+        .find(|s| matches!(s, CursorSaid::Moved { .. }))
+    {
+        return moved;
+    }
+    CursorSaid::Unknown
+}
+
+/// THE DOWNGRADE AND THE SHARPENING, one pure function so both of its sentences are testable
+/// without a desktop. A leg written to go red accepts being told to go grey - see the gate
+/// text - and the cursor then says WHICH silence this run measured. It never goes the other
+/// way: a Broken with input live stays Broken however the cursor read, because "the OS never
+/// moved my cursor" is a reason to judge nothing, not a licence to judge more.
+pub fn soften(verdict: Menu, input_live: bool, cursor: CursorSaid) -> Menu {
+    match verdict {
+        Menu::Broken(why) if !input_live => {
+            let gate = "no answer to the press, but the chord leg did not land a keystroke on   this window either - injected input is not arriving, so this is not a verdict about the   menu.";
+            let head = match cursor.clause() {
+                Some(clause) => format!("{clause} - "),
+                None => String::new(),
+            };
+            Menu::NotJudged(format!("{head}{gate} Named gap: {why}"))
+        }
+        Menu::NotJudged(why) => match cursor.clause() {
+            Some(clause) => Menu::NotJudged(format!("{why} - {clause}")),
+            None => Menu::NotJudged(why),
+        },
+        other => other,
+    }
+}
+
+/// The reading a leg has on its wrist: no press line, no cursor opinion.
+pub fn cursor_of(press: Option<PressReading>) -> CursorSaid {
+    press.map_or(CursorSaid::Unknown, cursor_said)
 }
 
 /// What a MENU leg said. Its own type and not [Toggle]: a toggle is about a draft file
@@ -5509,96 +5656,120 @@ fn product_menu_legs(
             product_drag_closes_menu(script, exe, session),
         ),
     ];
-    // THE DOWNGRADE, and why a leg that was written to go red accepts being told to go grey.
-    // Every one of these four legs decides on a line the PRODUCT prints after a press, and
-    // "no line" has two causes that look identical from here: the menu is deaf, or the press
-    // never arrived. The chord leg above is the only instrument in this file that answers
-    // the second question - it drives the same SetCursorPos/mouse_event/keybd_event doors at
-    // the same window, and it was proven green on real bytes - so when it did NOT land a
-    // keystroke, a menu leg that heard nothing cannot accuse the menu, and says so instead.
-    // When it did land, nothing here is softened: the promise stays red.
-    let legs = if input_live {
-        legs
-    } else {
-        legs.into_iter()
-            .map(|(name, verdict)| match verdict {
-                Menu::Broken(why) => (
-                    name,
-                    Menu::NotJudged(format!(
-                        "no answer to the press, but the chord leg did not land a keystroke on   this window either - injected input is not arriving, so this is not a verdict about the   menu. Named gap: {why}"
-                    )),
-                ),
-                other => (name, other),
-            })
-            .collect()
-    };
+    // Each leg brings its verdict AND what its own presses said about the cursor, because
+    // the cursor is the one reading that separates the two silences these legs can produce.
+    let legs: Vec<(&'static str, Menu)> = legs
+        .into_iter()
+        .map(|(name, (verdict, cursor))| (name, soften(verdict, input_live, cursor)))
+        .collect();
+    // THE DOWNGRADE now lives in [soften], called above, because its text and the cursor
+    // sentence are one judgement and two copies of them start disagreeing. Why a leg written
+    // to go red accepts being told to go grey at all: every one of these four legs decides
+    // on a line the PRODUCT prints after a press, and "no line" has two causes that look
+    // identical from here - the menu is deaf, or the press never arrived. The chord leg above
+    // is the instrument that answers the second question in the general case (the same
+    // SetCursorPos/mouse_event doors, the same window, proven green on real bytes), and each
+    // leg's own GetCursorPos reading is what answers it for THIS press. Neither is allowed to
+    // go the other way: when input did land, a leg that heard nothing stays red.
     restore_session(session, before.as_deref());
     legs
 }
 
 /// LEG A: hamburger, then the Auto-save row. Verdict in [judge_click_toggle].
-fn product_menu_click(script: &Path, exe: &Path, session: &Path) -> Menu {
+fn product_menu_click(script: &Path, exe: &Path, session: &Path) -> (Menu, CursorSaid) {
     let (probe, trace) = match run_product_probe(script, exe, session, PRODUCT_MENU_ALIVE_SECS, 4) {
         Ok(v) => v,
-        Err(e) => return Menu::NotJudged(format!("the click launch did not report: {e}")),
+        Err(e) => {
+            return (
+                Menu::NotJudged(format!("the click launch did not report: {e}")),
+                CursorSaid::Unknown,
+            );
+        }
     };
     if !probe.flag("DESKTOP") {
-        return Menu::NotJudged(
-            "the click launch found no interactive desktop, so there was no cursor to place"
-                .to_string(),
+        return (
+            Menu::NotJudged(
+                "the click launch found no interactive desktop, so there was no cursor to place"
+                    .to_string(),
+            ),
+            CursorSaid::Unknown,
         );
     }
     let press = press_reading(probe.get("ROW_AT"));
     let landed = press.map(|p| p.2).unwrap_or(false);
+    let cursor = cursor_of(press);
     let asked = voice_count(&trace, PRODUCT_MENU_NEEDLES[0].0);
     println!(
-        "smoke: menu-click: INFO - hamburger {} | row {} | toggle lines={} active={}",
+        "smoke: menu-click: INFO - hamburger {} | row {} | toggle lines={} active={} | cursor moved -> {}",
         probe.get("HAMBURGER_AT").unwrap_or("-"),
         probe.get("ROW_AT").unwrap_or("-"),
         asked,
-        probe.number("ACTIVE").unwrap_or(-1)
+        probe.number("ACTIVE").unwrap_or(-1),
+        cursor.shown()
     );
-    judge_click_toggle(asked, voice_toggled(&trace), landed)
+    (
+        judge_click_toggle(asked, voice_toggled(&trace), landed),
+        cursor,
+    )
 }
 
 /// LEG B: the Open row, modal stood down. Verdict in [judge_dialog_asked].
-fn product_dialog_asked_leg(script: &Path, exe: &Path, session: &Path) -> Menu {
+fn product_dialog_asked_leg(script: &Path, exe: &Path, session: &Path) -> (Menu, CursorSaid) {
     let (probe, trace) = match run_product_probe(script, exe, session, PRODUCT_MENU_ALIVE_SECS, 5) {
         Ok(v) => v,
-        Err(e) => return Menu::NotJudged(format!("the refusal launch did not report: {e}")),
+        Err(e) => {
+            return (
+                Menu::NotJudged(format!("the refusal launch did not report: {e}")),
+                CursorSaid::Unknown,
+            );
+        }
     };
     if !probe.flag("DESKTOP") {
-        return Menu::NotJudged("the refusal launch found no interactive desktop".to_string());
+        return (
+            Menu::NotJudged("the refusal launch found no interactive desktop".to_string()),
+            CursorSaid::Unknown,
+        );
     }
-    let landed = press_reading(probe.get("ROW_AT"))
-        .map(|p| p.2)
-        .unwrap_or(false);
+    let press = press_reading(probe.get("ROW_AT"));
+    let landed = press.map(|p| p.2).unwrap_or(false);
+    let cursor = cursor_of(press);
     let skipped = voice_count(&trace, PRODUCT_MENU_NEEDLES[1].0);
     println!(
-        "smoke: dialog-asked: INFO - row {} | refusal lines={}",
+        "smoke: dialog-asked: INFO - row {} | refusal lines={} | cursor moved -> {}",
         probe.get("ROW_AT").unwrap_or("-"),
-        skipped
+        skipped,
+        cursor.shown()
     );
-    judge_dialog_asked(skipped, landed)
+    (judge_dialog_asked(skipped, landed), cursor)
 }
 
 /// LEG C: item 4 proper. Verdict in [judge_native_dialog].
-fn product_native_dialog_leg(script: &Path, exe: &Path, session: &Path) -> Menu {
+fn product_native_dialog_leg(script: &Path, exe: &Path, session: &Path) -> (Menu, CursorSaid) {
     let (probe, trace) = match run_product_probe(script, exe, session, PRODUCT_MENU_ALIVE_SECS, 6) {
         Ok(v) => v,
-        Err(e) => return Menu::NotJudged(format!("the dialog launch did not report: {e}")),
+        Err(e) => {
+            return (
+                Menu::NotJudged(format!("the dialog launch did not report: {e}")),
+                CursorSaid::Unknown,
+            );
+        }
     };
     if !probe.flag("DESKTOP") {
-        return Menu::NotJudged(
-            "the dialog launch found no interactive desktop, so no modal could exist".to_string(),
+        return (
+            Menu::NotJudged(
+                "the dialog launch found no interactive desktop, so no modal could exist"
+                    .to_string(),
+            ),
+            CursorSaid::Unknown,
         );
     }
+    let cursor = cursor_of(press_reading(probe.get("ROW_AT")));
     let spawned = voice_count(&trace, PRODUCT_MENU_NEEDLES[2].0);
     let seen = probe.flag("DIALOG_SEEN");
     let gone = probe.flag("DIALOG_GONE");
     let main_alive = probe.flag("MAIN_ALIVE");
     println!(
-        "smoke: native-dialog: INFO - spawn lines={} handle={} seen={} at {}ms gone={}   main_alive={} row={}",
+        "smoke: native-dialog: INFO - spawn lines={} handle={} seen={} at {}ms gone={}   main_alive={} row={} | cursor moved -> {}",
         spawned,
         probe.number("DIALOG_HANDLE").unwrap_or(0),
         seen,
@@ -5606,38 +5777,54 @@ fn product_native_dialog_leg(script: &Path, exe: &Path, session: &Path) -> Menu 
         gone,
         main_alive,
         probe.get("ROW_AT").unwrap_or("-"),
+        cursor.shown(),
     );
-    judge_native_dialog(
-        spawned,
-        seen,
-        gone,
-        main_alive,
-        probe.number("DIALOG_MS").unwrap_or(-1),
+    (
+        judge_native_dialog(
+            spawned,
+            seen,
+            gone,
+            main_alive,
+            probe.number("DIALOG_MS").unwrap_or(-1),
+        ),
+        cursor,
     )
 }
 
-/// LEG D: the drag. Verdict in [judge_drag_closes].
-fn product_drag_closes_menu(script: &Path, exe: &Path, session: &Path) -> Menu {
+/// LEG D: the drag. Verdict in [judge_drag_closes]. Its cursor evidence is the WORST of
+/// the three presses it drove: a gesture whose hamburger never moved the pointer was never
+/// a gesture, whichever row press happened to look normal.
+fn product_drag_closes_menu(script: &Path, exe: &Path, session: &Path) -> (Menu, CursorSaid) {
     let (probe, trace) = match run_product_probe(script, exe, session, PRODUCT_MENU_ALIVE_SECS, 7) {
         Ok(v) => v,
-        Err(e) => return Menu::NotJudged(format!("the drag launch did not report: {e}")),
+        Err(e) => {
+            return (
+                Menu::NotJudged(format!("the drag launch did not report: {e}")),
+                CursorSaid::Unknown,
+            );
+        }
     };
     if !probe.flag("DESKTOP") {
-        return Menu::NotJudged("the drag launch found no interactive desktop".to_string());
+        return (
+            Menu::NotJudged("the drag launch found no interactive desktop".to_string()),
+            CursorSaid::Unknown,
+        );
     }
     let asks = voice_count(&trace, PRODUCT_MENU_NEEDLES[1].0);
-    let landed = ["HAMBURGER_AT", "ROW_AT", "ROW2_AT"]
+    let presses: Vec<PressReading> = ["HAMBURGER_AT", "ROW_AT", "ROW2_AT"]
         .iter()
         .filter_map(|k| press_reading(probe.get(k)))
-        .filter(|p| p.2)
-        .count();
+        .collect();
+    let landed = presses.iter().filter(|p| p.2).count();
+    let cursor = cursor_said_all(presses.iter().copied());
     println!(
-        "smoke: drag-closes-menu: INFO - band {} | presses landed on our window={}/3 |   refusal lines={} (want exactly 1)",
+        "smoke: drag-closes-menu: INFO - band {} | presses landed on our window={}/3 |   refusal lines={} (want exactly 1) | cursor moved -> {}",
         probe.get("BAND_DRAG").unwrap_or("-"),
         landed,
-        asks
+        asks,
+        cursor.shown()
     );
-    judge_drag_closes(asks, landed >= 2)
+    (judge_drag_closes(asks, landed >= 2), cursor)
 }
 
 /// Kill anything the failed run left on screen. ONLY called on a failure path: on a
@@ -8754,19 +8941,80 @@ notes-gpui: dialog[skipped]: SLINT_NO_DIALOG - (Open -> x)\n";
     }
 
     #[test]
-    fn a_press_reading_that_is_not_four_fields_is_no_answer() {
+    fn a_press_reading_that_is_not_six_fields_is_no_answer() {
         assert_eq!(
-            press_reading(Some("4299,228,1,197388")),
-            Some((4299, 228, true, 197388))
+            press_reading(Some("4299,228,1,197388,4299,228")),
+            Some((4299, 228, true, 197388, 4299, 228))
         );
         assert_eq!(
-            press_reading(Some("4299,228,0,7")),
-            Some((4299, 228, false, 7))
+            press_reading(Some("4299,228,0,7,-1,-1")),
+            Some((4299, 228, false, 7, -1, -1))
         );
+        // The landed pair is part of the SHAPE now: an answer that still carries only the
+        // four fields the old script wrote is a press whose cursor was never read, and a
+        // reading rule that guessed the missing half would be guessing at the one field
+        // that tells a locked session from a deaf window.
+        assert_eq!(press_reading(Some("4299,228,1,197388")), None);
         // The script's own "there was no client area to map" answer, and a missing key:
         // neither is a pass, and neither is the product's fault either.
-        assert_eq!(press_reading(Some("none,0,0")), None);
+        assert_eq!(press_reading(Some("none,0,0,0,-1,-1")), None);
         assert_eq!(press_reading(None), None);
+    }
+
+    /// THE SHARPENING, and it is the whole reason the landed pair exists: two runs that
+    /// print the same silence have to be tellable apart from the reading alone. Both answers
+    /// stay advisory - [soften] is allowed to explain a NOT JUDGED, never to create a FAIL,
+    /// and a leg whose input DID land keeps its red however the cursor read.
+    #[test]
+    fn the_landed_pixel_says_which_silence_this_run_measured() {
+        // Where this box sat: WindowFromPoint answered our HWND, the button went down, and
+        // the pointer stayed where it was.
+        let stuck = press_reading(Some("4299,228,1,197388,640,320"));
+        let deaf = press_reading(Some("4299,228,1,197388,4299,228"));
+        assert_eq!(
+            cursor_of(stuck),
+            CursorSaid::NeverMoved {
+                asked: (4299, 228),
+                landed: (640, 320)
+            }
+        );
+        assert_eq!(cursor_of(deaf), CursorSaid::Moved { at: (4299, 228) });
+        // Zero prints, and the cursor never moved: the session is the honest suspect.
+        let stuck_said = soften(judge_click_toggle(0, false, true), false, cursor_of(stuck));
+        let text = format!("{stuck_said}");
+        assert!(matches!(stuck_said, Menu::NotJudged(_)));
+        assert!(
+            text.contains("THE OS NEVER MOVED THE CURSOR (session locked/background?)"),
+            "the exculpatory half of the distinction: {text}"
+        );
+        // Zero prints, and the cursor went exactly where it was told: the window is the
+        // suspect, and the sentence says so - while the verdict itself stays NOT JUDGED,
+        // because the chord leg still has not landed a keystroke on this run.
+        let moved_said = soften(judge_dialog_asked(0, true), false, cursor_of(deaf));
+        let text = format!("{moved_said}");
+        assert!(matches!(moved_said, Menu::NotJudged(_)));
+        assert!(
+            text.contains("cursor moved, window ignored the press"),
+            "the indicting half of the distinction: {text}"
+        );
+        // NEVER a promotion: a red leg with input live stays red even when the cursor read
+        // is the sympathetic one, and the sentence is not bolted onto it.
+        let stays_red = soften(judge_click_toggle(0, false, true), true, cursor_of(stuck));
+        assert!(matches!(stays_red, Menu::Broken(_)));
+        assert!(!format!("{stays_red}").contains("NEVER MOVED THE CURSOR"));
+        // A press whose cursor was never read says nothing about the cursor - the -1,-1 the
+        // script writes when it declined to move is not a position, in either direction.
+        let unread = press_reading(Some("4299,228,0,7,-1,-1"));
+        assert_eq!(cursor_of(unread), CursorSaid::Unknown);
+        let blind = soften(judge_click_toggle(3, true, false), true, cursor_of(unread));
+        assert!(!format!("{blind}").contains("cursor"));
+        assert_eq!(cursor_of(None).shown(), "not read");
+        // And the gesture leg takes the worst of its three presses, not the last one.
+        let worst = cursor_said_all([
+            (4299, 228, true, 7, 4299, 228),
+            (4299, 268, true, 7, 640, 320),
+        ]);
+        assert!(matches!(worst, CursorSaid::NeverMoved { .. }));
     }
 
     #[test]
@@ -8854,6 +9102,9 @@ notes-gpui: dialog[skipped]: SLINT_NO_DIALOG - (Open -> x)\n";
         // for by class name AND owner pid - all of it has to be in the shipped script.
         for shape in [
             "WindowFromPoint",
+            // The press line carries where the pointer ACTUALLY landed, so the door that
+            // reads it has to be in the shipped script and not just in the Rust.
+            "GetCursorPos",
             "$HAMBURGER_X",
             "function Get-RowY",
             "function Drag-Band",
