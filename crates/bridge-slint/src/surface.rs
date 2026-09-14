@@ -2819,6 +2819,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_drag_band_stops_where_the_caption_begins() {
+        // THE MINIMIZE-CELL BUG, grepped off the markup because it is a markup fact: the caption
+        // slot is 1.5 slot-widths (chrome.slint's own caption-width), yet the drag band was cut
+        // 'root.width - Theme.slot-width * 2' - a whole slot-width short of the edge, which is
+        // 30px INSIDE that slot. Declared after the caption, so the band sat above it and every
+        // press meant for cap-min was swallowed as a drag start: right-75 went dead, right-50
+        // moved the window. The fix is the very subtraction the bar's own title row already uses,
+        // so the guard is that the two expressions match - one geometry, one owner of the seam.
+        let chrome = include_str!("../ui/chrome.slint");
+        let at = chrome
+            .find("max-band := TouchArea {")
+            .expect("the drag band that moves the window");
+        let band = &chrome[at..];
+        let width = band
+            .lines()
+            .find(|l| l.trim_start().starts_with("width:"))
+            .expect("the band's own width")
+            .trim();
+        assert!(
+            width.contains("root.caption-width"),
+            "the drag band's width must subtract the caption slot, or it presses out the              minimize cell it is declared on top of: {width}"
+        );
+        // And the subtraction is the SAME one the title row uses - not a second magic number
+        // invented to make this test pass.
+        let at = chrome
+            .find("centre := HorizontalLayout {")
+            .expect("the centred title row");
+        let row = &chrome[at..];
+        let row_width = row
+            .lines()
+            .find(|l| l.trim_start().starts_with("width:"))
+            .expect("the title row's own width")
+            .trim();
+        let tail = |s: &str| s[s.find("- Theme.slot-width").unwrap()..].to_string();
+        assert_eq!(
+            tail(width),
+            tail(row_width),
+            "band and title row must end at the same x, one expression (band: {width} / row: {row_width})"
+        );
+        // The band still starts one slot in, so the hamburger and pin keep their clicks: it is
+        // the RIGHT edge that was wrong, and only the right edge may change.
+        assert!(
+            band.contains("x: Theme.slot-width;"),
+            "the band's left edge stays where the left slot ends"
+        );
+        // A shortened band must still be a band: it has to reach the whole title, which is the
+        // centred row's own measure, and the double-click door must survive the edit.
+        assert!(
+            band.contains("double-clicked =>") && band.contains("root.toggle-max-requested();"),
+            "maximise on a double-click is the band's reason to exist"
+        );
+    }
+
     // ---- FIX-A: the CORNERS POLICY's gates, driven with no window and no engine. ----
     // The shape is the one `register_says` takes: what a wake DECIDES comes off the pump as a
     // pure verdict, so the decision is testable and only the SENDING needs a live note. What

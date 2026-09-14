@@ -502,7 +502,12 @@ export component Chrome inherits Rectangle {
 
     // ---- THE TITLE BAND: double-click asks for a maximise ----------------------
     // Exactly the CENTRE band and nothing else: it starts one slot-width in and stops
-    // one slot-width short, so the hamburger and the pin keep their own clicks. The band
+    // exactly where the caption slot begins - the SAME subtraction as the band above
+    // (:468), which is the whole point. The width used to be `root.width - slot-width*2`,
+    // one slot-width short of the edge; that was 30px too generous against a 90px caption
+    // and covered the MINIMIZE cell outright, and because this TouchArea is declared after
+    // the caption it sits ABOVE it, so every press there was swallowed as a drag. Now the
+    // hamburger, the pin and all three caption cells keep their own clicks. The band
     // is the only thing on a frameless window that reads as a title bar, and this is the
     // frame contract's one act (ui/main.slint:24-30 turns no-frame on, so there is no OS
     // caption to double-click). Declared after the title Text, which is not interactive,
@@ -510,7 +515,7 @@ export component Chrome inherits Rectangle {
     max-band := TouchArea {
         x: Theme.slot-width;
         y: 0px;
-        width: root.width - Theme.slot-width * 2;
+        width: root.width - Theme.slot-width - root.caption-width;
         height: parent.height;
 
         // Pointer state, local to this band. mouse-x/mouse-y are relative to the band, so
