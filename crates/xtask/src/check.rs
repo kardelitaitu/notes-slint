@@ -270,7 +270,12 @@ fn step_specs() -> Vec<StepSpec> {
             // schedule stays frozen, not gone.
             advisory: true,
             quick_skippable: true,
-            budget_secs: 120,
+            // 180, not 120: the row measured 100.2s WARM, i.e. with nothing to compile, and 12s of
+            // that is the four menu legs holding the window PRODUCT_MENU_ALIVE_SECS = 3 each
+            // (smoke.rs:4766). Which left ~20s for a build this lane has to do, and a cold one does
+            // not fit. The number moves, not the semantics: still advisory, still --quick-skipped,
+            // and the only test on it asks that the budget beat the harness's own deadlines.
+            budget_secs: 180,
         },
         // The bridge is GATED, and by more than a type-check: CI builds the
         // exe (the link has to work) and lints every target. Raising the local
