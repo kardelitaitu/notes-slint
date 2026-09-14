@@ -118,7 +118,7 @@ const MAX_DRAIN_PER_WAKE: usize = 64;
 /// is not re-exported - api only mentions it in a doc comment (crates/api/src/lib.rs:
 /// 170). So this bridge declares 750 ms itself, and if core or api ever moves theirs,
 /// NOTHING at compile time will say so. The one-line fix is a public constant in api;
-/// that is a request, not an edit - 14 Events and 10 Commands are pinned and the port
+/// that is a request, not an edit - 15 Events and 11 Commands are pinned and the port
 /// is not mine.
 const AUTOSAVE_IDLE: Duration = Duration::from_millis(750);
 

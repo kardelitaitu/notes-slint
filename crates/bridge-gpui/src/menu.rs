@@ -24,8 +24,8 @@
 //! not have to be discovered again.
 //!
 //! What is deliberately NOT here: `Theme`, `Root`, a kit `Input`, a popup or tooltip
-//! system, and any change to `editor.rs`. One window, one editor, one pump, 13 Events and
-//! 10 Commands.
+//! system, and any change to `editor.rs`. One window, one editor, one pump, 15 Events and
+//! 11 Commands.
 
 use gpui_kit::{KeyBinding, Menu, MenuItem, SharedString, actions};
 use notes_api::RecentEntry;
