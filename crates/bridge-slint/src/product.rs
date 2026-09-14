@@ -200,6 +200,56 @@ fn settle_says(moved_for: Duration, since_send: Option<Duration>) -> bool {
     moved_for >= GEOMETRY_QUIET || since_send.is_some_and(|ago| ago >= GEOMETRY_FORCE)
 }
 
+/// WHAT THIS WAKE'S MEASUREMENT MEANS to the watch, as pure as the decision beside it and for
+/// the same stated reason: no window, no channel, no clock, so a test can ask it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Wake {
+    /// The first rect this root has ever read. There is nothing for it to differ FROM, so it is a
+    /// BASELINE: the watch learns the number and opens no episode.
+    Baseline,
+    /// All four numbers identical to the last wake.
+    Same,
+    /// A rect the watch has not seen. THIS is the user moving or resizing the window.
+    Moved,
+}
+
+/// THE COMPARISON, lifted out of the wake unchanged in every particular except one: a watch that
+/// remembers nothing CANNOT have seen a change. It used to answer "changed" anyway, because
+/// `Settle::default()` seeds `seen: None` and the old test was a plain four-number inequality
+/// against an Option that had no value in it - so wake 1 of every launch looked exactly like a
+/// hand on an edge. That is not cosmetic: `Command::GeometryChanged` is a bare trigger, the
+/// engine answers it by MEASURING the live window (api engine.rs:783-795 via
+/// platform::frame_rect) and persisting what it measured, so every launch rewrote session.json
+/// with whatever the window happened to be. Under a window floor that becomes destructive rather
+/// than merely noisy: a saved 120x120 comes back 340x264 and the file is corrected to lie.
+fn wake_says(previous: Option<Rect>, measured: Rect) -> Wake {
+    let Some(then) = previous else {
+        return Wake::Baseline;
+    };
+    if then.x == measured.x && then.y == measured.y && then.w == measured.w && then.h == measured.h
+    {
+        Wake::Same
+    } else {
+        Wake::Moved
+    }
+}
+
+/// THE GATE, in one place so the wake below and the test agree on it: only a MOVE opens an
+/// episode, and an episode (`changed_at` set) is the ONLY thing the send is willing to wait on.
+/// A baseline therefore queues nothing, however long the run sits idle - which is this function's
+/// whole claim, and the reason `settle_says` below did not have to change by one character.
+fn arms_episode(wake: Wake) -> bool {
+    matches!(wake, Wake::Moved)
+}
+
+/// The restore asked for a size and the window came back SMALLER than that. Only the smaller
+/// direction counts: a maximised session legitimately comes back far larger than the rect the
+/// port stored, and saying "floored" about that would be a trace line about nothing. HALF a pixel
+/// of slack, because `want` is a divided-by-scale float while the read-back is an integer.
+fn floored_says(want: LogicalSize, measured: Rect) -> bool {
+    want.width - measured.w as f32 > 0.5 || want.height - measured.h as f32 > 0.5
+}
+
 /// STRIP-4a row 3, the part that CAN be unit-tested: the one line a panic gets, before the
 /// default hook unwinds. A windows_subsystem binary makes a panic otherwise INVISIBLE
 /// (bridge-gpui/src/main.rs:1396 says exactly that), so the line has to name itself as a panic,
@@ -464,6 +514,9 @@ fn main() {
     let tick_dialog_rx = Rc::clone(&dialog_rx);
     let tick_focus = Rc::clone(&focus_budget);
     let tick_settle = Rc::new(RefCell::new(Settle::default()));
+    // B-S3a: the size THIS root asked the window for, kept only so the first baseline can be
+    // compared against the request it is supposed to answer. Copy, and read-only from here on.
+    let tick_want = want;
     let weak = ui.as_weak();
     let tick = Timer::default();
     tick.start(TimerMode::Repeated, Duration::from_millis(8), move || {
@@ -568,15 +621,29 @@ fn main() {
             let wired = tick_register.borrow().last.is_some();
             ask_corners(&tick_gw, &tick_pump, !print.maximized, parked, wired);
             let mut st = tick_settle.borrow_mut();
-            let same = st.seen.as_ref().is_some_and(|previous| {
-                previous.x == measured.x
-                    && previous.y == measured.y
-                    && previous.w == measured.w
-                    && previous.h == measured.h
-            });
-            if !same && !parked {
-                st.changed_at = Some(now);
+            // B-S3a: the comparison is the pure `wake_says` now, and the difference it makes is
+            // one branch. A wake that the watch has never seen a rect for is a BASELINE - it seeds
+            // `seen` and leaves `changed_at` alone, which is the state the send below cannot fire
+            // from. Everything else about this arm is what it was: same four numbers compared, same
+            // `changed_at = Some(now)` on a real move, and the park still never seen, never
+            // compared, never told.
+            let wake = wake_says(st.seen, measured);
+            if !parked {
+                // The divergence is SPOKEN. A baseline that does not match what the restore asked
+                // for is a clamp of some kind talking - today the toolkit's own minimum and the
+                // frame-to-client arithmetic, tomorrow a floor this root set - and a run log that
+                // shows only the surviving rect cannot tell "restored faithfully" from "restored
+                // then overruled". One line, on the wake that seeds, never again this run.
+                if wake == Wake::Baseline && floored_says(tick_want, measured) {
+                    report(&format!(
+                        "geometry: floored {:.0}x{:.0} -> {}x{} (the restore asked for that; something brought back less)",
+                        tick_want.width, tick_want.height, measured.w, measured.h
+                    ));
+                }
                 st.seen = Some(measured);
+                if arms_episode(wake) {
+                    st.changed_at = Some(now);
+                }
             }
             if let Some(changed) = st.changed_at.filter(|_| !parked) {
                 let moved_for = now.saturating_duration_since(changed);
@@ -836,6 +903,63 @@ mod tests {
             (GEOMETRY_QUIET, GEOMETRY_FORCE),
             (Duration::from_millis(250), Duration::from_millis(1000))
         );
+    }
+
+    #[test]
+    fn an_idle_first_wake_seeds_the_watch_and_queues_nothing() {
+        // B-S3a, and the only reason the comparison had to leave the wake: the first rect this
+        // root ever reads is the one the RESTORE put on the window, not one a hand moved. Seeded
+        // with Settle::default() (seen: None), the old four-number inequality answered "different"
+        // against NOTHING, changed_at opened on wake 1, and since settle_says answers true as soon
+        // as the quiet reaches GEOMETRY_QUIET, every single launch sent Command::GeometryChanged
+        // with no user input whatsoever. GeometryChanged is a bare trigger - the engine measures
+        // the LIVE window and persists what it sees - so session.json was rewritten on every
+        // start, and under a window floor that stops being noise and becomes a lie with a number
+        // in it: 120x120 saved, 340x264 stored, forever, one launch at a time.
+        let placed = Rect::new(40, 60, 800, 600);
+        assert_eq!(
+            wake_says(None, placed),
+            Wake::Baseline,
+            "a first reading has nothing to differ from, so it cannot be a change"
+        );
+        // The gate the send actually sits behind, reachable without a window: no episode opens on
+        // a baseline, so there is no changed_at for settle_says to be asked about and NOTHING can
+        // be queued - not after 250 ms, not after an hour idle.
+        assert!(
+            !arms_episode(Wake::Baseline),
+            "an idle first wake must queue nothing"
+        );
+        assert!(
+            arms_episode(Wake::Moved),
+            "a real move still arms the episode"
+        );
+        assert!(!arms_episode(Wake::Same), "a stable window never re-times");
+        // Same-vs-Moved, on all four numbers, exactly as the inline comparison had it.
+        assert_eq!(wake_says(Some(placed), placed), Wake::Same);
+        for other in [
+            Rect::new(41, 60, 800, 600),
+            Rect::new(40, 61, 800, 600),
+            Rect::new(40, 60, 801, 600),
+            Rect::new(40, 60, 800, 601),
+        ] {
+            assert_eq!(
+                wake_says(Some(placed), other),
+                Wake::Moved,
+                "a {other:?} after {placed:?} is a change and must still arm"
+            );
+        }
+        // And the clamp's voice, which is what the baseline buys the right to report: smaller
+        // speaks, equal is silent, and LARGER is silent too - a maximised session comes back far
+        // bigger than the stored rect and that is a restore working, not a floor.
+        let want = LogicalSize::new(800.0, 600.0);
+        assert!(
+            floored_says(want, Rect::new(40, 60, 340, 264)),
+            "came back at the future floor after asking for 800x600: say it"
+        );
+        assert!(!floored_says(want, placed));
+        assert!(!floored_says(want, Rect::new(40, 60, 1920, 1040)));
+        // Half a pixel is the scale division rounding, not a divergence.
+        assert!(!floored_says(LogicalSize::new(799.6, 600.0), placed));
     }
 
     #[test]
