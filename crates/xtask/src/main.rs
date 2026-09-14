@@ -37,10 +37,14 @@ fn usage() {
         "       it by reading the resource back: exit 0 verified, 20 no SDK, 21 read-back refused"
     );
     eprintln!(
-        "usage: cargo xtask smoke [--reuse-state] [--no-build] [--require-ours] [--binary=gpui|slint|slint-probe]"
+        "usage: cargo xtask smoke [--reuse-state] [--no-build] [--require-ours] [--binary=slint|gpui|slint-probe]"
     );
+    eprintln!("       --binary defaults to slint: the exe it builds, launches and judges is");
+    eprintln!("       target/debug/notes-slint.exe, the product. gpui is frozen (ADR-0006), not");
+    eprintln!("       deleted - --binary=gpui still runs the needle schedule, and slint-probe");
+    eprintln!("       still resolves and still declines to judge. All three names are legal.");
     eprintln!(
-        "       builds notes-gpui first (exit 4 if it does not compile) and proves the exe is"
+        "       builds the selected exe first (exit 4 if it does not compile) and proves it is"
     );
     eprintln!(
         "       newer than its sources (exit 5 if it is not); --no-build skips the build but"

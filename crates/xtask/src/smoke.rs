@@ -23,12 +23,15 @@
 //! script prints KEY=VALUE lines and decides NOTHING: every verdict comes from
 //! `decide()`, a pure function under test.
 //!
-//! Scope of that rule, stated because it generalises: notes-gpui.exe is the
-//! ONLY long-lived artefact this crate launches, so it is the only one that can
-//! be stale. fixtures verify reads fixture files and compares bytes - no binary,
-//! no staleness exposure - and every other gate row is a cargo invocation, which
-//! rebuilds from the current source by definition. If a second launched artefact
-//! ever appears, it gets the same build-then-prove-freshness treatment.
+//! Scope of that rule, stated because it generalises: a built exe is the ONLY
+//! long-lived artefact this crate launches, so it is the only thing that can be
+//! stale - and WHICH exe that is follows the selection: `notes-slint.exe` for a bare
+//! run, because the product is the default (ADR-0006), `notes-gpui.exe` for the
+//! frozen leg that `--binary=gpui` still selects. fixtures verify reads fixture files
+//! and compares bytes - no binary, no staleness exposure - and every other gate row
+//! is a cargo invocation, which rebuilds from the current source by definition. The
+//! second launched artefact the old wording imagined did arrive, and it got the same
+//! build-then-prove-freshness treatment.
 //!
 //! # What makes this honest rather than decorative
 //!
@@ -285,6 +288,22 @@ const SLINT_PROBE_TARGET: ArtifactTarget = ArtifactTarget {
 /// THE THREE THINGS `--binary` ACCEPTS, in the order the refusal prints them.
 pub const BINARY_NAMES: &[&str] = &["gpui", "slint", "slint-probe"];
 
+/// THE ONE ARTIFACT A BARE RUN JUDGES: the product.
+///
+/// ADR-0006 froze `bridge-gpui` and named Slint the product, so a harness whose default
+/// still picked the frozen bridge was printing the verdict about the wrong binary every
+/// time nobody typed a flag - and "the default is the instrument, not the app" is not a
+/// decision anyone made on purpose. `gpui` stays a legal value of `--binary` and keeps
+/// its own leg (frozen is not deleted); it is no longer what you get for typing nothing.
+///
+/// Spelled once, as a literal, and PINNED to its slot in [BINARY_NAMES] rather than
+/// derived from it: `the_binary_flag_parses_both_shapes_and_defaults_to_the_product`
+/// asserts this equals `BINARY_NAMES[1]` and that the row it names resolves to
+/// `notes-slint.exe`. Reordering [BINARY_NAMES] or renaming the product therefore goes
+/// red here, in the same test that reads the flag - not quietly, in whichever string
+/// happened to be indexed by hand.
+pub const DEFAULT_BINARY: &str = "slint";
+
 /// The row `--binary` names, or None for a name that is not one of [BINARY_NAMES].
 /// Total and pure: the flag's whole job is picking which artifact the harness
 /// resolves, builds and staleness-checks, so the mapping is a lookup this crate can
@@ -365,8 +384,10 @@ pub struct Invocation {
     pub reuse: bool,
     pub no_build: bool,
     pub require_ours: bool,
-    /// The selected artifact, spelled as [BINARY_NAMES]. Defaults to gpui, which is
-    /// what every existing CI step and developer run means today.
+    /// The selected artifact, spelled as [BINARY_NAMES]. Defaults to [DEFAULT_BINARY] -
+    /// the product - because a bare run is a verdict about the app that ships, not about
+    /// the bridge [ADR-0006](../../../docs/decisions/0006-gpui-is-frozen-not-deleted.md)
+    /// froze. Every one of the three names is still selectable.
     pub binary: &'static str,
 }
 
@@ -376,7 +397,7 @@ pub struct Invocation {
 /// names - a usage line that omits them is a refusal that does not help.
 pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
     let mut inv = Invocation {
-        binary: "gpui",
+        binary: DEFAULT_BINARY,
         ..Invocation::default()
     };
     let mut it = args.iter();
@@ -402,7 +423,7 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             }
             other => {
                 return Err(format!(
-                    "unknown argument '{other}'; usage: cargo xtask smoke [--reuse-state] [--no-build] [--require-ours] [--binary={}]",
+                    "unknown argument '{other}'; usage: cargo xtask smoke [--reuse-state] [--no-build] [--require-ours] [--binary={}] (no flag at all judges {DEFAULT_BINARY})",
                     BINARY_NAMES.join("|")
                 ));
             }
@@ -413,13 +434,21 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
 
 fn unknown_binary(v: &str) -> String {
     format!(
-        "unknown --binary value '{v}'; this harness can point at {} - {} is the product, {} is the same bytes with the needle plumbing, and only the gpui artifact has a leg wired today",
+        "unknown --binary value '{v}'; this harness can point at {} - {} is the product AND the default a bare run judges, {} is the same bytes with the needle plumbing, and gpui is the frozen bridge (frozen, not deleted: naming it still runs the needle schedule)",
         BINARY_NAMES.join(", "),
         BINARY_NAMES[1],
         BINARY_NAMES[2],
     )
 }
 
+/// THE FROZEN LEG'S exe path, and the name says what it used to be: this was THE
+/// default's path, and it still is one - [DEFAULT_BINARY] is `slint`, so a bare run
+/// never resolves this string. Its only runtime reader is [decide], the needle
+/// schedule, which is the `gpui` leg; retargeting it to `notes-slint.exe` would have a
+/// red `--binary=gpui` run blame an antivirus block on a file it never launched. The
+/// DEFAULT's own path is derived from the selected row, never from here: `slint` resolves
+/// to `target/debug/notes-slint.exe`, and
+/// `the_binary_flag_parses_both_shapes_and_defaults_to_the_product` pins that.
 const BIN_REL: &str = GPUI_TARGET.exe_rel_debug;
 // EXE_NAME is gone entirely, with no wrapper left behind. It was a third copy of the
 // bin name, guarded only by a test comparing it to GPUI_TARGET.bin; once
@@ -428,6 +457,11 @@ const BIN_REL: &str = GPUI_TARGET.exe_rel_debug;
 // is the literal "notes-gpui.exe" in the test that pins what CI artifact paths and
 // xtask manifest assume by hand. Deleting a guarded duplicate beats guarding one;
 // deleting a duplicate's alias beats both.
+/// The build command the FROZEN `gpui` leg suggests when its exe will not start - the
+/// same leg as [BIN_REL], and the same reason not to widen it to the product. Every
+/// OTHER build text the harness prints takes the selected row's own [ArtifactTarget::
+/// build_args], so a bare run says "notes-slint" because that is the row it picked, not
+/// because a literal here was moved.
 const BUILD_HINT: &str = "cargo build -p notes-bridge-gpui --bin notes-gpui";
 const SESSION_FILE: &str = "session.json";
 /// The other file in the same directory, and the one the RECENTS live in (core's
@@ -3443,7 +3477,7 @@ pub fn manifest_of(root: &Path, exe: &Path) -> Result<crate::manifest::Markers, 
     let bytes = fs::read(exe).map_err(|e| format!("cannot read the exe: {e}"))?;
     Ok(crate::manifest::read_markers(&bytes, &identity, &wanted))
 }
-/// Entry point for `cargo xtask smoke [--reuse-state] [--no-build] [--require-ours] [--binary=gpui|slint|slint-probe]`".
+/// Entry point for `cargo xtask smoke [--reuse-state] [--no-build] [--require-ours] [--binary=slint|gpui|slint-probe]`; with no `--binary` the row is [DEFAULT_BINARY], the product.
 pub fn run(args: &[String]) -> i32 {
     // The contract first, before anything can fail: a log that shows a verdict
     // also shows the code table that verdict came out of.
@@ -6378,7 +6412,8 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
         assert_eq!(
             BIN_REL,
             format!("target/debug/{}.exe", GPUI_TARGET.bin),
-            "the default exe path and the launched name must agree about the same bin"
+            "the FROZEN gpui leg's own exe path and its launched name must agree about the \
+             same bin (this is not the default's path: a bare run judges notes-slint.exe)"
         );
         assert_eq!(
             SLINT_TARGET.exe_rel_debug,
@@ -6406,23 +6441,54 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
         );
     }
 
-    /// `--binary` parses in both shapes, defaults to the artifact every existing CI
-    /// step and developer run means, and refuses a name that is not one of the three
-    /// without losing the flag's value. The cases below are the whole surface of the
-    /// flag; the judgement it selects is the next test's business.
+    /// `--binary` parses in both shapes, defaults to THE PRODUCT, and refuses a name
+    /// that is not one of the three without losing the flag's value.
+    ///
+    /// This is the test that says what a bare run judges, and as of ADR-0006 it judges
+    /// `notes-slint.exe`. The default is asserted AGAINST [DEFAULT_BINARY] rather than a
+    /// literal, and the literal is asserted separately - so retargeting the const cannot
+    /// pass this test by accident, and cannot pass it while `main`'s usage line and the
+    /// resolved exe path still say gpui. `gpui` is still parsed explicitly, in both
+    /// shapes: frozen means it takes no new work, not that it stopped being legal.
     #[test]
-    fn the_binary_flag_parses_both_shapes_and_defaults_to_gpui() {
+    fn the_binary_flag_parses_both_shapes_and_defaults_to_the_product() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
-        assert_eq!(parse_args(&s(&[])).unwrap().binary, "gpui");
+        assert_eq!(parse_args(&s(&[])).unwrap().binary, DEFAULT_BINARY);
+        // ...and the const itself says the product, in the three ways a reader checks.
+        assert_eq!(
+            DEFAULT_BINARY, "slint",
+            "a bare run judges the product; if this moved, main.rs's usage line and every \
+             hint that names the default moved with it - or this test is now the only thing \
+             that knows the default"
+        );
+        assert_eq!(
+            BINARY_NAMES.get(1).copied(),
+            Some(DEFAULT_BINARY),
+            "the refusal text indexes BINARY_NAMES[1] as the product; the default is that \
+             same slot, so the order is load-bearing and a reorder is a retarget"
+        );
+        assert_eq!(
+            select_target(DEFAULT_BINARY).map(|t| (t.bin, t.exe_rel_debug)),
+            Some(("notes-slint", "target/debug/notes-slint.exe")),
+            "the default resolves to the PRODUCT exe - not the frozen bridge's file"
+        );
+        // A frozen target stays selectable, in both flag shapes.
+        assert_eq!(parse_args(&s(&["--binary=gpui"])).unwrap().binary, "gpui");
+        assert_eq!(
+            parse_args(&s(&["--binary", "gpui"])).unwrap().binary,
+            "gpui"
+        );
         assert_eq!(parse_args(&s(&["--binary=slint"])).unwrap().binary, "slint");
         assert_eq!(
             parse_args(&s(&["--binary", "slint-probe"])).unwrap().binary,
             "slint-probe"
         );
         // The other flags still work, and the value form does not eat its neighbour.
-        let mixed = parse_args(&s(&["--no-build", "--binary=slint", "--reuse-state"])).unwrap();
+        // Named NON-default on purpose: asking for `slint` here would pass even if the
+        // flag were ignored, because `slint` is what you get for free now.
+        let mixed = parse_args(&s(&["--no-build", "--binary=gpui", "--reuse-state"])).unwrap();
         assert!(mixed.no_build && mixed.reuse && !mixed.require_ours);
-        assert_eq!(mixed.binary, "slint");
+        assert_eq!(mixed.binary, "gpui");
         assert!(!parse_args(&s(&["--require-ours"])).unwrap().no_build);
     }
 
