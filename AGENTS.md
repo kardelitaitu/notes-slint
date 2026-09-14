@@ -24,9 +24,11 @@ first usable UI — is being built slice by slice on top of that engine, and as 
 being built on **two** bridges: `bridge-gpui`, and `bridge-slint`, which now ships a product
 (`notes-slint`) beside the instrumented probe that earned it (`notes-slint-probe`).
 
-The architecture invariants below are live, not aspirations: CI already runs the layering
-gate (`cargo xtask check-arch` in `.github/workflows/ci.yml`), and it fails the build when
-a boundary is crossed.
+The architecture invariants below are live, not aspirations: the layering gate
+(`cargo xtask check-arch`) is wired into `.github/workflows/ci.yml`, and a violation fails the
+build there. That is a fact about the file, not yet about the evidence — the workflow has run
+once, its `arch` step was skipped behind a failing test, so no runner has ever enforced it
+(see the CI sentence in the last bullet below).
 
 ## Architecture invariants
 
@@ -85,10 +87,22 @@ Rules that are easy to break politely:
 - **Do no harm.** Loading then saving a foreign file must be byte-identical: preserve
   encoding, BOM, line endings, trailing newline (whitepaper §4.5). Round-trip fixtures in
   `crates/core/tests/fixtures/` gate this; never "normalise" a file to be tidy.
-- **No M2 check's status moves on either bridge's account pre-CI** — not up on `bridge-slint`'s, because
-  `git remote -v` is empty and no workflow has ever run, and not down on `bridge-gpui`'s, because it is
-  frozen with its proofs still compiling (ADR-0006). The honesty gate is symmetric: a row that can only
-  travel one way is not a gate, it is a narrative.
+- **No M2 check's status moves on either bridge's account until CI is green** — not up on
+  `bridge-slint`'s, and the reason is no longer that CI does not exist: `origin` exists, and its **first
+  run (#1, head `4a107888`) completed as `failure`** at 21:41:38Z on 2026-09-14 — once, and red, twice,
+  in two different ways. On `gate / windows`, fmt, clippy, `check-deps`, `fixtures verify` and the docs
+  validator all passed and exactly one unit test failed:
+  `save::tests::locked_target_reports_locked_end_to_end` (157 passed, 1 failed). The three steps that
+  ran after it prove the manifests, the round-trip fixtures and the doc set; what it skipped is the
+  point — both bridges' build/clippy steps, `manifest`, both smoke legs, and `check-arch`,
+  `check-unsafe`, `check` and `check-ci`. So no machine has ever enforced the invariants below: a
+  step that never ran is silence, not a pass. `core-portable / ubuntu` is the other, unrelated red:
+  clippy failed on four unused-code findings in one test target, its `test` step was skipped, and its
+  `fixtures verify` passed on Linux — core's Linux portability is therefore *unknown*, not disproved,
+  and neither reading moves a row. `bridge-gpui / advisory` — a job whose own name reads
+  *tests only; never gates* — passed, which says only that its tests compiled and ran. Not down
+  on `bridge-gpui`'s either: it is frozen with its proofs still compiling (ADR-0006). The honesty
+  gate is symmetric: a row that can only travel one way is not a gate, it is a narrative.
 
 ## Deliberate non-goals
 
