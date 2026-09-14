@@ -40,7 +40,7 @@ use slint::{ComponentHandle, PhysicalPosition};
 
 use crate::Spike;
 use crate::plumbing::{
-    describe, dialog_allowed, do_no_harm, lf, note_dot, publish_title, report, send,
+    describe, dialog_allowed, do_no_harm, hwnd_of, lf, note_dot, publish_title, report, send,
 };
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DialogKind {
@@ -925,11 +925,18 @@ pub(crate) struct Pump {
     /// would name an attribute to the OS ~125 times a second; with it, a normal→maximised
     /// transition costs exactly one command. `ask_corners` is the only writer.
     pub(crate) corners_asked: Option<bool>,
-    /// C4: the OS said no, and this bridge believes it. The corner attribute is Windows 11+
-    /// and the support floor (R11) is Windows 10, where EVERY ask answers
-    /// `CornerRoundingFailed` - so the refusal has to retire the asking, not merely print.
-    /// Nothing else changes: the note stays square, which is what it was before corners were
-    /// a question, and the log says why. This is also the reason there is no retry.
+    /// C4: the OS said no, and this bridge believes it - the PERMANENT no, and only that one.
+    /// The corner attribute is Windows 11+ and the support floor (R11) is Windows 10, where the
+    /// SET call itself answers every ask; THAT refusal has to retire the asking, not merely
+    /// print. FIX-A (D2, 2026-09-15): a refusal naming any other call is transient - a handle
+    /// that went stale after the guard, a read that failed, a read-back contradicting an `S_OK` -
+    /// and retiring on one of those retired the SQUARE ask with it, which is how a maximised
+    /// note spent a whole run floating round over the taskbar. See
+    /// `corner_refusal_is_permanent`, which is where the two are told apart.
+    ///
+    /// There is still no retry on the SAME shape: `corners_asked` above is what bounds the rate,
+    /// and a transient refusal leaves it standing. Nothing else changes - the note stays square,
+    /// which is what it was before corners were a question, and the log says why.
     pub(crate) corners_refused: bool,
     /// How many autosave toggles this bridge has sent. The port echoes NO autosave event,
     /// so the menu check can only follow the ask - printed as 'menu: ...' so the
@@ -1018,13 +1025,10 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
             // rendered: the pin answers here because the strip DISPLAYS a pin, and a corner
             // displays itself. What this arm does instead is retire the asking - see
             // `Pump::corners_refused` - so a Windows 10 run prints once rather than once per
-            // maximise, which is the only reason the event exists at all.
-            Event::CornerRoundingFailed { reason } => {
-                pump.borrow_mut().corners_refused = true;
-                report(&format!(
-                    "corners: the OS refused the request ({reason}); not asking again this run"
-                ));
-            }
+            // maximise, which is the only reason the event exists at all. FIX-A (D2): WHICH
+            // refusals retire it is decided in `note_corner_refusal`, one call down, because
+            // latching on a transient one cost the square ask too.
+            Event::CornerRoundingFailed { reason } => note_corner_refusal(pump, reason),
             // (b) THE GENERATION, captured from the only two events that issue it.
             // grep of crates/api/src/event.rs: `Loaded { path, text, meta, epoch }`
             // (event.rs:308) and `Rebound { path, meta, revision, epoch }` (:369).
@@ -1507,7 +1511,14 @@ pub(crate) fn wire_callbacks(
             // dialog, and the user watches it happen. Read BACK rather than `want`
             // because this act is the toolkit's, not ours; if the read lags the ask, the
             // dedupe in `ask_corners` lets the next wake correct it by one command.
-            ask_corners(&gw, &pump, !window.is_maximized(), false);
+            //
+            // FIX-A (D1): the same gate the product tick passes, read the same way the tick's
+            // registration reads it - `hwnd_of` is the one question the port's register command
+            // answers. A caption button cannot be clicked before the window exists, so today this
+            // is belt-and-braces; it is spelled out because the gate belongs in the policy, not
+            // in the memory of whichever caller got there first.
+            let wired = hwnd_of(window).is_some();
+            ask_corners(&gw, &pump, !window.is_maximized(), false, wired);
             send(&gw, Command::GeometryChanged);
         });
     }
@@ -1824,28 +1835,136 @@ fn drag_by(weak: &slint::Weak<Spike>, pump: &RefCell<Pump>, dx: f32, dy: f32) {
 /// bit reads false for a window that is maximised, so an ask made there would be a fact about
 /// the park. Skipping is safe because the wake after the restore sees the real state, and the
 /// same reasoning already governs the rect two lines from that call site.
+///
+/// `wired` is the third gate, and the one that used to be missing (FIX-A / D1, 2026-09-15):
+/// HAS A WINDOW ACTUALLY REACHED THE PORT. Startup law says the handle may not exist after
+/// `show()`, and this wake runs from the first tick, so the first asks of a run used to be made
+/// into an engine with nothing registered - and the engine's corner arm, api's engine.rs:838-852,
+/// is `if let Some(handle) = self.window` with NO else and NO event: a drop
+/// so complete that not even a refusal came back. The bridge latched the shape it had not asked
+/// for and printed "round" for it, so the note was square for the whole session behind a log
+/// line saying otherwise. THAT is why the gate is a parameter rather than a check inside: the
+/// one fact that decides it - a handle the engine holds - is held by the caller's registration,
+/// and a policy function that guesses it is the second copy the law forbids. Each call site
+/// passes the truth nearest it: the product tick threads its own registration latch, and the
+/// caption's toggle reads the handle the same way that latch was set.
+///
+/// OUT: `Some(round)` when this wake spoke - the shape asked for, which is also the fact the
+/// tests below assert. `None` means this function neither sent, nor latched, nor printed: the
+/// three are one branch, and no gate can silence one of them while leaving the others.
 pub(crate) fn ask_corners(
     gateway: &Rc<RefCell<Option<Gateway>>>,
     pump: &RefCell<Pump>,
     round: bool,
     parked: bool,
-) {
-    if parked {
-        return;
-    }
-    {
-        let p = pump.borrow();
-        if p.corners_refused || p.corners_asked == Some(round) {
-            return;
+    wired: bool,
+) -> Option<bool> {
+    let verdict = {
+        let mut p = pump.borrow_mut();
+        // THE GATES, as a pure decision (`corner_says_ask`) so all four are testable with no
+        // window and no engine; the latch moves only when the verdict says to send.
+        let verdict = corner_says_ask(p.corners_asked, p.corners_refused, round, parked, wired);
+        if verdict {
+            p.corners_asked = Some(round);
         }
+        verdict
+    };
+    if !verdict {
+        return None;
     }
-    pump.borrow_mut().corners_asked = Some(round);
-    report(&format!(
+    report(&corner_words(round));
+    send(gateway, Command::SetCornerRounding(round));
+    Some(round)
+}
+
+/// The corner policy's ONE question: does this wake ask? Pure, in the shape `register_says` and
+/// `settle_says` already take - four remembered bits in, one bool out - so the guards are
+/// testable without a window, an engine, or the 8 ms clock.
+///
+/// The order is the order of cost, cheapest first, and the two FIX-A gates (`wired`, `parked`)
+/// sit BEFORE the dedupe on purpose: they are not repeats, they are wakes that must not even
+/// latch, so that the wake after them is free to ask. A gate placed after `asked == Some(round)`
+/// would be a gate that a silent first wake had already disarmed.
+fn corner_says_ask(
+    asked: Option<bool>,
+    retired: bool,
+    round: bool,
+    parked: bool,
+    wired: bool,
+) -> bool {
+    // No handle at the port: the command would be dropped in silence, so nothing is asked,
+    // nothing is remembered, and nothing is said. In the OS's parking lot: the shape this wake
+    // read is not the window's shape. Retired by a PERMANENT refusal: the asking is over. And
+    // the dedupe: one ask per shape change, because the caller is a wake that runs 125 times a
+    // second.
+    wired && !parked && !retired && asked != Some(round)
+}
+
+/// The one line an ask prints, returned rather than printed so a test can name the words the
+/// log carries without capturing stderr. Byte-for-byte the sentence this function used to build
+/// inline: the smoke lane's corners row depends on it, and D1's whole complaint was that the
+/// line could be said without a send behind it - so the fix is the gate, never the wording.
+fn corner_words(round: bool) -> String {
+    format!(
         "corners: {} (the window is {})",
         if round { "round" } else { "square" },
         if round { "normal" } else { "maximised" }
+    )
+}
+
+/// The Win32 entry point whose refusal means the OS has never heard of the attribute:
+/// `DwmSetWindowAttribute` failing IS the Windows 10 case, and no later ask will go differently.
+const SET_CORNER_API: &str = "DwmSetWindowAttribute";
+
+/// Which refusals retire the corner asking: only the one that names the SET call.
+///
+/// THE BUG THIS KILLS (FIX-A / D2). `Event::CornerRoundingFailed` used to latch
+/// `corners_refused` whatever the reason said, and the reasons are not one thing. Three of the
+/// four refusals `platform` can return are TRANSIENT - `InvalidHandle` (the handle went stale
+/// between the guard and the call: platform/lib.rs says a guard cannot hold a window open),
+/// a `DwmGetWindowAttribute` that failed outright, and the read-back contradiction, which is
+/// this crate's own sentence about a preference some policy or theme owns. Retiring on any of
+/// them also retired the SQUARE ask, so one hiccup in a single round ask left a maximised note
+/// floating round over the taskbar for the rest of the run - the exact defect the corner policy
+/// exists to prevent. A transient refusal now prints, leaves `corners_asked` standing, and the
+/// next shape change asks again; the rate is bounded by that dedupe rather than by a latch.
+///
+/// WHY A STRING, AND WHAT WOULD REPLACE IT: the port FLATTENS the typed refusal -
+/// `engine.rs:1777-1787` does `reason: error.to_string()` - so by the time the bridge sees it,
+/// `PlatformError`'s shape is gone and a `match` is not available at this layer (and reaching
+/// for `platform`'s type from a bridge is the layering violation check-arch exists to fail).
+/// What survives the flattening is the SENTENCE, and `PlatformError::Win32`'s Display is
+/// `"Win32 {api} failed: {message}"` with `api` naming the call that refused
+/// (platform/lib.rs:96-108; corners.rs:97-98 hands it `"DwmSetWindowAttribute"`, and the
+/// read-back branch hands it `"DwmGetWindowAttribute"`). Naming the failing api is therefore
+/// documented behaviour of the port's contract, not an accident of formatting - but it is still
+/// prose, so the test below feeds the EXACT shapes both ends produce and a Display change that
+/// drops the api name fails there rather than silently retiring asks again.
+///
+/// The right replacement is a TYPED refusal: an `Event::CornerRoundingRejected { api, message }`,
+/// or a `permanent: bool` decided down in `platform`, where the variant is still known. Either
+/// way this function becomes a `match` on `api`, and this paragraph becomes a line in the port's
+/// changelog. That is a request into `api` (15 Events are pinned), not an edit this fence can
+/// make.
+fn corner_refusal_is_permanent(reason: &str) -> bool {
+    reason.contains(SET_CORNER_API)
+}
+
+/// What a refusal does to the asking, and what it says. Split out of `drain` so the two kinds
+/// of refusal are testable without an engine to emit the event.
+fn note_corner_refusal(pump: &RefCell<Pump>, reason: &str) {
+    let permanent = corner_refusal_is_permanent(reason);
+    if permanent {
+        pump.borrow_mut().corners_refused = true;
+    }
+    report(&format!(
+        "corners: the OS refused the request ({reason}); {}",
+        if permanent {
+            "not asking again this run"
+        } else {
+            "transient - the next shape change asks again"
+        }
     ));
-    send(gateway, Command::SetCornerRounding(round));
 }
 
 #[cfg(test)]
@@ -1855,9 +1974,13 @@ mod tests {
     // separate function. The recents tests are the same argument one step on: a ROW BUILDER that
     // touches no window can be driven by real files, so it is driven by real files.
     use super::{
-        DragEpisode, MAX_RECENTS, RecentEntry, RecentRow, SHORTCUTS, drag_destination, recents_rows,
+        DragEpisode, MAX_RECENTS, Pump, RecentEntry, RecentRow, SHORTCUTS, ask_corners,
+        corner_refusal_is_permanent, corner_says_ask, corner_words, drag_destination,
+        note_corner_refusal, recents_rows,
     };
+    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const MARKUP: &str = include_str!("../ui/main.slint");
@@ -2571,5 +2694,159 @@ mod tests {
             src.contains("drag_episode.end()"),
             "and an episode is only safe because the release closes it"
         );
+    }
+
+    // ---- FIX-A: the CORNERS POLICY's gates, driven with no window and no engine. ----
+    // The shape is the one `register_says` takes: what a wake DECIDES comes off the pump as a
+    // pure verdict, so the decision is testable and only the SENDING needs a live note. What
+    // these four cannot prove is that the corners are round on the screen - that claim stays
+    // with the eye-pass in .agents/notes/implemented/2026-09-14-rounded-corners-dwm.md.
+
+    #[test]
+    fn a_wake_that_sees_no_window_latches_nothing_and_says_nothing() {
+        // D1, the startup law applied to corners: winit has not materialised the platform
+        // window yet, the port holds no handle, and the engine's corner arm drops the command
+        // with no event at all (crates/api/src/engine.rs:838-852). Fifteen normal-shape wakes
+        // like that - well over one second of 8 ms ticks - must leave the pump EXACTLY as it
+        // was. The bug this pins latched Some(true) and printed "round" on the FIRST of them.
+        let gw = Rc::new(RefCell::new(None));
+        let pump = RefCell::new(Pump::default());
+        for _ in 0..15 {
+            assert_eq!(
+                ask_corners(&gw, &pump, true, false, false),
+                None,
+                "an unwired wake asked"
+            );
+        }
+        assert_eq!(
+            pump.borrow().corners_asked,
+            None,
+            "an unwired wake latched a shape - the square-note-for-the-session bug, back"
+        );
+        // The latch, the line and the send are ONE branch behind ONE verdict, so a test that
+        // sees no verdict has seen no print: no path prints without latching, and none
+        // latches without sending. The gate the caller obeys is this one:
+        assert!(!corner_says_ask(None, false, true, false, false));
+        // The wake that CAN name a handle asks, once, and remembers what it really sent.
+        assert_eq!(ask_corners(&gw, &pump, true, false, true), Some(true));
+        assert_eq!(pump.borrow().corners_asked, Some(true));
+        // And the words are pinned, because a smoke lane reads this row and D1's complaint
+        // was the LINE'S TRUTH, never its wording.
+        assert_eq!(corner_words(true), "corners: round (the window is normal)");
+        assert_eq!(
+            corner_words(false),
+            "corners: square (the window is maximised)"
+        );
+    }
+
+    #[test]
+    fn a_transient_refusal_leaves_the_next_shape_askable() {
+        // D2, against the three refusals `platform` really produces that are NOT the OS
+        // saying it has never heard of attribute 33. These strings are the shapes, not
+        // paraphrases: `PlatformError::InvalidHandle`'s Display, and `Win32 { api, message }`
+        // rendered by that Display for the two api names the corners seam fills in - a failed
+        // read, and a read-back that contradicts an S_OK (crates/platform/src/lib.rs:88-108,
+        // crates/platform/src/windows/corners.rs:60-103).
+        let transient = [
+            "invalid window handle",
+            "Win32 DwmGetWindowAttribute failed: The parameter is incorrect. (0x80070057)",
+            "Win32 DwmGetWindowAttribute failed: the window reports DWMWCP_DEFAULT, not the requested DWMWCP_ROUND (attribute 33)",
+        ];
+        for reason in transient {
+            assert!(
+                !corner_refusal_is_permanent(reason),
+                "{reason} is not the SET call refusing"
+            );
+            let gw = Rc::new(RefCell::new(None));
+            let pump = RefCell::new(Pump::default());
+            assert_eq!(ask_corners(&gw, &pump, true, false, true), Some(true));
+            note_corner_refusal(&pump, reason);
+            assert!(
+                !pump.borrow().corners_refused,
+                "{reason} retired the asking for the whole run"
+            );
+            // THE DEFECT: the old latch killed the SQUARE ask with it, so one transient "no"
+            // left a maximised note floating round over the taskbar until the process ended.
+            // A shape change now gets its command, and the dedupe - not a latch - is what
+            // bounds the rate.
+            assert_eq!(
+                ask_corners(&gw, &pump, false, false, true),
+                Some(false),
+                "{reason} silenced the next shape change"
+            );
+        }
+    }
+
+    #[test]
+    fn a_set_call_refusal_is_silence_for_the_rest_of_the_run() {
+        // D2's other half, and the one case the retirement exists for: Windows 10 - R11's
+        // support floor - has no attribute 33, so the SET call itself refuses and no later ask
+        // can go differently (crates/platform/src/windows/corners.rs:33-40 says so on the
+        // seam). String-matching it is the port's own flattening, not this bridge's choice;
+        // see `corner_refusal_is_permanent` for the typed event that would replace the match.
+        let reason = "Win32 DwmSetWindowAttribute failed: The parameter is incorrect. (0x80070057)";
+        assert!(corner_refusal_is_permanent(reason));
+        let gw = Rc::new(RefCell::new(None));
+        let pump = RefCell::new(Pump::default());
+        assert_eq!(ask_corners(&gw, &pump, true, false, true), Some(true));
+        note_corner_refusal(&pump, reason);
+        assert!(
+            pump.borrow().corners_refused,
+            "a permanent no left asking alive"
+        );
+        // Silence for the rest of the run, in BOTH shapes and across many wakes: one print was
+        // the whole reason the event exists, one per maximise is the noise it was cut for, and
+        // one per wake is the storm P1b retired everywhere else in this loop.
+        for shape in [false, true, false] {
+            for _ in 0..8 {
+                assert_eq!(
+                    ask_corners(&gw, &pump, shape, false, true),
+                    None,
+                    "a retired asking spoke again"
+                );
+            }
+        }
+        // A permanent no is silent on the parked and unwired wakes too.
+        assert!(!corner_says_ask(Some(true), true, false, false, true));
+        assert!(!corner_says_ask(Some(true), true, false, true, true));
+    }
+
+    #[test]
+    fn the_corner_dedupe_still_collapses_repeats() {
+        // (d) The gate that predates FIX-A, still the only thing bounding the rate: 100 wakes
+        // of a held shape cost ONE ask, not a hundred attribute calls ~125 times a second.
+        let gw = Rc::new(RefCell::new(None));
+        let pump = RefCell::new(Pump::default());
+        let wakes: Vec<Option<bool>> = (0..100)
+            .map(|_| ask_corners(&gw, &pump, true, false, true))
+            .collect();
+        assert_eq!(
+            wakes.iter().filter(|asked| asked.is_some()).count(),
+            1,
+            "a held normal window must cost exactly one ask"
+        );
+        // A held maximisation: one more, and it is the square one.
+        let held: Vec<Option<bool>> = (0..100)
+            .map(|_| ask_corners(&gw, &pump, false, false, true))
+            .collect();
+        assert_eq!(
+            held.iter().filter(|asked| asked.is_some()).count(),
+            1,
+            "a held maximise must cost exactly one ask"
+        );
+        // Through the park and back: a parked wake says nothing (the maximised bit there is a
+        // fact about the OS's parking lot), the wake after the restore asks once, and its own
+        // repeat asks not at all.
+        assert_eq!(
+            ask_corners(&gw, &pump, true, true, true),
+            None,
+            "a parked wake asked"
+        );
+        assert_eq!(ask_corners(&gw, &pump, true, false, true), Some(true));
+        assert_eq!(ask_corners(&gw, &pump, true, false, true), None);
+        // And the pure gate agrees with every call above: the caller keeps no second copy of
+        // the rule that decides it.
+        assert!(!corner_says_ask(Some(true), false, true, false, true));
+        assert!(corner_says_ask(Some(true), false, false, false, true));
     }
 }

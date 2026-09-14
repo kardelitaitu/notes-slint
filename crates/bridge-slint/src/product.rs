@@ -539,7 +539,21 @@ fn main() {
             // so this is the safety net for every way a maximisation happens that this root
             // did not initiate: Win+Up, a snap layout, dragging the note to a screen edge,
             // the caption button, or a restored maximised session.
-            ask_corners(&tick_gw, &tick_pump, !print.maximized, parked);
+            //
+            // FIX-A (D1): THE SAME TRUTH THE REGISTRATION ABOVE IS GATED ON, THREADED - the
+            // startup law's hazard applied one line further down. `Register::last` is set only
+            // inside the `if let Some(hwnd)` two statements after the `Command::RegisterWindow`
+            // send, so `last.is_some()` IS the sentence "the port holds a handle for this
+            // window", and the gateway is FIFO: on the wake that registers, that send is
+            // already in the channel ahead of the corner ask made here. Before that wake the
+            // engine holds no handle, and its corner arm is `if let Some(handle) = self.window`
+            // with NO else and NO refusal event (crates/api/src/engine.rs:838-852) - the ask
+            // vanished, while this wake latched the shape and printed "corners: round". A
+            // square note for the session behind a log line claiming otherwise, unrecoverable,
+            // because the dedupe then refused every later ask for that shape. Silence is the
+            // fix, and it costs nothing: the wake after the handle lands asks for real.
+            let wired = tick_register.borrow().last.is_some();
+            ask_corners(&tick_gw, &tick_pump, !print.maximized, parked, wired);
             let mut st = tick_settle.borrow_mut();
             let same = st.seen.as_ref().is_some_and(|previous| {
                 previous.x == measured.x
