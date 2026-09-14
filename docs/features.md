@@ -75,8 +75,8 @@ sidebar — that distinction is now explicit and tabs are a stated non-goal (§3
 | **Open…** | Native file dialog, filtered to `.notes` first, all text types available. | `Ctrl+O` |
 | **Save** | Write to the current path. With autosave on this is a manual flush, not a distinct action — keep it anyway for muscle memory. | `Ctrl+S` |
 | **Save As…** | New path, and the document *rebinds* to it. Subsequent autosaves go to the new path. | `Ctrl+Shift+S` |
-| **Auto-save** | Toggle, with a visible checked state. Persisted. | — |
-| **Recent files** | Up to 10, most recent first. | `Ctrl+R` (optional) |
+| **Auto-save** | Toggle, with a visible checked state. Persisted. | `Ctrl+T` |
+| **Recent files** | Up to 10, most recent first, one chord per slot; `Clear recent` is its own row. | `Alt+1`…`Alt+0` (the tenth is `Alt+0`), clear with `Ctrl+Shift+R` |
 
 Consequences that need designing, not assuming:
 

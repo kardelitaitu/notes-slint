@@ -297,7 +297,8 @@ So the gateway must be **command/event**, not call/return:
 enum Command {
     Open(PathBuf),
     SaveAs { path: PathBuf, text: String, revision: u64 },
-    Flush { text: String, revision: u64, epoch: u64 },  // Ctrl+S and every autosave trigger
+    Save  { text: String, revision: u64, epoch: u64 },  // ADR-0007: the Save row, Ctrl+S, the path the document already has
+    Flush { text: String, revision: u64, epoch: u64 },  // the autosave timer and the pre-Shutdown flush - never Ctrl+S
     SetAutosave(bool),
     SetPinned(bool),
     ClearRecents,
@@ -315,6 +316,10 @@ enum Event {
 }
 ```
 
+This is the founding sketch, not the shipped vocabulary: `crates/api/src/command.rs` is the enum
+that exists, and it carries these plus `SetCornerRounding`, `RegisterWindow`, `GeometryChanged`
+and `UnregisterWindow`, with `Open` a struct variant there. What the sketch is for has not
+changed: commands in, events out, and the async failure with no caller to return `Err` to.
 `FileMeta` is where §4.5's do-no-harm data surfaces: encoding, line ending, trailing
 newline, read-only flag, and the size-guard verdict. The UI needs read-only and
 oversize to render honestly, and `status.rs` needs `SaveFailed` to go amber (§4.4).

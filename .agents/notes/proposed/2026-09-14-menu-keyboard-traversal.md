@@ -10,14 +10,16 @@ decision: null
 
 ## Question
 
-The popup has six command rows and a list of recents. A pointer reaches all of them; the keyboard
-reaches all of them **one at a time, by memorised chord** — and the count of those chords is
-fourteen, not fourteen-plus-ten: `SHORTCUTS` (`surface.rs:121-141`) is **four command chords**
-(Ctrl+O, Ctrl+S, Ctrl+T, Ctrl+Shift+R) **and the ten `Alt+1..0` recents doors**, which are rows 5
-through 14 of the same table. So `Alt+1..0` is inside the fourteen, not an addition to them. What
-the popup itself prints is narrower again — four chord cells, because a recents row carries its slot
-number in its label instead of an `Alt+n` (`plumbing.rs:803-807`, `:851-854`) — and it is the status
-line's legend that prints all fourteen. There is no way to move a visible current row with
+The popup has **seven** command rows and a list of recents — six when this note was filed, and
+A5's `Save` row made it seven, which `plumbing.rs`'s own census states: "seven command rows
+since A5's Save row, seven chord cells". A pointer reaches all of them; the keyboard reaches all of
+them **one at a time, by memorised chord** — and the count of those chords is fifteen, not
+fifteen-plus-ten: `SHORTCUTS` (`surface.rs:121-146`) is **five command chords**
+(Ctrl+O, Ctrl+S, Ctrl+Shift+S, Ctrl+T, Ctrl+Shift+R) **and the ten `Alt+1..0` recents doors**, which
+are rows 6 through 15 of the same table. So `Alt+1..0` is inside the fifteen, not an addition to
+them. What the popup itself prints is the seven chord cells of those command rows, because a recents
+row carries its slot number in its label instead of an `Alt+n` — and it is the status line's legend
+that prints all fifteen. There is no way to move a visible current row with
 `Up`/`Down` and press `Return`,
 and `docs/features.md` §4.4's menu has never promised one, so this is not a regression: it is the
 gap the previous slice found when it went looking for what the hand-rolled popup costs.

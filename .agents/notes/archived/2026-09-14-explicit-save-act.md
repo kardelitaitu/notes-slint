@@ -1,12 +1,15 @@
 ---
 title: The explicit save ADR-0001 waits for does not exist
-status: proposed
+status: archived
 id: 2026-09-14-explicit-save-act
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-15
 relates: [ADR-0001, ADR-0006, §4.4, §4.5]
-decision: null
+decision: docs/decisions/0007-save-is-a-conformance.md
 ---
+
+> Superseded by ADR-0007 on 2026-09-15 — the ask shipped as `Command::Save`; the body below stands
+> as written, including the drafting recommendation the ADR overruled.
 
 ## Question
 

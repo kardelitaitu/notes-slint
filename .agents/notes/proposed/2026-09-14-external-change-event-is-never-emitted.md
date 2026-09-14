@@ -3,7 +3,7 @@ title: ExternalChange is declared, rendered, and never emitted
 status: proposed
 id: 2026-09-14-external-change-event-is-never-emitted
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-15
 relates: [§4.2, §4.5, §5.4, §8, §9, §10]
 decision: null
 ---
@@ -182,6 +182,17 @@ that would catch it, disarmed — while three documents, one of them an `impleme
 describe the mechanism as present. The `#[ignore]` reason is currently the most accurate
 sentence about document debounce in the tree.
 
+**This is the note's second live instance, and it is still open.** The index sentence —
+`README.md:23`, "Autosaves | Continuously, **debounced**, atomically." — asserts a behaviour the
+suite deliberately declines to prove, and it has now been flagged twice while working the intent
+docs without being changed. It was not changed here, on purpose: softening or striking that word
+is a **status move**, so it is gated. The symmetry that stops an M2 or M4 row travelling **up**
+before CI is the same thing stopping the word from being deleted — AGENTS.md's reason is exactly
+this: "a row that can only travel one way is not a gate, it is a narrative." So this note records
+the gap, edits no README, and does not touch the `#[ignore]`. The owner of the gate decides, and
+the two honest exits are the same pair as above: build the document debounce so the test can be
+un-ignored, or stop advertising the word — with CI's account, not this note's.
+
 ## Recommendation
 
 **Hold both options, and do the cheap probes first.** Concretely:
@@ -198,9 +209,11 @@ sentence about document debounce in the tree.
 4. If it is not meant to, then Option B happens **with** the CI evidence that makes a row move
    legal, in one commit that also names where the promise went (a §10 entry), not as a quiet
    doc edit.
-5. The debounce prose is separable from all of the above and needs no CI to settle: one of
-   `README.md:23`, `docs/roadmap.md:179`, and `debounce.rs:69` is wrong. Which one is the
-   human's call — it is a wording decision about a claim, not a status row.
+5. The debounce word is **not** separable after all, and this note's first draft claimed it was:
+   softening or striking `debounced` in `README.md:23` is a status move, so it waits on CI exactly as
+   Options A and B do. What survives the correction: one of `README.md:23`, `docs/roadmap.md:179`
+   and `debounce.rs:69` is wrong, and it is the human's call which — but the call is gated, not
+   free.
 
 ## Consequences
 

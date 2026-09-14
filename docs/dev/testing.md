@@ -112,20 +112,56 @@ schedule keeps running as evidence while nothing new is added to it.
 ### The Product leg, and what its green does not buy
 
 `--binary=slint` runs a **different contract**, not a shorter version of the gpui one. It
-reads the startup lines off the product's own piped stderr, asserts the window is still
-there at 45 s (nothing in the product self-hides, so "alive" is assertable rather than
-inferred), and sends a `WM_CLOSE` the app must answer by exiting 0 on its own. The pass
-line is the disclaimer, in the same breath:
+reads the startup lines off the product's own piped stderr, asserts the window is still there at
+45 s (`PRODUCT_ALIVE_SECS`; nothing in the product self-hides, so "alive" is assertable rather
+than inferred), sends a `WM_CLOSE` the app must answer by exiting 0 on its own, and then runs
+two more things than this page used to admit: the geometry cycle and one real chord.
 
-> `smoke:   what this proves: notes-slint said its startup lines, was still on screen at
-> 45s, took a WM_CLOSE, said the close and the joined shutdown, and left with 0 by
-> itself. What it does NOT prove: the rect, the pin, the recents trace, or the maximised
-> cycle - those are the needle schedule's claims, and this leg does not run it.`
+The pass line is the contract, in the harness's own words (the `what this proves:` print in
+`crates/xtask/src/smoke.rs`):
 
-So a green `--binary=slint` is proof of **launch, presence and an honest shutdown** for the
-shipping exe — and it says so rather than leaving the reader to assume the M3/M4 promises
-came with it. The leg deliberately does not move the user's `session.json`, seed a recent,
-read a rect or poll a pin.
+> `smoke:   what this proves: notes-slint.exe said its startup lines, was still on screen at
+> 45s, took a WM_CLOSE, said the close and the joined shutdown, left with 0 by itself, and then
+> did the thing this leg used to refuse to read: a real maximise, a close, a relaunch and a close
+> again, with the restore rect unchanged to the pixel. That is the M9 window-memory promise,
+> measured on PRODUCT bytes.`
+
+and the next line still prints what it does **not** prove: the pin, the dragged-rect round trip,
+the recents trace, and SAVE AS by pointer. The maximised cycle left that list when
+`ProductCycle::Held` became part of this lane — the `smoke: geometry: drift=(…)`
+verdict=HELD line is the same measurement — and §9 records the cycle against `bdf9b844`.
+
+**One chord is pressed for real.** S9b item 5 (`product_autosave_toggle`) launches the product
+again in probe **mode 3** and drives `Ctrl+T` through the operating system: `keybd_event` with a
+real scancode from `MapVirtualKeyW`, and the foreground lock broken by `AttachThreadInput` twice —
+the recipe is written down as paid-for, because a bare `SetForegroundWindow` with scan-0 keys
+"landed a chord on the outermost scope and never a letter on the caret". The verdict is not a line
+the app chose to log: `judge_toggle` returns `Held` from four readings of the product's own scratch
+draft on disk — window foreground, a baseline edit that landed with autosave ON, the edit typed
+after the first `Ctrl+T` **absent**, the edit after the second **present**. `smoke: autosave-toggle:
+off-held on-landed` summarises those bytes, and `restore_draft` puts the file back. That is
+behavioural evidence about **one** chord; it says nothing about `Ctrl+O`, `Alt+1`, the pin, or
+which legend row a chord is listed against.
+
+**Four press legs exist, and none has a recorded green run.** Modes 4–7 — `THE MENU ANSWERS A REAL
+CLICK`, `THE REFUSAL PROOF`, `THE NATIVE DIALOG ON CAMERA`,
+`LEG C: THE DRAG CLOSES THE POPUP` — are the only instruments in this repo that inject a mouse
+press, and no other leg presses a key at all.
+The tail is honest about which of them answered: it prints "A pointer then pressed its own menu,
+and it answered: …" only when every leg reported `Held`, and otherwise prints the count and names
+the rest. What the tree does not hold is a recorded run of those four, which is the finding in
+[`2026-09-15-no-instrument-tests-a-pointer`](../../.agents/notes/proposed/2026-09-15-no-instrument-tests-a-pointer.md).
+Present, wired, unproven — in both directions, that is the whole claim.
+
+So a green `--binary=slint` is proof of **launch, presence, an honest shutdown, the restore-rect
+fixed point, and the auto-save toggle round-tripped through its chord** — and not of the pin, the
+dragged rect, the recents trace, or any pointer press.
+
+**The lane is not read-only, and does not claim to be.** It reads the user's `session.json` and puts
+it back around itself, deliberately keeping a session the app genuinely rewrote rather than
+restoring a stale one, and the toggle leg types into the product's `notes/untitled.notes` draft and
+restores it. Run it on a machine whose state you care about with your eyes open; the rule above
+still holds — a green here is **advisory, never a gate**.
 
 ### `slint-probe` declines, out loud
 

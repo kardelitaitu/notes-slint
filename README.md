@@ -23,7 +23,7 @@ product, and the editing surface can stay deliberately minimal.
 | **Autosaves** | Continuously, debounced, atomically. No save dialog and no "save changes?" prompt. Toggleable. |
 | **Pins** | One click (plus a shortcut) puts it above every other window. State persists. |
 | **Plays nicely with files** | Native `.notes` format, but opens ordinary text files too — and will not silently change their encoding or line endings. |
-| **Menu** | Open, Save As, recent files (up to 10) with Clear, auto-save toggle. There is no plain Save — and because Windows stores the menu bar without drawing it, these commands reach the user as key chords: Ctrl+O, Ctrl+S, Ctrl+T, Ctrl+Shift+R, Alt+1–0. |
+| **Menu** | Open, Save, Save As, auto-save toggle, recent files (up to 10) with Clear. Because Windows stores the menu bar without drawing it, the commands reach the user as key chords too, and the startup legend prints exactly these rows in exactly this order: `Ctrl+O` Open · `Ctrl+S` Save · `Ctrl+Shift+S` Save As · `Ctrl+T` toggle auto-save · `Ctrl+Shift+R` clear recent files · `Alt+1`…`Alt+0` recent 1…10 (`Alt+0` is the tenth). One table generates all of it — `SHORTCUTS` in `crates/bridge-slint/src/surface.rs` — and docs/features.md §4.4 owns the command list it implements. |
 
 ## Stack
 
@@ -67,7 +67,7 @@ placement validator fails the build when two files claim the same section.
 |---|---|
 | **M0** | **Spike — done 2026-09-10.** Does a standalone GPUI app build and run on Windows, and can we set topmost, set position, and open a native file dialog? Verdict: viable, every blocking question passed ([docs/roadmap.md](docs/roadmap.md) §12). |
 | M1 | **Done.** Core engine, headless. Tested with no window at all. |
-| M2 | **In flight on the Slint bridge.** First usable UI — *you can use it as a notepad*, and the app to run is `notes-slint.exe`: it passes its own smoke leg locally (`cargo xtask smoke --binary=slint`). `bridge-gpui` is **frozen**, not deleted — still built, still cited by the 3-of-7 machine-proven ledger in [docs/roadmap.md](docs/roadmap.md) §9, no new needles and no loosening of rows, and its removal waits on [ADR-0006](docs/decisions/0006-gpui-is-frozen-not-deleted.md). What is still owed is the CI evidence trail (this repo has no remote, so no workflow has ever run) and the human eye-pass list — [detail](docs/roadmap.md) §9. |
+| M2 | **In flight on the Slint bridge.** First usable UI — *you can use it as a notepad*, and the app to run is `notes-slint.exe`. Its machine evidence is **one chord and no pointer**: `cargo xtask smoke --binary=slint` proves launch, presence at 45 s, an honest `WM_CLOSE` that ends in exit 0, the M9 restore-rect fixed point across a real maximise — close — relaunch — close, and the auto-save toggle round-tripped through a real injected `Ctrl+T` on the shipping exe — judged as bytes appearing and disappearing in the product's own draft file, not as a line the app chose to log ([docs/dev/testing.md](docs/dev/testing.md); when a precondition is missing the toggle prints NOT JUDGED rather than pretending). Everything about the menu answering a **mouse** is unproven: the four press legs (smoke modes 4–7) carry no recorded green run, and no instrument here has ever watched a pixel reach a handler ([`2026-09-15-no-instrument-tests-a-pointer`](.agents/notes/proposed/2026-09-15-no-instrument-tests-a-pointer.md)). **M2 pointer interaction is untested**, and that is a sentence about the instruments, not a report that the menu is broken or that the app is keyboard-only; a person with a mouse settles it in a minute. `bridge-gpui` is **frozen**, not deleted — still built, still cited by the 3-of-7 machine-proven ledger in [docs/roadmap.md](docs/roadmap.md) §9, no new needles and no loosening of rows, and its removal waits on [ADR-0006](docs/decisions/0006-gpui-is-frozen-not-deleted.md). What is still owed is the CI evidence trail (this repo has no remote, so no workflow has ever run) and the human eye-pass list — [detail](docs/roadmap.md) §9. |
 | M3 | **Done.** Restore, monitor validation, DPI, and coming back maximised — the last one machine-proven, the smoke harness asserting the restore rect is unchanged across a real maximise-close-relaunch. |
 | M4 | **Done.** Autosave and pin. |
 | M5 | Polish, and the Windows portable + installer builds. |
@@ -79,19 +79,29 @@ Detail: [docs/roadmap.md](docs/roadmap.md) §9. Ship targets: `win-install`, `wi
 ## Questions we have not answered
 
 Tracked in §10 ([docs/open-questions.md](docs/open-questions.md)), and worked through one
-at a time in [`.agents/notes/proposed/`](.agents/notes/proposed/), which currently holds
-four open notes: how autosave arms on a foreign file when the port has no plain Save
-command, the title-bar `Root` overlay, a `New document` command, and who owns the autosave
-retry cadence now that the two bridges answer it differently. One question left this list by
-shipping: the Slint swap is settled and built
-([`2026-09-14-strip-program`](.agents/notes/implemented/2026-09-14-strip-program.md)). Coming back maximised is settled and shipped
-([`2026-09-12-maximized-persistence`](.agents/notes/implemented/2026-09-12-maximized-persistence.md)).
+at a time in [`.agents/notes/proposed/`](.agents/notes/proposed/), which holds **eleven open
+notes** as of 2026-09-15. The count and the one-line summaries live in that folder's own
+[index](.agents/notes/proposed/README.md), so this sentence is never patched again; the short
+version is four groups — what the save path still owes (five notes), what the menu and its
+keyboards and pointers still owe (three), what the window's own surface still owes (two), and
+one gap in the record itself: an `Event::ExternalChange` every bridge can render and no code
+emits.
 
-The rule that used to block M1 — autosave on files the app did not create — is settled:
-[ADR-0001](docs/decisions/0001-autosave-arms-on-explicit-save.md) arms autosave only after
-an explicit save on a foreign file, and M4 implements exactly that. Which user act counts
-as that explicit save is still open, because the shipped menu offers Save As and nothing
-else.
+Two questions left this list by being decided, not by being dropped. Autosave on a file the app
+did not create is settled: [ADR-0001](docs/decisions/0001-autosave-arms-on-explicit-save.md)
+arms it on one explicit save and M4 implements exactly that. Which act counts as that save is
+settled too, by [ADR-0007](docs/decisions/0007-save-is-a-conformance.md): `Command::Save` on
+`Ctrl+S` *is* the explicit save ADR-0001 was waiting for, so the menu no longer offers Save As
+and nothing else. The note that recorded the gap has graduated —
+[`2026-09-14-explicit-save-act`](.agents/notes/archived/2026-09-14-explicit-save-act.md) is now
+`archived/` with its `decision:` set, and its body stands as written, including the drafting
+recommendation the ADR overruled. One earlier note on the same subject,
+[`2026-09-12-arm-on-explicit-save-path`](.agents/notes/proposed/2026-09-12-arm-on-explicit-save-path.md),
+is overtaken by the same decision and still sits in `proposed/`: it records what was argued
+before it shipped, and moving it is not this edit's call. The Slint swap is settled and built
+([`2026-09-14-strip-program`](.agents/notes/implemented/2026-09-14-strip-program.md)), and coming
+back maximised is settled and shipped
+([`2026-09-12-maximized-persistence`](.agents/notes/implemented/2026-09-12-maximized-persistence.md)).
 
 ## Contributing
 
