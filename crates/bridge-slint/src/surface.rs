@@ -1192,7 +1192,8 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                     rows.iter().map(|row| row.label.clone().into()).collect();
                 {
                     let mut p = pump.borrow_mut();
-                    // Same builder, same order: the index main.slint fires for row N is the index
+                    // Same builder, same order: the index Chrome fires for the row it painted, and
+                    // the index main.slint fires for the chord, are both the index
                     // of slot N here, because both come out of one pass over the same ten.
                     p.recent_paths = rows.iter().map(|row| row.path.clone()).collect();
                 }
@@ -1221,7 +1222,7 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                         (Some(first), Some(last)) => {
                             format!("slots {}..={}", first.slot, last.slot)
                         }
-                        _ => String::from("no slots drawn, so no gap above them"),
+                        _ => String::from("no slots drawn, so the menu shows its six rows"),
                     };
                     let greyed = if greyed == 0 {
                         String::new()
@@ -1722,7 +1723,20 @@ pub(crate) struct DragEpisode {
     origin: Option<(i32, i32)>,
     /// Pointer travel since that origin, PHYSICAL px, summed one rounded step per event by the
     /// one arithmetic function. Zero deltas add nothing and, more importantly, lose nothing.
+    /// THE DISPLACEMENT, not the sum. Since S1 it is derived from the same two numbers the ask is
+    ///  derived from (`target - origin`), which is what lets the release line keep saying "travel"
+    /// and mean the pointer's own travel. See the note on `advance`: with the band holding its
+    /// anchor, `here + delta` IS `origin + pointer_travel`, exactly, on every delta - so this field
+    /// is now a WITNESS of the arithmetic rather than a second arithmetic that could disagree.
     travel: (i32, i32),
+    /// THE SCALE THIS GESTURE WAS MEASURED IN, sampled with its origin and then compared on every
+    /// later delta. A DPI change mid-drag makes each subsequent delta a conversion of logical px
+    /// by a factor the press never used, and there is no honest way to spend it: re-sampling the
+    /// origin throws away the pointer and re-basing the band's anchor throws away the frame, and the
+    /// two bridges would then disagree about which one moved. So the episode STOPS WRITING and says
+    /// so once; the release re-opens the door at the new scale. `None` while an origin is held is
+    /// the frozen state, which is why this is one field and not two - see `frozen`.
+    scale: Option<f32>,
     /// When the last delta of this episode arrived, and whether this episode has printed once
     /// yet. Both are per-gesture facts, so both die with the gesture.
     last: Option<Instant>,
@@ -1748,19 +1762,59 @@ impl DragEpisode {
             self.origin = Some(here);
             self.travel = (0, 0);
             self.printed = false;
+            // The press delta settles the gesture's scale, so every later delta has something to be
+            // compared against and `None` means exactly one thing for the rest of the episode: the
+            // DPI moved and this gesture has stopped writing.
+            self.scale = Some(scale);
         }
         let Some(origin) = self.origin else {
             // Unreachable: the block above just filled it. A return rather than an expect(),
             // because a position this bridge cannot read is not worth a panic over.
             return here;
         };
-        // THE PER-DELTA ARITHMETIC IS UNTOUCHED and still the only place a logical px becomes a
-        // physical one: asked for the step from `<0,0>`, `drag_destination` yields exactly the
-        // increment the old read-modify-write line added to a live read. What moved is the BASE.
-        let step = drag_destination((0, 0), dx, dy, scale);
-        self.travel = (self.travel.0 + step.0, self.travel.1 + step.1);
+        // THE SCALE LAW, and it is checked BEFORE the arithmetic because a frozen gesture must not
+        // move even by the amount it is being asked to freeze. A scale that differs from the
+        // gesture's own spends this episode's `scale` on the way in, which is the whole state
+        // change: `frozen()` is then true for every later delta until `end()` resets the episode,
+        // and the caller is told once. The press delta can never take this branch - it has no
+        // recorded scale to disagree with.
+        if let Some(at_press) = self.scale {
+            if at_press != scale {
+                // THE FREEZE, and the state change is the spending: `scale` goes to None, so every
+                // later delta of this episode takes the branch below, and the caller - which sees
+                // the transition, not just the state - prints once. Nothing else moves.
+                self.scale = None;
+                self.last = Some(now);
+                return here;
+            }
+        } else {
+            // Already frozen. The frame is handed back unchanged: re-asking for where the note
+            // stands is honest, while re-deriving that place from a factor nobody agreed to is not.
+            self.last = Some(now);
+            return here;
+        }
+        // S1: THE LIVE READ IS THE BASE AGAIN, and that is not the bug this file spent three micro-
+        // slices killing. The bug was adding an INCREMENT to a read that had not caught up with the
+        // last write. ui/chrome.slint's band has held its press anchor since 1085ef63, so the delta
+        // that crosses the seam is no longer an increment - it is the OUTSTANDING ERROR between
+        // pointer travel and applied travel. Two cases, and the same expression is right in both:
+        // the apply landed, `here` moved with it, and the outstanding error has shrunk to the new
+        // pointer step; the apply has not landed, `here` is behind, and the outstanding error has
+        // grown to cover exactly what was not applied. `here + delta` is therefore the full
+        // pointer-minus-frame decomposition, and it costs no accumulator to get there.
+        //
+        // WHY THE ACCUMULATOR IS GONE RATHER THAN MERELY UNUSED: it summed cumulative quantities.
+        // Five 6 px events asked for 396, 402, 408, 414, 420 - a gesture worth 18 px that outran
+        // the pointer by the amount it had already been told twice. The sum was the pre-hold
+        // leftover, correct only while the band re-anchored every event, and keeping it next to a
+        // held anchor is the quadratic case in disguise.
+        let step = drag_destination(here, dx, dy, scale);
+        // The displacement the release line reports, taken from the SAME arithmetic rather than
+        // beside it: with a held anchor the step already IS origin-plus-pointer-travel, so this is
+        // a reading of the answer, not a second answer.
+        self.travel = (step.0 - origin.0, step.1 - origin.1);
         self.last = Some(now);
-        (origin.0 + self.travel.0, origin.1 + self.travel.1)
+        step
     }
 
     /// The release: this gesture is over, so its origin is history and its travel is spent.
@@ -1772,6 +1826,13 @@ impl DragEpisode {
     /// one line per episode for the same flood reason `drag_refused_shown` exists for.
     pub(crate) fn unprinted(&self) -> bool {
         self.origin.is_some() && !self.printed
+    }
+
+    /// Is this gesture frozen by a DPI move it cannot honestly spend? Derived from the ONE field
+    /// the freeze spends, so there is no second bit to keep in step and no way for the answer to
+    /// disagree with the state that caused it.
+    pub(crate) fn frozen(&self) -> bool {
+        self.origin.is_some() && self.scale.is_none()
     }
 
     /// Mark this episode's one line as printed.
@@ -1821,17 +1882,44 @@ fn drag_by(weak: &slint::Weak<Spike>, pump: &RefCell<Pump>, dx: f32, dy: f32) {
         }
         return;
     }
-    // READ ONCE, AND ONLY WHEN THE EPISODE HAS NO ORIGIN YET. `here` is an input to `advance`,
-    // which uses it on the gesture's first delta and ignores it after that; the read-back below
-    // stays, but as a WITNESS of what the toolkit did, never as the base of the next sum. That
-    // separation is the whole repair.
+    // S1-b: PARKED, NOT MOVED - the same class of lie as the arm above, and it reads the OS's own
+    // bit rather than guessing from the numbers. Minimising puts the frame at (-32000,-32000)
+    // (plumbing.rs's Fingerprint::minimized, measured, not assumed), so a delta that arrives while
+    // the note is in the lot is an addition to a parking place: the arithmetic is perfect, the
+    // answer is a restore point made out of -32000, and this bridge has already had the port store
+    // a garbage rect once (probe.rs:1724-1742, the maximised case). It is placed ABOVE the read for
+    // the same reason the maximised arm is: a refusal must not sample an origin, must not write a
+    // position, and must not reach `advance` at all - the two greps in
+    // `a_drag_refused_while_maximised_moves_nothing_and_asks_once` bound exactly that region.
+    //
+    // ONE LINE PER GESTURE, reusing the refusal latch rather than adding a second bit to keep in
+    // step with the first: a delta that lands clears it, so a note restored mid-drag prints its
+    // first real move and only then starts refusing again if it is put back in the lot.
+    if window.is_minimized() {
+        let mut p = pump.borrow_mut();
+        if !p.drag_refused_shown {
+            p.drag_refused_shown = true;
+            drop(p);
+            report("drag[refused]: minimised, window unmoved");
+        }
+        return;
+    }
+    // READ ONCE PER DELTA, AND BELIEVED. `here` used to be sampled once per gesture and then
+    // ignored, because the delta arriving beside it was an INCREMENT and adding an increment to a
+    // frame that has not caught up is the moving-ruler bug. The band holds its anchor now, so the
+    // delta is the outstanding error against THIS frame and the two of them add up to the pointer.
+    // The read-back below stays a witness, as it always was.
     let here = window.position();
     let scale = window.scale_factor();
-    let (want, was_refusing, first) = {
+    let (want, was_refusing, first, froze_now, p_frozen) = {
         let mut p = pump.borrow_mut();
+        // Before and after the one call that can spend the gesture's scale - the pair is what
+        // turns a STATE into a TRANSITION, and a transition is the only thing that may print.
+        let was_frozen = p.drag_episode.frozen();
         let want = p
             .drag_episode
             .advance((here.x, here.y), dx, dy, scale, Instant::now());
+        let p_frozen = p.drag_episode.frozen();
         // THE FACT THAT WAS THE POINT OF C3: the frame-inclusive target the last delta asked for,
         // printed at the release and compared by the instrument against what the port stored.
         p.drag_target = Some(want);
@@ -1844,9 +1932,23 @@ fn drag_by(weak: &slint::Weak<Spike>, pump: &RefCell<Pump>, dx: f32, dy: f32) {
         // prints again instead of going silent for the rest of the run.
         let first = p.drag_episode.unprinted();
         p.drag_episode.mark_printed();
-        (want, was_refusing, first)
+        // The TRANSITION, decided in here where both halves are in scope: the delta that spent
+        // the gesture's scale prints, and every later one of the same episode does not.
+        (want, was_refusing, first, !was_frozen && p_frozen, p_frozen)
     };
-    window.set_position(PhysicalPosition::new(want.0, want.1));
+    // THE SCALE LAW, and the transition is the trigger, not the state: `advance` spends the
+    // episode's scale when the factor moves under the drag, so the delta that froze it is the one
+    // that prints and every later delta of the same gesture is silent and inert. A release resets
+    // the episode, which is why the sentence says what it says.
+    if froze_now {
+        report(&format!(
+            "drag: scale changed mid-gesture, release to re-grab (asked <{},{}>, note left where it stands)",
+            want.0, want.1
+        ));
+    }
+    if !p_frozen {
+        window.set_position(PhysicalPosition::new(want.0, want.1));
+    }
     // What the toolkit reads back is the fact; what was asked for is the intention, and the two
     // are printed together because the gap between them is the DPI/clamp story.
     let back = window.position();
@@ -2512,7 +2614,7 @@ mod tests {
         let arm = &src[src.find("Event::RecentsUpdated(list) =>").expect("the arm")..];
         let arm = &arm[..arm.find("Event::Saved").expect("the next arm")];
         assert!(
-            arm.contains("no slots drawn, so no gap above them"),
+            arm.contains("no slots drawn, so the menu shows its six rows"),
             "the needle says so out loud"
         );
         assert!(!arm.contains("slots 1..=0"), "and never numbers nothing");
@@ -2579,14 +2681,25 @@ mod tests {
 
     #[test]
     fn a_stalled_position_read_never_starves_a_gesture() {
-        // THE STALL SIMULATION: five events, 6 + 6 + 0 + 0 + 6 logical px, against a window that
-        // reads <390,278> every single time. The pointer travelled 18 px, so the last ask must be
-        // 390+18. Not 390+12, which is what the same stream credits the gesture with if a
-        // still-pointer event (a 0,0 delta) is mistaken for the end of it and the travel it
-        // carried is dropped; not 390+6, which is where a read-modify-write lands when every
-        // event reads the same stale corner and spends its delta against that.
-        let (asked, episode) =
-            stalled_gesture(&[(6.0, 0.0), (6.0, 0.0), (0.0, 0.0), (0.0, 0.0), (6.0, 0.0)]);
+        // THE STALL SIMULATION, and the inputs are no longer increments: five events carrying 6,
+        // 12, 12, 12, 18 logical px of OUTSTANDING ERROR - pointer travel minus travel the frame
+        // has applied - against a window that reads <390,278> every single time. The pointer
+        // travelled 18 px and the note travelled nothing, so the last ask must be 390+18.
+        //
+        // WHY THIS IS A STRONGER CLAIM THAN THE ONE IT REPLACES. The old stream was 6+6+0+0+6 and
+        // it proved that a still-pointer event does not end a gesture. This one proves something
+        // a sum could not: a read that lies - that never moves at all, for the whole gesture,
+        // cannot starve a drag whose delta is already the outstanding error, because the delta
+        // grew to cover the lie. The asks are identical to the old test's, line for line, and the
+        // mechanism that produces them is not: 396, 402, 402, 402, 408 used to come out of
+        // origin + sum(increments) and now come out of read + error, with no sum anywhere.
+        let (asked, episode) = stalled_gesture(&[
+            (6.0, 0.0),
+            (12.0, 0.0),
+            (12.0, 0.0),
+            (12.0, 0.0),
+            (18.0, 0.0),
+        ]);
         assert_eq!(
             asked,
             vec![(396, 278), (402, 278), (402, 278), (402, 278), (408, 278)],
@@ -2596,7 +2709,7 @@ mod tests {
         assert_eq!(episode.origin, Some((390, 278)));
         // And the 12, measured rather than asserted away: the same episode cut off at the first
         // still-pointer event is worth 12 px, which is the number the full gesture is not.
-        let (short, _) = stalled_gesture(&[(6.0, 0.0), (6.0, 0.0)]);
+        let (short, _) = stalled_gesture(&[(6.0, 0.0), (12.0, 0.0)]);
         assert_eq!(short.last(), Some(&(402, 278)));
         assert_ne!(
             episode.travel.0,
@@ -2610,8 +2723,13 @@ mod tests {
         // Mid-episode failures are all silent: `set_position` returns nothing, so a clamp
         // against the work area, a monitor that changed under the drag, or a windowing layer that
         // simply had not applied the last ask all look identical from here. The origin must not
-        // care: it is a fact the episode sampled once, not a value the episode re-reads and
-        // therefore cannot lose.
+        // care: it is a fact the episode sampled once, and the release line's displacement claim
+        // is measured from it. The INPUTS below are cumulative outstanding errors, and the three
+        // asks they produce are the same 110/120/130 this test has always expected - which is the
+        // point. The third delta is the interesting one: the frame jumped +300 out from under the
+        // gesture, so the band's own error shrank by exactly that much, and believing the read
+        // still lands on 130. Before S1 that line passed because the read was ignored; now it
+        // passes because the two halves of the decomposition add back up.
         let mut episode = DragEpisode::default();
         let t0 = Instant::now();
         assert_eq!(episode.advance((100, 100), 10.0, 0.0, 1.0, t0), (110, 100));
@@ -2620,15 +2738,23 @@ mod tests {
             Some((100, 100)),
             "the first read is the base"
         );
-        // The apply refused: the window still reads where it was.
+        // The apply refused: the window still reads where it was, so the error is now 20.
         assert_eq!(
-            episode.advance((100, 100), 10.0, 0.0, 1.0, t0 + Duration::from_millis(8)),
+            episode.advance((100, 100), 20.0, 0.0, 1.0, t0 + Duration::from_millis(8)),
             (120, 100)
         );
-        // The apply refused AND something else moved the note out from under the drag: a read that
-        // disagrees with the episode is not trusted mid-gesture, because trusting it is the bug.
+        // The apply refused AND something moved the note out from under the drag: the read is
+        // believed now, and it is believed TOGETHER WITH the error, which the band has already
+        // shrunk by the same 300 px. <400,400> plus <-270,-300> is <130,100> - the pointer was
+        // never wrong about where it wanted the note, and the frame is no longer ignored.
         assert_eq!(
-            episode.advance((400, 400), 10.0, 0.0, 1.0, t0 + Duration::from_millis(16)),
+            episode.advance(
+                (400, 400),
+                -270.0,
+                -300.0,
+                1.0,
+                t0 + Duration::from_millis(16)
+            ),
             (130, 100)
         );
         assert_eq!(episode.origin, Some((100, 100)), "the base never moved");
@@ -2656,7 +2782,7 @@ mod tests {
     }
 
     #[test]
-    fn a_release_that_never_arrived_cannot_strand_an_origin() {
+    fn a_stranded_release_cannot_carry_over_and_a_repeated_error_is_paid_once() {
         // `drag-ended` is the reset and the band's `changed pressed` is the only thing that fires
         // it. A release the markup never reports - the button let go off-window, a grab stolen by
         // the OS - would otherwise leave the note accumulating across two gestures forever. The
@@ -2664,10 +2790,15 @@ mod tests {
         let mut episode = DragEpisode::default();
         let t0 = Instant::now();
         assert_eq!(episode.advance((200, 200), 10.0, 0.0, 1.0, t0), (210, 200));
-        // still hot twenty-four wakes later: the same episode, still accumulating
+        // Still hot twenty-four wakes later, and the SAME error again - which is what the band
+        // emits when the pointer has not moved but the frame has not caught up either. The flip
+        // law says an assertion that changes value gets said out loud: this line used to expect
+        // 220, because the episode summed a cumulative quantity a second time and paid the frame
+        // for travel it had already been asked for. It now expects 210 - the same place, because
+        // the same outstanding error is the same destination. Paying once is the whole cure.
         assert_eq!(
             episode.advance((200, 200), 10.0, 0.0, 1.0, t0 + Duration::from_millis(192)),
-            (220, 200)
+            (210, 200),
         );
         // a full second cold, and the note has since been parked somewhere else: fresh origin
         assert_eq!(
@@ -2682,6 +2813,216 @@ mod tests {
         assert_eq!(episode.origin, Some((900, 900)));
         // and the print bit dies with the episode, so the new gesture gets its one line
         assert!(episode.unprinted());
+    }
+
+    #[test]
+    fn a_gesture_whose_delta_is_an_outstanding_error_cannot_be_starved() {
+        // S1, THE POINTER-FAITHFUL CASE - and it is the case the accumulator could not express.
+        // Scale 1, a read that is stale by exactly ONE apply (the note lands at the last ask one
+        // wake late, which is what Slint's ask-not-tell `set_position` actually does), and a
+        // pointer stepping 6 logical px per event. The band holds its press anchor, so the error
+        // on each event is the whole pointer travel minus the travel the frame has applied - 6,
+        // 12, 18, 24 - and a frame that reports the same corner four times is owed four bigger
+        // asks, not four equal ones.
+        let mut episode = DragEpisode::default();
+        let t0 = Instant::now();
+        let reads = [(390, 278), (390, 278), (390, 278), (390, 278)];
+        let errors = [6.0, 12.0, 18.0, 24.0];
+        let asked: Vec<(i32, i32)> = (0..4)
+            .map(|i| {
+                episode.advance(
+                    reads[i],
+                    errors[i],
+                    0.0,
+                    1.0,
+                    t0 + Duration::from_millis(8 * i as u64),
+                )
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            vec![(396, 278), (402, 278), (408, 278), (414, 278)],
+            "STRICTLY monotone: every event asks further than the last, because each one carries
+             the whole outstanding error and the read cannot hold it back"
+        );
+        for pair in asked.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0,
+                "a gesture that is only ever asked forwards: {asked:?}"
+            );
+        }
+        for pair in asked.windows(2) {
+            assert!(
+                pair[1].0 > pair[0].0,
+                "never a repeat, never a step back while the pointer keeps moving: {asked:?}"
+            );
+        }
+        assert!(
+            asked.iter().all(|a| a.0 > 390),
+            "and not one event asks for where the gesture started - the old failure"
+        );
+        // THE EXACT-APPLY TWIN: same pointer, no lag, and the error collapses to one step every
+        // time. Two different worlds, one expression, and the asks are the gesture the user made.
+        let mut exact = DragEpisode::default();
+        let twin: Vec<(i32, i32)> = (0..3)
+            .map(|i| {
+                exact.advance(
+                    (390 + 10 * i, 278),
+                    10.0,
+                    0.0,
+                    1.0,
+                    t0 + Duration::from_millis(8 * i as u64 + 1),
+                )
+            })
+            .collect();
+        assert_eq!(
+            twin,
+            vec![(400, 278), (410, 278), (420, 278)],
+            "no lag: the error is one 10 px step each time, so the ask is one step each time"
+        );
+        assert_eq!(
+            exact.travel,
+            (30, 0),
+            "and the witness still reads as pointer travel"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_teleported_under_the_drag_is_paid_for_once() {
+        // THE TELEPORT, at the numbers the design gave. Press: frame at <1000,500>, cursor at
+        // <1050,512>. The frame is then TAKEN +300,+150 by something the bridge did not ask for -
+        // a snap zone, a monitor change, a restore - and the pointer steps 10 logical px LEFT.
+        // The band's error is therefore <1050-10 minus 1300+... >, spelled out: pointer travel
+        // -10, applied travel +300, so the outstanding error is -310 in x and -150 in y.
+        let mut episode = DragEpisode::default();
+        let t0 = Instant::now();
+        let ask = episode.advance((1300, 650), -310.0, -150.0, 1.0, t0);
+        assert_eq!(
+            ask,
+            (990, 500),
+            "press-frame + pointer travel: 1000 + -10, 500 + 0 - the teleport is NOT collected twice"
+        );
+        // One more step left, and the frame has not moved again.
+        let ask2 = episode.advance(
+            (1300, 650),
+            -320.0,
+            -150.0,
+            1.0,
+            t0 + Duration::from_millis(8),
+        );
+        assert_eq!(ask2, (980, 500), "and the next 10 px is the next 10 px");
+        assert_eq!(
+            episode.origin,
+            Some((1300, 650)),
+            "the origin is the frame as first read - the teleport is already inside it"
+        );
+        // The witness, on the LAST ask: 980 - 1300, 500 - 650. It reads as a step BACKWARD
+        // because the origin already contains the teleport the bridge never asked for, and that
+        // is the truth the release line is supposed to tell - a gesture that fought a snap zone
+        // moved the note less than the pointer travelled, and printing the pointer instead would
+        // be the second copy of a fact that is already in the ask.
+        assert_eq!(
+            episode.travel,
+            (-320, -150),
+            "ask minus origin, both of them the frame's"
+        );
+    }
+
+    #[test]
+    fn a_clamped_frame_gains_debt_linearly_and_not_quadratically() {
+        // THE CLAMP DEBT, which is the hazard the hold prices out loud (chrome.slint:591-594): a
+        // move the OS refuses is never applied, so the outstanding error GROWS while the note is
+        // pinned, and it is paid back as one jump when the constraint clears. Under the retired
+        // accumulator that growth was summed a second time: 10 events against a pinned frame asked
+        // for 110, 130, 160, 200 - triangle numbers, and the note would have flown off the screen
+        // the instant it came free. Now the debt is linear and bounded by the pointer itself.
+        let mut episode = DragEpisode::default();
+        let t0 = Instant::now();
+        let asked: Vec<(i32, i32)> = (0..4)
+            .map(|i| {
+                // The read never moves: the frame is pinned against the work area at x=100.
+                episode.advance(
+                    (100, 100),
+                    10.0 * (i as f32 + 1.0),
+                    0.0,
+                    1.0,
+                    t0 + Duration::from_millis(8 * i as u64),
+                )
+            })
+            .collect();
+        assert_eq!(
+            asked,
+            vec![(110, 100), (120, 100), (130, 100), (140, 100)],
+            "one px of ask per px of pointer, not one px per px per event"
+        );
+        assert_eq!(
+            episode.travel,
+            (40, 0),
+            "the debt is the pointer travel, nothing more"
+        );
+        assert_eq!(
+            asked[3].0 - asked[0].0,
+            episode.travel.0 - 10,
+            "the growth is LINEAR in the events - a sum-of-sums would show 30 here and 90 there"
+        );
+    }
+
+    #[test]
+    fn a_dpi_move_mid_gesture_freezes_the_episode_and_says_so_once() {
+        // THE SCALE LAW. `drag_destination` converts every logical px by the scale it is handed,
+        // and the factor is a fact about the press: after a mid-gesture DPI change the same 10 px
+        // of pointer travel means a different number of physical px, and the frame the delta is
+        // measured against changed size under it. Re-sampling the origin throws away the pointer;
+        // re-basing the band's anchor throws away the frame. So NEITHER is written: the episode
+        // stops asking and the caller prints once, because a gesture whose arithmetic has gone
+        // ambiguous is worse than a note that waits for the next press.
+        let mut episode = DragEpisode::default();
+        let t0 = Instant::now();
+        assert_eq!(episode.advance((200, 200), 10.0, 0.0, 1.0, t0), (210, 200));
+        assert!(
+            !episode.frozen(),
+            "the press settled the scale and nothing else can spend it"
+        );
+        // The DPI moves under the drag - 1.0 to 1.5, the case a monitor change actually makes.
+        assert_eq!(
+            episode.advance((210, 200), 10.0, 0.0, 1.5, t0 + Duration::from_millis(8)),
+            (210, 200),
+            "the delta that discovers the change asks for where the note already stands"
+        );
+        assert!(
+            episode.frozen(),
+            "and the episode is frozen for the rest of the gesture"
+        );
+        assert_eq!(
+            episode.travel,
+            (10, 0),
+            "the freeze spent NO travel: the witness still says what the note was told to do"
+        );
+        // Later deltas of the same gesture stay inert, and they stay inert at the NEW factor too -
+        // the freeze is not a comparison that can be satisfied by drift back.
+        for i in 0..4u32 {
+            assert_eq!(
+                episode.advance(
+                    (210, 200),
+                    20.0 + i as f32,
+                    0.0,
+                    1.5,
+                    t0 + Duration::from_millis(16 + 8 * i as u64),
+                ),
+                (210, 200)
+            );
+        }
+        // The release is the re-grab: the next press samples the new scale and moves again.
+        episode.end();
+        assert!(
+            !episode.frozen(),
+            "the gesture is over, so so is the freeze"
+        );
+        assert_eq!(
+            episode.advance((210, 200), 10.0, 0.0, 1.5, t0 + Duration::from_millis(600)),
+            (225, 200),
+            "and the new press converts at the factor it was pressed under: 10 logical is 15 px"
+        );
     }
 
     #[test]
@@ -2740,6 +3081,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_hold_is_what_makes_the_read_safe() {
+        // S1-d, and the reason it is a CROSS-guard rather than a comment: from micro-1 to micro-3
+        // this file held its own base because the read could not be trusted. Since S1 it trusts
+        // the read every delta, and that is only correct while ui/chrome.slint holds the press
+        // anchor - `last-x` written on down, NEVER re-written on move. Advance that anchor and the
+        // emitted delta becomes an increment again, the arithmetic here turns quadratic, and the
+        // failure shows up as a note that outruns the hand: exactly the class of bug every needle
+        // in this module would still read as green. So the precondition lives in the markup, and
+        // the only proof available without a window is a grep of the block that emits the delta.
+        // Same shape as `the_drag_band_stops_where_the_caption_begins`: read the bar, slice the
+        // block, assert what the block must NOT contain.
+        let chrome = include_str!("../ui/chrome.slint");
+        let at = chrome
+            .find("moved => {")
+            .expect("the band's move handler - the thing that emits drag-delta");
+        let moved = &chrome[at..at
+            + chrome[at..]
+                .find("\n    }")
+                .expect("the end of the move handler")];
+        // COMMENTS OUT FIRST, and here the reason is not tidiness: this block carries a ten-line
+        // note quoting the very line it refuses to write - "Writing 'last-x = mouse-x' here (what
+        // this did before)" - so a grep over the raw text finds a re-anchor in the prose and fails
+        // the commit that documented the fix. Same discipline as the licence guard in probe.rs,
+        // which cuts the comment lines out of chrome.slint for exactly this reason.
+        let moved_code: String = moved
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !moved_code.contains("last-x =") && !moved_code.contains("last-y ="),
+            "the band must HOLD its press anchor: re-anchoring on move turns the outstanding
+             error back into an increment and makes `here + delta` a sum of increments again"
+        );
+        assert!(
+            moved_code.contains("max-band.mouse-x - max-band.last-x"),
+            "and it keeps emitting the pointer-minus-anchor, which is the delta this file can add
+             to a live read"
+        );
+        // The Rust side of the same contract, in one line: the base of the ask is the read.
+        let whole = include_str!("../src/surface.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        let adv = &src[src.find("pub(crate) fn advance(").expect("the delta")..];
+        let adv = &adv[..adv.find("/// The release:").expect("the next method")];
+        assert!(
+            adv.contains("drag_destination(here, dx, dy, scale)"),
+            "the ask is computed FROM THE READ - the accumulator is gone, not merely unused"
+        );
+        assert!(
+            !adv.contains("self.travel.0 +"),
+            "and nothing sums a cumulative quantity any more"
+        );
+    }
     #[test]
     fn a_drag_asks_for_the_dismissal_once_per_episode_and_not_per_frame() {
         // HAMBURGER-3. THE HAZARD IS MEASURED, NOT SUPPOSED: the click-away catcher is mounted
@@ -2845,7 +3240,8 @@ mod tests {
     }
 
     #[test]
-    fn the_band_that_moves_the_window_is_listened_to() {
+    fn the_band_that_moves_the_window_is_listened_to_and_its_two_reads_are_the_base_and_the_witness()
+     {
         // C3, and the shape of the bug it guards against is not hypothetical: the markup has
         // emitted `drag-delta` since S5 and main.slint has forwarded it since S5, and the product
         // still did not move, because nothing on the Rust side had ever registered a handler -
@@ -2869,14 +3265,19 @@ mod tests {
             1,
             "drag_destination must be the only place this file moves the window"
         );
-        // THE READ-ONCE RULE, grepped because it is the rule a future edit is most likely to undo:
-        // the window's corner is sampled exactly twice in this file - once to open an episode,
-        // once as the read-back witness - and never to base a sum on. A third read is the
-        // moving-ruler bug walking back in with a green arithmetic test.
+        // THE TWO READS, and what they are now. This assertion used to carry a prohibition -
+        // "sample once, never base a sum on the read" - and S1 retired the prohibition while
+        // keeping the count: the corner is still read exactly twice per delta, once as the BASE of
+        // the ask and once as the WITNESS beside it. The reason the base is safe to use again is
+        // one property of the markup, not of this file: the band holds its press anchor, so the
+        // delta arriving next to the read is the outstanding ERROR, not an increment, and
+        // base + error is the pointer in either direction the frame moved. What would walk the
+        // moving-ruler bug back in is therefore NOT a third read - it is a third read paired with
+        // an increment, which is what `the_hold_is_what_makes_the_read_safe` below watches for.
         assert_eq!(
             src.matches("= window.position()").count(),
             2,
-            "one origin sample and one witness: the delta must not be added to a fresh read"
+            "the base and the witness: two reads, one per delta, and no third anywhere"
         );
         // Token-shaped needles, not whole-call ones: rustfmt is free to break a method chain
         // across lines, and a guard that only passes on one particular wrap is a test that fails
