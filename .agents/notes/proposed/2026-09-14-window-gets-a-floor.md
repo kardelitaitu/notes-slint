@@ -153,13 +153,33 @@ port **measures** the live window (`engine.rs:1804-1836` per the drag-path note)
 A rubber-band that saves the stretched state on its way back. Worse than A′, which costs one line
 more and no polling.
 
-### D. Make the footer adaptive - **attacks the cause, edits frozen evidence**
+### D. Make the footer adaptive - **half of it is already built, and the half that is not is frozen twice over**
 
-A shorter panel cannot be cut off. But the panel *is* its obligation text, and its first edit is
-the pinned box: `width: 340px;` / `height: 260px;` at `chrome.slint:1001-1002`, asserted verbatim
-at `probe.rs:2104-2111` ("the About panel has no fixed box to fill"). That is frozen evidence, so D
-is a sanctioned-needle-edit conversation, not a slice. It is also the option to raise *after* the
-floor exists, because a floor makes scrolling unnecessary at the sizes the app ships at.
+This option has to be split before it is refused, because two of its three forms are already in the
+tree and refusing them would be refusing work this week did:
+
+- **D as footer growth - built.** `note-lines` decides whether the footer exists at all and the
+  layout's own minimum decides how tall it is (`chrome.slint:744-758`, `footer-height` at
+  `:756-758`), so the popup already pays in height for a wrapped sentence instead of eliding the one
+  string this app must never cut short.
+- **D as width adaptation - built.** `popup-left` gives About its own measure with a **zero floor**
+  (`:230-234`): on a narrow host the panel surrenders its margin rather than its right edge.
+- **D as a smaller or scrolled LICENCE BOX - frozen, three assertions deep.** The 340x260 at
+  `chrome.slint:1001-1002` is pinned by `probe.rs:2131` and `:2135`, which demand the verbatim markup
+  text `"width: 340px;"` and `"height: 260px;"` inside
+  `aboutsLint_is_instantiated_exactly_once_in_markup_that_paints` (`:2079`) - content matches in the
+  probe's own test module, so neither can be edited after its verdict - and by `plumbing.rs:913-914`,
+  which reads the About block's OWN `width:` line and asserts it equals `"width: 340px;"` inside
+  `the_wider_panel_gets_the_clamp_the_narrower_one_was_judged_with` (`:871`). That third one matters
+  more than it looks: `product.rs`, `probe.rs`, `surface.rs` and `plumbing.rs` compile into BOTH bins
+  (`probe.rs` declares `mod plumbing;` itself), so a `plumbing.rs` guard **fires inside the probe
+  test target too**. Both files cross-reference each other as `probe.rs:2105`, which is drifted - the
+  assertions sit at `:2131`/`:2135` today.
+
+And the reason a scroll is not the escape hatch it looks like: **the clip is at the host level, not
+inside the panel.** The panel's bottom edge sits below the window's client edge, so an interior
+scroll region would scroll content that is already off-screen and change nothing about what a person
+can read. Prefer the floor; D's surviving form is a sanctioned-needle-edit conversation, not a slice.
 
 ## Recommendation
 
@@ -168,7 +188,8 @@ floor exists, because a floor makes scrolling unnecessary at the sizes the app s
 1. Add the two knobs to `main.slint` and bind `min-width` / `min-height` to them. Default `0px`,
    which is the no-floor state, so the shared file changes no behaviour until a caller opts in.
 2. Set 340 x 262 in `product.rs` immediately before `window.set_size(want)` at `:355` - with the
-   derivation in the comment beside it, not a claim of measurement.
+   derivation and its **scope** (262 ends the clipping question, not the covered-bar one) in the
+   comment beside it, not a claim of measurement.
 3. **Mirror the two About flags before claiming anything about them.** Today `about-floored`
    (`chrome.slint:235-236`) and `about-overflow` (`:240-241`) are markup-internal bindings with no
    mirror on `Spike`: `main.slint` mirrors out `menu-shown` (`:156`), `about-shown` (`:158`),
@@ -190,7 +211,12 @@ floor exists, because a floor makes scrolling unnecessary at the sizes the app s
   `border_width` inside the item box (`item_rendering.rs:523`, `:544`). 263 and 264 each add a border
   that is not additive. What is left is a stated choice, not an arithmetic dispute: **260** is the
   strict obligation, **262** is the obligation plus the gap the markup itself asks for - this note
-  picks 262. It is the taller of the two content floors; the menu's is 186, quoted from
+  picks 262. **Scope it, though: 262 ends the CLIPPING question, not the bar question.** `popup-top`
+  holds y at `Theme.bar-height` only once the host reaches 290 (`min(28, host - 262)`), so between
+  **262 and 290 the floor delivers a whole licence panel OVER THE BAR** - readable, and covering the
+  bar's lower pixels. Whether that trade is the right one is the 290 question
+  `2026-09-14-menu-keyboard-traversal`:135-139 still holds open, and this note does not close it.
+  262 is the taller of the two content floors; the menu's is 186, quoted from
   `2026-09-14-popup-stays-inside-its-window`:172-175 rather than re-derived here.
 - **340** = the panel's width, `chrome.slint:1001` - the value below which `about-overflow` says
   there is no placement at all. It is also the value `popup-x` was never computed for (that rule
@@ -213,8 +239,8 @@ floor exists, because a floor makes scrolling unnecessary at the sizes the app s
   panel rather than cutting it, and it stays whole to 262. The sentence is a true counterfactual about
   the unraised resting place (28 bar + 260 panel + 2 gap = 290), which is exactly why it reads as a
   floor - and it, plus a border added twice, is where 264 came from. `chrome.slint` is NOT edited for
-  it: that file is outside this chain's fence, and its 340/260 literals are pinned twice over by
-  needles (`probe.rs:2104-2111` and the counts in `plumbing.rs`).
+  it: that file is outside this chain's fence, and its 340/260 literals are pinned three times over, in
+  both bins (`probe.rs:2131`, `:2135`, `plumbing.rs:913-914` - see option D).
 
 ## A second chain in the same file: the geometry watch has no baseline
 
@@ -289,6 +315,61 @@ direction, because no workflow has run (AGENTS.md's honesty gate). What is owed 
 edit: run the geometry leg on the patched build and confirm `PERSIST` and `RELAUNCH` still earn their
 words from the move alone - and if a leg goes red there, that is the fingerprint of this bug, not
 evidence against the fix.
+
+## Evidence: one clean run of the baseline, and one claim it broke
+
+Measured 2026-09-14, after the revert, by running `notes-slint-probe` once against the tree
+`c42b21d0` left. The transcript is the run's output; it is not copied into this file, so what follows
+is what was compared and what it says, not a quotation.
+
+**The safety gate held.** The first line on stderr was the isolation report - "state-dir: isolated
+C:/dev/notes-gpui/target/debug/slint-probe/data (port rule alone would give
+C:/dev/notes-gpui/target/debug/data)" (`probe.rs:88` prints it) - so the run wrote its session under
+`target/` and never touched the real `%APPDATA%`. That is worth stating first because every claim
+below depends on it: an instrument that had judged the user's own state file would not be evidence,
+it would be an incident.
+
+**All four recorded overlay triples reproduced IDENTICALLY**, including the one the revert died over:
+`overlay[after 180px]: menu-shown=true popup-x=8px floored=true overflow=true`, with the other three
+(open / after 400px / after restore) unchanged too. The comparison was programmatic - label plus the
+three `k=v` fields - not by eye.
+
+**Say exactly what that evidences, because it is less than it first looks.** The tree this ran on
+has **no knobs in it** - `c42b21d0` removed the only `min-*` lines `main.slint` ever had - so the run
+proves the BASELINE A-prime must not disturb, and it proves the 180px arm at `probe.rs:1037`
+measures a 180px host today, which is precisely the state the 340px floor destroyed. It does **not**
+demonstrate that `min-width: root.floor-width` bound to an unset `0px` leaves the arm alone: that
+claim is still unknown 2, still read off `i-slint-core` rather than off a window, and it becomes
+testable only once the markup exists. What the run buys is the before-half of a comparison, which is
+more than this chain had and less than a proof. It
+does NOT reach finding (b)'s About half, and it must not be read as if it did: the instrument prints
+`popup-x` / `popup-floored` / `popup-overflow` and never an about height (`:1835-1842`), so nothing in
+this run reports anything in the 262-to-290 band, and nothing here speaks for the licence panel at
+all. That half still owes the mirrors in Recommendation step 3.
+
+**One deviation, recorded rather than papered over: there was no `probe over` line.** The epilogue
+that prints it is `probe.rs:1310`, and it is reached at the script's own `END` cap of 28 s
+(`:396`). This run closed through the scripted Quit-row arm (`ui.invoke_quit_asked()`, `:1249`) about
+a second early, so some of the trailing report the recorded baseline implies did not appear. Which
+closer ran is the fact worth keeping: an identical overlay block is a comparison of four lines, not
+of a whole transcript, and anyone re-running this should expect a short run rather than a truncated
+one.
+
+**And one recorded claim that did not survive the re-run.** `c42b21d0`'s message asserts, as part of
+its own evidence, "session.json md5 b8e2cf37... identical before and after the run". Measured today,
+the isolated `session.json` was `27a8ce184d97d1b46773681d5d2b851f` before the run and
+`944731dfd14af957243d4951521d9cbf` after it. The recorded hash matches **neither**, and
+"identical before and after" did not reproduce. That is a claim inside a commit message that the same
+command no longer supports.
+
+Do not oversell it in either direction. The probe writes recents and scratch fixtures during a run,
+so a changed hash is not by itself proof that GEOMETRY was rewritten - the confound is real and named
+here. But it is precisely what the no-baseline watch above predicts: a launch with no user action
+writes its own state, so a file that stays byte-identical across a run is the surprising outcome, not
+the expected one. Present it as corroboration, not as a verdict, and record the debt: **the
+`c42b21d0` md5 claim needs re-earning by whoever next cites it** - and the cheap way to earn it is
+the same measurement with the hash taken over the rect object rather than the whole file, so recents
+and scratch noise cannot move it.
 
 ## Why this is not the rejected drag-path visibility clamp
 
@@ -373,7 +454,7 @@ rejection covers this has to say which axis it applies to.
   actually feel. It would need its own note, a Command shape that carries no product numbers, and
   an answer to "who owns the window winit created".
 - **D becomes the answer** if the About obligation can be met by a shorter panel; that needs a
-  sanctioned needle edit at `probe.rs:2104-2111` first.
+  sanctioned needle edit at `probe.rs:2131` / `:2135` and `plumbing.rs:913-914` first.
 - **A-prime is wrong, and gets a new note, if** unknown (1) or (2) resolves against it - a knob that
   does not bind a programmatic size, or a zero that is not inert, leaves the bug open while the code
   looks fixed, which is the exact failure mode the revert was written about.
