@@ -59,6 +59,14 @@ export component Spike inherits Window {
     in property <bool> save-failed: false;
     in property <bool> autosave: false;
 
+    // THE POPUP'S FOOTER: two sticky strings, and "" is the empty case. Same rule as the three
+    // signals above - each is a RENDER of an answer the port already gave, and markup computes
+    // nothing. `why-not-saved` is the reason a write did not happen; docs/features.md §4.4 asks
+    // for it IN THE MENU precisely because the status line has one writer and erases the sentence
+    // under the next event. `file-words` is the FileMeta verdict on the document now open.
+    in property <string> why-not-saved: "";
+    in property <string> file-words: "";
+
     // The only thing the strip may decide by itself. `in-out`, per finding 3.
     in-out property <int> taps: 0;
 
@@ -388,6 +396,8 @@ export component Spike inherits Window {
         dirty: root.dirty;
         save-failed: root.save-failed;
         autosave: root.autosave;
+        why-not-saved: root.why-not-saved;
+        file-words: root.file-words;
         // C1: Chrome carries a pin STATE, never a window level - nothing in this file
         // names always-on-top or a level, and notes-platform stays the one
         // WS_EX_TOPMOST writer. The bool Chrome hands back is the WIDGET'S GUESS at

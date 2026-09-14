@@ -90,6 +90,16 @@ export component Chrome inherits Rectangle {
     /// toggle whose position is invisible (titlebar.rs:188-206).
     in property <bool> autosave: false;
 
+    // ---- what the popup EXPLAINS, as opposed to what it acts on -----------------------------
+    // Two sticky strings, written by Rust and computed by nothing here. They are sticky because the
+    // status line cannot hold them: `set_status` has one writer, so the sentence explaining a
+    // refused write is erased by the next event, and docs/features.md §4.4 asks for the reason in
+    // the MENU - a surface a person opens after the fact, when they are wondering whether their
+    // notes are safe. `file-words` is core's FileMeta verdict on the document that is open, in the
+    // same sentence bridge-gpui prints.
+    in property <string> why-not-saved: "";
+    in property <string> file-words: "";
+
     // ---- what the bar may decide by itself --------------------------------------
     // 'in-out', not 'in': a handler may not assign an 'in' property (this bridge's own
     // finding 3), and the menu is local state - it opens a list of things the app already
@@ -584,6 +594,9 @@ export component Chrome inherits Rectangle {
     // the recents it acts on and Quit last), and a SIXTH row the model does not have: About
     // Slint - there because the royalty-free licence's section 2(a) asks for an About screen
     // reachable from the top level menu, and this menu IS this app's top level menu.
+    // SIX is the row count, and it is still the row count: what was added on 2026-09-14 is a
+    // FOOTER below them (§4.4's reason, and the FileMeta verdict), which asks for nothing and is
+    // deliberately not counted as rows - see the header at the block itself.
     // Two plausible rows are STILL absent BECAUSE THE LIST SAYS SO, not because they were
     // forgotten: no New and no plain Save.
     //
@@ -636,15 +649,39 @@ export component Chrome inherits Rectangle {
         root.about-open = false;
     }
 
+    // ---- THE FOOTER'S SIZE, and why it is not two more rows ---------------------------------
+    // The popup's height has been an arithmetic of ROWS since the first commit: the pad, six rows,
+    // five gaps. The footer is not rows. It has no TouchArea, no chord, and no act behind it, and it
+    // must not be dressed up as a 7th and 8th row - the probe counts the 6th row's cells exactly, and
+    // a click on an explanation is not a thing that should happen. So the row arithmetic stands and
+    // this adds whatever the wrapped text asks for: `note-lines` decides whether there is a footer at
+    // all, and the layout's own MINIMUM height decides how tall it is. (`min-height`, not an
+    // implicit one: a layout reports its content demand as a minimum, and 1.17 says so by refusing
+    // to compile the other name.)
+    //
+    // WRAPPING IS NOT DECORATION. The longest sentence the port hands us - "a file this app did not
+    // create: Save As once (Ctrl+S) and it keeps saving" - does not fit the 182px of content width on
+    // one line, and an ELIDED reason is the one string in this app that must not be cut short: the
+    // entire point is that a person can read why their file is not being saved. The caption row of the
+    // type scale takes the second line quietly, and the popup pays for it in height, which is the
+    // honest direction for a menu to grow.
+    property <int> note-lines: (root.why-not-saved != "" ? 1 : 0)
+        + (root.file-words != "" ? 1 : 0);
+    property <length> footer-height: root.note-lines == 0
+        ? 0px
+        : 1px + Theme.menu-gap + notes.min-height;
+
     menu := Rectangle {
         x: root.popup-x;
         y: parent.height;
         width: Theme.menu-width;
-        // SIX rows now (the 6th is About, and it is the licence's row - see the import above), so
-        // both numbers move together: the count of rows and the count of gaps between them. One
-        // constant per row, one less gap, and the test that counts writes to menu-open moves with
-        // this line rather than after it.
-        height: Theme.menu-pad * 2 + 6 * Theme.menu-row-height + 5 * Theme.menu-gap;
+        // SIX rows (the 6th is About, and it is the licence's row - see the import above), so both
+        // numbers move together: the count of rows and the count of gaps between them. One constant
+        // per row, one less gap, and the test that counts writes to menu-open moves with this line
+        // rather than after it. The footer hangs below that arithmetic and grows it, which is why it
+        // is one term outside it rather than two more rows inside it.
+        height: Theme.menu-pad * 2 + 6 * Theme.menu-row-height + 5 * Theme.menu-gap
+            + (root.note-lines > 0 ? Theme.menu-gap + root.footer-height : 0px);
         visible: root.menu-open;
         background: Theme.menu-bg;
         border-radius: Theme.menu-radius;
@@ -700,6 +737,54 @@ export component Chrome inherits Rectangle {
             Text { col: 0; row: 5; text: "About Slint"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
             Text { col: 1; row: 5; text: ""; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
             row-about := TouchArea { col: 0; row: 5; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.about-open = true; root.menu-open = false; } }
+        }
+
+        // ---- THE FOOTER: the one block in this popup that asks for nothing ----------------------
+        // Sibling of the GridLayout, placed by the same arithmetic the height above spends. The 1px
+        // hairline of Theme.bar-edge on top - the line the popup's own border is drawn with - is what
+        // makes it read as "not a row" before it reads as anything else: a row announces itself with a
+        // hover tint and a TouchArea, and this block has neither.
+        //
+        // `if`, not `visible: false`, and that is a correctness choice rather than a style one: a
+        // layout reserves its child's space whether the child is hidden or absent, so a hidden line
+        // would leave a gap in a popup that has nothing to say. An `if`-element that is not created
+        // costs nothing, which is the same reason notes.min-height is trusted here.
+        footer := Rectangle {
+            x: Theme.menu-pad;
+            y: Theme.menu-pad + 6 * Theme.menu-row-height + 5 * Theme.menu-gap + Theme.menu-gap;
+            width: parent.width - Theme.menu-pad * 2;
+            height: root.footer-height;
+            visible: root.note-lines > 0;
+
+            Rectangle {
+                width: parent.width;
+                height: 1px;
+                background: Theme.bar-edge;
+            }
+
+            notes := VerticalLayout {
+                x: 0;
+                y: 1px + Theme.menu-gap;
+                width: parent.width;
+                height: parent.height - 1px - Theme.menu-gap;
+                spacing: 1px;
+                alignment: start;
+
+                if root.why-not-saved != "": Text {
+                    text: root.why-not-saved;
+                    color: Theme.amber;
+                    font-size: 1rem * Theme.font-scale-caption;
+                    wrap: TextWrap.word-wrap;
+                    vertical-alignment: center;
+                }
+                if root.file-words != "": Text {
+                    text: root.file-words;
+                    color: Theme.text-muted;
+                    font-size: 1rem * Theme.font-scale-caption;
+                    wrap: TextWrap.word-wrap;
+                    vertical-alignment: center;
+                }
+            }
         }
     }
 

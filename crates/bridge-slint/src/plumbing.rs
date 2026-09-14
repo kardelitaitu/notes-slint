@@ -3,7 +3,7 @@
 //! written. These are not decisions, and they are not the probe's either: they are the small
 //! mechanical layer every root needs, which is why surface.rs used to reach them with a glob
 //! import of the crate root and a comment saying "that is not hygiene". This file is the answer to
-//! that comment - the reach is now an import list naming seven things.
+//! that comment - the reach is now an import list naming eleven things.
 //!
 //! The rule the moved bodies keep: report() is the ONLY writer of the `notes-gpui: ` prefix (the
 //! smoke contract), lf() is the ONLY line-ending normaliser, publish_title()/note_dot() are the
@@ -14,7 +14,10 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-use notes_api::{Command, DropGuard, Event, Gateway, Rect, WindowHandle, arm_file_drop};
+use notes_api::{
+    Command, DropGuard, Encoding, Event, FileMeta, Gateway, LineEnding, Rect, SkipReason,
+    WindowHandle, arm_file_drop,
+};
 // STRIP-2b: hwnd_of came with its trait, which is the whole reason the raw-window-handle
 // dependency is used by BOTH roots rather than by the probe alone.
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -131,6 +134,96 @@ pub(crate) fn dot_word(save_failed: bool, dirty: bool) -> &'static str {
         "red(dirty)"
     } else {
         "none(clean)"
+    }
+}
+
+/// THE POPUP'S EXPLANATION, in the user's words. Two voices for one fact is normally drift, and
+/// this split is deliberate rather than sloppy: [`describe`] above prints the Debug shape
+/// (`AutosaveSkipped reason=ReadOnly`) because the INSTRUMENT quotes it - probe.rs:540 records a
+/// real failure by that exact string, and an instrument's evidence is not edited after its verdict
+/// (ADR-0006 §4: "never as probe edits"). The menu is not an instrument. docs/features.md §4.4 asks
+/// for "the reason in the menu", on a surface a person reads, and `api` assigns that wording to the
+/// UI on purpose: SkipReason carries no Display so the bridge owns the sentence. The strings below
+/// are the SAME ones bridge-gpui's `skip_words` chose, deliberately: two bridges explaining one skip
+/// two different ways is the drift that is not allowed, and gpui's copy was argued out first.
+pub(crate) fn skip_words(reason: SkipReason) -> &'static str {
+    match reason {
+        SkipReason::AutosaveDisabled => "auto-save is off",
+        SkipReason::ForeignFileNotArmed => {
+            "a file this app did not create: Save As once (Ctrl+S) and it keeps saving"
+        }
+        SkipReason::Clean => "nothing changed since the last write",
+        SkipReason::Superseded => {
+            "the edit belonged to a note that has since been replaced, so it was discarded"
+        }
+        SkipReason::NeedsPath => "this note has no file yet: use Save As",
+        SkipReason::ReadOnly => "the file is read-only",
+        SkipReason::Oversize => "the file is over the size guard, so writes are refused",
+    }
+}
+
+/// WHAT THIS FILE IS - the same sentence bridge-gpui prints (`meta_words`), not a second phrasing
+/// of it. This is the product's actual promise: "your file came back identical". Every one of these
+/// six facts is decided in `core`, carried on `Event::Loaded`/`Event::Rebound`, and was invisible to
+/// the person whose file it is. The `armed` verdict is the important one: it is the difference
+/// between "auto-save is off" and "this file will never be saved unless you say so", and ADR-0001's
+/// design turns on a user being able to tell those two apart.
+pub(crate) fn file_words(meta: &FileMeta) -> String {
+    let FileMeta {
+        encoding,
+        line_ending,
+        trailing_newline,
+        read_only,
+        oversize,
+        armed,
+    } = *meta;
+    format!(
+        "{} · {} · newline {} · {} · {} · autosave {}",
+        encoding_words(encoding),
+        line_ending_words(line_ending),
+        if trailing_newline { "kept" } else { "none" },
+        if read_only { "read-only" } else { "writable" },
+        if oversize {
+            "over the guard"
+        } else {
+            "within the guard"
+        },
+        if armed { "armed" } else { "not armed" },
+    )
+}
+
+/// Exhaustive like the first bridge's: a new encoding is a compile error here, not a file whose
+/// encoding the menu declines to name.
+fn encoding_words(encoding: Encoding) -> String {
+    match encoding {
+        Encoding::Utf8 => "utf-8".to_string(),
+        Encoding::Utf8Bom => "utf-8 with BOM".to_string(),
+        Encoding::Utf16Le => "utf-16 le".to_string(),
+        Encoding::Utf16Be => "utf-16 be".to_string(),
+        // The codepage id is a fact the port carries on the variant, so the line names it:
+        // utf-8-without-a-BOM and CP1252 must not read the same (D14).
+        Encoding::Ansi(codepage) => format!("ansi cp{codepage}"),
+    }
+}
+
+fn line_ending_words(line_ending: LineEnding) -> &'static str {
+    match line_ending {
+        LineEnding::Lf => "lf",
+        LineEnding::CrLf => "crlf",
+    }
+}
+
+/// ONE WRITER for the popup's explanation, in the shape [`note_dot`] uses for the dot triple: read
+/// both strings off the pump and set both unconditionally, because these are bindings - an
+/// unchanged value costs nothing, and a changed one must not be lost to a printed-diff heuristic.
+pub(crate) fn publish_explain(pump: &RefCell<Pump>, weak: &slint::Weak<Spike>) {
+    let (why, file) = {
+        let p = pump.borrow();
+        (p.why.clone(), p.file_words.clone())
+    };
+    if let Some(ui) = weak.upgrade() {
+        ui.set_why_not_saved(why.into());
+        ui.set_file_words(file.into());
     }
 }
 
@@ -295,5 +388,224 @@ pub(crate) fn fingerprint_of(window: &slint::Window) -> Fingerprint {
         rect: Rect::new(position.x, position.y, size.width, size.height),
         maximized: window.is_maximized(),
         minimized: window.is_minimized(),
+    }
+}
+
+#[cfg(test)]
+/// THE COPY TESTS, and they live beside the copy because that is the guard law this crate already
+/// follows: a guard moves with the code it polices. What makes these worth writing is not the
+/// strings, it is what they cross-check. A sentence in `skip_words` PROMISES an affordance ("Save
+/// As once (Ctrl+S)"), and the only thing in this crate that knows what Ctrl+S is bound to is the
+/// chord table in `surface.rs` - so the promise is now tested against the table, which is the only
+/// way a rebind can be caught before the menu starts telling people to press a key that does
+/// something else. A footer nobody can read is not an explanation, so the second test pins that
+/// the block is unclickable, and the third that its height and its position are the SAME
+/// arithmetic (two numbers that agree today and drift apart tomorrow would clip it or float it).
+mod tests {
+    use super::{encoding_words, file_words, line_ending_words, skip_words};
+    use crate::surface::SHORTCUTS;
+    use notes_api::{Encoding, FileMeta, LineEnding, SkipReason};
+
+    fn meta(
+        encoding: Encoding,
+        line_ending: LineEnding,
+        trailing: bool,
+        read_only: bool,
+        oversize: bool,
+        armed: bool,
+    ) -> FileMeta {
+        FileMeta {
+            encoding,
+            line_ending,
+            trailing_newline: trailing,
+            read_only,
+            oversize,
+            armed,
+        }
+    }
+
+    #[test]
+    fn every_skip_is_explained_and_the_one_with_an_act_names_the_real_one() {
+        // Exhaustive by construction: this list is the compiler's check that skip_words has not
+        // dropped a variant, and the empty-string check is that none of them is a shrug.
+        let all = [
+            SkipReason::AutosaveDisabled,
+            SkipReason::ForeignFileNotArmed,
+            SkipReason::Clean,
+            SkipReason::Superseded,
+            SkipReason::NeedsPath,
+            SkipReason::ReadOnly,
+            SkipReason::Oversize,
+        ];
+        for reason in all {
+            let words = skip_words(reason);
+            assert!(!words.is_empty(), "{reason:?} would render a blank reason");
+            assert!(
+                words.chars().next().unwrap().is_lowercase(),
+                "{reason:?} is a clause inside a sentence, not a heading: {words}"
+            );
+        }
+        // THE CROSS-CHECK, and the reason this test exists. ForeignFileNotArmed is the only skip
+        // that tells the user to DO something, and what it tells them is the chord table's own
+        // display string for save-as. Rebind Ctrl+S in SHORTCUTS and this fails, because the menu
+        // would then be ordering people to press a key that saves something else.
+        let unarmed = skip_words(SkipReason::ForeignFileNotArmed);
+        let chord = SHORTCUTS
+            .iter()
+            .find(|(_, _, _, act)| *act == "save-as")
+            .expect("the table still has a save-as row")
+            .1;
+        assert!(
+            unarmed.contains(chord),
+            "the reason offers {chord} as the act, and says: {unarmed}"
+        );
+        assert!(
+            unarmed.contains("Save As"),
+            "and it names the row by the name the row paints: {unarmed}"
+        );
+        // The two sentences that must never be confused, because confusing them is the difference
+        // between "nothing to do" and "this file will never be saved unless you say so".
+        assert_ne!(
+            skip_words(SkipReason::AutosaveDisabled),
+            skip_words(SkipReason::ForeignFileNotArmed)
+        );
+    }
+
+    #[test]
+    fn the_file_line_states_every_verdict_core_carries() {
+        let plain = file_words(&meta(
+            Encoding::Utf8,
+            LineEnding::Lf,
+            true,
+            false,
+            false,
+            true,
+        ));
+        assert_eq!(
+            plain,
+            "utf-8 · lf · newline kept · writable · within the guard · autosave armed"
+        );
+        // The shape this app is actually for: a CRLF file with no final newline, foreign enough to
+        // be disarmed. Every one of those four facts used to be invisible.
+        let foreign = file_words(&meta(
+            Encoding::Utf8,
+            LineEnding::CrLf,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert_eq!(
+            foreign,
+            "utf-8 · crlf · newline none · writable · within the guard · autosave not armed"
+        );
+        // D14's rule, tested as a sentence: the two encodings that differ only by a BOM, and the
+        // codepage that must carry its number, all read differently.
+        assert_ne!(
+            encoding_words(Encoding::Utf8),
+            encoding_words(Encoding::Utf8Bom)
+        );
+        assert_eq!(encoding_words(Encoding::Ansi(1252)), "ansi cp1252");
+        assert_eq!(line_ending_words(LineEnding::CrLf), "crlf");
+        // The two refusals a user can act on, and the one they cannot.
+        assert!(
+            file_words(&meta(
+                Encoding::Utf16Le,
+                LineEnding::Lf,
+                true,
+                true,
+                false,
+                true,
+            ))
+            .contains("read-only")
+        );
+        assert!(
+            file_words(&meta(
+                Encoding::Utf16Be,
+                LineEnding::Lf,
+                true,
+                false,
+                true,
+                true,
+            ))
+            .contains("over the guard")
+        );
+    }
+
+    #[test]
+    fn the_footer_explains_and_asks_for_nothing() {
+        let chrome = include_str!("../ui/chrome.slint");
+        let main = include_str!("../ui/main.slint");
+        let footer = &chrome[chrome
+            .find("footer := Rectangle {")
+            .expect("the footer block")
+            ..chrome
+                .find("about := Rectangle {")
+                .expect("the panel that ends it")];
+        // NOT A ROW. Six is still the row count precisely because this block cannot be clicked, so
+        // it inherits none of the row duties - and the popup's existing guards, which count the
+        // 6th row's cells, stay true.
+        assert!(
+            !footer.contains("TouchArea"),
+            "an explanation is not an act"
+        );
+        assert!(!footer.contains("clicked"), "and it has no handler at all");
+        assert!(
+            footer.contains("color: Theme.amber"),
+            "the reason shares the dot's amber, so the two agree about what is wrong"
+        );
+        // The absent-not-hidden choice, pinned: a hidden child still occupies the layout, which
+        // would leave a gap in a popup with nothing to say.
+        assert!(
+            footer.contains("if root.why-not-saved != \"\":")
+                && footer.contains("if root.file-words != \"\":"),
+            "each line exists only when the port said the thing behind it"
+        );
+        // ONE ARITHMETIC, TWO USERS: the popup's height and the footer's y both spend the six rows
+        // and their five gaps. Written twice, they must agree, and the only test that can tell is a
+        // count of the shared expression.
+        let whole = chrome.replace(['\n', ' '], "");
+        assert_eq!(
+            whole
+                .matches("6*Theme.menu-row-height+5*Theme.menu-gap")
+                .count(),
+            2,
+            "the height formula and the footer's offset are the same row arithmetic"
+        );
+        // The wire, both ends. THIS file writes each setter exactly once - and the count is taken
+        // from a slice that stops at the tests module, because a grep that counts its own counting
+        // line is the trap this crate has already named. Six arms and hooks in surface.rs publish
+        // through publish_explain, and NO arm writes a property directly: one author, so a sticky
+        // fact cannot be set in one place and cleared in another that nobody reads.
+        let whole = include_str!("../src/plumbing.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        assert_eq!(
+            src.matches("set_why_not_saved(").count(),
+            1,
+            "one writer for the reason, and it is this function"
+        );
+        assert_eq!(
+            src.matches("set_file_words(").count(),
+            1,
+            "one writer for the file line, same door"
+        );
+        let surface = include_str!("../src/surface.rs");
+        assert_eq!(
+            surface.matches("set_why_not_saved(").count()
+                + surface.matches("set_file_words(").count(),
+            0,
+            "and no drain arm reaches past publish_explain to write either one"
+        );
+        assert_eq!(
+            surface.matches("publish_explain(").count(),
+            6,
+            "every sticky change publishes: two adoptions, one save, one skip, one failure, \
+             one toggle. A seventh sticky write must publish too, or the footer goes stale."
+        );
+        assert!(
+            main.contains("why-not-saved: root.why-not-saved")
+                && main.contains("file-words: root.file-words"),
+            "and both are forwarded to Chrome at the one instantiation"
+        );
     }
 }

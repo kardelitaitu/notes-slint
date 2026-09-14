@@ -40,7 +40,8 @@ use slint::{ComponentHandle, PhysicalPosition};
 
 use crate::Spike;
 use crate::plumbing::{
-    describe, dialog_allowed, do_no_harm, hwnd_of, lf, note_dot, publish_title, report, send,
+    describe, dialog_allowed, do_no_harm, file_words, hwnd_of, lf, note_dot, publish_explain,
+    publish_title, report, send, skip_words,
 };
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DialogKind {
@@ -938,6 +939,18 @@ pub(crate) struct Pump {
     /// and a transient refusal leaves it standing. Nothing else changes - the note stays square,
     /// which is what it was before corners were a question, and the log says why.
     pub(crate) corners_refused: bool,
+    /// THE POPUP'S EXPLANATION, sticky; `""` means nothing to say. This exists because
+    /// docs/features.md §4.4 asks for the autosave reason IN THE MENU and the status line cannot
+    /// carry one: `set_status(describe(..))` has a single writer, so the next event overwrites the
+    /// sentence and the reason for a failure that is STILL TRUE is gone within a few hundred
+    /// milliseconds. The pump is the only place a sticky fact can live, and
+    /// [`publish_explain`](crate::plumbing::publish_explain) is the only writer to the UI.
+    pub(crate) why: String,
+    /// What the current file IS - the `FileMeta` verdict from the last `Loaded`/`Rebound`, put into
+    /// words by [`file_words`](crate::plumbing::file_words). Written on a document change and on
+    /// nothing else: saving does not alter a file's encoding, and refreshing it anywhere else would
+    /// have the bridge guessing at a verdict only core holds.
+    pub(crate) file_words: String,
     /// How many autosave toggles this bridge has sent. The port echoes NO autosave event,
     /// so the menu check can only follow the ask - printed as 'menu: ...' so the
     /// convention is visible instead of pretending to be a report.
@@ -1055,6 +1068,10 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 p.lock_word = word.to_string();
                 // A new document, a new lock: the refusal gets to speak once about THIS file.
                 p.lock_needled = false;
+                // THE FILE, DESCRIBED, while this borrow is already open: the same FileMeta that
+                // decides the lock decides what the menu's footer says about this document.
+                p.file_words = file_words(meta);
+                p.why.clear();
                 let (locked, word) = (p.locked, p.lock_word.clone());
                 drop(p);
                 // An adoption is not a user edit, and the startup one is not a switch either -
@@ -1078,6 +1095,9 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                     }
                     publish_title(&ui, Some(path), true, "loaded");
                 }
+                // The footer follows the document, in the same breath the title does: a new file
+                // has both a description and no unresolved failure to explain.
+                publish_explain(pump, weak);
                 report(&format!(
                     "load: path={} epoch={epoch} gen={generation} meta(read_only={} oversize={} armed={}) locked={locked} announced, buffer adopted ({} bytes, CR-normalised)",
                     path.display(),
@@ -1109,6 +1129,11 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 p.locked = !word.is_empty();
                 p.lock_word = word.to_string();
                 p.lock_needled = false;
+                // A Save As can land on a different file, so the description is re-read from this
+                // event's meta rather than kept from the Loaded - and the arming bit is exactly the
+                // thing that flips here, which is the one word in the footer a user acts on.
+                p.file_words = file_words(meta);
+                p.why.clear();
                 let (locked, word) = (p.locked, p.lock_word.clone());
                 drop(p);
                 let generation = note_adoption(pump, path);
@@ -1123,6 +1148,7 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                     }
                     publish_title(&ui, Some(path), true, "rebound");
                 }
+                publish_explain(pump, weak);
                 report(&format!(
                     "rebind: path={} epoch={epoch} gen={generation} meta(read_only={} oversize={} armed={}) locked={locked}; the next Flush echoes it",
                     path.display(),
@@ -1224,8 +1250,14 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 // The bytes landed, so the failure is over - cleared here and nowhere
                 // else: "latched until the next successful Saved", in one line.
                 pump.borrow_mut().save_failed = false;
+                // So is the menu's explanation. The footer outlives the status line by design,
+                // which means it has to be cleared by design too: an "auto-save is off" still
+                // hanging under a save that just worked would be the one lie this addition could
+                // tell.
+                pump.borrow_mut().why.clear();
                 let dirty = pump.borrow().dirty;
                 note_dot(pump, weak, dirty, "saved");
+                publish_explain(pump, weak);
                 if which == 1 {
                     report(&format!("saved: rev={revision} {}", path.display()));
                 } else {
@@ -1256,15 +1288,22 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
             // not see it and burned 2.0 s on every session with autosave off. The arm keeps the
             // catch-all's status line (still one writer of the words, `describe`) and adds the
             // settle, which is the only fact the root is waiting for.
-            Event::AutosaveSkipped { .. } => {
+            Event::AutosaveSkipped { reason } => {
                 {
                     let mut p = pump.borrow_mut();
                     p.saves_settled += 1;
                     p.saves_answer = "AutosaveSkipped";
+                    // THE REASON, made sticky. This is §4.4's "the reason in the menu", and the
+                    // pattern used to end in `..`: the port answered, the bridge put the sentence on
+                    // the status line, and the next event erased it - so a file that will never be
+                    // saved explained itself for one frame. The words are the bridge's by api's
+                    // design; plumbing::skip_words says why they are not describe()'s Debug shape.
+                    p.why = skip_words(*reason).to_string();
                 }
                 if let Some(ui) = weak.upgrade() {
                     ui.set_status(describe(event).into());
                 }
+                publish_explain(pump, weak);
             }
             Event::SaveFailed { reason, .. } => {
                 pump.borrow_mut().save_failed = true;
@@ -1292,6 +1331,12 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                     // sit out its deadline because the bytes it waited for are never coming.
                     p.saves_settled += 1;
                     p.saves_answer = "SaveFailed";
+                    // The port's OWN sentence, passed through rather than re-worded: SaveError has
+                    // a Display precisely because "the UI must render the reason" (AGENTS.md, code
+                    // conventions) - unlike SkipReason, which no Display reaches, so the bridge
+                    // words that one itself. The prefix is the status line's, character for
+                    // character: one hex-owner rule, and the footer outlives the line it copies.
+                    p.why = format!("save failed: {reason}");
                     report(&format!(
                         "retry: a failed save restored the send witness (retry #{})",
                         p.retries
@@ -1307,6 +1352,7 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                     // wording, the bridge owns the sentence around it.
                     ui.set_status(format!("save failed: {reason}").into());
                 }
+                publish_explain(pump, weak);
             }
             other => {
                 if let Some(ui) = weak.upgrade() {
@@ -1426,6 +1472,10 @@ pub(crate) fn wire_callbacks(
                 let mut p = pump.borrow_mut();
                 let was = p.autosave;
                 p.autosave = !was;
+                // The toggle retires the last refusal. "auto-save is off" is a sentence about the
+                // setting the user has just changed, and the next save answers under the new one -
+                // leaving it standing would be the footer contradicting the row above it.
+                p.why.clear();
                 was
             };
             report(&format!(
@@ -1435,6 +1485,7 @@ pub(crate) fn wire_callbacks(
             send(&gw, Command::SetAutosave(!was));
             let dirty = pump.borrow().dirty;
             note_dot(&pump, &weak, dirty, "autosave-row");
+            publish_explain(&pump, &weak);
         });
     }
     // A recent row is an ask, the same shape as the pin strip: index in, Command out, and the text
