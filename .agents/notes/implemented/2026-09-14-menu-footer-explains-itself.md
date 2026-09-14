@@ -142,7 +142,10 @@ answered here.
   into the product's caret without first winning the foreground it cannot win. So that sentence in
   the menu is currently evidenced by unit tests and by the frozen probe's needles, not by a window
   anybody watched.
-- The popup can now outgrow a short window: the recents cap of five exists precisely because
-  `Chrome` cannot ask the window how tall it is. With both blocks the popup wants ~294px against a
-  minimum window height — unmeasured, and the same open fit question the width clamp already
-  answers with `popup-floored`/`popup-overflow`.
+- **The popup can no longer outgrow the window it hangs in — but a floor was found under that.**
+  The recents clamp (`519df1c7`) makes the list yield to the window before the footer can be cut,
+  measured at 294→184px across eight heights with the footer intact at each. What remains is below
+  the recents: under roughly **212px** of window height the six *command rows* are what clips, and
+  nothing in the Window, the bridge or `platform` enforces a minimum height. `Chrome` cannot fix
+  that and must not try by shortening its vocabulary; the honest owner is a `min-height` at the
+  window, which is a behaviour change for a person dragging an edge, not a menu change.
