@@ -756,22 +756,35 @@ pub(crate) fn answer_dialog(
 /// hidden, because it is a behaviour a person could notice.
 pub(crate) fn note_adoption(pump: &RefCell<Pump>, path: &Path) -> i32 {
     let mut p = pump.borrow_mut();
-    p.edited_flag = false;
-    p.pending_at = None;
+    // D61: the gate the two CLEARS were always missing. Read the rule as it was written - "an
+    // adoption is not a user edit" - and it looks harmless: whoever adopts, the witness goes. It
+    // was masked for as long as a Rebound only ever arrived with a different path. After 59de9c59
+    // an in-place Ctrl+S answers Saved then Rebound with the UNCHANGED path and the UNCHANGED
+    // epoch, so this function now runs on EVERY save, and the blanket clear spent the witness of
+    // whatever was typed between the send and the answer: edited_flag false, pending_at None, the
+    // debounce cancelled, and no scheduled write left for text the buffer still holds. Silent
+    // loss, on the act whose entire purpose is not losing text. The unchanged-path Rebound is the
+    // IN-PLACE ARMING signal (ADR-0001's save arming a foreign file), never a reload - so it
+    // retires nothing. Both clears now sit behind the same fact the generation step was already
+    // gated on, in one branch, so the three cannot disagree about what a switch was.
+    //
     // The FIRST adoption of a run is the baseline, not a switch: there is no previous document
     // whose bytes could be sitting in the undo stack. Two consequences written down because they
-    // are limits, not details: (1) a step needs a path to differ FROM, so `is_some_and`, not a
+    // are limits, not details: (1) a switch needs a path to differ FROM, so `is_some_and`, not a
     // bare inequality - the first draft used `!= Some(path)` and stepped immediately, which the
     // test caught as `left: 1, right: 0`; and (2) this assumes every run BEGINS with an adoption,
     // which is this bridge's behaviour today (every log shows `rebind: epoch=1` then
     // `load: epoch=2` before the user does anything). If a later `New document` act lets a person
     // type into a never-adopted buffer and then Open, that first adoption is a real switch and
-    // would not step - the way to see that break is the first assertion below.
+    // would neither step nor retire the witness - the way to see that break is the first
+    // assertion in a_refused_load_adopts_nothing_and_says_why.
     let switching = p
         .adopted_path
         .as_deref()
         .is_some_and(|previous| previous != path);
     if switching {
+        p.edited_flag = false;
+        p.pending_at = None;
         p.generation = next_generation(p.generation);
     }
     p.adopted_path = Some(path.to_path_buf());
@@ -2330,6 +2343,43 @@ mod tests {
         assert!(
             src.contains("\"rebind: path={} epoch={epoch}"),
             "Rebound must print its path"
+        );
+        // D61, the behavioural half - no window, no engine, just the policy this fn is. Before the
+        // gate, EVERY adoption spent edited_flag and pending_at. That was harmless while a Rebound
+        // only ever meant a switch; after 59de9c59 an in-place Ctrl+S answers Saved then Rebound
+        // with the UNCHANGED path and UNCHANGED epoch, so this runs on every save, and anything
+        // typed between the send and the answer lost its witness AND its scheduled write.
+        // WHICH WAY THEY MOVE IS THE PROOF THE GATE LOADS: remove the gate (clear unconditionally)
+        // and the FIRST pair below fails - left false / None, right true / Some - while the last
+        // trio still passes; clear nothing at all and only the last trio fails, which is the
+        // half that keeps a real switch from echoing a dead document.
+        let pump = RefCell::new(Pump::default());
+        let here = Path::new("C:/notes/in-place.notes");
+        let there = Path::new("C:/notes/another-one.notes");
+        super::note_adoption(&pump, here);
+        {
+            let mut p = pump.borrow_mut();
+            p.edited_flag = true;
+            p.pending_at = Some(Instant::now());
+        }
+        super::note_adoption(&pump, here);
+        assert!(
+            pump.borrow().edited_flag,
+            "an unchanged-path Rebound spent the dirty witness: text typed after the Save was sent              has no witness left and no write scheduled"
+        );
+        assert!(
+            pump.borrow().pending_at.is_some(),
+            "and it cancelled the pending debounce, so that text can never reach disk"
+        );
+        let before = pump.borrow().generation;
+        super::note_adoption(&pump, there);
+        assert!(
+            !pump.borrow().edited_flag && pump.borrow().pending_at.is_none(),
+            "a differing path must still retire the outgoing document's witnesses"
+        );
+        assert!(
+            pump.borrow().generation > before,
+            "and a switch must still step the generation, or the undo quarantine mis-arms"
         );
     }
 
