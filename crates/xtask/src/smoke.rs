@@ -4163,6 +4163,29 @@ public static class PROD {
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [StructLayout(LayoutKind.Sequential)] public struct WINDOWPLACEMENT { public int length; public int flags; public int showCmd; public POINT ptMinPosition; public POINT ptMaxPosition; public RECT rcNormalPosition; public RECT rcReserved; }
   [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
+  // S9b ITEM 5: THE KEY AND POINTER DOORS, and the thread doors that decide whether using
+  // them is honest. keybd_event and mouse_event inject at the OS level, so a press walks
+  // the same road a user's takes - Slint's capture-key-pressed scope, the route table, the
+  // menu handler, the Command, the engine's autosave bit - and nothing is SendMessage'd
+  // into the app. MapVirtualKeyW supplies the REAL scancode: a key injected with scan 0
+  // was measured reaching the chord scope and never the caret.
+  // AttachThreadInput is the FOREGROUND LOCK, broken the way the chord-wiring E2E broke
+  // it: attach this thread to the target's AND the current foreground thread to the
+  // target's, and only then ask for the foreground. Bare SetForegroundWindow can be
+  // refused, and the keys then land nowhere near the app.
+  // GetForegroundWindow is the SAFETY gate, not decoration: a keystroke goes to whatever
+  // is focused, so no key is sent unless the tested window IS the foreground window.
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+  [DllImport("user32.dll")] public static extern uint MapVirtualKeyW(uint uCode, uint uMapType);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool mix);
+  [DllImport("user32.dll")] public static extern bool DetachThreadInput(uint a, uint b);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
 }
 '@
 $win32 = [bool](Add-Type -TypeDefinition $code -PassThru)
@@ -4244,7 +4267,134 @@ function Get-Settled($h, $ceiling) {
 # From here every read goes through Get-Handle, so the cached $handle is only ever the
 # "did a window appear at all" answer the ALIVE line above is about.
 $handle = Get-Handle $p
-if ([int64]$handle -ne 0 -and $Maximise -ge 1) {
+if ($Maximise -eq 3) {
+  # ---- S9b ITEM 5: THE AUTOSAVE TOGGLE, DRIVEN BY THE REAL CHORD ---------------------
+  # Three acts, in the order a live run proved. (1) THE SETTLED RECT, then a click inside
+  # it: Slint installs the caret's focus item on a POINTER PRESS, while a chord rides the
+  # outermost scope the app already focuses itself - so without this click a chord lands
+  # and a letter does not. Measured, not theorised. The rect is POLLED because the first
+  # sample can answer 0,0,16,16 for a window that is really there. (2) THE FOREGROUND
+  # LOCK, broken by AttachThreadInput TWICE with the ids read from
+  # GetWindowThreadProcessId's RETURN value, and only then SetForegroundWindow. (3)
+  # keybd_event with a REAL scancode from MapVirtualKeyW. The instrument is the product's
+  # own scratch draft, resolved by the portable rule and never by a guessed %APPDATA%.
+  # The state dir, by the app's OWN rule (core paths.rs, mirrored by app_state_dir): a
+  # data/ directory beside the exe wins, whatever %APPDATA% says. Watching the roaming
+  # profile while the portable marker sent the process next to the exe is the 2026-09-13
+  # dossier's mistake, and this leg refuses to make it twice.
+  $exeDir = Split-Path -Parent $Exe
+  if (Test-Path (Join-Path $exeDir 'data')) { $stateDir = Join-Path $exeDir 'data' }
+  else { $stateDir = Join-Path $env:APPDATA 'notes-gpui' }
+  $draft = Join-Path (Join-Path $stateDir 'notes') 'untitled.notes'
+  "DRAFTPATH=$draft"
+  function Get-DraftText { if (-not (Test-Path $draft)) { return '' }; try { return [IO.File]::ReadAllText($draft) } catch { return '' } }
+  function Report($tag) {
+    $t = Get-DraftText
+    # One key per line: parse_probe splits at the first '=' and keeps the rest as the
+    # value, so a four-pair line is ONE unreadable value, not four readings.
+    Write-Output ($tag + '_BYTES=' + $t.Length)
+    Write-Output ($tag + '_HAS_ALPHA=' + [int][bool]$t.Contains('alpha1'))
+    Write-Output ($tag + '_HAS_BETA=' + [int][bool]$t.Contains('beta2'))
+    Write-Output ($tag + '_HAS_CHARLIE=' + [int][bool]$t.Contains('charlie3'))
+  }
+  function Send-Key([int]$vk, [bool]$up) {
+    $scan = [PROD]::MapVirtualKeyW([uint32]$vk, 0)
+    $flags = 0
+    if ($up) { $flags = 2 }
+    [PROD]::keybd_event([byte]$vk, [byte]$scan, [uint32]$flags, [UIntPtr]::Zero)
+  }
+  function Send-Chord {
+    Send-Key 17 $false; Start-Sleep -Milliseconds 40
+    Send-Key 84 $false; Start-Sleep -Milliseconds 40
+    Send-Key 84 $true; Start-Sleep -Milliseconds 40
+    Send-Key 17 $true; Start-Sleep -Milliseconds 150
+  }
+  function Send-Text($s) {
+    foreach ($c in $s.ToCharArray()) {
+      $vk = 0
+      if ($c -match '[A-Za-z]') { $vk = [int][char]($c.ToString().ToUpper()) }
+      elseif ($c -match '[0-9]') { $vk = [int][char]$c }
+      elseif ($c -eq ' ') { $vk = 32 }
+      if ($vk -eq 0) { continue }
+      Send-Key $vk $false; Start-Sleep -Milliseconds 35
+      Send-Key $vk $true; Start-Sleep -Milliseconds 35
+    }
+  }
+  # ACT 1 - the rect, re-sighted on every sample and only accepted once it is a window.
+  $rc = New-Object PROD+RECT
+  $cx = 0; $cy = 0; $tries = 0
+  while ($tries -lt 20) {
+    $p.Refresh()
+    $hh = $p.MainWindowHandle
+    [void][PROD]::GetWindowRect($hh, [ref]$rc)
+    $w = $rc.Right - $rc.Left; $ht = $rc.Bottom - $rc.Top
+    if ($w -gt 200 -and $ht -gt 200) { $cx = [int]($rc.Left + $w/2); $cy = [int]($rc.Top + ($ht*7/10)); break }
+    $tries++; Start-Sleep -Milliseconds 250
+  }
+  Write-Output "RECT_TRIES=$tries"
+  Write-Output "RECT=$($rc.Left),$($rc.Top),$($rc.Right),$($rc.Bottom)"
+  "CLICK_AT=$cx,$cy"
+  # ACT 2 - the lock. The ids come from the RETURN value; the out parameter is the PROCESS
+  # id, and attaching to a pid is a silent no-op that costs the whole leg its keys.
+  # Re-sighted, never the handle cached at sighting - the rule this file already states
+  # for every other read, and the one place a mode-3 leg can silently attach to nothing.
+  $h3 = Get-Handle $p
+  Write-Output "TOGGLE_HANDLE=$([int64]$h3)"
+  $curTid = [PROD]::GetCurrentThreadId()
+  $fgH = [PROD]::GetForegroundWindow()
+  $pidOut = [uint32]0
+  $fgTid = [PROD]::GetWindowThreadProcessId($fgH, [ref]$pidOut)
+  $pidOut2 = [uint32]0
+  $tTid = [PROD]::GetWindowThreadProcessId($h3, [ref]$pidOut2)
+  $att1 = [PROD]::AttachThreadInput($curTid, $tTid, $true)
+  $att2 = $false
+  if ($fgTid -ne 0 -and $fgTid -ne $tTid) { $att2 = [PROD]::AttachThreadInput($fgTid, $tTid, $true) }
+  $sfw = [PROD]::SetForegroundWindow($h3)
+  Start-Sleep -Milliseconds 600
+  $fgOk = ([int64][PROD]::GetForegroundWindow() -eq [int64]$h3)
+  Write-Output "ATTACH_cur=$([int][bool]$att1)"
+  Write-Output "ATTACH_fg=$([int][bool]$att2)"
+  Write-Output "SFW=$([int][bool]$sfw)"
+  Write-Output "FOREGROUND=$([int]$fgOk)"
+  if ($fgOk) {
+    [void][PROD]::SetCursorPos($cx, $cy)
+    Start-Sleep -Milliseconds 300
+    [PROD]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 80
+    [PROD]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 500
+    'CLICKED=1'
+    Send-Text 'alpha1'
+    Start-Sleep -Milliseconds 2500
+    Report 'A1'
+    # THE BASELINE, read BEFORE anything is claimed about the toggle: alpha1 with autosave
+    # ON must reach the disk by itself. If it does not, letters never fed the caret and the
+    # toggle was never tested - which is a fact about this instrument, not a verdict on the
+    # app, and it is reported as NOT JUDGED.
+    $baseline = [int][bool]((Get-DraftText).Contains('alpha1'))
+    "BASELINE_LANDED=$baseline"
+    if ($baseline -eq 1) {
+      # ACT 3 - the chord OFF (settings default arms autosave, so THIS is the disarm) and a
+      # NEW edit. beta2 must not reach the draft.
+      Send-Chord
+      Start-Sleep -Milliseconds 700
+      Send-Text 'beta2'
+      Start-Sleep -Milliseconds 2500
+      Report 'A2'
+      # ACT 4 - the chord back ON and another new edit: a re-armed autosave needs a fresh
+      # change to have anything to write, and the buffer then carries both pending edits.
+      Send-Chord
+      Start-Sleep -Milliseconds 700
+      Send-Text 'charlie3'
+      Start-Sleep -Milliseconds 2500
+      Report 'A3'
+    }
+    if ($att1) { [void][PROD]::DetachThreadInput($curTid, $tTid) }
+    if ($att2) { [void][PROD]::DetachThreadInput($fgTid, $tTid) }
+  } else {
+    'CLICKED=0'; 'BASELINE_LANDED=0'
+    Report 'A2'; Report 'A3'
+  }
+  'NORMAL='; 'NORMAL_STABLE=0'; 'NORMAL_SHOWCMD=-1'; 'MAX_ASKED=0'; 'SHOWCMD_AFTER_MAX=-1'
+} elseif ([int64]$handle -ne 0 -and $Maximise -ge 1) {
     # Mode 0 - the plain launch - takes NONE of this path at all, so the geometry phase
     // cannot add a single second to the runtime the 45s claim is timed against.
     $a = (Get-Settled (Get-Handle $p) $SettleMs).Split('|')
@@ -4334,6 +4484,151 @@ if ($exited) {
 exit 0
 "#;
 
+/// How long the toggle launch sits on screen before it is driven: long enough that the
+/// app has claimed its focus item (a chord dies without one) and the caret click has
+/// landed. NOT [PRODUCT_ALIVE_SECS] - the 45s claim is one claim about the shipped app,
+/// and the plain launch makes it exactly once.
+const PRODUCT_TOGGLE_ALIVE_SECS: u64 = 5;
+
+/// What the autosave round trip said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Toggle {
+    /// Ctrl+T disarmed the autosave (the edit typed after it stayed out of the draft) and
+    /// Ctrl+T armed it again (the edit after THAT landed). The switch did its job through
+    /// the chord a user presses - not through a file the harness wrote.
+    Held,
+    /// A precondition went missing: no foreground window, no caret under the click, no
+    /// probe answer. Nothing is claimed in either direction. Advisory, never a red.
+    NotJudged(String),
+    /// The chord was driven and the draft disagreed with it.
+    Broken(String),
+}
+
+/// THE TOGGLE VERDICT, pure over its four readings, because a judge nobody can feed
+/// cannot be tested without a desktop.
+///
+/// THE BASELINE IS WHAT MAKES THIS HONEST. A letter that never reached the disk with
+/// AUTOSAVE ON says the keys never fed the caret - and then "nothing landed while it was
+/// off" proves nothing about the switch. That line is the whole difference between NOT
+/// JUDGED and a product bug, and it is the exact trap this leg fell into once: the chord
+/// landed in both directions, the caret never did, and the run read as a broken toggle.
+pub fn judge_toggle(
+    foreground: bool,
+    baseline_landed: bool,
+    beta_while_off: bool,
+    charlie_after_on: bool,
+) -> Toggle {
+    if !foreground {
+        return Toggle::NotJudged(
+            "the product window never became the foreground window, so NO key was sent: a keystroke goes to whatever is focused, and the harness will not press a chord into somebody elses editor".to_string(),
+        );
+    }
+    if !baseline_landed {
+        return Toggle::NotJudged(
+            "a letter typed with autosave ON never reached the draft, so the caret was never fed and the switch was never actually tested - an instrument finding, not a verdict on the toggle".to_string(),
+        );
+    }
+    if beta_while_off {
+        return Toggle::Broken(
+            "the chord did not disarm the autosave: the edit typed after it reached the draft anyway".to_string(),
+        );
+    }
+    if !charlie_after_on {
+        return Toggle::Broken(
+            "the chord did not re-arm the autosave: the baseline landed, the edit typed while off was held, and the edit typed after the way back never landed".to_string(),
+        );
+    }
+    Toggle::Held
+}
+/// THE AUTOSAVE TOGGLE, ROUND-TRIPPED THROUGH THE REAL CHORD (roadmap M2 item 5).
+///
+/// One launch in mode 3, the product's OWN scratch draft as the instrument, and no door
+/// into the app that a user does not have. The recipe lives in the probe mode-3 block and
+/// every move in it was paid for by a run that failed without it: the SETTLED rect (the
+/// first sample can answer 0,0,16,16 about a window that is really there), the CLICK that
+/// installs the caret, the DOUBLE AttachThreadInput with the thread ids read from
+/// GetWindowThreadProcessId's RETURN value (its out parameter is a PROCESS id, and
+/// attaching to a pid is a silent no-op that costs the leg every key), and the scancode
+/// from MapVirtualKeyW. Bare SetForegroundWindow with scan-0 keys was measured landing a
+/// chord on the outermost scope and never a letter on the caret.
+///
+/// TODO, for whichever slice decides this verdict deserves a CODE of its own:
+/// smoke::CONTRACT has no row for a toggle, so a BROKEN one rides the existing step code
+/// (a gap, exit 1) and an unmeasurable one prints NOT JUDGED and changes nothing. Minting
+/// a code is deliberately NOT this slice's job, and the rule it would owe is the one
+/// check-ci enforces: changing the contract means arming it in ci.yml IN THE SAME COMMIT,
+/// because [arm-missing] turns an unarmed row into a red run, not a review comment.
+fn product_autosave_toggle(script: &Path, exe: &Path, session: &Path) -> Toggle {
+    // The draft, by the app's OWN rule - the same [app_state_dir] the geometry cycle reads
+    // its session through, so a data/ directory beside the exe wins over %APPDATA%. That
+    // is what keeps this leg from watching a roaming profile while the portable marker
+    // sends the process next to the exe, which is the mistake the 2026-09-13 dossier
+    // records. The candidate SEARCH list answers a different question and is not used here.
+    let Some(state) = app_state_dir(exe) else {
+        return Toggle::NotJudged("the app own state dir could not be resolved".to_string());
+    };
+    let draft = state.join("notes").join("untitled.notes");
+    let before = fs::read(&draft).ok();
+    println!(
+        "smoke: autosave-toggle: armed (S9b) on {} - Ctrl+T, a typed edit, 2.5s, and the draft read between them",
+        draft.display()
+    );
+    let probe = match run_product_probe(script, exe, session, PRODUCT_TOGGLE_ALIVE_SECS, 3) {
+        Ok(probe) => probe,
+        Err(e) => {
+            restore_draft(&draft, before.as_deref());
+            return Toggle::NotJudged(format!("the toggle launch did not report: {e}"));
+        }
+    };
+    let verdict = judge_toggle(
+        probe.flag("FOREGROUND"),
+        probe.number("BASELINE_LANDED") == Some(1),
+        probe.number("A2_HAS_BETA") == Some(1),
+        probe.number("A3_HAS_CHARLIE") == Some(1),
+    );
+    // The readings, printed whenever the launch answered at all. The byte counts ARE the
+    // evidence, so they get their own line rather than being folded into a verdict that a
+    // green could hide.
+    println!(
+        "smoke: autosave-toggle: draft bytes before={} after_alpha={} after_beta={} after_charlie={} | rect_tries={} click_at={} attach_cur={} attach_fg={} fg={}",
+        before.as_ref().map(|b| b.len()).unwrap_or(usize::MAX),
+        probe.number("A1_BYTES").unwrap_or(-1),
+        probe.number("A2_BYTES").unwrap_or(-1),
+        probe.number("A3_BYTES").unwrap_or(-1),
+        probe.number("RECT_TRIES").unwrap_or(-1),
+        probe
+            .get("CLICK_AT")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        probe.flag("ATTACH_cur"),
+        probe.flag("ATTACH_fg"),
+        probe.flag("FOREGROUND")
+    );
+    // Do no harm, in both directions: the draft comes back byte-for-byte, or goes away if
+    // it was not there. The typed marks were the test, never the product.
+    restore_draft(&draft, before.as_deref());
+    println!(
+        "smoke: autosave-toggle: the draft is put back {}",
+        match &before {
+            Some(b) => format!("as the {} bytes it was found at", b.len()),
+            None => "absent, which is how it was found".to_string(),
+        }
+    );
+    verdict
+}
+
+/// Put the scratch draft back exactly as it was found, INCLUDING ABSENT - which is why a
+/// file that was not there is removed rather than written as zero bytes.
+fn restore_draft(path: &Path, bytes: Option<&[u8]>) {
+    match bytes {
+        Some(b) => {
+            let _ = fs::write(path, b);
+        }
+        None => {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
 /// Same two-PowerShell fallback the first probe uses: a runner may ship either, and
 /// neither is a dependency of this crate.
 fn spawn_product_probe(
@@ -4970,6 +5265,37 @@ fn run_product_leg(target: &ArtifactTarget, exe: &Path) -> i32 {
         None => {}
     }
     let cycle_broke = matches!(cycle, Some(ProductCycle::Broken(_)));
+    // ---- S9b ITEM 5: THE AUTOSAVE TOGGLE, ROUND-TRIPPED THROUGH THE REAL CHORD -------
+    // OFF has to mean nothing reaches the disk; ON has to mean the buffer does. Driven by
+    // the recipe in the probe mode-3 block, judged in [judge_toggle], and put back by
+    // [restore_draft]. Run only off a clean plain launch AND a cycle that did not break:
+    // a window that will not close politely has already been accused of the louder thing.
+
+    // ITEM 4 (the OPEN / SAVE-AS dialogs) IS STILL OPEN AND IS NOT STUBBED. Ctrl+O and
+    // Ctrl+Shift+S raise a NATIVE rfd dialog, which is a second, foreign window on the
+    // desktop, and this slice never reached automating it: the assertion is ABSENT, not
+    // faked. The door item 4 needs is live in this probe - the settled rect, the double
+    // AttachThreadInput, real scancodes, the foreground gate - plus the dialog own tree.
+    let toggle: Option<Toggle> = if gaps.is_empty() && !cycle_broke {
+        Some(product_autosave_toggle(&script, exe, &session))
+    } else {
+        println!(
+            "smoke: autosave-toggle: NOT RUN - the launch before it did not pass, so there was no window left that could take a chord"
+        );
+        None
+    };
+    match &toggle {
+        Some(Toggle::Held) => println!("smoke: autosave-toggle: off-held on-landed"),
+        Some(Toggle::NotJudged(why)) => {
+            println!("smoke: autosave-toggle: NOT JUDGED (advisory) - {why}")
+        }
+        Some(Toggle::Broken(why)) => {
+            println!("SMOKE TOGGLE FAIL: {why}");
+            println!("smoke: autosave-toggle: BROKE - see the line above");
+            gaps.push(format!("SMOKE FAIL: autosave-toggle - {why}"));
+        }
+        None => {}
+    }
     let elapsed = started.elapsed();
     if gaps.is_empty() && !cycle_broke {
         println!(
@@ -7573,6 +7899,102 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
         assert_eq!(SW_SHOWMAXIMIZED, 3);
     }
 
+    /// S9b ITEM 5, the half that needs no desktop: the judge. The trap this leg fell into
+    /// once was reading "nothing landed while off" as a verdict when the caret had never
+    /// been fed at all - which is NOT JUDGED, not a broken toggle.
+    #[test]
+    fn the_autosave_toggle_judge_needs_a_landed_baseline_before_it_accuses_anything() {
+        assert_eq!(judge_toggle(true, true, false, true), Toggle::Held);
+        // Text on the disk while the switch was supposed to be off: it did not disarm.
+        assert!(matches!(
+            judge_toggle(true, true, true, true),
+            Toggle::Broken(_)
+        ));
+        assert!(matches!(
+            judge_toggle(true, true, true, false),
+            Toggle::Broken(_)
+        ));
+        // Held while off and never landed after the way back: it did not re-arm.
+        assert!(matches!(
+            judge_toggle(true, true, false, false),
+            Toggle::Broken(_)
+        ));
+        // The two declines. No foreground means no key was ever sent; no baseline means
+        // the caret was never fed - either way the switch was not tested, so it is not
+        // accused. A decline outranks every reading, including a loud-looking one.
+        assert!(matches!(
+            judge_toggle(false, false, false, false),
+            Toggle::NotJudged(_)
+        ));
+        assert!(matches!(
+            judge_toggle(true, false, false, false),
+            Toggle::NotJudged(_)
+        ));
+        assert!(matches!(
+            judge_toggle(false, true, true, true),
+            Toggle::NotJudged(_)
+        ));
+    }
+
+    /// The other half, and the reason the recipe is spelled out in the script: the probe
+    /// carries the doors the leg presses and prints the keys the judge reads. Asserted
+    /// against the script text for the same reason the geometry needles are - the
+    /// alternative is a desktop run.
+    #[test]
+    fn the_product_probe_carries_the_chord_recipe_and_the_toggle_keys() {
+        for needle in [
+            "public static extern void keybd_event",
+            "public static extern uint MapVirtualKeyW",
+            "public static extern bool AttachThreadInput",
+            "public static extern bool DetachThreadInput",
+            "public static extern uint GetCurrentThreadId",
+            "public static extern uint GetWindowThreadProcessId",
+            "public static extern bool SetCursorPos",
+            "public static extern void mouse_event",
+            "public static extern bool GetWindowRect",
+            "$Maximise -eq 3",
+            "FOREGROUND=$([int]$fgOk)",
+            "BASELINE_LANDED=$baseline",
+            "_BYTES=",
+            "_HAS_ALPHA=",
+            "_HAS_BETA=",
+            "_HAS_CHARLIE=",
+            "Report 'A1'",
+            "Report 'A2'",
+            "Report 'A3'",
+            "RECT_TRIES=",
+            "untitled.notes",
+            "_HAS_ALPHA=",
+        ] {
+            assert!(
+                PRODUCT_PROBE.contains(needle),
+                "the product probe no longer carries {needle:?}, and  product_autosave_toggle needs it"
+            );
+        }
+        let leg = run_product_leg_text();
+        assert!(
+            leg.contains("product_autosave_toggle(&script, exe, &session)"),
+            "{leg}"
+        );
+        assert!(leg.contains("gaps.is_empty() && !cycle_broke"));
+        assert!(leg.contains("SMOKE FAIL: autosave-toggle"));
+        assert!(leg.contains("autosave-toggle: off-held on-landed"));
+        // And the draft is put back, in both shapes: a write path and a delete path.
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/smoke.rs"))
+            .expect("smoke.rs is readable from its tests");
+        assert!(src.contains("fs::write(path, b)"));
+        assert!(src.contains("fs::remove_file(path)"));
+    }
+
+    /// What this slice did NOT do, said in the suite so a green row is never read as item
+    /// 4 having shipped: the native Open / Save-As dialog stays un-asserted.
+    #[test]
+    fn item_4_the_native_dialog_is_still_unasserted_and_not_stubbed() {
+        assert!(!PRODUCT_PROBE.contains("UIAutomation"));
+        assert!(!PRODUCT_PROBE.contains("System.Windows.Forms"));
+        assert!(!PRODUCT_PROBE.contains("UIAutomation"));
+        assert!(!PRODUCT_PROBE.contains("ValuePattern"));
+    }
     /// The reason this slice exists as its own ticket: code 6 had no producer on the leg
     /// that runs by default. It is not enough that 6 is IN the table - ci.yml arms the
     /// table - the product leg has to be able to RETURN it, with no flag, no needle
