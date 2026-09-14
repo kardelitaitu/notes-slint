@@ -253,10 +253,12 @@ about bytes on disk. A retry that needs arming to work has the wrong channel.
   deliberately is not: it is the one place both binaries share, and a send inside it would
   be a product decision made on the instrument's account.
 - **The door is ONE post-drain step in the product tick**, which already holds a gateway:
-  the tick calls `drain(&tick_events, &tick_pump, &ui.as_weak())` and then
-  `text_pump(&tick_gw, ...)` on the same wake, so a step placed after the drain sees both
-  the answered events and the wire. That is the only place in the product where a retry can
-  be issued without inventing a second route to the port.
+  the tick calls `drain(&tick_events, &tick_pump, &ui.as_weak())` and then, on the same wake,
+  `text_pump(&ui, &tick_gw, &tick_pump)` - quoted as an exact literal, because that string is
+  one of the three the ordering test slices for, so the citation is the thing the test reads.
+  A step placed after the drain therefore sees both the answered events and the wire, which is
+  the only place in the product where a retry can be issued without inventing a second route
+  to the port.
 - **That step must NOT sit between the panic-hook take and `Gateway::start`.** The region is
   sliced by file index and asserted against - `product.rs`'s own module header enumerates
   what is paid for it, including `smoke.rs`'s `PRODUCT_CLOSE_NEEDLES` - so inserting there
@@ -284,3 +286,35 @@ The retry stays this note's. **What a switch may do while it waits for an answer
 that law lives in
 `.agents/notes/proposed/2026-09-15-held-switch-waits-for-answer.md`, which shares the
 funnel, the plumbing constraint above, and the discipline of answering rather than waiting.
+
+
+### Evidence moved: the transcript changed, and that is a re-earning owed, not a regression
+
+`7f6d40e7` landed the channel law, and it changed what the frozen instrument **reports** -
+which is a re-earning owed under ADR-0006 §4, not a regression, and this paragraph exists so
+that nobody reads the old transcript and concludes the bridge got worse. Four lines were
+**removed**: the family `retry: a failed save restored the send witness (#1..#4)`, because
+the probe's read-only-lock act presses Save on a file it cannot write, the old lane cleared
+`last_sent`, and the pump re-sent a `Flush` 750 ms later and was refused again - the doomed
+loop this addendum condemns, running inside the instrument and being read as normal output
+(`probe.rs` carries no `retry` line at all today). One line **changed**: the chrome verdict
+moved from `save-failed=true dirty=false` to `dirty=true`, so the old record contained a
+failed save reporting the document CLEAN. Nothing was **added**: the honest else-branch
+sentence saying a refusal had no explicit Save behind it was deleted before the commit
+precisely because ADR-0006 §4 protects what the instrument reports and an adapter slice may
+not add to it - the branch survives as a comment in
+`a_refused_save_owes_a_retry_and_the_retry_carries_the_same_pair`, where it is asserted
+rather than printed. Measured: the save-failed family went 17 lines to 13, unique normalised
+product lines 140 to 139, the six `do-no-harm` lines and the nine arming lines are
+unchanged, and all seven overlay triples are byte-identical. Two gaps, and they are not the
+same gap. The **call is pinned**:
+`an_owed_retry_decides_a_save_and_the_door_is_called_after_the_drain` unwraps `expect("the
+door is called in the tick")` on the literal call, so deleting the call panics that test, and
+one review claim did not survive reading it. The **send inside it is what no test reaches**,
+because a send needs a live gateway and a queue: `retry_door` names its own `send(gw, ...)`
+"the one untested line", and its test says plainly that it "does NOT prove a byte reached the
+channel". Between those two sits a third, weaker fact - the SaveFailed arm's write is guarded
+only by a source-slice assert, so gating just that write on the autosave toggle would keep the
+suite green. And the ask: whoever re-earns a menu or save claim against that transcript must
+cite the **new** line set, because a verdict earned against four doomed lines is not evidence
+about the fixed bridge.

@@ -176,11 +176,13 @@ of the state, not a measured failure.
 So a reader can pick this up cold. Four slices, in this order, each with its own green run recorded in
 the commit that lands it.
 
-1. **The door.** The one post-drain step in `product.rs`'s tick - the place that already holds a
-   gateway, right where the tick calls `drain(&tick_events, &tick_pump, &ui.as_weak())` and then
-   `text_pump(&tick_gw, ...)` on the same wake. It does nothing on its own; it makes sending possible
-   from a place that sees the answered events. Not between the panic-hook take and `Gateway::start`:
-   that region is sliced by file index and asserted against.
+1. **The door.** The one post-drain step in `product.rs`'s tick - the place that already
+   holds a gateway, right where the tick calls `drain(&tick_events, &tick_pump, &ui.as_weak())`
+   and then `text_pump(&ui, &tick_gw, &tick_pump)` - an exact literal, because the ordering test
+   slices for that string, so the citation is the thing the needle reads. The door does nothing
+   on its own; it makes sending possible from a place that sees the answered events. Not between
+   the panic-hook take and `Gateway::start`: that region is sliced by file index and asserted
+   against.
 2. **The retry trio** - the `pending` field, the `why` precedence rule, and `retry_says` - in the other
    note, with the retry channel switched from `Flush` to `Save`. First, because a retry that re-sends
    `Flush` is dead, and every rule here about refusal presumes a refusal that can actually be produced.

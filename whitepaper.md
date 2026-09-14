@@ -58,7 +58,12 @@ Three things to carry into M1, in order of how much they cost to discover late:
    one.
 2. **ADR-0001 changes the autosave interface.** `.notes` autosaves immediately; a foreign
    file stays disarmed until one explicit save arms it, and `Event::AutosaveSkipped` must be
-   rendered. `core/autosave.rs` must be written knowing this.
+   rendered. The gate is `crates/core/src/document.rs` (`armed`, `should_autosave`, and
+   `should_save_manual` for the hand-triggered act), the clock that fires it is
+   `crates/api/src/engine.rs` (`AUTOSAVE_IDLE`, `on_tick`), and the events a bridge renders
+   are declared in `crates/api/src/event.rs`; all of them were written knowing this. There is no
+   `core/autosave.rs`, and the split is the rule rather than an accident — `core` decides,
+   `api` routes and times.
 3. **Two M0 checks are still open**: no dialog was actually presented, and no human looked
    at whether the painted frame is correct. Both are minutes. Do them before M2 is called
    done, not after.
