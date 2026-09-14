@@ -220,6 +220,7 @@ pub(crate) fn save_now(
         // owed retry, so the retry can carry the revision and epoch the engine already saw rather
         // than a fresh reading - and so "something is unsaved" stops being a string comparison.
         p.last_send = Some((text.clone(), p.edits, p.epoch));
+        p.last_sent_rev = p.edits;
         // FIX THREE: a NEWER explicit Save is a newer payload, so any ladder still live is about
         // bytes that are no longer the newest - leaving it running would put two payloads in play,
         // which is the same class of bug as arming off a stale pair. The next refusal, if there is
@@ -300,7 +301,12 @@ pub(crate) fn retry_take(pump: &RefCell<Pump>) -> Retake {
     match retry_says(record.waited(), record.every, record.attempts) {
         Due::NotYet => Retake::Waiting,
         Due::Terminal => {
-            pump.borrow_mut().retry = None;
+            // SHOULD (a): retirement is retirement everywhere - the ladder and the PAIR both go,
+            // or a slow write that lands after the cap finds a dead obligation still recorded and
+            // arms a fresh ladder for an obligation the cap already retired.
+            let mut p = pump.borrow_mut();
+            p.retry = None;
+            p.last_send = None;
             Retake::Terminal
         }
         Due::Send { next } => {
@@ -428,6 +434,26 @@ pub(crate) fn retry_arm(pump: &RefCell<Pump>) -> bool {
     // to last_sent (the adoption made them equal at the send) and reports clean, and the exit reads
     // that clean. FIX FOUR is the repair, and it consults the record rather than the witness.
     p.edited_flag = true;
+    true
+}
+
+/// MUST ONE: rewind the debounced lane's send witness to the bytes the port last CONFIRMED on
+/// disk. Returns false and changes nothing when the build has no unsent-recovery (the instrument),
+/// and equally nothing when no disk truth is known - a rewind to an unknown value would invent a
+/// difference and send bytes nobody typed, which is the same class of error as the stale pair FIX
+/// TWO drops. Pure state, because that is what makes it testable at all: the refusal lane needs a
+/// live port to reach, and a law nobody can drive is a law nobody can disprove.
+pub(crate) fn heal_flush_lane(p: &mut Pump) -> bool {
+    if !p.retry_enabled {
+        return false;
+    }
+    let Some(on_disk) = p.disk_text.clone() else {
+        return false;
+    };
+    p.last_sent = on_disk;
+    // A fresh debounce window, so the heal re-sends on the ordinary idle rather than on the tail of
+    // a clock that started before the refusal.
+    p.pending_at = None;
     true
 }
 
@@ -680,6 +706,7 @@ pub(crate) fn text_pump(ui: &Spike, gw: &Rc<RefCell<Option<Gateway>>>, pump: &Re
     pump.edits += 1;
     let (revision, epoch) = (pump.edits, pump.epoch);
     pump.last_sent = text.clone();
+    pump.last_sent_rev = revision;
     let quiet = pump.pending_at.map_or_else(
         || String::from("unknown"),
         |at| format!("{:?}", at.elapsed()),
@@ -1230,6 +1257,21 @@ pub(crate) struct Pump {
     /// cannot discharge a record is never handed one. Default false is the safe direction: a field
     /// that must be switched ON by the code that can finish the job.
     pub(crate) retry_enabled: bool,
+    /// MUST ONE: the last bytes the PORT CONFIRMED on disk - the disk witness, as distinct from the
+    /// send witness in last_sent. Tonight's fix made the send witness honest ("this went out") and in
+    /// doing so removed the only mechanism the DEBOUNCED lane had for noticing a refusal: the failure
+    /// lane used to clear last_sent, and the compare pump then saw a difference and re-sent. A
+    /// refusal of a flush left the two witnesses equal forever, so one transient lock - an antivirus
+    /// handle, a OneDrive sync - halted autosave until the user typed again, for every session that
+    /// never presses Ctrl+S, which is the product default. The law is one law: unsent is a fact the
+    /// pump carries. This field IS that fact for the flush lane, written by an ANSWER and never by a
+    /// send, and the failure lane rewinds the send witness back to it so the buffer differs again.
+    pub(crate) disk_text: Option<String>,
+    /// Which revision `last_sent` describes, so a `Saved` can confirm by IDENTITY (the bytes THIS
+    /// send carried are on disk) rather than by "a save happened". Without it, a slow write landing
+    /// after a newer send would record the newer text as confirmed, which is a lie in the same
+    /// direction in the other order.
+    pub(crate) last_sent_rev: u64,
     /// The port has NO event that echoes autosave - engine.rs:601-602 assigns the bool
     /// and says nothing back - so this is InitialState's answer XORed by every
     /// Command::SetAutosave this bridge sends. The bridge's own last ask, named as such
@@ -1431,6 +1473,11 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 // bump sites reach this bridge as exactly two events.
                 retire_owed(&mut p);
                 p.last_sent = adopted.clone();
+                // MUST ONE: an open is the port telling us what is ON disk, so both witnesses start
+                // this document equal and the revision they describe is the current one. This is
+                // the only place the disk witness is written other than by a confirming Saved.
+                p.disk_text = Some(adopted.clone());
+                p.last_sent_rev = p.edits;
                 p.load_answers += 1; // S4d: an answer arrived - what the locked act waits for
                 // S8b: THE VERDICT, read at last. This pattern used to end in `..`, which dropped
                 // the whole FileMeta - the disk flag, D9's size verdict, ADR-0001's arming bit -
@@ -1626,6 +1673,15 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                     p.saves += 1;
                     p.saves_settled += 1;
                     p.saves_answer = "Saved";
+                    // MUST ONE: CONFIRM BY IDENTITY. The event names the revision whose bytes are now
+                    // on disk; when that is the revision our send witness describes, the send witness
+                    // graduates into the disk witness. When it is not - a slow write answering an older
+                    // send - nothing is confirmed, because we do not know the bytes of the text that
+                    // landed. This is the rule the retry lane already uses, applied to the other
+                    // witness: an answer releases or records only what its own send asked about.
+                    if *revision == p.last_sent_rev {
+                        p.disk_text = Some(p.last_sent.clone());
+                    }
                     // FIX THREE: a Saved that answers THIS pair retires the record and the pair, by
                     // identity - the revision the event names against the revision the send carried,
                     // which is the rule the held-switch note states for the funnel and which applies
@@ -1731,6 +1787,29 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                     // the footer outlives the line it copies. RANKED now: this is the disk speaking,
                     // and a setting's sentence must not arrive later and erase it.
                     note_why(&mut p, WHY_DISK, &format!("save failed: {reason}"));
+                    // MUST ONE: HEAL THE DEBOUNCED LANE. The refusal just said the bytes in
+                    // last_sent are NOT on disk, and for the flush lane that witness is the whole
+                    // schedule - text == last_sent means nothing to do, forever. One transient lock
+                    // (an antivirus handle, a OneDrive sync) therefore halted autosave until the user
+                    // typed again, in every session that never presses Ctrl+S, which is the product
+                    // default; and the close reported a clean buffer over text that was never written.
+                    // The repair is the rewind this field exists for: the send witness goes back to
+                    // the last text the port CONFIRMED on disk, so the buffer differs again and the
+                    // ordinary pump re-sends it on its own clock. That also fixes the case the old
+                    // clear could never reach - select-all, delete, refused - because the rewind
+                    // target is the file's real bytes and an empty buffer differs from them, where
+                    // clearing last_sent made "" equal "" and the lane stopped.
+                    //
+                    // GATED ON THE SAME OPT-IN as the ladder, and that is a cost, not a cleverness:
+                    // no honest discriminator separates "a flush was refused" from the instrument's
+                    // Save As refusal, because both carry the revision the send witness names. So the
+                    // frozen probe cannot exercise the heal, which means the instrument measures the
+                    // window contract exactly as the accepted record does and measures NOTHING about
+                    // unsent-recovery. The alternative - let it fire - moves a transcript that has
+                    // already been re-earned once tonight, and that is a different trade, not a
+                    // better one. retry_enabled is read here rather than passed because the pump owns
+                    // both witnesses and the rule is one rule for both lanes.
+                    heal_flush_lane(&mut p);
                 }
                 if retry_arm(pump) {
                     report(
@@ -2823,6 +2902,51 @@ mod tests {
             matches!(super::retry_take(&pump), super::Retake::Idle),
             "a newer send alone makes the owed pair undeliverable"
         );
+        // 2c-d. MUST TWO, the direction that lived only in prose: the carry-forward is keyed on
+        //     IDENTITY, so an arm of a DIFFERENT revision while a ladder is live must start a NEW
+        //     ladder at zero with the first delay. Asserting only the same-revision case is what let
+        //     "delete the identity check and nothing reddens" happen - the reject side was tested and
+        //     the accept side was a sentence in a comment. Both directions, one after the other, on
+        //     the same live record.
+        {
+            let mut p = pump.borrow_mut();
+            p.edits = 9;
+            p.last_send = Some(("a newer Ctrl+S".to_string(), 9, 3));
+        }
+        assert!(super::retry_arm(&pump), "a newer refused pair arms");
+        {
+            let p = pump.borrow();
+            let owed = p.retry.as_ref().expect("owed");
+            assert_eq!(owed.revision, 9, "the payload moved to the newer pair");
+            assert_eq!(
+                owed.attempts, 0,
+                "and the LADDER restarted - a different obligation"
+            );
+            assert_eq!(
+                owed.every,
+                super::RETRY_FIRST,
+                "at the first delay, because climbing a ladder it never paid for could make a brand
+                 new write terminal on its first refusal"
+            );
+        }
+        // ...and the same obligation still carries forward, which is the other half of the key.
+        {
+            let mut p = pump.borrow_mut();
+            let owed = p.retry.as_mut().expect("owed");
+            owed.attempts = 2;
+            owed.every = Duration::from_millis(3000);
+        }
+        assert!(super::retry_arm(&pump), "re-armed on the same pair");
+        {
+            let p = pump.borrow();
+            let owed = p.retry.as_ref().expect("owed");
+            assert_eq!(owed.attempts, 2, "SAME revision: the rung is kept");
+            assert_eq!(
+                owed.every,
+                Duration::from_millis(3000),
+                "and the delay it reached"
+            );
+        }
         // 2d. FIX ONE, the rung nothing proved before: a SECOND refusal, answering a retry rather
         //     than an act, must ADVANCE the ladder - attempts and delay carried forward - because
         //     resetting them is what made the cap unreachable and the loop endless at 750 ms. The
@@ -3016,6 +3140,120 @@ mod tests {
             );
         }
 
+        // 6f. MUST ONE, the lane tonight's fix stopped. This is the debounced flush, not the explicit
+        //     Save: no ladder, no door, just the pump's own comparison, which is why the heal has to
+        //     move a WITNESS rather than schedule a write. The refusal said the bytes in last_sent are
+        //     not on disk, so the send witness goes back to the disk truth and the buffer differs
+        //     again. Before this, one transient lock halted autosave until the next keystroke in every
+        //     session that never presses Ctrl+S, and the close reported a clean buffer.
+        {
+            let mut p = pump.borrow_mut();
+            p.last_sent = "T2, refused by a locked file".to_string();
+            p.disk_text = Some("T0, what is actually on disk".to_string());
+            p.pending_at = Some(Instant::now());
+        }
+        let buffer = "T2, refused by a locked file".to_string();
+        assert!(
+            buffer == pump.borrow().last_sent,
+            "the hazard itself: the send witness matches the buffer, so the pump has nothing to do"
+        );
+        {
+            let mut p = pump.borrow_mut();
+            assert!(
+                super::heal_flush_lane(&mut p),
+                "the heal runs in the armed build"
+            );
+        }
+        {
+            let p = pump.borrow();
+            assert_eq!(
+                p.last_sent, "T0, what is actually on disk",
+                "the send witness is the disk truth again"
+            );
+            assert!(
+                buffer != p.last_sent,
+                "and the buffer differs, so the ordinary pump re-sends on its own clock"
+            );
+            assert!(
+                p.pending_at.is_none(),
+                "a fresh debounce window, not a stale clock"
+            );
+            assert!(
+                p.disk_text.is_some(),
+                "and the disk truth itself is untouched by the rewind"
+            );
+        }
+        // Two ways the heal must REFUSE, both of them the safety of the rewind: a build with no
+        // unsent-recovery (the instrument, which the opt-in keeps out and which the probe run proves
+        // by moving no line), and a pump that has never been told what is on disk - a rewind to an
+        // unknown would invent a difference and send bytes nobody typed.
+        {
+            let quiet = RefCell::new(Pump::default());
+            {
+                let mut q = quiet.borrow_mut();
+                q.last_sent = buffer.clone();
+                q.disk_text = Some("T0".to_string());
+            }
+            assert!(
+                !super::heal_flush_lane(&mut quiet.borrow_mut()),
+                "an un-armed pump must not heal - this is the instrument's pump"
+            );
+            assert_eq!(
+                quiet.borrow().last_sent,
+                buffer,
+                "and its witness is unchanged"
+            );
+            let blank = RefCell::new(Pump::default());
+            {
+                let mut q = blank.borrow_mut();
+                q.retry_enabled = true;
+                q.last_sent = buffer.clone();
+                q.disk_text = None;
+            }
+            assert!(
+                !super::heal_flush_lane(&mut blank.borrow_mut()),
+                "no disk truth, no rewind"
+            );
+            assert_eq!(blank.borrow().last_sent, buffer, "nothing was invented");
+        }
+        // 6g. The other half of the disk witness, which is the only thing that makes a rewind
+        //     honest: a Saved must CONFIRM by identity, or last_sent would rewind to bytes that
+        //     never landed. Inside an event arm, so it is pinned as the comparison it makes rather
+        //     than as behaviour - a slow write answering an older send must not promote the newest
+        //     send witness into the disk truth.
+        {
+            fn saved_arm() -> String {
+                let whole = include_str!("../src/surface.rs");
+                let src = &whole[..whole.find("mod tests").expect("the tests module")];
+                let saved = &src[src
+                    .find("Event::Saved { path, revision } =>")
+                    .expect("the Saved arm")..];
+                saved[..saved.find("Event::AutosaveSkipped").expect("the next arm")].to_string()
+            }
+            let saved = saved_arm();
+            assert!(
+                saved.contains("*revision == p.last_sent_rev"),
+                "a Saved confirms the disk witness only for the revision its own send carried"
+            );
+            assert!(
+                saved.contains("p.disk_text = Some(p.last_sent.clone())"),
+                "and the confirm is a call in the arm, not a rule in a comment"
+            );
+            let whole2 = include_str!("../src/surface.rs");
+            let src2 = &whole2[..whole2.find("mod tests").expect("the tests module")];
+            let failed = &src2[src2
+                .find("Event::SaveFailed { reason, .. } =>")
+                .expect("the SaveFailed arm")..];
+            let failed = &failed[..failed.find("other =>").expect("the next arm")];
+            assert!(
+                failed.contains("heal_flush_lane(&mut p)"),
+                "the failure lane must run the heal, or the witness never moves"
+            );
+            assert!(
+                !failed.contains("p.last_sent.clear()"),
+                "and not the old way: clearing the witness is what could never see an empty buffer"
+            );
+        }
         // 7. REPAIR TWO, the precedence. A verdict about the DISK outranks a verdict about a
         //    SETTING, so a skip arriving after a failure can no longer stamp "a file this app did
         //    not create: Save once (Ctrl+S) and it keeps saving" over the reason the save failed -
@@ -3117,30 +3355,6 @@ mod tests {
         assert!(
             skip.contains("note_why(&mut p, WHY_SETTING"),
             "the setting lane must write through the rank, or it still stamps over the disk"
-        );
-        // 9. And the retirement's call sites, which ARE a census and are claimed as one: the three
-        //    bump sites (open, restore_missing_scratch, save_as) reach this bridge as exactly TWO
-        //    events - the first two both emit Loaded - so exactly two arms may retire, one in each.
-        //    Deleting either call reddens this and nothing else, which is the price of having no
-        //    window to drive.
-        assert_eq!(
-            src.matches("retire_owed(&mut p)").count(),
-            2,
-            "exactly the two arms that adopt an epoch may retire an owed retry"
-        );
-        let loaded = &src[src.find("let adopted = lf(text);").expect("the Loaded arm")..];
-        let loaded = &loaded[..loaded.find("Event::Rebound {").expect("the next arm")];
-        assert!(
-            loaded.contains("retire_owed(&mut p)"),
-            "the switch lane must retire the outgoing document's retry"
-        );
-        let rebound = &src[src.find("Event::Rebound {").expect("the Rebound arm")..];
-        let rebound = &rebound[..rebound
-            .find("Event::Saved { path, revision } =>")
-            .expect("the next arm")];
-        assert!(
-            rebound.contains("retire_owed(&mut p)"),
-            "and so must the rebind lane, because a Save As bumps the epoch"
         );
         // 9. And the retirement's call sites, which ARE a census and are claimed as one: the three
         //    bump sites (open, restore_missing_scratch, save_as) reach this bridge as exactly TWO

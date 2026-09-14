@@ -878,10 +878,11 @@ fn main() {
     // either, so the honest fact is the record itself. Asking for it is also what makes the cap's
     // terminal state true at close: the door runs in the wait below, so an owed write is ATTEMPTED
     // before the window goes, instead of being silently dropped by a lane that never looked.
-    let dirty_at_exit = {
+    let unsent = || {
         let p = pump.borrow();
         p.dirty || p.retry.is_some()
     };
+    let mut dirty_at_exit = unsent();
     let asked = Instant::now();
     while dirty_at_exit
         && pump.borrow().saves == saves_at_entry
@@ -892,6 +893,15 @@ fn main() {
         text_pump(&ui, &gateway, &pump);
         drain(&events, &pump, &ui.as_weak());
         retry_door(&gateway, &pump);
+        // SHOULD (b): recomputed EVERY iteration, because an obligation can be armed INSIDE the
+        // wait - the door's own attempt can be refused, and MUST ONE's heal can make the buffer
+        // differ from the send witness again. A once-computed flag let the loop leave on a stale
+        // reading and then report that nothing more was coming, over text that was never written.
+        // What still stands, and is not fixed here: the wait exits on the FIRST terminal answer
+        // even if a new obligation arrived with it, because that is the settled contract of this
+        // lane (fix 3, the autosave-off tax) and changing it is a morning decision, not a
+        // one-line one.
+        dirty_at_exit = unsent();
     }
     let verdict = {
         let p = pump.borrow();
@@ -1683,6 +1693,32 @@ mod tests {
         assert!(
             door > start,
             "and it is nowhere in the startup band the panic-hook guard slices"
+        );
+        // MUST ONE / the opt-in's other half, and the point of stating it HERE is that the guarantee
+        // does not need a pin inside the frozen file. The instrument is not allowed to arm a retry or
+        // run the flush heal, so it cannot move the record it is the measure of - and the way to hold
+        // that is on the RULE, not on a test written in the file that must not opt in: exactly one
+        // assignment flips the flag in this root, it lives in the constructor path that also wires
+        // the door, and the other root has no such line at all.
+        let whole_prod = include_str!("product.rs");
+        let prod = &whole_prod[..whole_prod.find("mod tests").expect("the tests module")];
+        assert_eq!(
+            prod.matches("retry_enabled = true").count(),
+            1,
+            "one writer, this root's constructor, or two builds start to differ"
+        );
+        let flip = prod.find("retry_enabled = true").expect("the writer");
+        let built = prod
+            .find("let pump = Rc::new(RefCell::new(Pump::default()));")
+            .expect("the product pump constructor");
+        assert!(
+            flip > built && flip < built + 4000,
+            "the flag is flipped where the pump is made, beside the wiring that owns the door"
+        );
+        let probe = include_str!("probe.rs");
+        assert!(
+            !probe.contains("retry_enabled"),
+            "the instrument root never opts in, so nothing it does can arm a retry or rewind a              witness - which is why the probe transcript can stay the measure it is"
         );
     }
 }
