@@ -110,8 +110,23 @@ a rescue or as a glitch.
    what a person can do by dragging an edge — so it is a design decision, not a menu detail, and it
    belongs to whoever owns the window. Ask, or propose it in `.agents/notes/proposed/`; do not leave
    "nobody enforces this" as the steady state.
-2. **`popup-x` is measuring the wrong block for About.** 190px is assumed where 340px is drawn.
-   Fixing it needs new evidence from the live leg, not an edit to the frozen instrument.
+2. **`popup-x` is not a clamp, and About has now been taken off it.** The expression is
+   `Math.max(8px, Math.min(Theme.menu-inset, host - menu-width - 8px))` and its floor (8) sits *above*
+   the inset (4) its ceiling is capped against, so it returns **8px on every host** — arithmetic at
+   twelve widths, then pixels: the menu's left edge is x=9 (8 + border) at 1200, 800, 400, 360, 250,
+   200 and 190 alike. `popup-floored` is true everywhere, so the flag that exists to "admit the
+   remainder" reports a tautology, and the branch its own comment calls "the interesting case — a
+   narrow host where the ceiling takes over" cannot execute. The rule is frozen evidence
+   (`probe.rs:1837`, pinned by a count in `plumbing.rs`) so it stays exactly where its verdict left
+   it; what changed is that About — 340px where the expression assumes 190px — now has its own
+   `popup-left(about.width)`, resting at the same 8px so the two panels still line up, ceiling at the
+   host, and **a floor of zero, because a cut licence is worse than no left margin**. Measured: on a
+   340px host the panel sits at x=1 with its right edge at 338, whole, where the inert rest left it
+   hanging 6px off the edge; at 800/400/360 it did not move at all, which is the point. Below 340 no
+   placement exists and `about-overflow` says so against `about.width` rather than a second copy of
+   the literal that `probe.rs:2105` pins.
+   The remaining item is the frozen half: making `popup-x` a real clamp needs fresh evidence, which is
+   the same re-earning keyboard traversal is waiting on (`2026-09-14-menu-keyboard-traversal`).
 3. **The menu is not accessible, and the skill says so in terms.** `ContextMenuArea`'s entries "are
    exposed to accessibility frameworks — a hand-rolled overlay menu is neither". Ours is hand-rolled
    by decision: the rows carry the pin glyph, the checkmark, the shortcut display, and the frozen

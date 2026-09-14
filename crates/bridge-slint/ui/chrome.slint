@@ -205,6 +205,41 @@ export component Chrome inherits Rectangle {
     in property <bool> about-raised: root.host-height > 0px
         && root.popup-top(about.height) < Theme.bar-height;
 
+    /// THE SAME RULE ON THE AXIS `popup-x` IS NOT ALLOWED TO LEAVE - and here, a working one.
+    ///
+    /// `popup-x` reads `Math.max(8px, Math.min(Theme.menu-inset, host-width - menu-width - 8px))`, and
+    /// because its FLOOR (8px) sits ABOVE the inset its ceiling is capped against (4px), the min-term
+    /// can never survive the max: the expression returns **8px on every host**, from 1200 down to 190,
+    /// arithmetically - and `popup-floored` is therefore true everywhere, which is accurate but says
+    /// nothing, while the comment's "the interesting case is a narrow host where the ceiling takes
+    /// over" describes a branch that cannot execute. The flag that does carry information is
+    /// `popup-overflow`, and it only lights below a ~202px host, because a 190px menu at x=8 overflows
+    /// at 198. None of that is fixable here: the instrument prints popup-x as recorded evidence
+    /// (probe.rs:1837) and plumbing.rs counts the expression so a change must be meant. It is recorded
+    /// in this file's note, and the fix is the same re-earning keyboard traversal needs.
+    ///
+    /// About is not under that verdict, and About is the block the inertness actually damages: 340px
+    /// where the rule was computed for 190px. So this is the rule the other one intended - rest at the
+    /// same 8px the menu sits at, because the two blocks must line up, ceiling at host - width - 8, and
+    /// a FLOOR OF ZERO because a cut licence is worse than no left margin. It buys real ground: on a
+    /// 348px host the panel moves to x=0 and the whole 340px of it is on screen, where the inert rule
+    /// left it hanging 8px off the edge.
+    ///
+    /// Its own width is read, not copied: probe.rs:2105 pins the literal `width: 340px;`, so a token
+    /// would put the number in two places and one of them is frozen.
+    function popup-left(needed: length) -> length {
+        root.host-width <= 0px
+            ? Theme.menu-inset
+            : Math.max(0px, Math.min(8px, root.host-width - needed - 8px))
+    }
+    in property <bool> about-floored: root.host-width > 0px
+        && root.popup-left(about.width) < 8px;
+    /// Below this there is no placement at all: with the margin spent, a 340px panel needs 340px of
+    /// host, and the licence is cut whatever x says. Said as a flag for the reason `popup-overflow`
+    /// gives - a flag that admits beats a screenshot that hides.
+    in property <bool> about-overflow: root.host-width > 0px
+        && root.host-width < about.width;
+
     // ---- the asks ---------------------------------------------------------------
     // toggled-pin carries the state to ASK for, because this closure cannot see the wire and
     // the bridge must not keep a second copy of the bit (titlebar.rs:310-311).
@@ -957,7 +992,8 @@ export component Chrome inherits Rectangle {
     // hand it no box and the honest outcome is nothing visible, which would satisfy nobody, least
     // of all the licence.
     about := Rectangle {
-        x: root.popup-x;
+        // Its own rule on both axes, because its own measure is 340px where popup-x assumes 190px.
+        x: root.popup-left(about.width);
         // The same bound, and it binds harder here: this box is a fixed 340x260, so a window under
         // 290px tall would otherwise cut the licence text - the one block in the menu whose whole
         // reason for existing is an obligation.

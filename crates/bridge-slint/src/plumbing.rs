@@ -712,4 +712,52 @@ mod tests {
             "the width clamp still measures the 190px menu it was judged against"
         );
     }
+
+    /// THE WIDER PANEL GETS THE CLAMP THE NARROWER ONE WAS SUPPOSED TO HAVE. Two claims live here,
+    /// and the second is arithmetic rather than taste: `popup-x`'s floor (8px) sits ABOVE the inset
+    /// (4px) its ceiling is capped against, so `Math.max(8, Math.min(4, host-198))` returns 8 on
+    /// every host - confirmed at 1200, 800, 400, 360, 350, 348, 340, 250, 206, 202, 198 and 190, and
+    /// confirmed in rendered pixels, where the menu's left edge is x=9 (8 plus the border) at every
+    /// one of them. `popup-floored` is therefore true everywhere, and the branch the comment calls
+    /// "the interesting case" cannot execute. That rule is frozen evidence, so it is recorded and
+    /// left alone; what is NOT frozen is the block the inertness actually damages, and About is
+    /// 340px wide where the expression assumes 190px.
+    ///
+    /// Measured, at the host widths where the difference is real: 340px of panel sits at x=1 with its
+    /// right edge at 338 inside a 340px host - whole - where the inert 8px rest left it hanging 6px
+    /// off the edge. At 800, 400 and 360 nothing moved, which is the point: the clamp rests at the
+    /// same 8px the menu uses, so the two panels line up until there is no room for the lie.
+    #[test]
+    fn the_wider_panel_gets_the_clamp_the_narrower_one_was_judged_with() {
+        let chrome = include_str!("../ui/chrome.slint");
+        let flat = chrome.replace(['\n', '\r', ' '], "");
+        assert!(
+            flat.contains("Math.max(0px,Math.min(8px,root.host-width-needed-8px))"),
+            "About's rest is the menu's 8px, its ceiling is the host, and its floor is ZERO - a cut \
+             licence is worse than no left margin, which is the priority order popup-x lacks"
+        );
+        // One consumer each, and the frozen one is still the menu's.
+        assert_eq!(
+            chrome.matches("x: root.popup-left(").count(),
+            1,
+            "the working rule serves exactly the block that needs it"
+        );
+        assert_eq!(
+            chrome.matches("x: root.popup-x;").count(),
+            1,
+            "and the judged expression still places exactly one block: the 190px menu it was \
+             measured on. About left it in this slice because the expression assumes a width About \
+             does not have - if this count becomes 2, somebody put a 340px panel behind a 190px rule"
+        );
+        // The admission, spelled against the panel's own measure rather than a number added twice.
+        assert!(
+            flat.contains("root.host-width<about.width"),
+            "about-overflow says so when no placement exists, against about.width and not a copy of 340"
+        );
+        assert!(
+            !chrome.contains("width: Theme.menu-about-width"),
+            "the 340px literal stays, because probe.rs:2105 pins it and a token would put the number \
+             in two places with one of them frozen"
+        );
+    }
 }
