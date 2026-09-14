@@ -241,12 +241,25 @@ fn step_specs() -> Vec<StepSpec> {
         },
         StepSpec {
             name: "smoke",
-            display: "cargo run --locked -p xtask -- smoke (advisory: opens a real window on this desktop)",
+            display: "cargo run --locked -p xtask -- smoke (advisory: the PRODUCT by default - DEFAULT_BINARY=slint - opens a real window on this desktop)",
             program: "cargo",
             args: &["run", "--locked", "-p", "xtask", "--quiet", "--", "smoke"],
             // Advisory, never a gate: a runner with no desktop is not a broken
             // repo, and a GUI row that goes red for an environmental reason
             // trains people to ignore the row. --quick skips it too.
+            //
+            // BARE, and the bareness is load-bearing. smoke with no --binary judges
+            // DEFAULT_BINARY = "slint" (smoke.rs:291-305), so this row IS the product
+            // leg now; and it is also the row ci.yml 3e's exit-code CONTRACT arms are
+            // judged against, because check_ci::Step::is_smoke() recognises the smoke
+            // step by the LAST TOKEN of its command being "smoke". Put a flag on this
+            // command and no step is recognised, decide_contract returns
+            // [contract-unreadable], and check-ci exits 2 - it refuses rather than
+            // reports green. So the product travels by default, never by a flag here.
+            // The arms stay 0,1,2,3,4,5,6,7,9 as published by smoke::CONTRACT: 6/7/9
+            // are the gpui needle schedule's verdicts and simply cannot fire on the
+            // product leg until the re-earnings (S8/S9) re-earn them - which is not a
+            // licence to delete the arms, since the schedule stays frozen, not gone.
             advisory: true,
             quick_skippable: true,
             budget_secs: 120,
@@ -339,23 +352,25 @@ fn step_specs() -> Vec<StepSpec> {
             quick_skippable: true,
             budget_secs: 900,
         },
-        // M5-S1: THE PRODUCT GETS JUDGED OFF THIS MACHINE TOO. Same instrument as the
-        // "smoke" row above, pointed at notes-slint.exe by smoke's own --binary flag, so
-        // the row runs the PRODUCT contract leg (startup lines, alive at 45 s, a WM_CLOSE
-        // answered by exiting 0) rather than gpui's needle schedule against bytes that no
-        // longer speak it. The gap this closes is the one README M2 states: 3f/3g link and
-        // lint this binary, and nothing ever launched it on an evidence trail.
+        // M5-S2: THIS ROW IS THE FROZEN SCHEDULE, NOW EXPLICITLY PINNED. It used to run
+        // `smoke --binary=slint`, and that stopped being a distinct thing the moment
+        // DEFAULT_BINARY landed in smoke.rs: the bare "smoke" row above judges the very
+        // same product leg, so this row had become a second cell asking for the same
+        // verdict. Deleting it is what FREEZE LAW (ADR-0006) forbids - rows may not
+        // LOOSEN, and the needle schedule's automated coverage must not silently die -
+        // so the row is REPURPOSED, not removed: it now names the thing the default no
+        // longer covers, gpui's needle schedule, pinned by an explicit `--binary=gpui`
+        // instead of by the accident of a default. Advisory exactly as before; the
+        // schedule still runs, still on a real window, still nowhere near a gate.
         //
-        // Advisory and --quick-skipped for exactly the "smoke" row's reason - a runner
-        // with no desktop is not a broken repo, and a GUI row that reddens for an
-        // environmental reason trains people to ignore it. That is a judgement about
-        // DESKTOPS only: the compile verdict for the same exe stays GATED above here.
-        // budget_secs 120 copied from "smoke": it must exceed the harness's own bounded
-        // waits (its pwsh child is killed at 40 s), and CI pays for the compile inside the
-        // step on a cold target dir.
+        // NOT the exit-code CONTRACT row - that is the bare "smoke" above, the only
+        // command whose last token is "smoke" (check_ci::Step::is_smoke). So ci.yml's
+        // arms here are human wording, and they are wording about the schedule this
+        // step really does run: 6/7/9 can fire HERE even though they cannot fire on the
+        // product leg. Budget and quick-skippability are the "smoke" row's, unchanged.
         StepSpec {
-            name: "smoke-slint",
-            display: "cargo run --locked -p xtask -- smoke --binary=slint (advisory: opens a real window on this desktop)",
+            name: "smoke-gpui",
+            display: "cargo run --locked -p xtask -- smoke --binary=gpui (advisory: the frozen gpui needle schedule - ADR-0006 - opens a real window on this desktop)",
             program: "cargo",
             args: &[
                 "run",
@@ -365,7 +380,7 @@ fn step_specs() -> Vec<StepSpec> {
                 "--quiet",
                 "--",
                 "smoke",
-                "--binary=slint",
+                "--binary=gpui",
             ],
             advisory: true,
             quick_skippable: true,

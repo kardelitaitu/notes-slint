@@ -347,14 +347,27 @@ jobs:
             *) echo "::error::MANIFEST COULD NOT JUDGE (exit $status) - the tool returned something outside its published contract, so nothing about the shipped manifest is known. This arm deliberately names NO numbers, because an arm that enumerates codes goes stale the day one is added; read it as no information, never as a pass." ;;
           esac
           exit $status
-      # --- 3e. the GUI smoke, which stays advisory ---------------------------
-      # "cargo run -p xtask -- smoke" (crates/xtask/src/smoke.rs) launches the real
-      # notes-gpui.exe that step 3b just linked, waits a bounded time for a window handle
+      # --- 3e. the smoke leg, which is the PRODUCT by default, and stays advisory -
+      # "cargo run -p xtask -- smoke" (crates/xtask/src/smoke.rs) with NO --binary flag
+      # judges smoke::DEFAULT_BINARY = "slint": it launches the real notes-slint.exe - the
+      # shipped product, not the frozen bridge - waits a bounded time for a window handle
       # and a title, closes it with a REAL WM_CLOSE, asserts the process exited BY ITSELF
       # with the observed code, then asserts that run wrote session.json. A forced kill
       # can never print PASS even when the exit code reads 0 (pinned by a test), so this is
       # the one row that says "the app shut down honestly and persisted" - no compile step
       # can say that, and no headless unit test does either.
+      #
+      # BARE IS A CONTRACT HERE, NOT SHORTHAND. This is the step check-ci recognises as the
+      # smoke row - check_ci::Step::is_smoke() reads the LAST TOKEN of the command, and
+      # "smoke" is that token only while no flag follows it - so the arms below are the ones
+      # machine-checked against smoke::CONTRACT. Spelling the default out as --binary=slint
+      # would un-recognise the step, and decide_contract would print [contract-unreadable]
+      # and exit 2: check-ci refuses rather than report a green it did not earn. The product
+      # travels by DEFAULT on this line; the flag lives in 3h, where it pins the other leg.
+      # 6/7/9 - the gpui needle schedule's product verdicts - therefore CANNOT fire on this
+      # product leg until the re-earnings (S8/S9) re-earn them over Slint bytes, and they
+      # stay armed anyway, because a published contract code keeps its arm whatever the
+      # current artifact can return. The schedule itself now runs, named out loud, in 3h.
       #
       # ADVISORY (continue-on-error) on purpose, twice over: a runner with no interactive
       # desktop is not a broken repo (exit 3 = DECLINED), and a GUI row that goes red for
@@ -453,7 +466,7 @@ jobs:
       # kills its pwsh child at 40 s, the row budget is 120 s). 15 min is ~7x that worst
       # measured compile and a third of the 45-minute job timeout - a hung GUI or a stuck
       # link now dies with THIS step named, instead of eating the whole job in silence.
-      - name: smoke — cargo run --locked -p xtask -- smoke (advisory - needs a desktop session)
+      - name: smoke (product by default) — cargo run --locked -p xtask -- smoke (advisory - needs a desktop session)
         id: xtask_smoke
         continue-on-error: true
         shell: bash
@@ -497,8 +510,10 @@ jobs:
       # timeout is the backstop, and a guessed step timeout below the cold graph build
       # turns a slow green into a false red).
       # POSITION: after 3e deliberately, not beside 3b. 3d mutates the exe 3b linked and
-      # 3e launches that same file; the slint pair builds a DIFFERENT binary, so placing
+      # 3h launches that same file; the slint pair builds a DIFFERENT binary, so placing
       # it between that write and its read-back would only make the chain harder to read.
+      # (3h, not 3e: since DEFAULT_BINARY landed, 3e launches notes-slint.exe, which this
+      # step also builds - so the order keeps the two artifacts' chains apart either way.)
       # What it does NOT do, stated so nobody assumes it: there is no manifest step for
       # notes-slint.exe. crates/bridge-slint has no build.rs and no app.manifest today, so
       # `xtask manifest` has nothing of ours to verify in that artifact; giving the second
@@ -545,50 +560,55 @@ jobs:
           fi
           exit $status
 
-      # --- 3h. THE PRODUCT, SMOKE-TESTED OFF A DEV MACHINE ----------------------
-      # The same instrument as 3e, pointed at the second bridge's shipped binary by
-      # smoke's own --binary flag (crates/xtask/src/smoke.rs: BINARY_NAMES, select_target),
-      # so the row runs the PRODUCT contract leg - startup lines on the product's own
-      # stderr, still alive at 45 s, a WM_CLOSE it answers by exiting 0 by itself - and not
-      # gpui's needle schedule against bytes that stopped speaking it. README M2 named this
-      # as the missing piece: the slint product passed its smoke locally and had no CI
-      # evidence trail, because nothing here ever asked it to run.
+      # --- 3h. THE FROZEN SCHEDULE, PINNED EXPLICITLY (ADR-0006) ------------------
+      # The same instrument as 3e, pointed BACK at the gpui needle schedule by an explicit
+      # `--binary=gpui` (crates/xtask/src/smoke.rs: BINARY_NAMES, select_target). Why this
+      # row moved: it used to run `smoke --binary=slint`, and the moment DEFAULT_BINARY
+      # made a bare `smoke` the product leg, that became a second cell asking for exactly
+      # the verdict 3e already asks for - a duplicate, and a misleading name for it.
+      # Deleting the row is what the freeze law forbids: ADR-0006 froze bridge-gpui with its
+      # rows intact, rows may not LOOSEN, and the needle schedule's automated coverage must
+      # not die quietly. So the row is REPURPOSED rather than removed - same shape, same
+      # budget, same advisory colour, now naming the one leg the default no longer covers.
+      # gpui is no longer what you get for typing nothing; it is what you get for asking.
       #
       # Shape copied from 3e deliberately: advisory, bash, tee-d whole, the status echoed
       # to GITHUB_OUTPUT, and every verdict armed. ADVISORY for the same reason and no
       # other - a headless runner has no window station, and an environmental red on a GUI
       # row trains people to ignore the row. That is a judgement about DESKTOPS, not about
-      # the code: 3f/3g GATE the same binary's link and lints, so what this step can add is
-      # the running-app verdict, never a compile verdict.
+      # the code: 3b/3c GATE this binary's link and lints, so what this step can add is the
+      # running-app verdict, never a compile verdict.
       #
-      # The arms below cover what a default `--binary=slint` invocation can return - 0/1/2/3
-      # from the product leg, 4/5 from the build and staleness guards that run before it.
-      # 6/7/9 are needle-schedule verdicts, so they are NOT armed here; check-ci's contract
-      # rule judges the ROSTER of commands and the arms of the smoke row it recognises
-      # (its command ends at the subcommand), so this step's wording is a human claim.
+      # The arms below cover 0/1/2/3 from this leg plus 4/5 from the build and staleness
+      # guards that run before it. 6/7/9 - the needle schedule's own product verdicts, the
+      # ones THIS step can produce and 3e now cannot - carry no arm here on purpose: check-ci
+      # judges the ROSTER of commands and the arms of the smoke row it recognises, which is
+      # the one whose command ends at the subcommand (3e), so this step's wording is a human
+      # claim either way, and a 6/7/9 reaching the catch-all below says so and points at 3e
+      # for their sentences. Arming them here would copy prose, not add coverage.
       #
       # timeout-minutes: 15, same number as 3e for the same measured reason: smoke pays for
       # its own compile (worst measured cold cost of this graph, 2m11s with a private target
       # dir), the row budget is 120 s, and a hung GUI should die with THIS step named
       # instead of eating the 45-minute job.
-      - name: smoke (slint product) — cargo run --locked -p xtask -- smoke --binary=slint (advisory - needs a desktop session)
-        id: xtask_smoke_slint
+      - name: smoke (frozen gpui schedule - ADR-0006) — cargo run --locked -p xtask -- smoke --binary=gpui (advisory - needs a desktop session)
+        id: xtask_smoke_gpui
         continue-on-error: true
         shell: bash
         timeout-minutes: 15
         run: |
           set -o pipefail
           status=0
-          cargo run --locked -p xtask --quiet -- smoke --binary=slint 2>&1 | tee "$RUNNER_TEMP/xtask-smoke-slint.log" || status=$?
+          cargo run --locked -p xtask --quiet -- smoke --binary=gpui 2>&1 | tee "$RUNNER_TEMP/xtask-smoke-gpui.log" || status=$?
           echo "status=$status" >> "$GITHUB_OUTPUT"
           case "$status" in
-            0) echo "smoke (slint product): PASS - notes-slint.exe opened a real window, was still there at 45 s, took a WM_CLOSE and exited 0 by itself, and said its own startup lines on its own stderr. This is the CI evidence trail README M2 said the product owed: the same verdict 3e records for gpui, off a dev machine, on the shipped second-bridge binary." ;;
-            1) echo "::error::SMOKE EXIT 1 (slint product) - the instrument ran and a product leg failed. Read the SMOKE FAIL line above it: startup (no window in the budget), alive (the window was gone at 45 s - nothing in the product self-hides, so this is a real assertion), or close (not answered, forced, or an exit code that was not 0). Do not read this as gpui failing: this row launched notes-slint.exe, named on the identity line above." ;;
-            2) echo "::error::SMOKE HARNESS COULD NOT RUN (exit 2, slint product) - the instrument failed before judging anything: no PowerShell to write and run the product probe, the probe never completed its keys, or a bad invocation. Nothing about the app was measured; this is the harness's own fault. Read the lines above for which precondition failed." ;;
-            3) echo "::notice::smoke (slint product) DECLINED - the summary line above says which of the two it was: no interactive desktop to open a window on, or foreign state occupying the state path this harness would have to relocate. Neither is a failure and neither is a pass; the row simply did not judge this machine." ;;
-            4) echo "::error::SMOKE EXIT 4 (slint product) - THE TARGET DID NOT COMPILE, so notes-slint.exe was never launched and no cached exe was substituted to keep the row green. This says nothing about the running app; it is a build failure reported as an annotation only because a GUI step must not gate a headless runner. 3f carries the same verdict with a name - fix the code, then re-read the arms above." ;;
-            5) echo "::error::SMOKE EXIT 5 (slint product) - STALE BINARY: notes-slint.exe on disk is older than the sources that build it, so the harness refused to judge the running app against a build nobody compiled from this commit. The instrumentation declining to lie about WHICH exe it tested: the app was never launched, so this is neither a product bug nor a pass. Rebuild, do not force a run." ;;
-            *) echo "::error::SMOKE (slint product) COULD NOT JUDGE (exit $status) - an unknown verdict: read it as no information about the app, never as a pass and never as a missing desktop. 3e's comment carries the contract table this arm has no wording for." ;;
+            0) echo "smoke (frozen gpui schedule): PASS - notes-gpui.exe opened a real window and ran the FULL needle schedule: self-hide, the window/close/session triple, the geometry and recents probes - then answered a WM_CLOSE by exiting 0 BY ITSELF and wrote session.json. This is the leg 3e no longer produces, and the reason this row exists: the frozen bridge's own contract, still automated, now pinned by --binary=gpui instead of by a default." ;;
+            1) echo "::error::SMOKE EXIT 1 (frozen gpui schedule) - the instrument ran and a leg of the needle schedule failed. Read the smoke: window=.../close=.../session=... line and the SMOKE FAIL line above it: close=FORCED means the app had to be killed to stop it (shutdown bug); session=FAILED, with every path searched printed, means nothing was persisted (product bug); window=MISSING close=NOBIN means the exe vanished between its build and the launch, which is not a shutdown bug either. A target that does not compile is exit 4, not this one. Do NOT read this row as the product failing - this leg launched notes-gpui.exe, named on the identity line above; 3e is the row that judges notes-slint.exe." ;;
+            2) echo "::error::SMOKE HARNESS COULD NOT RUN (exit 2, frozen gpui schedule) - the instrument failed before it could judge anything: no PowerShell to post WM_CLOSE with, the probe script could not be written or run, the source mtimes could not be read (deliberately NOT reported as 5/stale), or a bad invocation of cargo xtask smoke --binary=gpui. Nothing was launched, so no verdict about the app exists in either direction; this is the one code that is always the harness own fault. Read the eprintln lines above for which precondition failed." ;;
+            3) echo "::notice::smoke (frozen gpui schedule) DECLINED - the summary line above says which of the two it was: (no desktop) means no interactive session to open a window in; (BLOCKED BY FOREIGN STATE) means something that is not a session file occupies the state path, which is machine pollution and not the app - the DECLINED line prints what is sitting there. Neither is a failure and neither is a pass; the check was simply not possible on this machine." ;;
+            4) echo "::error::SMOKE EXIT 4 (frozen gpui schedule) - THE TARGET DID NOT COMPILE. notes-gpui.exe was never launched and no cached exe was substituted to keep the row green, so this says nothing about shutdown, persistence or geometry: it is a build failure, reported as an annotation only because a GUI step must not gate a headless runner. 3b/3c usually carry the same verdict with a name - fix the code, and remember smoke builds its own target, so a green 3b does not refute this 4." ;;
+            5) echo "::error::SMOKE EXIT 5 (frozen gpui schedule) - STALE BINARY: notes-gpui.exe on disk is older than the sources that build it, so the harness refused to judge the running app against a build nobody compiled from this commit (window=STALE close=STALE session=STALE, and the identity line prints the age plus built_by_this_run=NO). Read it as the instrumentation refusing to lie about WHICH binary it tested: the app was never launched, so this is neither a product bug nor a pass. Rebuild, do not force a run." ;;
+            *) echo "::error::SMOKE (frozen gpui schedule) COULD NOT JUDGE (exit $status) - an unrecognised verdict. This arm deliberately names NO numbers: check-ci's contract rule does NOT judge this step (it arms the smoke row whose command ends at the subcommand, i.e. 3e), so 6/7/9 - the needle verdicts THIS leg can genuinely produce - have no sentence below and land here, where the log above and 3e's comment carry their wording. Read anything reaching this arm as no information about the app, never as a pass and never as a missing desktop." ;;
           esac
           exit $status
 
