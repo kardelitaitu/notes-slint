@@ -875,3 +875,133 @@ fn a_flush_cannot_write_the_file_whose_open_was_just_refused() {
         "and still not one byte of it became ours"
     );
 }
+
+/// THE THIRD ARM, AND THE LAST ONE WITHOUT AN IDENTITY CASE OF ITS OWN. The refused
+/// target is checked at the head of Save As, and a same-spelling version of that
+/// refusal is pinned in tests/session.rs (the 8 MiB fixture, refused at the stat,
+/// then refused as a Save As target). What NOTHING pinned was the word
+/// IDENTITY in that arm - the guard compares `identity_key`, and every existing
+/// case handed it the same string twice. This case hands it three spellings of
+/// one file: the document carries the lowercase name it was read under, the
+/// refusal is remembered under the shouted one, and the Save As is aimed with a
+/// mixed-case third. Degrade the predicate to a PathBuf compare and all three
+/// stop being one file as far as the guard is concerned - which is also why the
+/// third spelling uses CASE rather than separators: `Path` compares COMPONENTS,
+/// not bytes, so a forward-slash spelling of a path is the SAME PathBuf to Rust
+/// even though it is a different string. A separator fixture discriminates on
+/// identity_key alone and never on path equality; a case fixture discriminates on
+/// both. The guard has to survive that pair, so the fixture is built from it.
+///
+/// The second half is the SCOPE the arm asserts: a refusal of one name must not
+/// hold every name hostage. After the refused Save As comes a Save As onto an
+/// untouched name, and it must work - the document rebinds, the epoch moves, and
+/// the buffer keeps a home. A bool latch where the slot should be would pass the
+/// slot should be would pass the first half and fail this one, which is the
+/// c92494f3 bug and its mirror image, settled in one scenario.
+#[test]
+fn save_as_refuses_the_name_whose_open_was_refused_whichever_spelling_arrives() {
+    let mut app = Harness::new();
+    let md = app.file("notes.md", b"a small foreign file");
+    app.open(&md);
+    let generation = app.epoch;
+    let first = app.save("a small foreign file, edited", 1);
+    assert_saved(&first, &md, 1);
+
+    let foreign = [0xFF_u8, 0xFE, 0x41];
+    fs::write(&md, foreign).expect("replace the file with undecodable bytes");
+    let shouted = app.root.join("NOTES.MD");
+    app.send(Command::Open {
+        path: shouted.clone(),
+    });
+    app.until("LoadFailed(Undecodable)", |ev| {
+        matches!(
+            ev,
+            Event::LoadFailed {
+                path,
+                reason: LoadError::Undecodable { .. },
+                ..
+            } if path == &shouted
+        )
+    });
+    app.wait_a_tick();
+
+    // THE THIRD SPELLING, aimed as the Save As target: mixed case, distinct from
+    // both names above. CASE is the only axis that genuinely differs here, and
+    // finding that out is part of why this case exists - `Path` compares
+    // COMPONENTS, not bytes, so a forward-slash spelling of the same path is the
+    // SAME PathBuf to Rust even though it is a different string. A separator
+    // fixture therefore discriminates on identity_key alone and never on path
+    // equality, while a case fixture discriminates on both: which is exactly the
+    // pair a guard must survive.
+    let third = app.root.join("NoTeS.Md");
+    assert_ne!(third, md, "the fixture must really be a third spelling");
+    assert_ne!(third, shouted, "and a different one again");
+    app.send(Command::SaveAs {
+        path: third.clone(),
+        text: "the text from the read that did succeed".to_string(),
+        revision: 2,
+    });
+    let events = app.answer_window();
+    match one_answer(&events) {
+        Event::SaveFailed {
+            path,
+            revision,
+            reason,
+        } => {
+            // The NAME IT REFUSED, not the name the document carries: Save As
+            // answers about the target the caller chose, where the Save and Flush
+            // arms answer about the file the buffer belongs to. Two questions, two
+            // correct paths in the same event.
+            assert_eq!(
+                path.as_path(),
+                &third,
+                "it names the target it refused to write"
+            );
+            assert_eq!(
+                *revision, 2,
+                "and the revision that write would have anchored"
+            );
+            assert_eq!(
+                *reason,
+                SaveError::NoTarget,
+                "the verdict all three arms state"
+            );
+        }
+        other => panic!("expected one SaveFailed, got {other:?} in {events:?}"),
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev, Event::Rebound { .. } | Event::Saved { .. })),
+        "a refused Save As rebinds nothing: {events:?}"
+    );
+    assert_eq!(
+        app.epoch, generation,
+        "and a refused Save As moves no generation"
+    );
+    assert_eq!(
+        app.bytes(&md),
+        foreign,
+        "the three refused bytes are still the three bytes on disk"
+    );
+
+    // THE SCOPE: the other name is still savable, so the slot is a fact about one
+    // file and not a shut door.
+    let home = app.root.join("home.md");
+    app.send(Command::SaveAs {
+        path: home.clone(),
+        text: "the text from the read that did succeed".to_string(),
+        revision: 2,
+    });
+    let moved = app.answer_window();
+    assert_saved(&moved, &home, 2);
+    assert_ne!(
+        app.epoch, generation,
+        "a SUCCESSFUL Save As does move it, and says so"
+    );
+    assert_eq!(
+        app.bytes(&md),
+        foreign,
+        "and the refused file is still untouched, now that the note lives elsewhere"
+    );
+}
