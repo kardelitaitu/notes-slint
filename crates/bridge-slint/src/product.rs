@@ -124,6 +124,28 @@ const EXIT_REWAIT: Duration = Duration::from_secs(10);
 /// (see `Register`), and an uncapped focus retry is the same storm in a different name.
 const FOCUS_TRIES: u16 = 250;
 
+/// B-S4: THE FLOOR, in logical CLIENT pixels, and the first value the markup's two knobs have ever
+/// had. Both numbers are read off chrome.slint's own About panel rather than picked.
+///
+/// 340 is the panel's width with NO padding: popup-left's floor is zero (chrome.slint:230-234), so
+/// the 8px side margins are POLICY while the panel's own width is OBLIGATION - under 340 no x places
+/// the licence at all, which is precisely what about-overflow asserts (host-width < about.width).
+///
+/// 262 is the panel's 260 plus exactly ONE Theme.menu-gap of 2, the gap popup-top keeps under the
+/// box (chrome.slint:198-202). NOT 263 and NOT 264: a Slint Rectangle draws its border CENTERED on
+/// the geometry edge (i-slint-core graphics/border_radius.rs:195-199, the inner/outer pair at
+/// half_border_width; item_rendering.rs:523,544 clip children by that same border_width INSIDE the
+/// item box), so the 260px literal is already border-inclusive and counting border-width a second
+/// time would ask the floor for half a pixel of antialiasing.
+///
+/// These two lines are the RUST side of a contract whose numbers belong to the markup, and
+/// tests::the_floor_contract_is_ordering_and_this_slice_sets_no_floor_value is what keeps them
+/// married: it parses the About block, computes the demand from what it finds, and compares these
+/// consts against it as ORDERING (a floor below the demand clips the licence and fails; a floor
+/// above it is never an error). That is why the consts carry these exact names.
+const FLOOR_WIDTH: f32 = 340.0;
+const FLOOR_HEIGHT: f32 = 262.0;
+
 /// HYGIENE (P1b fix 1): the LATE-REGISTRATION LATCH. The guard this replaced was
 /// "is the drop lease still empty", and plumbing.rs:255-262 deliberately leaves that lease empty
 /// when `arm_file_drop` refuses - so one refusing handle re-sent `RegisterWindow`, re-ran the arm
@@ -242,12 +264,26 @@ fn arms_episode(wake: Wake) -> bool {
     matches!(wake, Wake::Moved)
 }
 
-/// The restore asked for a size and the window came back SMALLER than that. Only the smaller
-/// direction counts: a maximised session legitimately comes back far larger than the rect the
-/// port stored, and saying "floored" about that would be a trace line about nothing. HALF a pixel
-/// of slack, because `want` is a divided-by-scale float while the read-back is an integer.
+/// The restore asked for a size and the window came back at a DIFFERENT one, in a direction a
+/// clamp owns. Both directions count now that B-S4 raised a real floor.
+///
+/// SMALLER than asked is the old case, and still the one with no other explanation.
+///
+/// BIGGER than asked counts only when what was asked for sat UNDER the floor - that IS the floor
+/// speaking, a seeded 120x120 coming back as 340x262, exactly the run where the file and the window
+/// disagree, and what this line was written to voice. Bigger-than-asked with a want already above
+/// the floor stays silent, because that is a maximised session returning from the port's own
+/// snapshot and "floored" about it would be a trace line about nothing.
+///
+/// HALF a pixel of slack on both, because `want` is a divided-by-scale float while the read-back is
+/// an integer.
 fn floored_says(want: LogicalSize, measured: Rect) -> bool {
-    want.width - measured.w as f32 > 0.5 || want.height - measured.h as f32 > 0.5
+    let slack = 0.5;
+    let (w, h) = (measured.w as f32, measured.h as f32);
+    let smaller = want.width - w > slack || want.height - h > slack;
+    let raised = (w - want.width > slack && want.width < FLOOR_WIDTH)
+        || (h - want.height > slack && want.height < FLOOR_HEIGHT);
+    smaller || raised
 }
 
 /// STRIP-4a row 3, the part that CAN be unit-tested: the one line a panic gets, before the
@@ -402,6 +438,17 @@ fn main() {
     ));
     let want = LogicalSize::new(session.rect.w as f32 / scale, session.rect.h as f32 / scale);
     let at = LogicalPosition::new(session.rect.x as f32 / scale, session.rect.y as f32 / scale);
+    // B-S4, and THE ORDER IS THE REQUIREMENT, not a style: the floor goes up BEFORE the restored
+    // size is asked for, never after. Raised first, winit clamps inner_size against min_inner_size
+    // while the window is being created (winit window.rs:1267-1272), so wake 1 measures the
+    // ALREADY-FLOORED rect, books it as the baseline (see wake_says), and an idle launch sends
+    // nothing at all. Raised after, the snap-up is a genuine rect change that reaches the
+    // GEOMETRY_QUIET window, emits Command::GeometryChanged, and lets the engine persist the
+    // FLOORED rect - a saved 120x120 turned into 340x262 after one run, which is the exact
+    // destruction 4b92cef2 exists to prevent. The floor test asserts both calls stay above this
+    // line rather than trusting the comment that says so.
+    ui.set_floor_width(FLOOR_WIDTH);
+    ui.set_floor_height(FLOOR_HEIGHT);
     window.set_size(want);
     window.set_position(at);
     if session.maximized {
@@ -636,7 +683,7 @@ fn main() {
                 // then overruled". One line, on the wake that seeds, never again this run.
                 if wake == Wake::Baseline && floored_says(tick_want, measured) {
                     report(&format!(
-                        "geometry: floored {:.0}x{:.0} -> {}x{} (the restore asked for that; something brought back less)",
+                        "geometry: floored {:.0}x{:.0} -> {}x{} (not the size the restore asked for)",
                         tick_want.width, tick_want.height, measured.w, measured.h
                     ));
                 }
@@ -954,10 +1001,22 @@ mod tests {
         let want = LogicalSize::new(800.0, 600.0);
         assert!(
             floored_says(want, Rect::new(40, 60, 340, 264)),
-            "came back at the future floor after asking for 800x600: say it"
+            "came back below what the restore asked for: say it"
         );
         assert!(!floored_says(want, placed));
         assert!(!floored_says(want, Rect::new(40, 60, 1920, 1040)));
+        // And the direction B-S4 creates for real: a 120x120 seed that comes back AT the floor
+        // must speak, because that is the run where session.json and the window disagree. Want
+        // already above the floor, given a work area, stays silent - a maximised restore is not a
+        // clamp, and the second assertion is the one that keeps it that way.
+        assert!(
+            floored_says(LogicalSize::new(120.0, 120.0), Rect::new(40, 60, 340, 262)),
+            "a rect raised to the floor is the divergence this line exists to voice"
+        );
+        assert!(
+            !floored_says(LogicalSize::new(800.0, 600.0), Rect::new(0, 0, 1920, 1080)),
+            "a maximised restore is not a floor"
+        );
         // Half a pixel is the scale division rounding, not a divergence.
         assert!(!floored_says(LogicalSize::new(799.6, 600.0), placed));
     }
@@ -1048,10 +1107,6 @@ mod tests {
             .unwrap_or_else(|err| panic!("\"{prefix}\" no longer parses as a length: {err}"))
     }
 
-    /// The first number at or after `from`, for the RUST side of the contract, where a const may
-    /// be written `const FLOOR_WIDTH: f32 = 340.0;` or `= 340;` and the type sits in between. Skips
-    /// to the next digit run rather than assuming one; a name with no number near it panics,
-    /// because that is a floor nobody wrote down.
     /// The value a const DECLARATION gives `name`, read from the RIGHT of its equals sign. Two
     /// review findings are the shape of this function. (1) Scanning forward from the NAME reads a
     /// digit run out of the TYPE token: `const FLOOR_WIDTH: f32 = 340.0;` yielded 32, so the exact
@@ -1262,13 +1317,21 @@ mod tests {
             "the horizontal demand grew a term - popup-left's floor is zero, so its margins are policy while only the width is obligation"
         );
 
-        // The enforcement the pending branch was missing, and the reason that branch was a
-        // landmine rather than a politeness: these knobs are IN properties, so the generated Rust
-        // hands every caller a setter whether or not any const exists. A slice could therefore give
-        // the window a live floor from anywhere in the crate without ever writing a FLOOR_WIDTH
-        // token, and the guard below would stay green forever. So: NO caller may call either setter
-        // until the sanctioned slice lands. The needles are BUILT at run time because a census that
-        // greps its own grep line is the trap this crate has already named (plumbing.rs:579).
+        // B-S4: the door is now OPEN on purpose, so the census flipped from "no caller anywhere" to
+        // "exactly ONE caller, in ONE place, in the RIGHT order". Three things it still refuses, each
+        // for a reason that outlives this slice: a second caller (a floor set from two places is a
+        // floor nobody owns), a caller in another file (the probe has its own main and must never
+        // raise a floor, or its frozen 180px arm stops measuring a 180px host), and a caller BELOW
+        // the size ask - which is the destruction 4b92cef2 exists to prevent, so the ordering is
+        // asserted rather than commented. The needles are BUILT at run time because a census that
+        // greps its own grep line is the trap this crate already named (plumbing.rs:579).
+        let whole = include_str!("product.rs");
+        let head = &whole[..whole
+            .find("mod tests")
+            .expect("this file has a tests module")];
+        let ask = head
+            .find("window.set_size(want)")
+            .expect("the startup still asks for the restored size");
         let mut sources = Vec::new();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         rust_files(&root.join("src"), &mut sources);
@@ -1284,12 +1347,28 @@ mod tests {
             for file in &sources {
                 let text = std::fs::read_to_string(file)
                     .unwrap_or_else(|err| panic!("{} unreadable: {err}", file.display()));
-                assert!(
-                    !text.contains(&door),
-                    "THE FLOOR IS BEING SET before it was approved: {} calls {door}. The only legal floor until the sanctioned slice is the markup's own 0px - and when that slice DOES land, it must retire this line in favour of the const check below, not delete the check.",
-                    file.display()
+                let sanctioned =
+                    file.file_name().and_then(|name| name.to_str()) == Some("product.rs");
+                let scope = if sanctioned { head } else { &text[..] };
+                assert_eq!(
+                    scope.matches(&door).count(),
+                    usize::from(sanctioned),
+                    "{} raises the floor {} time(s); exactly one sanctioned call lives in this
+                     file's startup and nowhere else - the probe root must never gain one",
+                    file.display(),
+                    scope.matches(&door).count()
                 );
             }
+            // THE ORDERING, the requirement rather than the style. Below the size ask, the snap-up
+            // is a real rect change: it reaches GEOMETRY_QUIET, emits GeometryChanged, and the
+            // engine persists the FLOORED rect - a saved 120x120 becomes 340x262 after one run.
+            // Above it, winit clamps as the window is created, wake 1 measures the floored rect,
+            // books it as the baseline, and an idle launch sends nothing.
+            assert!(
+                head[..ask].contains(&door),
+                "{door} is no longer ABOVE the startup's size ask at offset {ask}: raised after the
+                     ask, the clamp reads as a user move and gets persisted",
+            );
             // ... and the same door from the markup side, where a handler could bind the knob
             // without a single Rust call existing anywhere.
             let assign = format!("floor-{} =", axis);
@@ -1299,16 +1378,11 @@ mod tests {
             );
         }
 
-        // And the pending half, honestly: the Rust consts do not exist yet, so nothing here can
-        // claim a value passes. This looks for a const DECLARATION in the shipping part of this file
-        // (above the tests) and, the day a slice names one, applies the contract to the number it
-        // actually declares - read from after the equals sign, so the type token cannot be mistaken
-        // for the value. No edit to this test is needed for that to start working, and no invented
-        // value is asserted while the door stands open.
-        let whole = include_str!("product.rs");
-        let head = &whole[..whole
-            .find("mod tests")
-            .expect("this file has a tests module")];
+        // The contract, armed. The day these two consts were named, the pending branch below
+        // stopped running and this one started: it reads each value from after its equals sign
+        // (never from the type token, which is how the first draft mis-parsed 340.0 as 32) and
+        // compares it against the demand parsed out of chrome.slint above. ORDERING, so a floor
+        // bigger than the panel is never an error and only a clip-capable one is.
         for (name, demanded) in [("FLOOR_WIDTH", demand_w), ("FLOOR_HEIGHT", demand_h)] {
             match const_number(head, name) {
                 Some(value) => assert!(
@@ -1316,10 +1390,12 @@ mod tests {
                     "{name} = {value} sits below the {demanded} the About panel demands - the licence would clip, which is the only thing this contract forbids"
                 ),
                 None => {
-                    // Inert today, and said out loud rather than asserted away.
+                    // Reachable only by renaming the consts away while the startup still calls both
+                    // setters - which the census above has already caught. Kept, because a pending
+                    // branch nobody can reach is cheaper than a guard that quietly stops checking.
                     assert!(
                         main.contains("floor-width:0px") && main.contains("floor-height:0px"),
-                        "{name} is not declared yet, and the markup's floor is no longer 0px - a floor with no owner is worse than no floor at all"
+                        "{name} is no longer declared here, and the markup's 0px default is the only floor left - which means the knob is set from somewhere this guard does not read"
                     );
                 }
             }
