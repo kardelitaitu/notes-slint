@@ -60,7 +60,8 @@ features `compat-1-2`, `backend-winit`, `renderer-software`, `raw-window-handle-
    DWMWCP_ROUND /* 2 */)` returns `S_OK`, reads back `2` through `DwmGetWindowAttribute`, and the
    corner pixel stops being the app's `#2B2B2B` and becomes the desktop's. That is the only
    mechanism measured to actually work here, and it needs no alpha at all: DWM clips and
-   antialiases, and keeps its own shadow.
+   antialiases the corner. Whether it also draws the shadow R11 pairs with the corners was asserted
+   in the first draft of this note and is measured, and bounded, in "The shadow half" below.
 
 ## Options
 
@@ -168,6 +169,74 @@ hardware. The 150 %-scale drag evidence is still unit-test-grade (the record in
 test - the arc above is a pixel mask read by a script, which can see a corner was clipped and
 cannot see whether it matches the strip's 6 px menu radius well enough to please anybody.
 
+## The shadow half of R11, measured on 2026-09-14 (and one claim retracted)
+
+`"rounded corners and shadow"` is one line in R11, and the first pass of this work answered the
+first half with a measurement and the second half with an assertion — that DWM, having taken over
+the corner shape, must still be drawing the shadow it draws for every window. The assertion was
+carried over from the phrasing of the requirement, not from a pixel. It has now been chased, and
+the chase is the useful part, because the first three attempts to measure it were all wrong.
+
+**What does not work as an instrument.** A shadow is darkened desktop just outside the visible
+window edge, so the first probe captured the bands around the window rect and compared them with
+the window shown and hidden. Every band read the desktop's own value and the probe declared "no
+shadow" — on a desktop whose wallpaper there is **black**, where darkening is by definition
+invisible. Repeating it over a white field painted by a throwaway window fixed that, and the
+second mistake replaced it: measuring from `GetWindowRect`, which on Windows 11 sits ~7 px OUTSIDE
+the visible frame (the invisible resize border), so the band that looked like "outside the window"
+was inside the window's own rect for a decorated window and outside for ours.
+
+**What does.** Capture an 80 px strip straddling the edge and print luminance per row, which makes
+the capture prove its own placement. Over the white field (255.0), for the note window whose rect
+bottom is y=900:
+
+```
+  898    41.0   inside the window (its own pixels)
+  899   200.0   the last partial row - the transition, exactly where it must be
+  900   255.0   === the rect edge ===
+  901..946  255.0   forty-six rows, every one of them exactly 255
+```
+
+So the placement is right and there is **no measurable shadow** around the note: not one pixel
+below 255 in 46 px on the side that matters.
+
+**And the control says that is not yet a verdict about our window.** The same method, pointed at a
+plain decorated WinForms form (`FormBorderStyle = Sizable`) in the same white field, measured from
+its *visible* edge (`DWMWA_EXTENDED_FRAME_BOUNDS`, inset 7 px as expected), also read 255.0 in every
+ring. A decorated window has a shadow that is visible to the eye. Therefore this machine, in this
+configuration, is not drawing detectable window shadows for anything, and the note's number cannot
+be attributed to `no-frame`.
+
+Two levers were tried on a throwaway instance before that limitation was understood, and both are
+**void as evidence** for the same reason — the instrument could not have seen a success: setting
+`DWMWA_NCRENDERING_POLICY := DWMWCP_FORCE_ENABLE` (set returned `S_OK`; the attribute would not even
+read back, `E_INVALIDARG`) and adding `WS_EX_WINDOWEDGE` to the extended style. Neither moved the
+band off 255.0, and neither could have.
+
+What *was* established while chasing it, and is worth keeping:
+
+- the note's window is stylistically an ordinary decorated window — `GWL_EXSTYLE 0x00040110`
+  (`WS_EX_APPWINDOW`, and *not* `TOOLWINDOW`/`LAYERED`/`TRANSPARENT`), `GWL_STYLE 0x16CF0000`
+  (`WS_CAPTION | WS_SYSMENU | WS_THICKFRAME`, no `WS_POPUP`), `DWMWA_NCRENDERING_ENABLED = 1`. There
+  is no exotic style here that could plausibly be suppressing a shadow;
+- `GetClientRect` equals `GetWindowRect` with origin offset `(0,0)` — the client covers the whole
+  window, so there is no non-client pixel for the OS to hang a frame on, which is the mechanism by
+  which a shadow would normally be ours to ask for and is the one real structural difference from
+  the control window;
+- this machine has `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize
+  EnableTransparency = 0` (transparency effects off) while `VisualFXSetting = 2` ("best appearance")
+  and `UserPreferencesMask` byte 0 = `0x9E` (the shadow bit set). The off-transparency is the only
+  configured thing found that could plausibly blank shadows for everything, and it is **not proven**
+  to be the cause.
+
+**What would settle it, in order of cheapness.** Look at the note next to another window and decide
+whether it appears to float — an eye-pass, and the only one that can be done on this machine right
+now. Or flip transparency effects on (`EnableTransparency = 1` plus a `WM_SETTINGCHANGE` broadcast)
+and re-run the control: if the decorated window's band darkens and ours still reads 255.0, `no_frame`
+is the cause, and the fix is the invisible-border route — keep the frame styles and handle
+`WM_NCCALCSIZE` so DWM has room to draw — which is a larger change than the attribute and belongs in
+a note of its own.
+
 ## Consequences
 
 - `Command` went 10 → 11 and `Event` 14 → 15, each with its pinned count test, `rebuild()`
@@ -177,9 +246,11 @@ cannot see whether it matches the strip's 6 px menu radius well enough to please
   function with one `// SAFETY:` block, which `check_unsafe` counts.
 - The bridge owns the *policy* (round normal, square maximized) and the port owns the *act*, which
   keeps platform's "decides nothing" rule intact.
-- R11's "rounded corners" item gains a machine-visible answer and a human eye-pass, and its
-  "shadow" item is answered by DWM rather than by us — worth saying out loud, because R11 was
-  written expecting us to draw both.
+- R11's "rounded corners" item gains a machine-visible answer and a human eye-pass. Its "shadow"
+  item is **not** answered by this change, and the sentence in the first draft of this note (and in
+  commit `8fb8382a`) that DWM "keeps its own shadow" was an assumption carried over from the way
+  R11 words the two together. It is measured, and bounded, in "The shadow half" above; nothing here
+  should be read as the shadow being delivered.
 - If Slint ever gains a released `WindowMoveArea` (i.e. a 1.18+ that ships it), the drag stops
   being ours. That is a separate question from this one, and it should stay separate: A does not
   foreclose it, and neither would B.

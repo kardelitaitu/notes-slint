@@ -90,9 +90,13 @@ it is why upstream's example, which is drawn with a GL-capable renderer, gets aw
 Options, in order of how boring they are:
 
 - **Ask the OS.** On Windows 11, `DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE /* 33 */,
-  DWMWCP_ROUND /* 2 */)` rounds and antialiases the corners, keeps the OS shadow, and needs no
-  alpha at all; `DWMWCP_DONOTROUND` (1) when maximized matches native behaviour. It is
+  DWMWCP_ROUND /* 2 */)` rounds and antialiases the corners and needs no alpha at all;
+  `DWMWCP_DONOTROUND` (1) when maximized matches native behaviour. It is
   Windows-11-only (on 10 the call fails; the window stays square) and the radius is the OS's.
+  Do **not** assume this also buys the shadow people pair with the corners: on the machine this was
+  written on, no shadow was measurable around a `no-frame` window *or* around an ordinary decorated
+  control window, so the attribute's shadow behaviour is unverified, not verified-absent. Measure it
+  against a decorated window in the same capture before repeating the claim.
 - **Draw it, with a real alpha surface** — i.e. a GL/skia renderer. Costs cold start and every
   behaviour you measured on the software path.
 - **`SetWindowRgn`** — works back to Windows 10, but the corners are unantialiased and the region
