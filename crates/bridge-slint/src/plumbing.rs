@@ -561,16 +561,19 @@ mod tests {
                 && footer.contains("if root.file-words != \"\":"),
             "each line exists only when the port said the thing behind it"
         );
-        // ONE ARITHMETIC, TWO USERS: the popup's height and the footer's y both spend the six rows
+        // ONE ARITHMETIC, TWO USERS: the popup's height and the rows region both spend the six rows
         // and their five gaps. Written twice, they must agree, and the only test that can tell is a
-        // count of the shared expression.
+        // count of the shared expression. The footer was once the second user and now anchors to
+        // `parent.height - footer-height`, reading nothing; the recents clamp reads the grid's own
+        // measure (`menu.rows-bottom`) rather than copying it - so the count is still two, and a
+        // third copy anywhere is what this fails on.
         let whole = chrome.replace(['\n', ' '], "");
         assert_eq!(
             whole
                 .matches("6*Theme.menu-row-height+5*Theme.menu-gap")
                 .count(),
             2,
-            "the height formula and the footer's offset are the same row arithmetic"
+            "the popup's height and the rows region are the same row arithmetic, twice written"
         );
         // The wire, both ends. THIS file writes each setter exactly once - and the count is taken
         // from a slice that stops at the tests module, because a grep that counts its own counting
@@ -606,6 +609,57 @@ mod tests {
             main.contains("why-not-saved: root.why-not-saved")
                 && main.contains("file-words: root.file-words"),
             "and both are forwarded to Chrome at the one instantiation"
+        );
+    }
+
+    /// THE ORDER THINGS YIELD. The popup hangs below a 28px band inside a window whose height it is
+    /// told (`host-height`, fed from `root.height`), nobody enforces a minimum window height, and
+    /// Slint clips an overflowing child at the client edge silently - so a count that ignores the
+    /// window is a count that hides the bottom of the menu. When there is not room for everything,
+    /// the list gives way and the explanation does not.
+    ///
+    /// Measured on the same markup at eight heights, ten recents seeded: a 294px popup at 640 (five
+    /// rows shown), 250 at 300 (three), 228 at 258 (two), 206 at 236 (one), 184 at 220 and 214
+    /// (none) - the footer's amber lines present at every one, and the popup's bottom edge inside
+    /// the window down to ~212. Below that the six command rows themselves are what a short window
+    /// cuts, which is a minimum-size question for the bridge and `platform`, not a menu question:
+    /// nothing inside `Chrome` may shorten the vocabulary to fit.
+    #[test]
+    fn the_menu_yields_its_list_before_its_explanation() {
+        let chrome = include_str!("../ui/chrome.slint");
+        // The set is ['\n', '\r', ' '] and the '\r' is not decoration: this checkout carries CRLF,
+        // so a guard that flattens to compare across lines must strip the carriage return too, or
+        // every phrase it looks for is interrupted by one invisible character. Single-line counts
+        // (the row arithmetic above) never noticed, which is why the trap is here rather than there.
+        let flat = chrome.replace(['\n', '\r', ' '], "");
+        assert!(
+            flat.contains(
+                "property<length>recents-budget:root.host-height-Theme.bar-height\
+                 -(menu.rows-bottom+Theme.menu-pad)-root.footer-height"
+            ),
+            "the budget subtracts the bar, the rows' own measure and the footer's tail BEFORE the \
+             list is counted - the explanation is a cost in the arithmetic, never a casualty of it"
+        );
+        assert!(
+            flat.contains("Math.min(5,root.recents-fit)"),
+            "five is still the cap; the window may ask for fewer, never more"
+        );
+        assert!(
+            flat.contains("root.host-height<=0px?Math.min(root.recents.length,5)"),
+            "and a bar that was never told its window's height keeps the old constant behaviour, \
+             so no harness that omits host-height silently loses rows"
+        );
+        // The explanation cannot be cut by anything in this file: the footer block reads no host
+        // at all. If a future fit fix reaches in here, this is the line that says so.
+        let footer = &chrome[chrome
+            .find("footer := Rectangle {")
+            .expect("the footer block")
+            ..chrome
+                .find("about := Rectangle {")
+                .expect("the panel that ends it")];
+        assert!(
+            !footer.contains("host-height") && !footer.contains("recents-fit"),
+            "the footer yields to nothing - ADR-0001 forbids the silence that fitting would buy"
         );
     }
 }

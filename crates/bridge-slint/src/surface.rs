@@ -2590,10 +2590,17 @@ mod tests {
         // (`the_drag_closes_the_popup_once_per_gesture` and
         // `the_drag_band_stops_where_the_caption_begins` both include_str! the bar).
         let popup = include_str!("../ui/chrome.slint");
+        // Read FLAT, because the cap is now a two-branch expression and a guard that spans lines
+        // must not care where the lines fall. Both branches still hold five: the first is the old
+        // constant, kept for a bar that was never told its window's height; the second lets the
+        // window ask for fewer rows, never more.
+        let flat = popup.replace(['\n', '\r', ' '], "");
         assert!(
-            popup.contains("property <int> recents-shown: Math.min(root.recents.length, 5)"),
-            "the popup's height IS the row count, capped at the five it can hang - so an empty list
-             cannot leave a gap in the menu, and a ten-entry list cannot overflow the popup"
+            flat.contains("root.host-height<=0px?Math.min(root.recents.length,5)")
+                && flat.contains("Math.min(root.recents.length,Math.min(5,root.recents-fit))"),
+            "the popup's height IS the row count, capped at the five it can hang and cut shorter by \
+             the window it hangs in - so an empty list cannot leave a gap in the menu, and neither a \
+             ten-entry list nor a short window can overflow the popup"
         );
         // AND PERMANENCE, the negative half: the stack must not come back as a second copy of the
         // list. `stack-h`/`row-h` are matched as DECLARATIONS, not as words - this file's own

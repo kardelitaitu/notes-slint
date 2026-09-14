@@ -693,20 +693,45 @@ export component Chrome inherits Rectangle {
         ? 0px
         : 1px + Theme.menu-gap + notes.min-height;
 
-    // ---- THE RECENTS' SIZE, capped at FIVE -------------------------------------------------
+    // ---- THE RECENTS' SIZE, capped at FIVE and by the window ------------------------------
     // THE CAP IS GEOMETRY, NOT THE MODEL. The port hands up to ten (recents_rows' MAX_RECENTS, ten
-    // because there are ten doors) and this file may not ask the window how tall it is - the same
-    // rule that makes host-height an in-property - so the popup hangs FIVE rows and no more below a
-    // 28px band. Entries six..ten are therefore reachable and undrawn: Alt+6..0 still open them, and
-    // that is a divergence, said here rather than smoothed over. It wants a clamp on host-height
-    // the day a bar is given a window height it can trust; until then the constant is honest about
-    // being a constant.
+    // because there are ten doors) and this block hangs below a 28px band inside a window, so the
+    // row count is bounded TWICE: five, because that is what a menu may spend on a list, and fewer,
+    // because a popup taller than the window left is not scrolled, warned about or shrunk - Slint
+    // clips it at the window's bottom edge and the part that disappears is the bottom of the menu.
+    // `host-height` is the in-property that makes the second bound computable (root.height, fed from
+    // main.slint since the width clamp needed a host to be floored against), and nobody enforces a
+    // minimum window height anywhere: not the Window, not the bridge, not platform, so "short" is a
+    // state reached by dragging the bottom edge up.
+    //
+    // THE ORDER OF YIELDING is the decision, not the arithmetic: the recents give way and the footer
+    // does not. A list row that is not drawn is not a row that is unreachable - Alt+1..0 still open
+    // all ten, and the cap has always traded sight for reachability - while the footer's lines are
+    // the answer to "why is my file not being saved", which ADR-0001 forbids cutting into silence.
+    // The height formula already puts the list above the sentence; this says which one goes first
+    // when there is only room for one.
+    //
+    // The subtraction reads the grid's OWN measure (`menu.rows-bottom`, +28 bar +4 bottom pad + the
+    // footer's tail with the gap in front of it) rather than restating six rows and five gaps - a
+    // third copy of that expression is what plumbing.rs counts and refuses.
     //
     // 1.17 has NO array-slice builtin to cut the model with (no subarray/slice in builtins or the
     // style library), so the cap is spent TWICE: once in this arithmetic, once in the per-row
     // visibility guard below. Zero entries cost ZERO - no row, no leading gap, no separator. That is
     // menu.rs:280's "no dangling separator" in the shape this toolkit has, and surface.rs guards it.
-    property <int> recents-shown: Math.min(root.recents.length, 5);
+    property <length> recents-budget: root.host-height - Theme.bar-height
+        - (menu.rows-bottom + Theme.menu-pad)
+        - root.footer-height
+        - (root.note-lines > 0 ? Theme.menu-gap : 0px)
+        - Theme.menu-gap;
+    property <int> recents-fit: Math.floor((root.recents-budget + Theme.menu-gap)
+        / (Theme.menu-row-height + Theme.menu-gap));
+    // host-height 0 means nobody told the bar how tall its window is, which is every harness that
+    // builds Chrome without the host: there the clamp stands down and the constant governs, so this
+    // changes what a real window shows and nothing else.
+    property <int> recents-shown: root.host-height <= 0px
+        ? Math.min(root.recents.length, 5)
+        : Math.max(0, Math.min(root.recents.length, Math.min(5, root.recents-fit)));
     property <length> recents-height: root.recents-shown <= 0 ? 0px
         : root.recents-shown * Theme.menu-row-height
             + (root.recents-shown - 1) * Theme.menu-gap;
