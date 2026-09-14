@@ -176,6 +176,35 @@ export component Chrome inherits Rectangle {
     in property <bool> popup-overflow: root.host-width > 0px
         && root.popup-x + Theme.menu-width > root.host-width - 4px;
 
+    /// THE SAME ARGUMENT, TURNED DOWN THE PAGE. Nothing in this app enforces a minimum window
+    /// height - not the Window, not the bridge, not `platform` - and Slint clips a child at the
+    /// client edge with no scroll and no warning, so a menu that hangs below a 28px band in a short
+    /// window loses whatever is at the bottom: the About row, and then the two lines that explain
+    /// why a file is not being saved. Clipping is the one outcome a popup must never reach.
+    ///
+    /// So the popup keeps its own bottom edge INSIDE the host by moving its top edge up, the way a
+    /// platform menu does when there is no room under the bar: what the shortfall costs is the
+    /// overlap of the bar's lower pixels, not the loss of a row. `parent.height` (the resting y of
+    /// both blocks) is the bar's own height, which is `Theme.bar-height`, which main.slint's
+    /// `height: 28px` and theme.slint agree on - stated as the token here because a function cannot
+    /// be asked what somebody else's parent is.
+    ///
+    /// NOT APPLIED TO THE X RULE. `popup-x` is printed as evidence by the frozen instrument
+    /// (probe.rs:1837, `popup-x=... floored=... overflow=...`), and an instrument that acquires new
+    /// assertions after its verdict is a wish, not evidence (ADR-0006 §4) - so the width rule stays
+    /// where its verdict left it, and the known gap that About is 340px wide while `popup-x` is
+    /// computed for a 190px menu is recorded instead of quietly fixed. Height is not under that
+    /// freeze: nothing has ever printed a y position, so this adds a rule and not a re-writing.
+    function popup-top(needed: length) -> length {
+        root.host-height <= 0px
+            ? Theme.bar-height
+            : Math.max(0px, Math.min(Theme.bar-height, root.host-height - needed - Theme.menu-gap))
+    }
+    in property <bool> menu-raised: root.host-height > 0px
+        && root.popup-top(menu.height) < Theme.bar-height;
+    in property <bool> about-raised: root.host-height > 0px
+        && root.popup-top(about.height) < Theme.bar-height;
+
     // ---- the asks ---------------------------------------------------------------
     // toggled-pin carries the state to ASK for, because this closure cannot see the wire and
     // the bridge must not keep a second copy of the bit (titlebar.rs:310-311).
@@ -758,7 +787,9 @@ export component Chrome inherits Rectangle {
         property <length> rows-bottom: rows.y + rows.height;
 
         x: root.popup-x;
-        y: parent.height;
+        // Its resting place is under the bar; its bound is the window. See popup-top: a short window
+        // costs the bar's lower pixels, never the bottom of the menu.
+        y: root.popup-top(menu.height);
         width: Theme.menu-width;
         // SIX command rows (the 6th is About, and it is the licence's row - see the import above),
         // so both numbers move together: the count of rows and the count of gaps between them. One
@@ -927,7 +958,10 @@ export component Chrome inherits Rectangle {
     // of all the licence.
     about := Rectangle {
         x: root.popup-x;
-        y: parent.height;
+        // The same bound, and it binds harder here: this box is a fixed 340x260, so a window under
+        // 290px tall would otherwise cut the licence text - the one block in the menu whose whole
+        // reason for existing is an obligation.
+        y: root.popup-top(about.height);
         width: 340px;
         height: 260px;
         visible: root.about-open;

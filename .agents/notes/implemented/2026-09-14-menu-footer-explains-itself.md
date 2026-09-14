@@ -142,10 +142,12 @@ answered here.
   into the product's caret without first winning the foreground it cannot win. So that sentence in
   the menu is currently evidenced by unit tests and by the frozen probe's needles, not by a window
   anybody watched.
-- **The popup can no longer outgrow the window it hangs in — but a floor was found under that.**
+- **The popup can no longer outgrow the window it hangs in — and the follow-up is owned elsewhere.**
   The recents clamp (`519df1c7`) makes the list yield to the window before the footer can be cut,
-  measured at 294→184px across eight heights with the footer intact at each. What remains is below
-  the recents: under roughly **212px** of window height the six *command rows* are what clips, and
-  nothing in the Window, the bridge or `platform` enforces a minimum height. `Chrome` cannot fix
-  that and must not try by shortening its vocabulary; the honest owner is a `min-height` at the
-  window, which is a behaviour change for a person dragging an edge, not a menu change.
+  measured at 294→184px across eight heights with the footer intact at each. The next slice carried
+  that through: when even the irreducible menu does not fit below the bar, the popup **rises** and
+  pays with the bar's lower pixels instead of losing its own bottom
+  ([`2026-09-14-popup-stays-inside-its-window`](2026-09-14-popup-stays-inside-its-window.md)) —
+  whole down to ~186px for the menu, ~262px for About. Below that the window is simply smaller than
+  the thing inside it, which no `Chrome` can fix and which is a minimum-window-size decision nobody
+  currently owns; that note states the number (~264px) and asks who should decide it.

@@ -662,4 +662,54 @@ mod tests {
             "the footer yields to nothing - ADR-0001 forbids the silence that fitting would buy"
         );
     }
+
+    /// THE POPUP KEEPS ITS OWN BOTTOM INSIDE THE WINDOW. Clipping is the one outcome a popup must
+    /// not reach: what disappears is the last thing in it, which for this menu is the About row and
+    /// then the two lines that explain why a file is not being saved. Measured on the same markup at
+    /// nine heights, the menu is whole from 640 down to 186 (it rose from y=29 to y=3 as the window
+    /// shortened, covering the bar's lower pixels instead of losing its own), and the About panel is
+    /// whole down to 262 - below that a fixed 340x260 box simply does not fit, which is a minimum
+    /// window size nobody owns, not something `Chrome` may solve by cutting the licence.
+    #[test]
+    fn the_popup_keeps_its_bottom_inside_its_window() {
+        let chrome = include_str!("../ui/chrome.slint");
+        let flat = chrome.replace(['\n', '\r', ' '], "");
+        // The rule exists, and it stands down when nobody told the bar its window's height - the
+        // same courtesy the recents clamp pays to a harness that omits host-height.
+        assert!(
+            flat.contains("functionpopup-top(needed:length)->length{root.host-height"),
+            "there is one rule for where the popup may start"
+        );
+        assert!(
+            flat.contains("root.host-height<=0px?Theme.bar-height"),
+            "and it does nothing at all for a bar that was never told how tall its window is"
+        );
+        // Both blocks that hang below the bar go through it. Two, not one: the About panel is the
+        // TALLER of the two, so a fix that stopped at the menu would leave the licence clipping
+        // 26px sooner than the thing that opens it.
+        assert_eq!(
+            chrome.matches("y: root.popup-top(").count(),
+            2,
+            "the menu and the About panel share one bound"
+        );
+        assert!(
+            chrome.contains("y: root.popup-top(menu.height);")
+                && chrome.contains("y: root.popup-top(about.height);"),
+            "each measured by its own height, not by the other's"
+        );
+        // The flags that say it out loud: a popup that covers its own bar is a decision made under
+        // pressure, and it should be visible to a test rather than only to a screenshot.
+        assert!(
+            flat.contains("property<bool>menu-raised")
+                && flat.contains("property<bool>about-raised"),
+            "the markup admits when it had to rise"
+        );
+        // AND THE FROZEN HALF, guarded against drift rather than against intent: popup-x prints as
+        // evidence in the instrument (probe.rs:1837), so the width rule is not this change's to
+        // touch. If someone means to change it, this is the line that makes them say so.
+        assert!(
+            flat.contains("Math.min(Theme.menu-inset,root.host-width-Theme.menu-width-8px)"),
+            "the width clamp still measures the 190px menu it was judged against"
+        );
+    }
 }
