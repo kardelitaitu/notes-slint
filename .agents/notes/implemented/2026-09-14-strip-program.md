@@ -145,6 +145,13 @@ they mean). `e8aa2ac3` wired the middle one. In `crates/xtask/src/smoke.rs`:
   and `shutdown: joined cleanly` lines, and exit code 0 **by itself**. A force-kill cannot PASS
   whatever code it ends with (`:4329-4378`), and its own PASS line names its limits: it proves none
   of the rect, the pin, the recents trace or the maximised cycle (`:4386-4392`).
+  **Superseded in part, same file, by what happened after:** the rect and the maximised cycle have since
+  been **proved on these bytes** (`bdf9b844`, live - the M9 fixed point runs inside `--binary=slint`,
+  drift `(0,0,0,0)`, witnessed at `2026-09-14-rounded-corners-dwm.md:161-163`), so the surviving limits
+  of that PASS line are **the pin and the recents trace** (plus Save As by pointer, which the leg now
+  names too); and the cite `:4386-4392` has **drifted** onto the `Set-Active` foreground-lock comment -
+  the live clause is the PASS-line limits at `:6445-6452`. Full ledger:
+  [`2026-09-14-adr0006-ledger`](2026-09-14-adr0006-ledger.md).
 - `slint-probe` - `Leg::NotWired`, exit **2**, deliberately not 3: 3 claims the *machine* cannot host
   the check, which is a statement this decline is not entitled to make - a box with a perfect window
   station answers the same 2 (`:3490-3544`).

@@ -111,9 +111,18 @@ waits on **six re-earnings**, each an equivalent proof over Slint bytes rather t
   `crates/bridge-gpui/src/menu.rs:230-295` tests cited by check 5, over the product's own rendered rows;
 - **the §4.5 byte-identical bridge leg on Slint `TextEdit`** — a live round trip through the editor the
   user types into, not core's fixtures alone;
-- **the M9 rect fixed point `(0, 0, 0, 0)` on product bytes** — `run_product_leg` names reading a rect as
-  something it deliberately does **not** do (`crates/xtask/src/smoke.rs:4203-4211`), so this is new
-  harness surface, not a flag flip;
+- **the M9 rect fixed point `(0, 0, 0, 0)` on product bytes — LANDED, and this bullet is now the
+  odd one out.** The disclaimer it was written against is gone: `run_product_leg` reads its own rect as
+  of `bdf9b844`, whose comment states the two acts plainly — act one is the plain launch read "with no
+  rect, no seed and no move", act two is the fixed point itself, "a real maximise through the OS door
+  the caption button reaches, a close, a read of what the app persisted, a relaunch, and a second close"
+  (`crates/xtask/src/smoke.rs:6099-6114`, verdict at `:5296-5299`), so "comes back the size and place you
+  left it" is measured on the artifact that ships and not only on the frozen instrument. That is the
+  same claim §9's "Proved, locally" paragraph above already carries, and it is the one thing in this list
+  the harness now does rather than declines; the old `:4203-4211` cite is drift — those lines are the menu
+  legs' P/Invoke block today. It licenses **no** change to the seven-check count: with `git remote -v`
+  empty there is still no CI to grade it, and the other five bullets in this list stay owed. Ledger:
+  [`2026-09-14-adr0006-ledger`](../.agents/notes/implemented/2026-09-14-adr0006-ledger.md).
 - **the dialog flows Open and Save As driven to text-in-window** — `rfd` is already live
   (`crates/bridge-slint/src/surface.rs:541`); the gap is the assertion, not the code;
 - **the autosave toggle through the real menu** — check 6, closed on a product menu row;

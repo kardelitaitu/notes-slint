@@ -50,6 +50,9 @@
 //! (3) the panic hook, which a windows_subsystem binary NEEDS because a panic is otherwise
 //!     invisible (bridge-gpui/src/main.rs:1396);
 //! (4) the recents exists-mark, the legend keys in a real bar, and the pin check mark's round trip.
+//! STATUS (the ADR-0006 ledger): (1) PAID at 2fc924f3 live, (2) PAID on real stderr by
+//! smoke.rs's PRODUCT_CLOSE_NEEDLES, (3) PAID by tests/panic_hook.rs at ebbb755c; (4) is owed ONLY
+//! its pin check-mark round trip - see 2026-09-14-adr0006-ledger.md.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
