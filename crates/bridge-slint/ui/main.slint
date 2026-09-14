@@ -32,12 +32,16 @@ export component Spike inherits Window {
     // no floor value is set here, in product.rs, or anywhere else in this slice, because a later
     // slice owns 264/340 and the approval that has to come with them.
     //
-    // The 0px default is load-bearing, not a placeholder. i-slint-core's layout.rs builds the
-    // window's min constraint with `min_size = if min_width > 0. || min_height > 0. { Some(..) }
-    // else { None }`, so an unset floor never reaches the adapter at all and the window keeps the
-    // exact resize contract it had before these four lines existed. That is what protects the
-    // instrument: notes-slint-probe.exe mounts THIS SAME Spike, never sets either knob, and so
-    // still measures a genuine 180px host with nothing holding it up.
+    // The 0px default is load-bearing, not a placeholder - ON THE TARGET THIS BRIDGE SHIPS FOR,
+    // which is the scope actually checked. i-slint-core's layout.rs:94 builds the window's min
+    // constraint as `min_size = if min_width > 0. || min_height > 0. || cfg!(target_arch =
+    // "wasm32") { Some(..) } else { None }`, and the third term is part of the claim: on a desktop
+    // target (Windows; the only one this crate builds) 0px on BOTH axes means min_size is None and
+    // nothing reaches set_min_inner_size, so the window keeps the exact resize contract it had
+    // before these four lines existed. On wasm32 the same defaults produce Some(LogicalSize(0, 0)) -
+    // still no real constraint, but a call that exists, and nobody on this machine has measured it.
+    // That is what protects the instrument: notes-slint-probe.exe mounts THIS SAME Spike, never
+    // sets either knob, and so still measures a genuine 180px host with nothing holding it up.
     //
     // Bound rather than in-out, per finding 3 in the header: Rust writes the knob, the Window
     // reads it. Nothing in markup ever assigns to either name.
@@ -185,13 +189,26 @@ export component Spike inherits Window {
     in property <length> popup-x: chrome.popup-x;
     in property <bool> popup-floored: chrome.popup-floored;
     in property <bool> popup-overflow: chrome.popup-overflow;
-    /// WS-B B-S2: About's two placement flags, mirrored exactly the way the menu's are above -
-    /// a binding, never an access, so Chrome keeps a single writer of its own state. Before this
-    /// pair the two flags existed only as markup-derived booleans inside Chrome and NOTHING
-    /// outside could read them: no test, no probe, no run log. Closing that gap is the point of
-    /// the slice; what is read from them is a later slice's business.
-    in property <bool> about-floored: chrome.about-floored;
-    in property <bool> about-overflow: chrome.about-overflow;
+    /// WS-B B-S2, corrected by review: About's THREE placement flags, mirrored. Before this the
+    /// three existed only as markup-derived booleans inside Chrome and NOTHING outside could read
+    /// them - no test, no probe, no run log. Closing that gap is the point of the slice; what gets
+    /// read from them is a later slice's business.
+    ///
+    /// OUT, not in, and that is the review's finding rather than a style choice: the visibility is
+    /// the only thing that decides whether Rust gets a setter at all. 1.17 emits get_x for every
+    /// public property and set_x for every property that is not read_only, and read_only comes ONLY
+    /// from declaring a property out (i-slint-compiler generator/rust.rs:1062-1090) - so an `in`
+    /// mirror compiled `ui.set_about_floored(..)`, and a mirror Rust can overwrite is not a mirror:
+    /// that call would clobber Chrome's binding and the next print would be a fact about the caller.
+    /// `out` is exactly the shape close-allowed above already uses, and it is the one that makes the
+    /// "reads Chrome's output, writes nothing" sentence in this block TRUE in both directions.
+    ///
+    /// about-raised is the vertical axis - the one floor-height actually acts on - so leaving it
+    /// unmirrored would have kept the governed axis unreadable while the two horizontal-ish flags
+    /// got doors.
+    out property <bool> about-floored: chrome.about-floored;
+    out property <bool> about-overflow: chrome.about-overflow;
+    out property <bool> about-raised: chrome.about-raised;
 
     in property <[string]> recents;
     callback open-at-index(int);

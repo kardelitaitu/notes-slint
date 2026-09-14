@@ -1008,11 +1008,16 @@ mod tests {
 
     // ---- WS-B B-S2: the About mirrors and the inert floor knobs --------------------------
     //
-    // WHY THESE SIT HERE AND NOT IN plumbing.rs: four modules (plumbing, surface, title_contract,
-    // ui_gen) compile into BOTH bins - see the mod list above and probe.rs's own - so a test added
-    // there would also run inside notes-slint-probe.exe, whose verdict is already on record and
-    // may not acquire new assertions after the fact (ADR-0006 §4, cited at chrome.slint:193). This
-    // mod tests belongs to exactly one bin: the product.
+    // WHY THESE SIT HERE AND NOT IN plumbing.rs, in the right order after review. PRIMARY, and it
+    // is a placement rule rather than a counting rule: what a floor and a mirror assert is a
+    // PRODUCT claim, and ADR-0006 §4 donates exactly such claims to Leg::Product to be re-earned
+    // there (0006:70-72) - so the product's own mod tests is their home whoever compiles them.
+    // SECONDARY belt, not the reason: four modules (plumbing, surface, title_contract, ui_gen)
+    // compile into BOTH bins, so a test written there would also run inside notes-slint-probe.exe.
+    // What that clause actually protects is narrower than this comment used to claim - it forbids
+    // the instrument gaining new things it REPORTS after its verdict, not a module gaining tests -
+    // and it is the reporting that stays frozen here: nothing below prints into a run, and the
+    // probe's needles are untouched.
     //
     // Both needles read MARKUP TEXT, never a property at runtime: unit tests here get no window,
     // and the whole crate's guard style is "say it in text, count it in text". The two
@@ -1047,26 +1052,59 @@ mod tests {
     /// be written `const FLOOR_WIDTH: f32 = 340.0;` or `= 340;` and the type sits in between. Skips
     /// to the next digit run rather than assuming one; a name with no number near it panics,
     /// because that is a floor nobody wrote down.
-    fn number_after(text: &str, from: usize, name: &str) -> f64 {
-        let digits = text[from..]
-            .char_indices()
-            .find(|(offset, c)| {
-                c.is_ascii_digit() && {
-                    let run: String = text[from + offset..]
-                        .chars()
-                        .take_while(|d| d.is_ascii_digit() || *d == '.')
-                        .collect();
-                    !run.is_empty() && !run.matches('.').count().gt(&1)
-                }
-            })
-            .unwrap_or_else(|| panic!("{name} is declared with no number beside it"))
-            .0;
-        let run: String = text[from + digits..]
+    /// The value a const DECLARATION gives `name`, read from the RIGHT of its equals sign. Two
+    /// review findings are the shape of this function. (1) Scanning forward from the NAME reads a
+    /// digit run out of the TYPE token: `const FLOOR_WIDTH: f32 = 340.0;` yielded 32, so the exact
+    /// spelling this guard exists to check went red the day a floor was named correctly. (2) A bare
+    /// substring match arms the comparison against any number in prose that merely mentions the
+    /// name, so the line must really be a `const <name>` declaration and not a comment about one.
+    /// None means "no such declaration yet", which is the pending branch. A declaration whose value
+    /// is not a numeric literal PANICS rather than passing: a floor this guard cannot read is a
+    /// floor nobody read.
+    fn const_number(head: &str, name: &str) -> Option<f64> {
+        let line = head.lines().find(|l| {
+            let t = l.trim();
+            if t.starts_with("//") || t.starts_with("///") {
+                return false;
+            }
+            match t.find("const ") {
+                Some(at) => t[at + "const ".len()..].trim_start().starts_with(name),
+                None => false,
+            }
+        })?;
+        let (_, right) = line
+            .split_once('=')
+            .unwrap_or_else(|| panic!("{name} is declared with no value to read"));
+        let run: String = right
+            .trim_start()
             .chars()
-            .take_while(|d| d.is_ascii_digit() || *d == '.')
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
             .collect();
-        run.parse::<f64>()
-            .unwrap_or_else(|err| panic!("{name}'s number {run:?} does not parse: {err}"))
+        assert!(
+            !run.is_empty(),
+            "{name} is declared as something other than a numeric literal, and this guard can only              enforce what it can read - name the number or move the contract to the value's owner"
+        );
+        match run.parse::<f64>() {
+            Ok(value) => Some(value),
+            Err(err) => panic!("{name}'s value {run:?} does not parse: {err}"),
+        }
+    }
+
+    /// Every Rust file the crate ships, read at run time. A census that hand-lists its inputs stops
+    /// covering anything new the day somebody adds a file, and the setter census below has to see a
+    /// call from ANYWHERE in the crate - product, probe, plumbing, or a test written next month.
+    fn rust_files(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_files(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
     }
 
     /// THE CONTRACT, as a direction rather than a number: a floor clips the licence when - and
@@ -1079,27 +1117,46 @@ mod tests {
     }
 
     #[test]
-    fn abouts_two_placement_flags_now_reach_rust_and_chrome_still_derives_them() {
+    fn abouts_three_placement_flags_are_out_mirrors_and_chrome_still_derives_them() {
         let main = squeezed(include_str!("../ui/main.slint"));
         let chrome = include_str!("../ui/chrome.slint");
 
-        // Needle 1a: the mirrors. Rust cannot reach an element inside a component by id, so a
-        // read-only binding is the ONLY door that has ever worked here (menu-shown, about-shown,
-        // popup-*). about-shown's door is pre-existing and had better still be there.
+        // Needle 1a: the mirrors exist, and Rust cannot reach an element inside a component by id,
+        // so a binding is the ONLY door that has ever worked here. about-shown's door is pre-existing
+        // and had better still be there; the three flags below are the ones this slice opened, and
+        // about-raised is the third because it is the VERTICAL axis - the one floor-height acts on.
         for mirror in [
             "inproperty<bool>about-shown:chrome.about-open;",
-            "inproperty<bool>about-floored:chrome.about-floored;",
-            "inproperty<bool>about-overflow:chrome.about-overflow;",
+            "outproperty<bool>about-floored:chrome.about-floored;",
+            "outproperty<bool>about-overflow:chrome.about-overflow;",
+            "outproperty<bool>about-raised:chrome.about-raised;",
         ] {
             assert!(
                 main.contains(mirror),
                 "the mount lost a one-way About mirror: {mirror}"
             );
         }
-        // A mirror must not become a lever: the mount binds Chrome's outputs and writes none of
-        // them. probe.rs's census covers Chrome's own writes and the about-open assign form; this
-        // covers the two NEW names, which have no other guard.
-        for assigned in ["about-floored =", "about-overflow ="] {
+        // And the visibility is the half that makes "one-way" mean something, so it gets its own
+        // assertion rather than hiding inside the one above. 1.17 emits get_x for every public
+        // property and set_x for every property that is NOT read_only, and read_only comes only from
+        // declaring a property out (i-slint-compiler generator/rust.rs:1062-1090). As `in`, these
+        // three compiled ui.set_about_floored(..) and friends - a mirror Rust can overwrite is not a
+        // mirror, it is a second writer with a getter on it. `out` deletes the setter from the
+        // generated API, which is the difference between a claim and a hope.
+        for was_in in [
+            "inproperty<bool>about-floored",
+            "inproperty<bool>about-overflow",
+            "inproperty<bool>about-raised",
+        ] {
+            assert!(
+                !squeezed(include_str!("../ui/main.slint")).contains(was_in),
+                "{was_in} is back to IN, which re-opens ui.set_... on a read-only mirror"
+            );
+        }
+        // A mirror must not become a lever from the markup side either: the mount binds Chrome's
+        // outputs and writes none of them. probe.rs's census covers Chrome's own writes and the
+        // about-open assign form; this covers the three NEW names, which had no other guard.
+        for assigned in ["about-floored =", "about-overflow =", "about-raised ="] {
             assert!(
                 !include_str!("../ui/main.slint").contains(assigned),
                 "main.slint now ASSIGNS {assigned}, which would make the mount a second writer"
@@ -1205,28 +1262,64 @@ mod tests {
             "the horizontal demand grew a term - popup-left's floor is zero, so its margins are policy while only the width is obligation"
         );
 
+        // The enforcement the pending branch was missing, and the reason that branch was a
+        // landmine rather than a politeness: these knobs are IN properties, so the generated Rust
+        // hands every caller a setter whether or not any const exists. A slice could therefore give
+        // the window a live floor from anywhere in the crate without ever writing a FLOOR_WIDTH
+        // token, and the guard below would stay green forever. So: NO caller may call either setter
+        // until the sanctioned slice lands. The needles are BUILT at run time because a census that
+        // greps its own grep line is the trap this crate has already named (plumbing.rs:579).
+        let mut sources = Vec::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        rust_files(&root.join("src"), &mut sources);
+        rust_files(&root.join("tests"), &mut sources);
+        assert!(
+            sources.len() >= 8,
+            "the setter census found only {} files under {} - the layout moved and this guard now reads nothing",
+            sources.len(),
+            root.display()
+        );
+        for axis in ["width", "height"] {
+            let door = format!("set_floor_{}(", axis);
+            for file in &sources {
+                let text = std::fs::read_to_string(file)
+                    .unwrap_or_else(|err| panic!("{} unreadable: {err}", file.display()));
+                assert!(
+                    !text.contains(&door),
+                    "THE FLOOR IS BEING SET before it was approved: {} calls {door}. The only legal floor until the sanctioned slice is the markup's own 0px - and when that slice DOES land, it must retire this line in favour of the const check below, not delete the check.",
+                    file.display()
+                );
+            }
+            // ... and the same door from the markup side, where a handler could bind the knob
+            // without a single Rust call existing anywhere.
+            let assign = format!("floor-{} =", axis);
+            assert!(
+                !include_str!("../ui/main.slint").contains(&assign),
+                "the markup now ASSIGNS {assign} from inside a handler: a floor bound in markup walks around every guard on this side of the seam",
+            );
+        }
+
         // And the pending half, honestly: the Rust consts do not exist yet, so nothing here can
-        // claim a value passes. This LOOKS for them in the shipping part of this file (above the
-        // tests) and, the day a slice names them, starts applying the contract to the numbers it
-        // finds - no edit to this test required, and no invented value while the door is open.
+        // claim a value passes. This looks for a const DECLARATION in the shipping part of this file
+        // (above the tests) and, the day a slice names one, applies the contract to the number it
+        // actually declares - read from after the equals sign, so the type token cannot be mistaken
+        // for the value. No edit to this test is needed for that to start working, and no invented
+        // value is asserted while the door stands open.
         let whole = include_str!("product.rs");
         let head = &whole[..whole
             .find("mod tests")
             .expect("this file has a tests module")];
         for (name, demanded) in [("FLOOR_WIDTH", demand_w), ("FLOOR_HEIGHT", demand_h)] {
-            match head.find(name) {
-                Some(at) => {
-                    let value = number_after(head, at, name);
-                    assert!(
-                        !clips_the_panel(value, demanded),
-                        "{name} = {value}px sits below the {demanded}px the About panel demands -                          the licence would clip, which is the only thing this contract forbids"
-                    );
-                }
+            match const_number(head, name) {
+                Some(value) => assert!(
+                    !clips_the_panel(value, demanded),
+                    "{name} = {value} sits below the {demanded} the About panel demands - the licence would clip, which is the only thing this contract forbids"
+                ),
                 None => {
                     // Inert today, and said out loud rather than asserted away.
                     assert!(
                         main.contains("floor-width:0px") && main.contains("floor-height:0px"),
-                        "{name} is not declared yet, and the markup's floor is no longer 0px -                          a floor with no owner is worse than no floor at all"
+                        "{name} is not declared yet, and the markup's floor is no longer 0px - a floor with no owner is worse than no floor at all"
                     );
                 }
             }
