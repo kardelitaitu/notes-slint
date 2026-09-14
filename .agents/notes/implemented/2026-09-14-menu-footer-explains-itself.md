@@ -119,13 +119,18 @@ answered here.
 
 - **The footer's pixels are proven in a preview, not in a live window.** The fixes are committed in
   `79d11e86`, and the render that shows them correct came from `--load-data`. A real window can be
-  photographed here, but its menu cannot be opened from this session: `SetForegroundWindow` is
-  refused even with the `AttachThreadInput` dance, and without the foreground a synthetic press is
-  swallowed as an activation click — and any keystroke sent anyway goes to whoever *is* focused,
-  which is why the harness must read that gate's answer rather than ignore it. `cargo xtask smoke`
-  declines this class of run as **exit 3, "not the app's fault"**, and says in its own header that
-  "the CLICK half STAYS MANUAL". So "a person can open this menu and read the footer" is a manual
-  check, and it is still owed.
+  photographed here, but its menu cannot be opened from this session, and `069018ef`'s menu legs now
+  say so with numbers rather than with my failure: the whole harness passes (`product=PASS
+  alive=PASS close=PASS exit=0` at 800x600, where the popup stays at rest so the clamp is not
+  implicated) while `menu-click` reports `hamburger 2018,94,1 | row 2052,166,1 | toggle lines=0
+  active=1` and is **NOT JUDGED (advisory)**. The reason is now measured directly rather than
+  inferred from the keyboard leg: `SendInput` posts a 1px move and returns 1, and the cursor does not
+  move — and when the test ran, the cursor was sitting at **2052,122**, the exact Open-row pixel the
+  leg had pressed. So in this session `SetCursorPos` works and the button events do not, which is
+  what makes `presses landed on our window=3/3` (a hit-test at the right pixel) and "Rust heard
+  nothing" both true at once. That exonerates the row geometry for now, and it means **the live check
+  is still owed** — by a machine with a desktop this session can actuate, or by a harness that can
+  reach the TouchArea without an OS pointer.
 - **What a live run here cannot do, it can still feed.** Seeding the private profile's
   `session.json` with `"path"` makes the product restore the file through its own startup door, and
   a real window of a throwaway copy came up on a real foreign `.md`:
