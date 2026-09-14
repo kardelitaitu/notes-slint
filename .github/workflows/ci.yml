@@ -364,10 +364,20 @@ jobs:
       # would un-recognise the step, and decide_contract would print [contract-unreadable]
       # and exit 2: check-ci refuses rather than report a green it did not earn. The product
       # travels by DEFAULT on this line; the flag lives in 3h, where it pins the other leg.
-      # 6/7/9 - the gpui needle schedule's product verdicts - therefore CANNOT fire on this
-      # product leg until the re-earnings (S8/S9) re-earn them over Slint bytes, and they
-      # stay armed anyway, because a published contract code keeps its arm whatever the
-      # current artifact can return. The schedule itself now runs, named out loud, in 3h.
+      # WHICH OF 6/7/9 CAN ACTUALLY FIRE HERE is a different sentence than it was before
+      # S8, and it is spelled out because the old one went false under that commit:
+      #   6 CAN - product_maximised_cycle is a producer on THIS leg, so a bare run over
+      #     Slint bytes returns GEOMETRY_FAILED_EXIT by itself when a real maximise, a
+      #     close, a relaunch and the restore rect disagree. No flag, no needle schedule,
+      #     no gpui anywhere near the call - this arm has been waiting for it since the
+      #     product became the default.
+      #   7 CANNOT yet - its only producer is the two-polarity pin read inside the gpui
+      #     needle schedule's geometry_round_trip, which this leg does not run.
+      #   9 CANNOT yet - its only producer is judge_trace over the recents announce, in
+      #     that same schedule.
+      # 7 and 9 stay armed anyway: a published contract code keeps its arm whatever the
+      # current artifact can return, and check-ci's [arm-missing] rule goes red if an arm
+      # is dropped. The schedule itself now runs, named out loud, in 3h.
       #
       # ADVISORY (continue-on-error) on purpose, twice over: a runner with no interactive
       # desktop is not a broken repo (exit 3 = DECLINED), and a GUI row that goes red for

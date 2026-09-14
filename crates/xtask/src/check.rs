@@ -256,10 +256,18 @@ fn step_specs() -> Vec<StepSpec> {
             // command and no step is recognised, decide_contract returns
             // [contract-unreadable], and check-ci exits 2 - it refuses rather than
             // reports green. So the product travels by default, never by a flag here.
-            // The arms stay 0,1,2,3,4,5,6,7,9 as published by smoke::CONTRACT: 6/7/9
-            // are the gpui needle schedule's verdicts and simply cannot fire on the
-            // product leg until the re-earnings (S8/S9) re-earn them - which is not a
-            // licence to delete the arms, since the schedule stays frozen, not gone.
+            // The arms stay 0,1,2,3,4,5,6,7,9 as published by smoke::CONTRACT, and
+            // after S8 they are no longer all theoretical here. 6 HAS a producer on this
+            // leg: run_product_leg runs product_maximised_cycle over these bytes and
+            // returns GEOMETRY_FAILED_EXIT when a real maximise, a close, a relaunch and
+            // the restore rect disagree - no flag, no needle schedule, no gpui in the
+            // call. 7 and 9 still CANNOT fire on this leg: their only producers are the
+            // two-polarity pin read and the recents-trace judge, and both live in the
+            // gpui needle schedule (smoke.rs's geometry_round_trip and judge_trace),
+            // which the product leg does not run - so those wait on the re-earnings
+            // (S9). None of this is a licence to delete an arm: a published contract
+            // code keeps its arm whatever the current artifact can return, and the
+            // schedule stays frozen, not gone.
             advisory: true,
             quick_skippable: true,
             budget_secs: 120,
