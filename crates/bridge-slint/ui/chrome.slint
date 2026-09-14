@@ -544,8 +544,24 @@ export component Chrome inherits Rectangle {
                 max-band.moved-since-down = true;
                 root.drag-delta(max-band.mouse-x - max-band.last-x,
                                 max-band.mouse-y - max-band.last-y);
-                max-band.last-x = max-band.mouse-x;
-                max-band.last-y = max-band.mouse-y;
+                // MICRO-3a THE RE-ANCHOR, which turns out to be a HOLD, not an advance. The
+                // window this band lives in has just been asked to move by exactly the delta
+                // emitted above, so the pointer's coordinate IN THIS BAND has already shrunk by
+                // that same amount with the pointer not moving at all. The sample the next event
+                // must be measured against is therefore
+                //     mouse-x - delta  ==  last-x
+                // - the press sample itself. Writing 'last-x = mouse-x' here (what this did
+                // before) cancels the travel the frame already made and starves the stream: the
+                // next real pointer step reports 0 and the note falls behind the cursor. Holding
+                // the anchor makes every delta the OUTSTANDING error between pointer travel and
+                // applied travel, which is the number that has to be right; it also absorbs the
+                // physical/logical rounding of a single step for free.
+                // Still inside 'if max-band.pressed', so a mouse move that is not a drag cannot
+                // reach any of this and behaves exactly as before.
+                // THE ONE COST, priced rather than hidden: a move the OS refuses or clamps (a
+                // screen edge, a snap zone) is never applied, so the outstanding error grows
+                // while the note is stuck and is paid back as one jump when the constraint
+                // clears. That is what the 3a legs are here to measure, not to assume away.
             }
         }
     }
