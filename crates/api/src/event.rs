@@ -456,26 +456,23 @@ pub enum Event {
         /// What core's parser said, verbatim.
         reason: String,
     },
-    /// The session file could not be written. NOT a [`SaveFailed`]: that
-    /// event is a document save's answer and carries a `revision`, and a
-    /// session file has none - the old shape claimed revision 0, which is a
-    /// number the UI could render and the user could believe. Reported ONCE
-    /// per failure episode and latched until a write succeeds (M5): the tick
-    /// retries a failed session write forever, and without the latch that is
-    /// one error toast per tick, for a problem the user cannot act on from
-    /// inside the app. [`reason`] is core's own sentence (its SessionError
-    /// Display), passed through untranslated.
     /// A STATE file refused to be written: the session, or the settings -
     /// [`file`] names WHICH, so a status line can say "settings could not be
     /// saved" without the UI knowing which call it just made. One variant for
     /// both state files (D62 fold: two one-shot events with no subject became
     /// one named one; the count stays 13 because [`Event::PinFailed`] arrives
-    /// in the same wave). Same latch discipline as before - one report per
-    /// failure, retried every tick, cleared on the next success - and the
-    /// same no-revision honesty: a state file HAS no revision, and the old
-    /// shape claimed `revision: 0` through [`Event::SaveFailed`], which is a
-    /// document event. [`reason`] is core's own sentence (the error's
-    /// Display), passed through untranslated.
+    /// in the same wave; the session's half of that fold was: SessionWriteFailed
+    /// before 9c842242, and this block is where its doc now lives). Reported
+    /// ONCE per failure episode and latched until a write succeeds (M5): the
+    /// tick retries a failed state write forever, and without the latch that
+    /// is one error toast per tick, for a problem the user cannot act on from
+    /// inside the app - a success clears the latch, so the next DISTINCT
+    /// failure is news again. The no-revision honesty is the same on both
+    /// arms: a state file HAS no revision, and the old shape claimed
+    /// `revision: 0` through [`Event::SaveFailed`], which is a document event.
+    /// [`reason`] is core's own sentence (the error's Display - SessionError
+    /// on the session arm, SettingsError on the settings one), passed through
+    /// untranslated.
     StateWriteFailed {
         /// Which state file refused.
         file: StateFile,

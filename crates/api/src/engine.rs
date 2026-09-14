@@ -2200,11 +2200,15 @@ impl Engine {
     /// attempted on - and a real revision - the buffer revision that write
     /// would have anchored (D11) - and this helper is the guarantee's single
     /// point: state files have neither fact, which is exactly why they ride
-    /// their own events ([`Event::SessionWriteFailed`],
-    /// [`Event::SettingsWriteFailed`], [`Event::StateDirUnusable`]) instead of
-    /// this one with a revision of 0 - a number the UI could render and the
-    /// user could believe. Core refuses a nameless target as InvalidPath
-    /// before any save outcome exists (core/src/save.rs, `atomic_write`'s
+    /// their own event, [`Event::StateWriteFailed`], instead of this one with
+    /// a revision of 0 - a number the UI could render and the user could
+    /// believe. One event covers BOTH state files (9c842242 folded the two
+    /// per-file variants into it) and its `file` names which one refused:
+    /// `StateFile::Session` from the session arm of `flush_state`,
+    /// `StateFile::Settings` from its settings arm. The directory underneath
+    /// them is neither, and reports through [`Event::StateDirUnusable`]. Core
+    /// refuses a nameless target as InvalidPath before any save outcome exists
+    /// (core/src/save.rs, `atomic_write`'s
     /// file_name() guard - "the path has no file name component"), so an empty
     /// path here could only mean the port built the lie itself; the assert is
     /// the tripwire.
