@@ -881,4 +881,206 @@ mod tests {
             "the silent case keeps its alarming words - that is the one that can cost bytes"
         );
     }
+
+    // ---- WS-B B-S2: the About mirrors and the inert floor knobs --------------------------
+    //
+    // WHY THESE SIT HERE AND NOT IN plumbing.rs: four modules (plumbing, surface, title_contract,
+    // ui_gen) compile into BOTH bins - see the mod list above and probe.rs's own - so a test added
+    // there would also run inside notes-slint-probe.exe, whose verdict is already on record and
+    // may not acquire new assertions after the fact (ADR-0006 §4, cited at chrome.slint:193). This
+    // mod tests belongs to exactly one bin: the product.
+    //
+    // Both needles read MARKUP TEXT, never a property at runtime: unit tests here get no window,
+    // and the whole crate's guard style is "say it in text, count it in text". The two
+    // include_str! lines below are the only way to reach ../ui from a test, and the squeeze makes
+    // each needle survive a re-indent, because a comment that reflows must not read as drift.
+
+    /// Whitespace out of a line of markup, so a binding is matched on what it SAYS and not on how
+    /// far the formatter happened to indent it.
+    fn squeezed(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The number in the first `<prefix><digits>px` at or after `from`, read OUT of the markup.
+    /// These literals are frozen evidence (chrome.slint:1001-1002) and copying them into a Rust
+    /// literal is how a number ends up owned twice - so nothing below contains 340 or 260.
+    /// A missing or unparseable literal panics: that is the drift this is here to catch.
+    fn px_after(text: &str, from: usize, prefix: &str) -> f64 {
+        let hit = text[from..].find(prefix).unwrap_or_else(|| {
+            panic!("the markup no longer contains \"{prefix}\" after offset {from}")
+        });
+        let start = from + hit + prefix.len();
+        let digits: String = text[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        digits
+            .parse::<f64>()
+            .unwrap_or_else(|err| panic!("\"{prefix}\" no longer parses as a length: {err}"))
+    }
+
+    /// The first number at or after `from`, for the RUST side of the contract, where a const may
+    /// be written `const FLOOR_WIDTH: f32 = 340.0;` or `= 340;` and the type sits in between. Skips
+    /// to the next digit run rather than assuming one; a name with no number near it panics,
+    /// because that is a floor nobody wrote down.
+    fn number_after(text: &str, from: usize, name: &str) -> f64 {
+        let digits = text[from..]
+            .char_indices()
+            .find(|(offset, c)| {
+                c.is_ascii_digit() && {
+                    let run: String = text[from + offset..]
+                        .chars()
+                        .take_while(|d| d.is_ascii_digit() || *d == '.')
+                        .collect();
+                    !run.is_empty() && !run.matches('.').count().gt(&1)
+                }
+            })
+            .unwrap_or_else(|| panic!("{name} is declared with no number beside it"))
+            .0;
+        let run: String = text[from + digits..]
+            .chars()
+            .take_while(|d| d.is_ascii_digit() || *d == '.')
+            .collect();
+        run.parse::<f64>()
+            .unwrap_or_else(|err| panic!("{name}'s number {run:?} does not parse: {err}"))
+    }
+
+    /// THE CONTRACT, as a direction rather than a number: a floor clips the licence when - and
+    /// only when - it sits BELOW what the panel demands. Cut as ordering on purpose. Equality
+    /// (`floor == demanded`) would go red when a later slice trimmed a harmless pixel off the
+    /// floor while the panel stayed whole, and a guard that punishes a safe change trains people
+    /// to edit the guard.
+    fn clips_the_panel(floor: f64, demanded: f64) -> bool {
+        floor < demanded
+    }
+
+    #[test]
+    fn abouts_two_placement_flags_now_reach_rust_and_chrome_still_derives_them() {
+        let main = squeezed(include_str!("../ui/main.slint"));
+        let chrome = include_str!("../ui/chrome.slint");
+
+        // Needle 1a: the mirrors. Rust cannot reach an element inside a component by id, so a
+        // read-only binding is the ONLY door that has ever worked here (menu-shown, about-shown,
+        // popup-*). about-shown's door is pre-existing and had better still be there.
+        for mirror in [
+            "inproperty<bool>about-shown:chrome.about-open;",
+            "inproperty<bool>about-floored:chrome.about-floored;",
+            "inproperty<bool>about-overflow:chrome.about-overflow;",
+        ] {
+            assert!(
+                main.contains(mirror),
+                "the mount lost a one-way About mirror: {mirror}"
+            );
+        }
+        // A mirror must not become a lever: the mount binds Chrome's outputs and writes none of
+        // them. probe.rs's census covers Chrome's own writes and the about-open assign form; this
+        // covers the two NEW names, which have no other guard.
+        for assigned in ["about-floored =", "about-overflow ="] {
+            assert!(
+                !include_str!("../ui/main.slint").contains(assigned),
+                "main.slint now ASSIGNS {assigned}, which would make the mount a second writer"
+            );
+        }
+
+        // Needle 1b: the About bindings inside Chrome are untouched, read as squeezed text so a
+        // rewrap of Chrome's prose cannot look like a changed predicate.
+        let chrome_squeezed = squeezed(chrome);
+        assert!(
+            chrome_squeezed.contains(
+                "inproperty<bool>about-overflow:root.host-width>0px&&root.host-width<about.width;"
+            ),
+            "about-overflow no longer reads root.host-width < about.width"
+        );
+        assert!(
+            chrome_squeezed.contains("inproperty<bool>about-floored:root.host-width>0px&&root.popup-left(about.width)<8px;"),
+            "about-floored no longer reads popup-left(about.width) < 8px"
+        );
+        assert!(
+            chrome_squeezed.contains("inproperty<bool>about-raised:root.host-height>0px&&root.popup-top(about.height)<Theme.bar-height;"),
+            "about-raised, the vertical twin, also had better still read the same thing"
+        );
+    }
+
+    #[test]
+    fn the_floor_contract_is_ordering_and_this_slice_sets_no_floor_value() {
+        let main = squeezed(include_str!("../ui/main.slint"));
+
+        // The knobs, and the 0px that makes them inert. slint-core builds the window's min
+        // constraint as Some ONLY when a min exceeds zero, so 0px on both axes never reaches
+        // set_min_inner_size - which is why notes-slint-probe.exe, which mounts this same Spike
+        // and never sets a knob, still measures a genuine 180px host.
+        for knob in [
+            "inproperty<length>floor-width:0px;",
+            "inproperty<length>floor-height:0px;",
+            "min-width:root.floor-width;",
+            "min-height:root.floor-height;",
+        ] {
+            assert!(
+                main.contains(knob),
+                "the floor door changed shape: {knob} is gone from the markup"
+            );
+        }
+
+        // The demand, read out of the frozen markup rather than written down twice. About is a
+        // fixed box; the horizontal clause is about-overflow's own predicate (host < about.width,
+        // margins spendable because popup-left's floor is zero), the vertical one is
+        // popup-top's (height + the gap it keeps below the panel), plus the box's own border.
+        let chrome = include_str!("../ui/chrome.slint");
+        let about = chrome
+            .find("about := Rectangle {")
+            .expect("chrome.slint has an About panel block");
+        let panel_w = px_after(chrome, about, "width: ");
+        let panel_h = px_after(chrome, about, "height: ");
+        let border = px_after(chrome, about, "border-width: ");
+        let gap = px_after(include_str!("../ui/theme.slint"), 0, "menu-gap: ");
+        let demand_w = panel_w;
+        let demand_h = panel_h + border + gap;
+
+        // The contract, tested as a DIRECTION at the boundary rather than against a value: equal
+        // clears, a hair under clips, more than enough never clips. The third case is what makes
+        // this ordering and not equality - an == predicate fails it.
+        assert!(
+            !clips_the_panel(demand_w, demand_w),
+            "a floor AT the demand clears it"
+        );
+        assert!(
+            clips_the_panel(demand_w - 0.5, demand_w),
+            "a hair below the demand must read as clip-capable"
+        );
+        assert!(
+            !clips_the_panel(demand_h + 100.0, demand_h),
+            "a generous floor is never an error - equality would say otherwise"
+        );
+        assert!(
+            demand_w > 0.0 && demand_h > panel_h,
+            "the padding has to actually pad, or the vertical clause is the width clause in a costume"
+        );
+
+        // And the pending half, honestly: the Rust consts do not exist yet, so nothing here can
+        // claim a value passes. This LOOKS for them in the shipping part of this file (above the
+        // tests) and, the day a slice names them, starts applying the contract to the numbers it
+        // finds - no edit to this test required, and no invented value while the door is open.
+        let whole = include_str!("product.rs");
+        let head = &whole[..whole
+            .find("mod tests")
+            .expect("this file has a tests module")];
+        for (name, demanded) in [("FLOOR_WIDTH", demand_w), ("FLOOR_HEIGHT", demand_h)] {
+            match head.find(name) {
+                Some(at) => {
+                    let value = number_after(head, at, name);
+                    assert!(
+                        !clips_the_panel(value, demanded),
+                        "{name} = {value}px sits below the {demanded}px the About panel demands -                          the licence would clip, which is the only thing this contract forbids"
+                    );
+                }
+                None => {
+                    // Inert today, and said out loud rather than asserted away.
+                    assert!(
+                        main.contains("floor-width:0px") && main.contains("floor-height:0px"),
+                        "{name} is not declared yet, and the markup's floor is no longer 0px -                          a floor with no owner is worse than no floor at all"
+                    );
+                }
+            }
+        }
+    }
 }

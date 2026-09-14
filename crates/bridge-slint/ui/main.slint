@@ -28,6 +28,23 @@ export component Spike inherits Window {
     // Win+Up and the port's restore has nothing to restore INTO.
     no-frame: true;
     resize-border-width: 8px;
+    // WS-B B-S2: THE TWO KNOBS, and they are inert on purpose. This is a DOOR, not a decision:
+    // no floor value is set here, in product.rs, or anywhere else in this slice, because a later
+    // slice owns 264/340 and the approval that has to come with them.
+    //
+    // The 0px default is load-bearing, not a placeholder. i-slint-core's layout.rs builds the
+    // window's min constraint with `min_size = if min_width > 0. || min_height > 0. { Some(..) }
+    // else { None }`, so an unset floor never reaches the adapter at all and the window keeps the
+    // exact resize contract it had before these four lines existed. That is what protects the
+    // instrument: notes-slint-probe.exe mounts THIS SAME Spike, never sets either knob, and so
+    // still measures a genuine 180px host with nothing holding it up.
+    //
+    // Bound rather than in-out, per finding 3 in the header: Rust writes the knob, the Window
+    // reads it. Nothing in markup ever assigns to either name.
+    in property <length> floor-width: 0px;
+    in property <length> floor-height: 0px;
+    min-width: root.floor-width;
+    min-height: root.floor-height;
 
     // R2: the close act, driven through the ONLY close door this build exposes.
     // `slint::Window` has no request_close(), so Rust cannot fire the request; the
@@ -168,6 +185,13 @@ export component Spike inherits Window {
     in property <length> popup-x: chrome.popup-x;
     in property <bool> popup-floored: chrome.popup-floored;
     in property <bool> popup-overflow: chrome.popup-overflow;
+    /// WS-B B-S2: About's two placement flags, mirrored exactly the way the menu's are above -
+    /// a binding, never an access, so Chrome keeps a single writer of its own state. Before this
+    /// pair the two flags existed only as markup-derived booleans inside Chrome and NOTHING
+    /// outside could read them: no test, no probe, no run log. Closing that gap is the point of
+    /// the slice; what is read from them is a later slice's business.
+    in property <bool> about-floored: chrome.about-floored;
+    in property <bool> about-overflow: chrome.about-overflow;
 
     in property <[string]> recents;
     callback open-at-index(int);
