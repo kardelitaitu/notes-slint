@@ -7,6 +7,27 @@
 //! from a private TEMP root, whether two spellings of one file share one
 //! identity key — and documents the boundary where they do not.
 
+// BOTH CASES HERE ARE #[cfg(windows)], and the machinery beside them is too:
+// mklink_junction and hardlink shell out to `cmd /c mklink`, and what they
+// arrange is then unified by std::fs::canonicalise resolving through a junction
+// and casing a path the way NTFS reports it. None of that is available on Linux
+// and none of it is the RULE — so on that platform this target compiles to an
+// empty test binary and the leftovers above are legitimately unreached, which is
+// what this cfg_attr says out loud instead of hiding. The cross-platform half of
+// "one file, one entry" does NOT go missing with them: push dedupes, caps at ten
+// and reorders on every platform, pinned by the platform-neutral pure tests in
+// src/recent.rs (repeated_pushes_never_duplicate,
+// twelve_pushes_cap_at_ten_dropping_the_two_oldest, mark_missing_flips_exists_
+// without_reordering), none of which touches a filesystem. What Linux is left
+// unprobed here is only the Windows-specific ROUTE to one identity: a real file
+// reached through a junction, and the case-insensitive spelling of an existing
+// file. The third probe, the mapped-drive versus UNC volume question, was never
+// reachable from a private TEMP root on any platform - see arrangement 3 below.
+#![cfg_attr(
+    not(windows),
+    allow(unused_imports, dead_code, unused_crate_dependencies)
+)]
+
 use std::path::Path;
 use std::process::Command;
 

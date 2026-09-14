@@ -26,6 +26,9 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+// Its only user is hard_link_target_is_replaced_and_the_sibling_keeps_the_old_bytes,
+// which is #[cfg(windows)] because it arranges the link with `cmd /c mklink /H`.
+#[cfg(windows)]
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 

@@ -420,7 +420,19 @@ mod tests {
     /// green while the U+0130 shadow lived underneath it (D45). The pinned
     /// value makes the lexical rule itself load-bearing: change the folding,
     /// the verbatim stripping, or the fallback, and this fails.
+    /// THESE THREE PIN A WINDOWS RULE, so they run where the rule runs.
+    /// key_from_raw (above) folds case ONLY under `cfg!(windows)`; on a
+    /// case-sensitive platform the lexical fallback returns the spelling UNFOLDED,
+    /// on purpose, exactly as this module's docs say. Left un-gated, the three
+    /// below assert NTFS behavior on a kernel that deliberately does not have it.
+    /// The other side is not missing: `case_sensitive_platforms_keep_two_entries`
+    /// (#[cfg(not(windows))], below) already pins that two casings are TWO entries
+    /// there, and the platform-neutral MRU laws - dedupe, the cap, grey-out order -
+    /// live in the un-gated tests beside them. What Linux is left without is the
+    /// lowercase-folded key VALUE and the stability assertion that rides on it,
+    /// which is the same fact stated from the other window.
     #[test]
+    #[cfg(windows)]
     fn the_lexical_identity_key_pins_the_folding_rule() {
         let p = Path::new(r"C:\Some\WHERE\note.notes");
         assert_eq!(
@@ -432,6 +444,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn differently_cased_windows_paths_are_one_entry() {
         // The brief's example. Whether or not the file exists, the two
         // spellings share one identity: canonicalise unifies an existing
@@ -442,6 +455,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn repush_of_existing_entry_preserves_the_display_casing() {
         // Guaranteed-nonexistent directory: identity comes from the lexical
         // fallback, which is NOT canonical, so the user's original spelling
