@@ -54,7 +54,7 @@ export component Spike inherits Window {
     // S4b: THE THREE SIGNALS, now fed by the port through Rust instead of a constant.
     // Same rule as pinned above: each is a RENDER of an answer (or, for autosave, of the
     // last Command::SetAutosave this bridge sent, because the port echoes no event for
-    // it), and markup computes nothing - dirty is buffer!=last_sent in main.rs, not here.
+    // it), and markup computes nothing - dirty is buffer!=last_sent in surface.rs, not here.
     in property <bool> dirty: false;
     in property <bool> save-failed: false;
     in property <bool> autosave: false;
@@ -89,7 +89,7 @@ export component Spike inherits Window {
     // S6: the 5th row, forwarded like the other four.
     callback clear-recents-asked();
     /// Quit is not a command: it closes the window, which is the only shutdown route
-    /// that flushes and joins the engine (see the close contract in main.rs).
+    /// that flushes and joins the engine (see the close contract in product.rs).
     callback quit-asked();
 
     // S5: THE DRAG, forwarded exactly like the double-click. Chrome carries the pointer's
@@ -119,7 +119,7 @@ export component Spike inherits Window {
     /// S10: which document the editor is showing, in the bridge's own counting. Bumped at every
     /// adoption (Loaded and Rebound) and nothing else. It exists because 1.17 cannot clear a
     /// TextEdit's undo history (no such API exists - verified across the whole toolkit) and the
-    /// only other answer is to destroy and recreate the widget; see the finding in src/main.rs
+    /// only other answer is to destroy and recreate the widget; see the finding in src/probe.rs
     /// for why that half is not shipped yet.
     in-out property <int> doc-generation: 0;
 
@@ -179,7 +179,7 @@ export component Spike inherits Window {
     // routes no key so chords live before the first click. That is the other half of the rule. ONE
     // exception, and this sentence is the reason S10b had to edit it: Ctrl+Z and Ctrl+Y ARE named
     // below - not as commands, but as a quarantine that arms only after the first document
-    // switch. See undo_quarantined() in src/main.rs for why, and for what it costs.
+    // switch. See undo_quarantined() in src/surface.rs for why, and for what it costs.
     //
     // THE DIFF SHAPE, on purpose: the children below are NOT re-indented, so the body reads
     // as if it were still one level. Slint does not care and a 90-line re-indent would bury
@@ -198,11 +198,11 @@ export component Spike inherits Window {
             // S7: ESCAPE, and the parity question is answered by a WARNING, not by silence.
             // menu.rs has NO Escape row in its legend because Escape is not a command there -
             // and titlebar.rs:244-246 goes further: the first bridge deliberately leaves the
-            // key to the editor (main.rs:1499 binds it to editor::EscapeSelection, clearing a
+            // key to the editor (gpui main.rs:1508 binds it to editor::EscapeSelection, clearing a
             // selection) and never dismisses its popup with it. This bridge takes the key ONLY
             // while the popup is open, so an editor Escape is untouched - but that IS a
             // behavioural divergence from the model, made visible here rather than smoothed
-            // over, and it is why the chord table in main.rs stays at fourteen rows: a
+            // over, and it is why the chord table in surface.rs stays at fourteen rows: a
             // dismissal is not a command and does not belong in a legend of commands.
             // ABOUTSLINT widens the CONDITION, not the count: one branch, one accept, and it
             // now covers two surfaces - whatever is open on top is what the key closes. The
@@ -216,7 +216,7 @@ export component Spike inherits Window {
             // 1.17 cannot clear a TextEdit's undo stack (verified in S10), and the stack
             // survives a document switch because the widget is never destroyed - the
             // conditional-recreation answer needs a focus path 1.17 does not have (the finding is
-            // written out in src/main.rs). So from the first switch onward Ctrl+Z holds the
+            // written out in src/probe.rs). So from the first switch onward Ctrl+Z holds the
             // PREVIOUS document's bytes, and replaying them writes them into the NEW one under a
             // legal new epoch: the engine's own guard cannot see it, and the hazard is unbounded
             // in time. Swallowing the two replay keys is the only mitigation that ships today,
@@ -400,7 +400,7 @@ export component Spike inherits Window {
         }
         // S4b: the title band's double-click. Chrome emits the ASK and owns no geometry
         // (set_maximized is a window call, so it lives in Rust); this forwards it to the
-        // existing toggle-max() callback, which main.rs already binds to the SAME
+        // existing toggle-max() callback, which surface.rs binds, and probe.rs to the SAME
         // toggle_max() the synthetic driver calls - one implementation, two triggers.
         toggle-max-requested => {
             root.toggle-max();
