@@ -797,7 +797,19 @@ fn a_flush_cannot_write_the_file_whose_open_was_just_refused() {
     // the target of the debounce.
     let foreign = [0xFF_u8, 0xFE, 0x41];
     fs::write(&md, foreign).expect("replace the file with undecodable bytes");
-    app.send(Command::Open { path: md.clone() });
+    // Refused under a DIFFERENT SPELLING of the same name, which is how the two
+    // sides actually reach this point: the live one from the read that succeeded,
+    // the refused one from whatever the menu or the shell handed over next. So the
+    // debounced arm answers to the identity rule too - compare the two PathBufs
+    // instead of their identity_key, the guard misses, the write lands, and THIS
+    // case goes red. What stays asserted underneath: the refusal arrives naming
+    // the spelling it was given, the SaveFailed below names the spelling the
+    // document carries. Two callers, two displays, one file.
+    let shouted = app.root.join("NOTES.MD");
+    assert_ne!(shouted, md, "the fixture must really be another spelling");
+    app.send(Command::Open {
+        path: shouted.clone(),
+    });
     app.until("LoadFailed(Undecodable)", |ev| {
         matches!(
             ev,
@@ -805,7 +817,7 @@ fn a_flush_cannot_write_the_file_whose_open_was_just_refused() {
                 path,
                 reason: LoadError::Undecodable { .. },
                 ..
-            } if path == &md
+            } if path == &shouted
         )
     });
     assert_eq!(app.epoch, generation, "a refusal moves no generation");
