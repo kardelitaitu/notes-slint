@@ -1803,6 +1803,25 @@ fn drag_by(weak: &slint::Weak<Spike>, pump: &RefCell<Pump>, dx: f32, dy: f32) {
         ui.set_status(legend().into());
     }
     if first {
+        // HAMBURGER-3: THE DRAG DISMISSES WHAT IS OPEN, through the door that already exists.
+        // THE HAZARD IS MEASURED, not supposed: the click-away catcher is mounted BETWEEN the
+        // editor and the bar (ui/main.slint:345-359), so the band paints above it and a press there
+        // never reaches it. Which means a press on the band while the menu is open DRAGS WITH THE
+        // MENU OPEN, and a row's TouchArea - above the catcher too - answers the RELEASE inside the
+        // row: a gesture that starts on the title and ends over row 0 asks to OPEN a file. Closing
+        // the popup on THIS wake is what removes that target before the release lands.
+        //
+        // WHO CLOSES IS NOT THIS FILE'S QUESTION. `close-asks` is the root's in-out number
+        // (ui/main.slint:154), forwarded to Chrome (:373), and Chrome's `changed close-asks`
+        // (ui/chrome.slint:629-632) writes `menu-open = false` and `about-open = false` - the same
+        // two lines a backdrop click and an Escape reach. So menu-open keeps exactly ONE writer, no
+        // callback is added, no state is declared, and this line is the whole change. ONCE per
+        // gesture, because the latch that gates it is the SAME `unprinted`/`mark_printed` pair that
+        // bounds the print below - no second bit to keep in step. A press that produces no delta
+        // opens no episode and asks for nothing, and so does the maximised arm above: a refusal
+        // never reaches `first`. A drag that finds nothing open costs Chrome two writes of `false`
+        // to bits that are already false - no change, no re-render, no second owner to notice.
+        ui.set_close_asks(ui.get_close_asks() + 1);
         // THE SAME LINE C3 PRINTED, byte for byte on a gesture's first delta (where the episode's
         // origin and this read are the same number by construction), so every recorded verdict
         // about it keeps meaning what it said. The accumulation it cannot show is the accumulation
@@ -2646,6 +2665,110 @@ mod tests {
         assert!(
             by.contains(".advance("),
             "while the arm that moves does go through the episode"
+        );
+    }
+
+    #[test]
+    fn a_drag_asks_for_the_dismissal_once_per_episode_and_not_per_frame() {
+        // HAMBURGER-3. THE HAZARD IS MEASURED, NOT SUPPOSED: the click-away catcher is mounted
+        // BETWEEN the editor and the bar (ui/main.slint:345-359), so the band paints above it and a
+        // press there never reaches it - which means a press on the band while the menu is open
+        // DRAGS WITH THE MENU OPEN, and a row's TouchArea, above the catcher too, answers the
+        // RELEASE inside the row: a gesture that starts on the title and ends over row 0 asks to
+        // OPEN a file. The repair is to dismiss the popup on the gesture's FIRST delta, so there is
+        // no row left to release onto.
+        //
+        // 1. THE LATCH, driven with no window. The close path rides the episode's own
+        // once-per-gesture bit - the same unprinted()/mark_printed() pair that bounds the report
+        // line - so "once per episode, not per delta" is a property of THIS state machine and not
+        // of a second bool parked next to it. That is also why no new state was needed: the
+        // gesture already knew which delta was its first.
+        let mut episode = DragEpisode::default();
+        let t0 = Instant::now();
+        let mut asks = 0u32;
+        for i in 0..5u64 {
+            episode.advance((390, 278), 6.0, 0.0, 1.0, t0 + Duration::from_millis(8 * i));
+            if episode.unprinted() {
+                asks += 1;
+            }
+            episode.mark_printed();
+        }
+        assert_eq!(asks, 1, "five mouse-move frames, ONE dismissal");
+        // The release, and then a SECOND press: a new gesture, a new ask. The dismissal is
+        // per-gesture, not a once-per-run latch that goes stale and leaves row 0 armed again.
+        episode.end();
+        episode.advance((420, 278), 6.0, 0.0, 1.0, t0 + Duration::from_millis(100));
+        assert!(
+            episode.unprinted(),
+            "the gesture after a release is a fresh episode, so it dismisses again"
+        );
+        // And the release that NEVER arrived, which is the hazard an episode created: the gap
+        // restarts the episode, so the next real press still gets its dismissal instead of
+        // finding the bit spent.
+        let mut stranded = DragEpisode::default();
+        stranded.advance((100, 100), 5.0, 0.0, 1.0, t0);
+        stranded.mark_printed();
+        assert!(
+            !stranded.unprinted(),
+            "the second delta of the same gesture asks for nothing"
+        );
+        stranded.advance((100, 100), 5.0, 0.0, 1.0, t0 + Duration::from_millis(400));
+        assert!(
+            stranded.unprinted(),
+            "a press a quarter second later is a NEW press, and it asks again"
+        );
+
+        // 2. THE GREPS, which are the only way to see an ASK without a window. Four claims: the
+        // bump sits in the arm that runs once per gesture and NOWHERE on the per-delta path; it is
+        // the only close door this file touches; Rust writes NONE of Chrome's bits; and the door
+        // still reaches Chrome, whose handler is the writer. That last pair is the whole point -
+        // the ask is a number (ui/main.slint:154 -> :373) and Chrome answers it
+        // (ui/chrome.slint:629-632), so menu-open keeps exactly one owner and neither a callback
+        // nor a state property had to be added anywhere.
+        let whole = include_str!("../src/surface.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        assert_eq!(
+            src.matches("set_close_asks(").count(),
+            1,
+            "ONE door, bumped in exactly one place"
+        );
+        let by = &src[src.find("fn drag_by(").expect("the drag body")
+            ..src
+                .find("/// C4: the corner POLICY")
+                .expect("the next section")];
+        let arm = &by[by
+            .find("if first {")
+            .expect("the once-per-gesture arm, which is where the ask belongs")..];
+        assert!(
+            arm.contains("set_close_asks("),
+            "the ask rides the episode's FIRST delta"
+        );
+        let per_delta = &by[..by.find("if first {").expect("the once-per-gesture arm")];
+        assert!(
+            !per_delta.contains("set_close_asks("),
+            "and NOTHING on the per-delta path bumps it - that gating IS the once-per-gesture claim"
+        );
+        for forbidden in ["set_menu_open(", "set_about_open("] {
+            assert!(
+                !src.contains(forbidden),
+                "Rust writes none of Chrome's state - no {forbidden}"
+            );
+        }
+        // THE OTHER HALF OF THE DOOR, read from the markup: the number still travels to Chrome, and
+        // Chrome still owns the close. If the markup lane ever renames the property or moves the
+        // handler, this goes red HERE instead of in a live run that drags the note with the menu
+        // open and finds the menu still there.
+        assert!(
+            MARKUP.contains("close-asks: root.close-asks"),
+            "the mount still forwards the door to Chrome (ui/main.slint)"
+        );
+        let chrome = include_str!("../ui/chrome.slint");
+        let handler = &chrome[chrome
+            .find("changed close-asks =>")
+            .expect("Chrome's answer to the door")..];
+        assert!(
+            handler.contains("root.menu-open = false"),
+            "and Chrome, not this crate, is the one that closes"
         );
     }
 
