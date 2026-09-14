@@ -189,10 +189,13 @@ impl Document {
         // Skip::Oversize is UNREACHABLE THROUGH THE ENGINE TODAY, and that is a
         // fact about the caller, not a dead branch here: no engine path ever sets
         // this flag. All three `Document::open` calls hard-code `false` for it
-        // (api/engine.rs:447 session restore, :974-979 open, :1051 missing scratch),
-        // and an over-guard open is refused at the STAT before any Document exists —
-        // `LoadFailed { reason: LoadError::TooLarge }`, api/engine.rs:930-946, pinned
-        // by api/tests/session.rs:806-835.
+        // (api/engine.rs: `Engine::with_host`'s session restore, `Engine::open`,
+        // and `Engine::restore_missing_scratch`), and an over-guard open is
+        // refused at the STAT before any Document exists —
+        // `LoadFailed { reason: LoadError::TooLarge }`, api/engine.rs,
+        // `Engine::open`'s `if oversize` arm, pinned by
+        // `an_oversize_file_is_refused_from_the_stat_and_cannot_be_overwritten`,
+        // api/tests/session.rs.
         //
         // It stays because the guarantee is CORE's and not the engine's: a document
         // that carries the oversize verdict never autosaves, whoever constructed it

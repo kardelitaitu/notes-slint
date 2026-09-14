@@ -92,8 +92,9 @@ slint = {
 }
 # Win32_Graphics_Dwm: the corner preference (DwmSetWindowAttribute/DwmGetWindowAttribute,
 # attribute 33) that notes-platform/windows/corners.rs asks the OS for. It is in the ROOT list
-# because a member cannot widen this dependency for itself - see the hand-declared GetACP at
-# crates/platform/src/windows/mod.rs:81-92 for the alternative and why it was not taken twice:
+# because a member cannot widen this dependency for itself - see the hand-declared GetACP
+# block above `pub fn ansi_codepage` in crates/platform/src/windows/mod.rs, for the
+# alternative and why it was not taken twice:
 # GetACP is one argument-free symbol, this is two pointer-passing calls with a typed enum.
 windows = { version = "0.61", features = ["Win32_Foundation","Win32_UI_WindowsAndMessaging","Win32_UI_Shell","Win32_Graphics_Gdi","Win32_Graphics_Dwm","Win32_System_Ole","Win32_System_Com","Win32_System_SystemServices","Win32_System_DataExchange"] }
 # Paired to windows 0.61.3's own windows-core (lock-verified): the implement!

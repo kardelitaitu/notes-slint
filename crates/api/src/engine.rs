@@ -2163,9 +2163,10 @@ impl Engine {
                     self.settings_failure_latched = false;
                 }
                 Err(err) => {
-                    // The last `revision: 0` lie (engine.rs:933, the site core
-                    // named): a settings file HAS no revision, and SaveFailed
-                    // is a DOCUMENT event. Same latch discipline as the session
+                    // The last `revision: 0` lie (the session arm above in
+                    // `flush_state`, the site core named): a settings file HAS
+                    // no revision, and SaveFailed is a DOCUMENT event. Same latch
+                    // discipline as the session
                     // arm above - one report per failure, retried every
                     // tick, cleared on success - and core's own sentence
                     // (SettingsError's Display) as the reason.

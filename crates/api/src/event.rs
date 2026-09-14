@@ -77,21 +77,23 @@ pub struct FileMeta {
     /// document") describes the PRE-D9 world, and stopped being true when the guard
     /// moved to the stat: an [`Open`](crate::Command::Open) over the guard is now
     /// REFUSED, with `Event::LoadFailed { reason: LoadError::TooLarge }` and no
-    /// buffer, no `Loaded` and no `FileMeta` at all (`Engine::open`,
-    /// engine.rs:930-946). The reason D9 could not see is that the empty read-only
-    /// buffer put FOUR invented facts on the status line — an encoding, a line
-    /// ending, a trailing-newline bit and a read-only flag, for bytes nobody had
+    /// buffer, no `Loaded` and no `FileMeta` at all (engine.rs,
+    /// `Engine::open`'s `if oversize` arm). The reason D9 could not see is that
+    /// the empty read-only buffer put FOUR invented facts on the status line —
+    /// an encoding, a line ending, a trailing-newline bit and a read-only flag,
+    /// for bytes nobody had
     /// read — and left Save As able to write that empty buffer over a real 9 MiB
     /// file and report `Saved` (B1). Refusing the load protects the user's
     /// document; "nothing is ever refused" was about never losing an edit, never
     /// about pretending to have read something. Pinned by the test that names it:
     /// `an_oversize_file_is_refused_from_the_stat_and_cannot_be_overwritten`,
-    /// crates/api/tests/session.rs:806-835.
+    /// crates/api/tests/session.rs.
     ///
     /// So today every [`FileMeta`] the engine builds hard-codes this to `false`
-    /// (engine.rs:995, 1073, 1156, 1318, plus the two constructors below at 524 and
-    /// 638), and a bridge that renders it renders `false` on every event it can
-    /// receive.
+    /// (engine.rs: the four `oversize: false` writes in `open`,
+    /// `restore_missing_scratch`, `save_as` and `flush`; plus the two test
+    /// constructors in this file below - `meta` and `all_events`), and a bridge
+    /// that renders it renders `false` on every event it can receive.
     ///
     /// WHY THE BIT STAYS, rather than being deleted along with the dead branch: it
     /// is the seam where an "open it anyway, read-only, too big to edit" policy
