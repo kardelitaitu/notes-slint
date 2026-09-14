@@ -147,7 +147,7 @@ pub enum SkipReason {
     Superseded,
     /// We could not make a file for the note (D69): the scratch location or
     /// the write was refused. NOT "the note has no path" — the untitled note
-    /// owns a scratch home (<StateDir>/notes/untitled.notes) that the engine
+    /// owns a scratch home (`<StateDir>`/notes/untitled.notes) that the engine
     /// ensures and writes to, so a mere missing path can no longer reach
     /// here. A SKIP and not a failure: an
     /// error toast about a file that does not exist teaches the user nothing
@@ -244,7 +244,7 @@ pub enum SaveError {
     /// final component, so saving "a.notes." puts the bytes in "a.notes" while the
     /// app reports Ok for a path that does not exist (0db0b69's second data-loss
     /// fix). The [`String`] is core's sentence naming WHICH rule broke, kept
-    /// rather than laundered into [`Other`] (D29/D36: add the variant).
+    /// rather than laundered into [`SaveError::Other`] (D29/D36: add the variant).
     #[error("the path is not a usable file location: {0}")]
     InvalidPath(String),
     /// Anything else. Carries the OS text, because inventing a friendly string
@@ -318,7 +318,7 @@ pub enum LoadError {
 /// than a delta so the menu never has to reconstruct state it may have missed
 /// while the window did not exist.
 /// WHICH state file a failure names. A status line can say "settings could
-/// not be saved" only if the event carries the subject; [`Display`] renders
+/// not be saved" only if the event carries the subject; [`Display`](std::fmt::Display) renders
 /// the user-visible file name, lowercase, no path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StateFile {
@@ -379,8 +379,8 @@ pub enum Event {
     /// name, two causes, and the reason string is the only discriminator; the
     /// split is sequenced into the one event-vocabulary wave with the state-
     /// failure consolidation so the bridge's exhaustive match rewrites once.
-    /// [`rect`] is the rect the port asked
-    /// for, so the copy can name the place it could not reach; [`reason`] is
+    /// `rect` is the rect the port asked
+    /// for, so the copy can name the place it could not reach; `reason` is
     /// notes-platform's own sentence (its PlatformError Display) passed
     /// through untranslated, for the same reason [`SaveError::Other`] carries
     /// OS text - it is the one clue the user has, and the port may not invent
@@ -448,8 +448,8 @@ pub enum Event {
     /// settings - and this event is the rendering of THAT fact, because a
     /// corrupt file that quietly became defaults would read, a year later,
     /// as the app having lost a user's choice. Emitted once, at startup,
-    /// before any engine event: [`Gateway::start`] is where the file is read,
-    /// and the queue is the only output the port has. [`reason`] is core's
+    /// before any engine event: [`Gateway::start`](crate::Gateway::start) is where the file is read,
+    /// and the queue is the only output the port has. `reason` is core's
     /// own sentence (its SettingsError::Corrupt Display), passed through
     /// untranslated - the same rule as [`SaveError::Other`].
     SettingsCorrupt {
@@ -470,7 +470,7 @@ pub enum Event {
     /// failure is news again. The no-revision honesty is the same on both
     /// arms: a state file HAS no revision, and the old shape claimed
     /// `revision: 0` through [`Event::SaveFailed`], which is a document event.
-    /// [`reason`] is core's own sentence (the error's Display - SessionError
+    /// `reason` is core's own sentence (the error's Display - SessionError
     /// on the session arm, SettingsError on the settings one), passed through
     /// untranslated.
     StateWriteFailed {
@@ -486,7 +486,7 @@ pub enum Event {
     /// persist, at the moment it became true, instead of a status line after
     /// the first save quietly failed (the fresh-install blocker the smoke run
     /// caught: the app looked clean and remembered nothing). Emitted from
-    /// [`Gateway::start`], which owns the directory. [`reason`] is the OS's
+    /// [`Gateway::start`](crate::Gateway::start), which owns the directory. `reason` is the OS's
     /// sentence, or the factual sentence naming the path - never advice,
     /// because there is nothing to advise yet.
     StateDirUnusable {
@@ -496,7 +496,7 @@ pub enum Event {
     /// The pin request could not be honoured with what the port knows: the
     /// topmost call refused (the reason is platform's own sentence, and the
     /// day platform grows a verdict richer than an error string, it flows
-    /// through [`reason`] without a second vocabulary change). Rendered by
+    /// through `reason` without a second vocabulary change). Rendered by
     /// the bridge INSTEAD OF the state it asked for - a pin that failed and
     /// is rendered as a success is a lie in the title bar.
     PinFailed {
@@ -504,7 +504,7 @@ pub enum Event {
         reason: String,
     },
     /// The window's corners could NOT be given the shape the bridge asked for. The
-    /// refusal-only twin of [`Command::SetCornerRounding`], and there is no success
+    /// refusal-only twin of [`Command::SetCornerRounding`](crate::Command::SetCornerRounding), and there is no success
     /// counterpart because there is nothing to render: the corners are their own
     /// evidence, and an event per request would only let a bridge paint a check mark
     /// for a thing it cannot see.

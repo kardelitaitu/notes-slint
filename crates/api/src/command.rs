@@ -124,7 +124,7 @@ pub enum Command {
     /// on purpose. The pin has one because the title bar RENDERS the port's answer;
     /// a corner has nothing to render, and an echo of the ask would be the UI
     /// believing itself for no benefit. A REFUSAL is answered -
-    /// [`Event::CornerRoundingFailed`] - because an OS that does not know the
+    /// [`Event::CornerRoundingFailed`](crate::Event::CornerRoundingFailed) - because an OS that does not know the
     /// attribute will say so every time, and a bridge that cannot hear keeps asking
     /// on every maximise. With nothing registered the command does nothing at all:
     /// no window, no attribute, no event.

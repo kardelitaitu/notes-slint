@@ -32,7 +32,7 @@ pub use notes_core::geometry::Rect;
 /// its own toolkit and NOTHING else, so a resolver that lives in notes-core and is
 /// not named here forces the bridge to re-implement the portable rule - and one
 /// rule becoming two rules is the fork AGENTS.md warns about. Naming a function is
-/// not deciding with it: [`api`] still never calls it, never probes the
+/// not deciding with it: `api` still never calls it, never probes the
 /// filesystem to find out where it lives, and still receives an already-resolved
 /// `StateDir` in [`Gateway::start`](crate::Gateway::start) - which is why the
 /// type and the function are exported together, so a bridge cannot half-obey the
@@ -79,7 +79,7 @@ pub use notes_core::settings::Settings;
 /// The D-STATE rule itself, owned by notes_core::paths and re-exported so a bridge
 /// can obey it without importing notes-core (FCR 2 - this module exists precisely
 /// so a bridge can name these things). Pure passthrough: the decision (installed
-/// uses a usable roaming profile, portable is [`exe_dir`]/data, and an EMPTY
+/// uses a usable roaming profile, portable is `<exe_dir>`\data, and an EMPTY
 /// appdata counts as no profile at all so a one-word launcher change cannot
 /// redirect user state) is core's, and nothing in this crate wraps, defaults or
 /// calls it.
@@ -87,9 +87,9 @@ pub use notes_core::settings::Settings;
 /// The contract a bridge that reads ONLY this crate still has to honour, because it
 /// cannot see core's doc comment:
 ///
-/// * **The caller performs the existence probe.** If a [`data`] directory sits
+/// * **The caller performs the existence probe.** If a `data` directory sits
 ///   next to the executable, that is a portable deployment, so pass
-///   [`appdata`] = [`None`]. Passing [`None`] unconditionally is how an
+///   `appdata` = [`None`]. Passing [`None`] unconditionally is how an
 ///   installed app starts writing beside its own binary.
 /// * **Pass the roaming profile you actually read** (on Windows, APPDATA), not a
 ///   path assembled from a home directory.

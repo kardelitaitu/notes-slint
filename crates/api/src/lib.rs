@@ -169,13 +169,13 @@
 //! along, and the paragraph that claimed otherwise was false and is gone.
 //!
 //! What it unlocks, now that the frame-versus-client geometry question is settled
-//! (Win32 [`SetWindowPos`] and [`GetWindowRect`] are both frame space, and
+//! (Win32 `SetWindowPos` and `GetWindowRect` are both frame space, and
 //! gpui 0.2.2 cannot express frame space at all): next slice, on
 //! [`Command::RegisterWindow`] the port does the restore itself -- primary work
 //! area, the monitor the rect belongs to, core's [`Rect::clamped_to`], then
-//! [`set_frame_rect`] -- and applies topmost from the stored [`pinned`] bit,
+//! `set_frame_rect` -- and applies topmost from the stored `pinned` bit,
 //! which consumes the handle this crate only ever stored. Persistence moves to the
-//! RESTORE rect, because a maximized [`GetWindowRect`] overhangs the monitor by
+//! RESTORE rect, because a maximized `GetWindowRect` overhangs the monitor by
 //! the invisible borders and storing it stores a lie. A failed restore is reported,
 //! never silenced: [`Event::GeometryNotRestored`] (D29/D36: add the event). And
 //! [`show = false`] is not a way to hide the correction -- gpui re-applies
