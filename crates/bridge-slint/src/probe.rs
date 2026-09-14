@@ -287,8 +287,13 @@ const CHORD_TAIL_AT: Duration = Duration::from_millis(21600);
 /// comment that says it should.
 const CHORD_EVERY: Duration = Duration::from_millis(500);
 
-/// Which table rows to drive, by index into SHORTCUTS: Open, Alt+2, Auto-save, Save As,
-/// Clear recents. The order is a constraint, not a preference, and it cost a run to learn:
+/// Which table rows to drive, each named by its ACT and resolved against SHORTCUTS at the
+/// step - never by row index, because an index is a position and a position is not a promise:
+/// the moment this table grows a row (a plain Save is coming), a drive of [0, 5, 2, 1, 3]
+/// would keep running and quietly re-point every step after the insertion, printing needles
+/// about the rows that are no longer the ones this comment describes. Open, Alt+2, Auto-save,
+/// Save As, Clear recents. The order is a constraint, not a preference, and it cost a run to
+/// learn:
 ///  * Alt+2 before Clear - clearing first empties the list the recents act reads, so the Alt
 ///    needle would prove nothing.
 ///  * Save As AFTER the seed keystroke (SEED_KEY_AT, 19.2 s). Ctrl+S re-points the engine at
@@ -301,7 +306,7 @@ const CHORD_EVERY: Duration = Duration::from_millis(500);
 ///
 /// Quit closes the sequence and has no chord, which is the table's own absence, not an
 /// oversight.
-const CHORD_DRIVE: &[usize] = &[0, 5, 2, 1, 3];
+const CHORD_DRIVE: &[&str] = &["open", "recent-1", "autosave", "save-as", "clear-recents"];
 /// S8: the caption acts, and they close the run. Nine steps from here: minimize, observe,
 /// un-minimize, maximize THROUGH THE BUTTON'S OWN DOOR, a drag attempt on a maximised window,
 /// observe, restore, observe, close. The last replaces the Quit row's act - same callback,
@@ -1064,7 +1069,7 @@ fn main() {
             if driven < total {
                 let at = chord_at(driven);
                 if now >= at {
-                    let row = SHORTCUTS[CHORD_DRIVE[driven as usize]];
+                    let row = chord_row(CHORD_DRIVE[driven as usize]);
                     third_pump.borrow_mut().menu_act = driven + 1;
                     match route_of(row.3) {
                         Some(route) => fire(&ui, route, row.1, row.2),
@@ -1807,6 +1812,27 @@ fn chord_at(step: u64) -> Duration {
     }
 }
 
+/// One table row: (binding, display, what, act), spelled as a name so the resolver below can
+/// take ANY table - the real one at runtime, a grown copy in the 15th-row test - without a
+/// signature that reads like a pipe organ.
+type ShortcutRow = (&'static str, &'static str, &'static str, &'static str);
+
+/// Find a row BY ACT. The only lookup the walk is allowed to have, and the one
+/// `a_fifteenth_row_moves_an_index_drive_and_not_an_act_drive` runs against a table that has
+/// already grown, so the test exercises this scan rather than a copy of it.
+fn row_for_act<'a>(table: &'a [ShortcutRow], act: &str) -> Option<&'a ShortcutRow> {
+    table.iter().find(|row| row.3 == act)
+}
+
+/// Resolve one step of the walk to its row. There is no index fallback and there must never be
+/// one: a missing act is a broken needle, and a needle that silently drives the wrong row is
+/// what this file has been bitten by twice - so it panics on the spot, loudly, in front of the
+/// run log, instead of printing a confident line about some other row.
+fn chord_row(act: &str) -> &'static ShortcutRow {
+    row_for_act(SHORTCUTS, act)
+        .unwrap_or_else(|| panic!("CHORD_DRIVE names act {act}, which is not in SHORTCUTS"))
+}
+
 fn fire(ui: &Spike, route: Route, display: &str, what: &str) {
     report(&format!("chord: {display} -> {what}"));
     match route {
@@ -2458,6 +2484,129 @@ mod chords {
             keys.len(),
             SHORTCUTS.len(),
             "one binding cannot route two acts"
+        );
+    }
+
+    /// The five acts the synthetic walk drives, IN THE ORDER it drives them. This list is
+    /// deliberately spelled out a second time: CHORD_DRIVE could agree with itself and still
+    /// have been reordered, and the ordering is the thing that cost a run to learn (see the
+    /// doc comment on CHORD_DRIVE). A slice that moves a step has to change this line too, and
+    /// say why.
+    const DRIVE_WALK: [&str; 5] = ["open", "recent-1", "autosave", "save-as", "clear-recents"];
+
+    #[test]
+    fn chord_drive_names_each_step_by_act_and_in_the_saved_order() {
+        assert_eq!(
+            CHORD_DRIVE,
+            DRIVE_WALK.as_slice(),
+            "the walk changed its order or its acts"
+        );
+        let mut seen: Vec<&str> = CHORD_DRIVE.to_vec();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            CHORD_DRIVE.len(),
+            "one act driven twice proves nothing twice"
+        );
+        for act in CHORD_DRIVE {
+            // Exactly ONE row, not at least one: a duplicated act would let the walk aim at
+            // whichever row the scan happens to reach first.
+            assert_eq!(
+                SHORTCUTS.iter().filter(|row| row.3 == *act).count(),
+                1,
+                "chord drive names act {act}, which is not exactly one row of the table"
+            );
+            assert!(
+                route_of(act).is_some(),
+                "chord drive names act {act}, which nothing routes to"
+            );
+        }
+    }
+
+    #[test]
+    fn chord_drive_resolves_to_the_five_rows_the_needles_are_named_for() {
+        // The walk, as it will run: same display strings, same what-words, same routes, same
+        // order. This is the zero-behaviour-change proof for the act-addressed driver - the
+        // rows a [0, 5, 2, 1, 3] index walk picked on the 14-row table are exactly these.
+        let walked: Vec<(&str, &str, Route)> = CHORD_DRIVE
+            .iter()
+            .map(|act| {
+                let row = chord_row(act);
+                (
+                    row.1,
+                    row.2,
+                    route_of(row.3).expect("every driven act routes: proved above"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            walked,
+            vec![
+                ("Ctrl+O", "Open", Route::Open),
+                ("Alt+2", "recent 2", Route::Recent(1)),
+                ("Ctrl+T", "toggle auto-save", Route::Autosave),
+                ("Ctrl+S", "Save As", Route::SaveAs),
+                ("Ctrl+Shift+R", "clear recent files", Route::ClearRecents),
+            ],
+            "the chord walk now drives different rows than the index walk drove"
+        );
+    }
+
+    #[test]
+    fn seed_save_lands_inside_the_walk_before_save_as_moves_on() {
+        // The expensive half of the ordering, as arithmetic rather than as a paragraph: the
+        // seed's flush (SEED_KEY_AT plus the engine's 750 ms debounce, the cadence the
+        // CHORD_TAIL_AT comment measures) has to precede the Save As step, or no Event::Saved
+        // ever carries the seed path and the do-no-harm[saved] audit silently vanishes.
+        let step_of = |act: &str| {
+            CHORD_DRIVE
+                .iter()
+                .position(|a| *a == act)
+                .unwrap_or_else(|| panic!("the walk no longer drives {act}")) as u64
+        };
+        let debounce = Duration::from_millis(750);
+        assert!(
+            chord_at(step_of("open")) < SEED_KEY_AT,
+            "Open must make the seed current BEFORE the keystroke that dirties it"
+        );
+        assert!(
+            chord_at(step_of("save-as")) >= SEED_KEY_AT + debounce,
+            "Save As fired before the seed's own flush could land: the 4.5 audit would vanish"
+        );
+        assert!(
+            step_of("recent-1") < step_of("clear-recents"),
+            "Clear first empties the list the Alt needle reads"
+        );
+    }
+
+    #[test]
+    fn a_fifteenth_row_moves_an_index_drive_and_not_an_act_drive() {
+        // Why this slice exists: a plain Save row is coming. Insert a 15th row at EVERY
+        // position the next slice might put it, and the act-addressed walk must still name the
+        // same five chords in the same order.
+        for at in 0..=SHORTCUTS.len() {
+            let mut table = SHORTCUTS.to_vec();
+            table.insert(at, ("ctrl-s", "Ctrl+S", "Save", "save"));
+            let walked: Vec<&str> = CHORD_DRIVE
+                .iter()
+                .map(|act| row_for_act(&table, act).map_or("<MISSING ACT>", |row| row.1))
+                .collect();
+            assert_eq!(
+                walked,
+                ["Ctrl+O", "Alt+2", "Ctrl+T", "Ctrl+S", "Ctrl+Shift+R"],
+                "a row inserted at {at} moved the act-addressed walk"
+            );
+        }
+        // And the control: the retired index walk really would have re-pointed. Without this
+        // line the test above could pass on a driver that ignores the table entirely.
+        let mut table = SHORTCUTS.to_vec();
+        table.insert(1, ("ctrl-s", "Ctrl+S", "Save", "save"));
+        let by_index: Vec<&str> = [0usize, 5, 2, 1, 3].iter().map(|i| table[*i].1).collect();
+        assert_ne!(
+            by_index,
+            vec!["Ctrl+O", "Alt+2", "Ctrl+T", "Ctrl+S", "Ctrl+Shift+R"],
+            "the index walk this replaces would NOT have moved - the test is guarding nothing"
         );
     }
 
