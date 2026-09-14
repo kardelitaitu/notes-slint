@@ -1114,6 +1114,44 @@ impl Engine {
         self.queue(Target::Session);
     }
 
+    /// THE ONE REFUSED-LOAD RULE, asked by every arm of this port that writes a
+    /// file the caller did not just name: [`Engine::save_as`] at its head,
+    /// [`Engine::save`] at step 4b, and [`Engine::flush`] after its no-path arm.
+    /// "Is the name I am about to write the name whose [`Command::Open`] I
+    /// refused?" - and if so, nothing is written, on any of the three.
+    ///
+    /// WHY IT IS HERE AND NOT IN CORE: `load_refused_for` is port state. No
+    /// `Document` was ever constructed for a refused name, so there is no flag for
+    /// core to weigh, and core says as much itself (`Document::should_save_manual`,
+    /// the paragraph headed NOT A DOOR PAST THE PORT) - a jurisdiction declined, not
+    /// forgotten. Why it is ONE predicate and not three lines: [`Engine::save`]'s own
+    /// step 3 states the rule for this file, that a gate is CALLED, never copied, and
+    /// this gate would otherwise be a third literal restatement in one file - which
+    /// is how two become three become wrong. The debounced arm arrived later than the
+    /// other two, by the decision recorded in
+    /// `.agents/notes/proposed/2026-09-15-flush-shares-the-refused-load-guard.md`.
+    ///
+    /// WHY `identity_key` ON BOTH SIDES: AGENTS.md makes canonicalisation the
+    /// identity rule ("case-insensitive but not case-preserving"), and the two names
+    /// reach this function from different acts - one typed, one remembered - so a
+    /// `PathBuf` compare would hold only while the caller happened to repeat itself,
+    /// which is a coincidence with a comment on it, not a guard. Pinned for one of
+    /// these arms by
+    /// `the_refused_load_guard_recognises_the_same_file_spelled_differently`.
+    ///
+    /// NO SIZE BRANCH, DELIBERATELY: every refusal - read policy, the D9 stat,
+    /// decode, a sharing violation - lands in this SAME field, so a name refused for
+    /// size is covered here as a side effect and a second, size-specific test would
+    /// be a second rule about a fact the port remembers once. A file that GROWS past
+    /// the guard while open is a different question (no live path re-stats; that is
+    /// the external-change work), and it is not a hole this predicate was asked to
+    /// fill.
+    fn refused_target(&self, path: &Path) -> bool {
+        self.load_refused_for
+            .as_ref()
+            .is_some_and(|refused| identity_key(refused) == identity_key(path))
+    }
+
     /// Save As: write the snapshot at the chosen path, then rebind AND arm.
     ///
     /// Requirement 4 of ADR-0001 is [`Document::save_as`]'s job; this function
@@ -1144,11 +1182,7 @@ impl Engine {
         // around - it did not rebind anything, so the document behind it is
         // exactly the one the user was looking at, and holding THAT hostage
         // is the c92494f3 bug in reverse. See [`Engine::load_refused_for`].
-        if self
-            .load_refused_for
-            .as_ref()
-            .is_some_and(|refused| identity_key(refused) == identity_key(path))
-        {
+        if self.refused_target(path) {
             self.emit(Self::document_save_failed(
                 path.to_path_buf(),
                 revision,
@@ -1285,6 +1319,34 @@ impl Engine {
             self.bind_scratch(&text, revision);
             return;
         };
+        // THE SAME QUESTION, ASKED OF THE TIMER. [`Engine::refused_target`] is the
+        // one rule; the two explicit arms already asked it and the debounced one did
+        // not, which made writing foreign bytes unacceptable when a person presses
+        // Save and acceptable when nobody does - the wrong axis for a law about
+        // somebody else's file. A refused load moves no epoch and replaces no
+        // Document, so both guards above pass on their own honest terms and this is
+        // the only line left that knows the bytes on disk were just declined.
+        // PLACEMENT IS THE SCOPE OF THE RULE, so two things follow from putting it
+        // HERE, after the no-path arm: bind_scratch stays outside it, because the
+        // scratch is this port's own freshly created file and a foreign-file rule
+        // does not govern it (its own comment says so); and everything core already
+        // refuses - Clean, disarmed, autosave off - keeps answering with its own
+        // named skip rather than with a write failure it did not cause. The answer
+        // for a refused TARGET is the failure the OS would have reported, because
+        // AGENTS.md puts every autosave write failure in this lane: SaveFailed, the
+        // verdict the explicit arms state, through the same helper, so the UI renders
+        // one reason and the bridge's failure lane restores the send witness and
+        // retries. Retry cadence is not this line's business - see
+        // 2026-09-14-autosave-retry-ownership.md. Pinned by
+        // a_flush_cannot_write_the_file_whose_open_was_just_refused.
+        if self.refused_target(&path) {
+            self.emit(Self::document_save_failed(
+                path,
+                revision,
+                SaveError::NoTarget,
+            ));
+            return;
+        }
 
         let detected = self.detected;
         let disk_text = self.text_for_disk(&text);
@@ -1475,10 +1537,13 @@ impl Engine {
     /// `load_refused_for` with the epoch untouched, so neither of the two guards
     /// above can see the danger. The question can only be asked in the port: the
     /// refusal is api state, no Document was constructed for the refused name, and
-    /// core was never told. [`Engine::flush`] asks nothing of the kind today, and
-    /// that asymmetry is recorded rather than fixed here: closing it changes what a
-    /// debounced write may do, which is autosave's owner's call, not a routing
-    /// slice's. The ADR sentence this makes true is 0007's `api still applies the
+    /// core was never told. All three write arms now ask it through ONE predicate,
+    /// [`Engine::refused_target`] - [`Engine::save_as`] at its head, this step 4b,
+    /// and [`Engine::flush`] after its no-path arm. The debounced arm was left out
+    /// when this command shipped, on a premise about invisible autosave answers that
+    /// has since been disproved; the call to close it is recorded in
+    /// `.agents/notes/proposed/2026-09-15-flush-shares-the-refused-load-guard.md`,
+    /// and the ADR sentence all three now make true is 0007's `api still applies the
     /// refused-load guard`.
     fn save(&mut self, text: String, revision: u64, epoch: u64) {
         // 1. THE STALE GUARD - flush's, same shape because same payload.
@@ -1526,11 +1591,8 @@ impl Engine {
         //     SAME verdict Save As states for the same refusal
         //     ([`SaveError::NoTarget`]) so the UI renders one reason and not two.
         //     Pinned by a_save_cannot_write_the_file_whose_open_was_just_refused.
-        if self
-            .load_refused_for
-            .as_ref()
-            .is_some_and(|refused| identity_key(refused) == identity_key(&path))
-        {
+        //     One predicate for all three arms now: [`Engine::refused_target`].
+        if self.refused_target(&path) {
             self.emit(Self::document_save_failed(
                 path,
                 revision,

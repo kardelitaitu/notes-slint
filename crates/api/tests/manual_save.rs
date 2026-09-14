@@ -768,3 +768,98 @@ fn the_refused_load_guard_recognises_the_same_file_spelled_differently() {
         assert_eq!(bytes.len(), size + 1, "a different spelling opened no door");
     }
 }
+
+/// THE DEBOUNCED HALF OF THE SAME LAW. [`Engine::refused_target`] is now one
+/// predicate with three arms; this is the arm that was missing, and the shape is
+/// the sibling of the Save case on purpose, so the two read as one rule seen from
+/// two acts. The fixture is the UNDECODABLE arm rather than the size arm because
+/// it is the refusal that cannot also refuse the write: a red line here can only
+/// mean the guard moved, never that the OS said no underneath. And the act is the
+/// timer rather than a keystroke, because the axis the old asymmetry turned on -
+/// acceptable when a person presses Save, more acceptable when nobody does - is
+/// the wrong axis for a law about a file belonging to someone else.
+#[test]
+fn a_flush_cannot_write_the_file_whose_open_was_just_refused() {
+    let mut app = Harness::new();
+    let md = app.file("notes.md", b"a small foreign file");
+    app.open(&md);
+    let generation = app.epoch;
+    // THE ARMING ACT first, so both flush guards pass afterwards: the file is
+    // armed, the buffer is dirty, and the only thing left that can refuse is the
+    // refused-load question. Skipping this step would let the test pass for the
+    // wrong reason - ForeignFileNotArmed is a skip, not this guard.
+    let first = app.save("a small foreign file, edited", 1);
+    assert_saved(&first, &md, 1);
+
+    // Bytes this app declines to read: a UTF-16 BOM whose last unit is
+    // unterminated. The refusal replaces no Document and moves no generation, so
+    // the buffer on screen is still the one that WAS read, and the path is still
+    // the target of the debounce.
+    let foreign = [0xFF_u8, 0xFE, 0x41];
+    fs::write(&md, foreign).expect("replace the file with undecodable bytes");
+    app.send(Command::Open { path: md.clone() });
+    app.until("LoadFailed(Undecodable)", |ev| {
+        matches!(
+            ev,
+            Event::LoadFailed {
+                path,
+                reason: LoadError::Undecodable { .. },
+                ..
+            } if path == &md
+        )
+    });
+    assert_eq!(app.epoch, generation, "a refusal moves no generation");
+    app.wait_a_tick();
+
+    // THE DEBOUNCE. Before this arm existed the write went through and three
+    // bytes somebody else wrote became our text, atomically, with a Saved on the
+    // wire.
+    let events = app.flush("the text from the read that did succeed", 2);
+    match one_answer(&events) {
+        Event::SaveFailed {
+            path,
+            revision,
+            reason,
+        } => {
+            assert_eq!(path.as_path(), &md, "it names the file it refused to write");
+            assert_eq!(
+                *revision, 2,
+                "and the revision that write would have anchored"
+            );
+            assert_eq!(
+                *reason,
+                SaveError::NoTarget,
+                "the verdict the explicit arms state, so the UI renders one reason"
+            );
+        }
+        other => panic!("expected one SaveFailed, got {other:?} in {events:?}"),
+    }
+    assert_eq!(
+        app.bytes(&md),
+        foreign,
+        "the refused bytes are still the bytes on disk"
+    );
+
+    // THE REFUSAL IS A STATE, NOT A COINCIDENCE, so it does not wear off: the
+    // next debounce answers the same way instead of failing open. Only a read
+    // clears the refused name (engine.rs, the clear sites inside open), so the
+    // ways out are a re-Open that succeeds or a Save As onto another name - and
+    // the retry cadence that makes the loop audible belongs to
+    // 2026-09-14-autosave-retry-ownership.md, not to this guard.
+    let again = app.flush("the text from the read that did succeed", 2);
+    assert!(
+        matches!(
+            one_answer(&again),
+            Event::SaveFailed {
+                reason: SaveError::NoTarget,
+                ..
+            }
+        ),
+        "a refused target stays refused rather than failing open: {again:?}"
+    );
+    assert_eq!(
+        app.bytes(&md),
+        foreign,
+        "and still not one byte of it became ours"
+    );
+}
