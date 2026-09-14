@@ -46,6 +46,7 @@ Skim the matching file *before* building in that area, not only when stuck.
 | [events-and-overlays.md](reference/events-and-overlays.md) | Clicks/keys/modifiers, or popovers/menus/context menus. |
 | [icons-and-theming.md](reference/icons-and-theming.md) | Icons, or light/dark theming. |
 | [interop.md](reference/interop.md) | Connecting the UI to host-language logic (models, callbacks, globals). |
+| [window-chrome.md](reference/window-chrome.md) | A frameless/custom title bar: dragging, resizing, maximize, rounded corners, what `no-frame` really removes. |
 | [polish.md](reference/polish.md) | The UI works but looks rough; reviewing a rendered screenshot. |
 | [debugging-and-mcp.md](reference/debugging-and-mcp.md) | Runtime debugging, headless/CI rendering, screenshots, the MCP server. |
 | [tools-install.md](tools-install.md) | Installing `slint-lsp` (language server) or `slint-viewer` (preview / screenshots). |
