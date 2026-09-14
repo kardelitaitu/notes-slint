@@ -34,7 +34,9 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use notes_api::{Command, Event, Gateway};
-use slint::ComponentHandle;
+// C3: the drag writes a PHYSICAL target, so the physical type is named here rather than routed
+// through a logical one and converted twice (see `drag_destination` for why once is the whole rule).
+use slint::{ComponentHandle, PhysicalPosition};
 
 use crate::Spike;
 use crate::plumbing::{
@@ -840,6 +842,11 @@ pub(crate) struct Pump {
     /// against what the port actually persisted, which is what the next launch restores
     /// from; kept here because the tick that printed it is long gone.
     pub(crate) drag_target: Option<(i32, i32)>,
+    /// C3: has THIS drag episode printed its one line yet? A real drag emits a callback per
+    /// mouse-move frame, so an unguarded print is a hundred lines for one gesture - the same
+    /// flood the instrument refused for its refusal print (`drag_refused_shown` above), for the
+    /// same reason. Written by the product's drag handler; cleared when the band releases.
+    pub(crate) drag_reported: bool,
     /// How many autosave toggles this bridge has sent. The port echoes NO autosave event,
     /// so the menu check can only follow the ask - printed as 'menu: ...' so the
     /// convention is visible instead of pretending to be a report.
@@ -1262,6 +1269,10 @@ pub(crate) fn restore_from_session(gw: &Rc<RefCell<Option<Gateway>>>, path: &Pat
 /// minus the probe's measurement witnesses. Nothing here decides anything the port has not been
 /// asked to decide: pin is `Command::SetPinned`, clear is `Command::ClearRecents`, and the two
 /// frame acts are `ui.window()` calls, which are the bridge's per the geometry law.
+///
+/// C3 (2026-09-14) adds a FIFTH row, and it is not a verbatim move: the drag. The band's deltas
+/// were already arriving and being forwarded, with no listener - see the hook below for what it
+/// does and `drag_destination` for the arithmetic it corrects.
 #[allow(dead_code)] // dead in the PROBE root only: probe.rs wires its own handlers
 pub(crate) fn wire_callbacks(
     ui: &Spike,
@@ -1398,10 +1409,131 @@ pub(crate) fn wire_callbacks(
             ));
         });
     }
+    // C3 (5) THE DRAG. The band has been emitting since S5 (`chrome.slint:529-550`: sample the
+    // pointer on press, `drag-delta` on every move while pressed, `drag-ended` once on release),
+    // main.slint has been forwarding since the same slice (:408-412), and NOTHING on the product
+    // side was listening - so every title-band drag fell on the floor of an unwired callback.
+    // This is the bug the user reported as "we cannot move the window", and it is the same shape
+    // as STEP B's unwired chords: markup fires, Rust never registered.
+    {
+        let weak = ui.as_weak();
+        let pump = Rc::clone(pump);
+        ui.on_drag_delta(move |dx, dy| {
+            drag_by(&weak, &pump, dx, dy);
+        });
+    }
+    // The release is the OTHER half, and it is the only half that talks to the port: moving the
+    // window is a per-frame act, asking it to STORE a rect is not. main.slint:97-99 states this
+    // contract for the drag ("the port is asked to STORE a rect once per drag, on the drop, not
+    // once per frame"), and the settle watch in product.rs is the general net that catches every
+    // other way a rect changes - so a drag lands two GeometryChanged asks, which the engine
+    // answers by queueing one session write. Deterministic beats opportunistic here.
+    {
+        let gw = Rc::clone(gw);
+        let pump = Rc::clone(pump);
+        ui.on_drag_ended(move || {
+            let target = pump.borrow_mut().drag_target.take();
+            pump.borrow_mut().drag_reported = false;
+            report(&format!(
+                "drag: released from {target:?}, asking the port to store the rect"
+            ));
+            send(&gw, Command::GeometryChanged);
+        });
+    }
+}
+
+/// THE DRAG'S ARITHMETIC, pure, so the DPI half of it is testable without a window.
+///
+/// IN: the window's CURRENT position in PHYSICAL pixels, the pointer's delta in LOGICAL pixels
+/// (every `length` in the markup is logical), and the scale factor. OUT: the target, in PHYSICAL
+/// pixels - which is how it is fed to `set_position`, through `WindowPosition::Physical`. One
+/// conversion, in this function, and the read and the write are the same unit by construction.
+///
+/// WHY NOT INHERIT THE INSTRUMENT'S LINE: `probe.rs:1755-1757` adds a logical delta to a physical
+/// position and then writes a LOGICAL target, and says so out loud - "at 1.25 or 1.5 the division
+/// by `window.scale_factor()` belongs in THIS function", with the whole probe pinned to scale 1.0
+/// where the identity holds. That is the same bug class R1 found from the other direction (a band
+/// that reads one kind of rect and writes the other walks the window across the screen): at 150 %
+/// a drag would move the window two thirds of the pointer's travel, and the user's own pointer
+/// outruns the note. Retiring the debt is cheaper than re-documenting it, and the tests below are
+/// the proof that scale 1.0 still behaves exactly as the instrument measured.
+pub(crate) fn drag_destination(here: (i32, i32), dx: f32, dy: f32, scale: f32) -> (i32, i32) {
+    // A scale of 0 or NaN is not a thing to propagate through a window position: it would freeze
+    // the note in place (0) or park it at an undefined point (NaN), and neither is recoverable
+    // from the log. Fall back to 1.0, which is what the rest of this crate's startup path does.
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    (
+        here.0 + (dx * scale).round() as i32,
+        here.1 + (dy * scale).round() as i32,
+    )
+}
+
+/// THE DRAG, moved. Reading and writing the window is bridge work (AGENTS.md: geometry RESTORE is
+/// the bridge's, geometry STORAGE is core's), so this function is the only place in the product
+/// that turns a pointer's movement into a position.
+fn drag_by(weak: &slint::Weak<Spike>, pump: &RefCell<Pump>, dx: f32, dy: f32) {
+    let Some(ui) = weak.upgrade() else { return };
+    let window = ui.window();
+    // REFUSE while maximised - the one guard the instrument earned the hard way and records at
+    // probe.rs:1724-1742: a maximised window reports `position()` as `<-8,-8>` (the invisible
+    // border), so "read, add, write" is arithmetically perfect and semantically wrong, and it
+    // made the PORT STORE `-8,52` as the normal position, destroying a restore point while every
+    // delta needle still read cleanly. The check cannot see that class, because the arithmetic is
+    // not the bug: the INPUT is meaningless. Printed once per episode for the same flood reason.
+    if window.is_maximized() {
+        let mut p = pump.borrow_mut();
+        if !p.drag_refused_shown {
+            p.drag_refused_shown = true;
+            drop(p);
+            report("drag[refused]: maximised, window unmoved");
+            // And said to the person, not just to stderr: a refused drag is an input that did
+            // nothing, which is the class `locked` (S8b) and the pin refusal both answer on the
+            // status line. The legend is a lot of small text to overwrite, and it is the only
+            // surface a person is already reading. `ui` is already upgraded above - a second
+            // `weak.upgrade()` here would be the same handle twice for no reason.
+            ui.set_status("drag refused: the note is maximised".into());
+        }
+        return;
+    }
+    let here = window.position();
+    let scale = window.scale_factor();
+    let want = drag_destination((here.x, here.y), dx, dy, scale);
+    window.set_position(PhysicalPosition::new(want.0, want.1));
+    // What the toolkit reads back is the fact; what was asked for is the intention, and the two
+    // are printed together because the gap between them is the DPI/clamp story.
+    let back = window.position();
+    let (first, was_refusing) = {
+        let mut p = pump.borrow_mut();
+        p.drag_target = Some(want);
+        // The refusal bit doubles as "the status line is currently lying about this band": a
+        // delta that lands means the note moves after all, so stop saying otherwise.
+        let was_refusing = p.drag_refused_shown;
+        p.drag_refused_shown = false;
+        let first = !p.drag_reported;
+        p.drag_reported = true;
+        (first, was_refusing)
+    };
+    if was_refusing {
+        ui.set_status(legend().into());
+    }
+    if first {
+        report(&format!(
+            "drag: from <{},{}> by <{dx},{dy}> at scale {scale} -> asked <{},{}>, reads <{},{}>",
+            here.x, here.y, want.0, want.1, back.x, back.y
+        ));
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    // The grep guards below need no parent names, so this module had no import until the drag's
+    // arithmetic became testable without a window - which is the whole point of it being a
+    // separate function.
+    use super::drag_destination;
 
     const MARKUP: &str = include_str!("../ui/main.slint");
 
@@ -1578,6 +1710,67 @@ mod tests {
         assert!(
             !arm.contains("mark is core's. The bridge renders"),
             "a comment must not claim a mark the code never drew - the old wording did"
+        );
+    }
+
+    #[test]
+    fn a_drag_at_scale_one_is_the_identity_the_instrument_measured() {
+        // The instrument's needles were all cut at scale 1.0 (probe.rs:1717-1720 says so), so
+        // 1.0 must stay an identity or every recorded drag verdict stops meaning anything.
+        assert_eq!(drag_destination((100, 200), 60.0, 40.0, 1.0), (160, 240));
+        assert_eq!(drag_destination((-8, -8), -20.0, 0.0, 1.0), (-28, -8));
+        // A zero delta is a click on the band, not a move, and must not move anything.
+        assert_eq!(drag_destination((390, 278), 0.0, 0.0, 1.0), (390, 278));
+    }
+
+    #[test]
+    fn a_drag_at_150_percent_lands_where_the_pointer_is() {
+        // THE DEBT THIS RETIRES. Reading physical and writing logical made the window cover
+        // delta*scale of ground while the pointer covered delta: at 1.5 a 10 px drag asked for
+        // 15 px of travel. One conversion, in drag_destination, in the direction that matches.
+        assert_eq!(drag_destination((100, 100), 10.0, 10.0, 1.5), (115, 115));
+        assert_eq!(drag_destination((100, 100), 5.0, -5.0, 1.5), (108, 92));
+        // Rounding, not truncation: 0.4 px rounds down, 0.6 rounds up, both physical px.
+        assert_eq!(drag_destination((0, 0), 0.4, 0.6, 1.0), (0, 1));
+    }
+
+    #[test]
+    fn an_unusable_scale_moves_the_window_rather_than_losing_it() {
+        // 0 would freeze the note wherever it is and NaN would park it at an undefined point.
+        // Both are recovered as 1.0 - the same fallback product.rs:321-325 applies to the
+        // session's stored scale before it places the window at startup.
+        assert_eq!(drag_destination((10, 10), 5.0, 5.0, 0.0), (15, 15));
+        assert_eq!(drag_destination((10, 10), 5.0, 5.0, f32::NAN), (15, 15));
+        assert_eq!(
+            drag_destination((10, 10), 5.0, 5.0, f32::INFINITY),
+            (15, 15)
+        );
+    }
+
+    #[test]
+    fn the_band_that_moves_the_window_is_listened_to() {
+        // C3, and the shape of the bug it guards against is not hypothetical: the markup has
+        // emitted `drag-delta` since S5 and main.slint has forwarded it since S5, and the product
+        // still did not move, because nothing on the Rust side had ever registered a handler -
+        // exactly how the chords behaved before STEP B (product.rs:425-432). Emission is not
+        // wiring, and a grep is the only cheap proof that both halves exist.
+        let whole = include_str!("../src/surface.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        assert!(
+            MARKUP.contains("drag-delta(dx, dy)"),
+            "the band still asks (ui/chrome.slint -> ui/main.slint)"
+        );
+        assert!(src.contains("ui.on_drag_delta("), "and the product listens");
+        assert!(
+            src.contains("ui.on_drag_ended("),
+            "the release too - a drag that never tells the port stores no rect"
+        );
+        // ONE arithmetic, one writer of a position through the drag path. The startup restore in
+        // product.rs is the other legitimate writer, and it lives in the other file.
+        assert_eq!(
+            src.matches("set_position(").count(),
+            1,
+            "drag_destination must be the only place this file moves the window"
         );
     }
 }

@@ -433,7 +433,9 @@ fn main() {
     let (dialog_tx, dialog_rx) = mpsc::channel::<DialogReply>();
     let dialog_rx = Rc::new(RefCell::new(dialog_rx));
     wire_callbacks(&ui, &gateway, &pump, &dialog_tx);
-    report("wiring: menu rows and chords hooked (open, save-as, autosave, recent, quit)");
+    report(
+        "wiring: menu rows, chords and the title-band drag hooked (open, save-as, autosave, recent, quit, drag)",
+    );
 
     // ---- the loop: a WAKE, not a clock ----
     // 8 ms is a poll interval, and the probe's 8 ms tick is a SCHEDULE: twenty-four *_AT consts, an
