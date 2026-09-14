@@ -9,6 +9,12 @@
 use std::path::{Path, PathBuf};
 
 /// Autosave skip decisions: why a debounced autosave did not run.
+///
+/// The SAME type is the refusal shape for a hand-triggered save
+/// ([`Document::should_save_manual`]): one vocabulary, so the port maps one
+/// enum to `SkipReason` and the bridge renders one list of reasons — whether
+/// nothing saved because a toggle is off or because the file is read-only is
+/// the user's question either way.
 // NOTE(api): the PUBLIC vocabulary is api::SkipReason, written by the api
 // worker in this same wave; its variant names are identical to this enum's,
 // so the later dto/re-export join is mechanical. core must not depend on
@@ -230,6 +236,86 @@ impl Document {
             return Some(Skip::Clean);
         }
         self.should_autosave(autosave_enabled)
+    }
+
+    /// THE hand-triggered save rule: may a save the USER asked for (a Save menu
+    /// row, a key chord) proceed? Same question as [`Self::should_flush`], same
+    /// typed answer — `Some(reason)` is a refusal the caller MUST render
+    /// (ADR-0001 requirement 1: every save answers Saved, SaveFailed, or a
+    /// refusal; never silence), `None` means write it.
+    ///
+    /// It differs from the debounced path by EXACTLY TWO of that one's gates,
+    /// and only those two:
+    ///
+    /// * [`Skip::AutosaveDisabled`] is BYPASSED. The toggle is a standing
+    ///   instruction about UNATTENDED writes — "do not touch my file when I did
+    ///   not ask". A save the user just asked for is the case the toggle was
+    ///   never about, and refusing it would make "autosave off" mean "no
+    ///   saving". That is the exact situation the Save row and chord are being
+    ///   built for: THE PORT HAS NO PLAIN SAVE COMMAND YET (api's Command has
+    ///   SaveAs and Flush only), and this method is the core half of the one a
+    ///   later slice routes here — written now so the routing adds no rule.
+    /// * [`Skip::ForeignFileNotArmed`] is BYPASSED, and by name rather than by
+    ///   accident: ADR-0001 arms a foreign file "after the user performs one
+    ///   explicit save". A gate that refused the save until the file was armed
+    ///   would make its own arming act unreachable — the deadlock ADR-0001
+    ///   exists to avoid. An explicit Save IS the arming act.
+    ///
+    /// Arming costs nothing and is NOT re-implemented here: this is a pure
+    /// query. The success path already ends at [`Self::mark_saved`], the one
+    /// site that sets `armed = true` and clears dirty, so this method opens no
+    /// second arming or dirty-clearing door.
+    ///
+    /// What survives the bypass is the do-no-harm pair, in [`Self::should_autosave`]'s
+    /// order so the rendered reason stays deterministic: [`Skip::ReadOnly`] —
+    /// consent to save is not the write permission the filesystem withheld, and
+    /// Save As to a new name is the way out (which arms, per ADR-0001
+    /// requirement 4); [`Skip::Oversize`] — same reason it has in
+    /// [`Self::should_autosave`]: the guarantee is core's, and a save the user
+    /// asked for must not rewrite bytes the app refused to read. [`Self::should_flush`]'s
+    /// D11 staleness gate needs no twin here — it exists to drop a DEBOUNCED
+    /// write a newer save already covered, and a hand-triggered save carries no
+    /// in-flight queue to go stale. The ordinary dirty gate below takes its
+    /// place: nothing unsaved is nothing to write, and answering Clean keeps an
+    /// accidental keystroke from churning the file — and, for an empty untitled
+    /// buffer, from minting a scratch file for nothing (the D69 empty-buffer
+    /// rule holds on this path too).
+    ///
+    /// NOT A DOOR PAST THE PORT. The refused-load guard that stops the measured
+    /// 0-byte overwrite — api's `load_refused_for`, which refuses to write a
+    /// buffer into the file whose OPEN was refused — is about a PATH, and core
+    /// holds no such state: it decides only from what it was handed. The caller
+    /// applies that guard before writing, and nothing here lets a manual save
+    /// talk its way past it.
+    ///
+    /// CALLER CONTRACT (the routing is slice 3's; the anchor rule is the part a
+    /// debug-only assert cannot carry): [`Self::mark_saved`]'s
+    /// `debug_assert!(revision <= noted)` compiles out in release, so it is a
+    /// tripwire, not the contract. A manual save must [`Self::note_revision`]
+    /// the revision it is anchoring BEFORE [`Self::mark_saved`] — exactly the
+    /// order `Engine::flush` uses — or a release build quietly anchors an
+    /// un-noted revision and the next real flush reads as Clean and is skipped.
+    /// And if the command's revision is ABOVE core's counter, the buffer moved
+    /// without core being told, so the caller marks it dirty first (`flush`
+    /// does, with [`Self::apply_edit`]): asking this method without that mark
+    /// is how a real save gets refused as Clean.
+    pub fn should_save_manual(&self) -> Option<Skip> {
+        // NO `autosave_enabled` argument, and that absence IS the decision: the
+        // toggle gates unattended writes only. `armed` is deliberately unread
+        // here — an explicit save is what SETS it, so it cannot be the reason to
+        // refuse one. `dirty` is asked instead of `revision > saved_revision`: a
+        // hand-triggered save has no queue to be stale, and dirty is the state
+        // that means "the file does not have this text yet".
+        if self.read_only {
+            return Some(Skip::ReadOnly);
+        }
+        if self.oversize {
+            return Some(Skip::Oversize);
+        }
+        if !self.dirty {
+            return Some(Skip::Clean);
+        }
+        None
     }
 }
 
@@ -515,5 +601,250 @@ mod tests {
         let mut d = native();
         d.apply_edit(); // revision 1, core-local: the bridge never noted it
         d.mark_saved(); // must panic: anchoring an un-noted revision
+    }
+
+    // --- THE HAND-TRIGGERED SAVE: Document::should_save_manual ---
+
+    /// The whole state space both save rules read — native/foreign x
+    /// read-only x oversize x clean/dirty — labelled, so the claim that a
+    /// manual save bypasses EXACTLY the two gates the contract names is
+    /// checked over every state rather than sampled by hand.
+    fn every_state() -> Vec<(String, Document)> {
+        let mut out = Vec::new();
+        for native in [true, false] {
+            for read_only in [true, false] {
+                for oversize in [true, false] {
+                    for dirty in [true, false] {
+                        let kind = if native {
+                            FileKind::Notes
+                        } else {
+                            FileKind::Foreign
+                        };
+                        let name = if native { "C:/n/a.notes" } else { "C:/n/a.md" };
+                        let mut d = Document::open(Path::new(name), kind, read_only, oversize);
+                        if dirty {
+                            d.apply_edit();
+                        }
+                        out.push((
+                            format!(
+                                "{name} ro={read_only} oversize={oversize} dirty={dirty}",
+                                name = if native { "notes" } else { "foreign" }
+                            ),
+                            d,
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn an_autosave_disabled_document_still_saves_when_the_user_asks() {
+        let mut d = native();
+        d.apply_edit();
+        // The debounced path is off, and owns that: the toggle refuses it.
+        assert_eq!(
+            d.should_flush(d.revision(), false),
+            Some(Skip::AutosaveDisabled),
+            "autosave stays off"
+        );
+        // A save the user asked for is not a debounced write.
+        assert_eq!(
+            d.should_save_manual(),
+            None,
+            "the toggle may not refuse a save the user asked for"
+        );
+        // One accepted Save does not switch autosave back on.
+        d.note_revision(d.revision());
+        d.mark_saved();
+        d.apply_edit();
+        assert_eq!(
+            d.should_flush(d.revision(), false),
+            Some(Skip::AutosaveDisabled),
+            "the toggle is still the toggle for the next debounce"
+        );
+        assert_eq!(
+            d.should_save_manual(),
+            None,
+            "and the next ask is still honoured"
+        );
+    }
+
+    #[test]
+    fn a_foreign_documents_first_explicit_save_arms_it_and_autosave_takes_over() {
+        let mut d = foreign();
+        d.apply_edit(); // revision 1
+        // Autosave may not touch a foreign file yet (ADR-0001's disarm)...
+        assert_eq!(d.should_flush(1, true), Some(Skip::ForeignFileNotArmed));
+        // ...and that disarm may not be the reason to refuse the act that lifts it.
+        assert_eq!(
+            d.should_save_manual(),
+            None,
+            "an explicit Save IS the arming act"
+        );
+        // The port wrote it. Anchor per the caller contract: note BEFORE mark,
+        // because the D11 assert is debug-only and so is not the contract.
+        d.note_revision(1);
+        d.mark_saved();
+        // Arming was FREE — mark_saved is the only site that set it.
+        assert!(d.is_armed(), "the explicit save armed the foreign file");
+        assert!(!d.is_dirty());
+        assert_eq!(d.saved_revision, d.revision());
+        assert_eq!(
+            d.should_save_manual(),
+            Some(Skip::Clean),
+            "nothing left to write"
+        );
+        // And the debounced path is live from here on, which was the point.
+        d.apply_edit();
+        assert_eq!(
+            d.should_flush(d.revision(), true),
+            None,
+            "autosave runs on its own after the one save"
+        );
+    }
+
+    #[test]
+    fn a_read_only_document_refuses_even_an_explicit_save() {
+        let mut d = Document::open(Path::new("C:/n/locked.notes"), FileKind::Notes, true, false);
+        d.apply_edit();
+        assert_eq!(
+            d.should_save_manual(),
+            Some(Skip::ReadOnly),
+            "asking louder does not grant the write permission the filesystem withheld"
+        );
+        // Un-armed as well: the answer is still the permission, not the arming.
+        let mut foreign_ro =
+            Document::open(Path::new("C:/n/locked.md"), FileKind::Foreign, true, false);
+        foreign_ro.apply_edit();
+        assert_eq!(foreign_ro.should_save_manual(), Some(Skip::ReadOnly));
+    }
+
+    #[test]
+    fn an_oversize_document_refuses_even_an_explicit_save() {
+        let mut d = Document::open(Path::new("C:/n/huge.md"), FileKind::Foreign, false, true);
+        d.apply_edit();
+        // Both bypassed gates are true of this document, and neither is the answer:
+        assert_eq!(d.should_autosave(false), Some(Skip::AutosaveDisabled));
+        assert_eq!(d.should_autosave(true), Some(Skip::Oversize));
+        assert_eq!(
+            d.should_save_manual(),
+            Some(Skip::Oversize),
+            "consent to save is not consent to rewrite bytes the app refused to read"
+        );
+    }
+
+    #[test]
+    fn a_manual_save_answers_read_only_before_oversize() {
+        // Fixed order, mirrored from should_autosave with the two bypassed arms
+        // simply gone — so the reason the user sees is deterministic.
+        let mut d = Document::open(
+            Path::new("C:/n/locked-huge.md"),
+            FileKind::Foreign,
+            true,
+            true,
+        );
+        d.apply_edit();
+        assert_eq!(d.should_save_manual(), Some(Skip::ReadOnly));
+    }
+
+    #[test]
+    fn an_untouched_document_has_nothing_for_an_explicit_save_to_write() {
+        let blank = Document::new();
+        assert_eq!(
+            blank.should_save_manual(),
+            Some(Skip::Clean),
+            "the D69 empty-buffer rule holds here too: a stray keystroke may not mint a scratch file"
+        );
+        let mut d = native();
+        d.apply_edit();
+        d.note_revision(d.revision());
+        d.mark_saved();
+        assert_eq!(
+            d.should_save_manual(),
+            Some(Skip::Clean),
+            "already on disk: nothing to write, and the answer is a reason, not silence"
+        );
+        assert_eq!(d.revision(), 1);
+        assert!(!d.is_dirty());
+    }
+
+    #[test]
+    fn an_untitled_note_is_answered_by_the_ports_path_rule_not_a_core_refusal() {
+        // core adds NO new gate here: should_flush never reads the path field
+        // either, and D69's scratch machinery in the port owns where a nameless
+        // buffer's bytes land. A dirty untitled note is therefore a save that
+        // proceeds; the empty one above is the Clean refusal.
+        let mut d = Document::new();
+        d.apply_edit();
+        assert_eq!(d.path(), None);
+        assert_eq!(d.should_save_manual(), None);
+    }
+
+    #[test]
+    fn asking_whether_to_save_never_saves_anything() {
+        let mut d = foreign();
+        d.apply_edit();
+        let before = d.clone();
+        for _ in 0..3 {
+            assert_eq!(d.should_save_manual(), None);
+            assert_eq!(d.should_autosave(false), Some(Skip::AutosaveDisabled));
+        }
+        assert_eq!(d, before, "the query moved no state");
+        assert!(!d.is_armed(), "asking must not arm — only the save arms");
+    }
+
+    #[test]
+    fn the_documented_save_order_anchors_where_the_bridge_noted() {
+        // The CALLER CONTRACT, run end to end: note_revision BEFORE mark_saved.
+        // debug_assert! is the tripwire; this is the proof the order the doc
+        // names is the order that works, and that the anchor lands exactly on
+        // the revision the port wrote.
+        let mut d = foreign();
+        d.apply_edit();
+        d.apply_edit(); // revision 2
+        assert_eq!(d.should_save_manual(), None);
+        d.note_revision(2);
+        d.mark_saved(); // 2 <= noted 2: no trip
+        assert_eq!(d.saved_revision, 2);
+        assert!(d.is_armed());
+        assert_eq!(d.should_save_manual(), Some(Skip::Clean));
+    }
+
+    #[test]
+    fn an_explicit_save_bypasses_exactly_two_gates_and_no_other_verdict() {
+        for (label, d) in every_state() {
+            for enabled in [false, true] {
+                let autosave = d.should_autosave(enabled);
+                let manual = d.should_save_manual();
+                // 1. A hand-triggered save is NEVER refused for either bypassed
+                //    reason, in any state, toggle either way.
+                assert!(
+                    !matches!(
+                        manual,
+                        Some(Skip::AutosaveDisabled) | Some(Skip::ForeignFileNotArmed)
+                    ),
+                    "{label} enabled={enabled}: a Save refused for {manual:?}"
+                );
+                // 2. It is never STRICTER than the autosave it replaces.
+                if autosave.is_none() {
+                    assert_eq!(
+                        manual, None,
+                        "{label} enabled={enabled}: autosave would have written"
+                    );
+                }
+                // 3. The ONLY saves it grants over autosave are the two gates the
+                //    contract names — nothing else in the order ever differs.
+                if manual.is_none() {
+                    if let Some(refusal) = autosave {
+                        assert!(
+                            matches!(refusal, Skip::AutosaveDisabled | Skip::ForeignFileNotArmed),
+                            "{label} enabled={enabled}: manual overruled {refusal:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
