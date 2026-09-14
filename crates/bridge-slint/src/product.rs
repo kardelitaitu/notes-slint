@@ -282,6 +282,16 @@ fn main() {
         default_hook(info);
     }));
 
+    // STRIP-4 debt reckoning, row 3: the hook was CODE-PAID AND PROOF-OWED, and this is the door
+    // the proof reads. tests/panic_hook.rs spawns THIS binary with the variable set and asserts the
+    // line the hook above really voices. ONE order only, and BEFORE the port exists, so the provoked
+    // run touches no state dir and never asks for a window. There is deliberately NO mid-loop
+    // variant: an act timed inside the pump races the event loop, which is a flaky timer wearing a
+    // proof's name - and a proof that sometimes fails proves nothing at all.
+    if std::env::var_os("NOTES_PANIC_PROBE").is_some() {
+        panic!("NOTES_PANIC_PROBE=startup: provoked before the port was asked for a snapshot");
+    }
+
     // ---- whitepaper 5.5, in order: query, place, show, handle, register, pin ----
     let dir = state_dir();
     report(&format!("startup: state dir {}", dir.0.display()));
@@ -744,6 +754,64 @@ mod tests {
         // The word that makes it findable in a merged log, and the prefix the smoke contract
         // owns - the note goes out through report(), never through its own writer.
         assert!(panic_note("x", None).starts_with("panic:"));
+    }
+
+    // STRIP-4 debt reckoning, row 3's OTHER half. The hook is a closure a unit test cannot call,
+    // so what a unit test CAN do is forbid the order from drifting. The live proof - a child that
+    // really panicked and really was heard - is tests/panic_hook.rs, which exists because this file
+    // used to say out loud that no live panic was ever provoked.
+    #[test]
+    fn the_panic_hook_is_installed_before_the_port_and_chains_the_default() {
+        let whole = include_str!("product.rs");
+        let installed = whole
+            .find("std::panic::take_hook()")
+            .expect("the hook takes ownership of the default before replacing it");
+        let set = whole
+            .find("std::panic::set_hook(")
+            .expect("and only then installs its own");
+        let port = whole
+            .find("Gateway::start(")
+            .expect("the port is started somewhere in this root");
+        assert!(
+            installed < set && set < port,
+            "order drifted: a hook installed after Gateway::start at {port} leaves a panic inside the port startup unvoiced"
+        );
+        // The window the hook owns: its install up to the port. Three things live inside it.
+        let between = &whole[installed..port];
+        assert!(
+            between.contains("default_hook(info)"),
+            "the hook stopped chaining std's default hook, and that call is what keeps the panicked-at report, the location and the nonzero exit alive beside our line"
+        );
+        assert!(
+            !between.contains("process::exit"),
+            "an exit between taking the hook and starting the port ends the run and takes the trace line with it - main owns no exit here, only the shutdown arms do"
+        );
+        // The gate the child test drives sits in that window, behind its variable, so a shipped
+        // binary can never panic at startup for a person who did not order it.
+        assert!(
+            between.contains("var_os(\"NOTES_PANIC_PROBE\")")
+                && between.contains("panic!(\"NOTES_PANIC_PROBE"),
+            "the startup probe left the hook's window or lost its gate - tests/panic_hook.rs reads this exact pair"
+        );
+    }
+
+    #[test]
+    fn a_payload_that_prints_as_nothing_is_still_named_as_a_panic() {
+        // The third arm of the hook's downcast ladder: a payload that is neither a String nor a
+        // &str - a u32, a struct, anything that panics with a VALUE - carries no prose, and the line
+        // says so in words of this file's own. Before this test that fallback had NO owner: rename
+        // it inside the closure and nothing anywhere went red, which is how a panic hook ends up
+        // printing "panic: " and nothing else.
+        const UNPRINTABLE: &str = "(unprintable panic payload)";
+        assert_eq!(
+            panic_note(UNPRINTABLE, None),
+            "panic: (unprintable panic payload)",
+            "the word panic is the only thing this case carries, so it may not be optional"
+        );
+        assert!(
+            include_str!("product.rs").contains(UNPRINTABLE),
+            "the hook's fallback no longer matches the string this test pins - the wording is drifting in one place only, and the smoke contract reads the other"
+        );
     }
 
     #[test]
