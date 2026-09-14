@@ -43,9 +43,9 @@ not sentiment about the first bridge, is what this record exists to hold.
    proof replaces them, and the freeze is no licence to retire a claim early either.
 2. **The retarget.** What changes is what the repo faces by default, not what exists: `cargo xtask
    smoke` defaults to the Slint product, CI's smoke rows point there, and the docs say Slint. Today's
-   shape is still the old one — the default leg runs the needle schedule, and CI carries the gpui row
-   at `.github/workflows/ci.yml:350` beside the Slint product row at `:574` — so this is a work
-   order, stated here so a freeze is never mistaken for "carry on as you were".
+   shape is still the old one — the default leg runs the needle schedule, and CI still carries the gpui
+   smoke as row **3e** (`.github/workflows/ci.yml:350`) beside the Slint product row at `:574`. So the
+   retarget is a work order, stated here so a freeze is never mistaken for "carry on as you were".
 3. **The terminal delete happens only when these six are green** — all six, on the Slint side, each an
    *equivalent proof* rather than a ported file:
    - **the recents label trio on product rows**: Slint-side equivalents of the three
