@@ -220,6 +220,11 @@ pub(crate) fn save_now(
         // owed retry, so the retry can carry the revision and epoch the engine already saw rather
         // than a fresh reading - and so "something is unsaved" stops being a string comparison.
         p.last_send = Some((text.clone(), p.edits, p.epoch));
+        // FIX THREE: a NEWER explicit Save is a newer payload, so any ladder still live is about
+        // bytes that are no longer the newest - leaving it running would put two payloads in play,
+        // which is the same class of bug as arming off a stale pair. The next refusal, if there is
+        // one, installs THIS pair with a fresh ladder.
+        p.retry = None;
         (p.edits, p.epoch, text.len())
     };
     report(&format!(
@@ -279,6 +284,19 @@ pub(crate) fn retry_take(pump: &RefCell<Pump>) -> Retake {
     let Some(record) = pump.borrow().retry.clone() else {
         return Retake::Idle;
     };
+    // FIX TWO, checked HERE and not only at arming, because this is the last moment before the
+    // damage: a record whose revision is behind the sender clock describes bytes that are no longer
+    // the newest thing this bridge has put on the wire. The epoch guard cannot help, because the
+    // epoch is per-DOCUMENT and this hazard is per-BUFFER - the same file the whole time. Dropping
+    // it is the only answer that is not a write: the newer text is owed elsewhere (its own send
+    // moved the clock, and a newer Ctrl+S installs its own pair), so an older payload must never go
+    // out again. The Idle here is what the test drives.
+    if record.revision < pump.borrow().edits {
+        let mut p = pump.borrow_mut();
+        p.retry = None;
+        p.last_send = None;
+        return Retake::Idle;
+    }
     match retry_says(record.waited(), record.every, record.attempts) {
         Due::NotYet => Retake::Waiting,
         Due::Terminal => {
@@ -311,24 +329,104 @@ pub(crate) fn retry_take(pump: &RefCell<Pump>) -> Retake {
     }
 }
 
+/// A6 / the epoch question, answered in code rather than in prose: an owed retry belongs to a
+/// DOCUMENT, and the port refuses to let it write into a different one. `Engine::save` runs its epoch
+/// guard FIRST - "GUARD, MARK, NOTE, ASK, WRITE, ANCHOR, ANSWER" (crates/api/src/engine.rs:1493) - and
+/// `if epoch != self.epoch { emit(AutosaveSkipped { Superseded }); return; }` at engine.rs:1550-1555,
+/// so the fear that a retry could write the outgoing note into the file the user just opened is
+/// already closed by the port, and closed on the ONLY channel where it could be closed: Save carries
+/// no path, so the echoed generation is the stale-write defense (engine.rs:1496-1498).
+///
+/// What that leaves is a different hole, and this is the repair: the refused pair stays OWED. Every
+/// later attempt is answered by the same Superseded skip, which is not a SaveFailed, so the failure
+/// lane never re-arms and nothing retires it either - six doomed writes up the ladder, and the record
+/// outlives the document it was about. Retire it when the epoch it carries stops being the live one.
+///
+/// The bump sites are THREE and only three - `Engine::open`, `Engine::save_as`,
+/// `Engine::restore_missing_scratch` (engine.rs:1525-1529) - and they arrive at this bridge through
+/// TWO arms: the first and the third both emit `Loaded`, the second emits `Rebound`. So calling this
+/// from both covers every site, and it is silent by construction because the epoch an in-place Save
+/// echoes is UNCHANGED (engine.rs:1517-1524) - the case D61 is about cannot retire anything.
+///
+/// What this does NOT do, said plainly: it does not recover the text. After a switch the buffer holds
+/// the new file's bytes and the old ones are gone from the screen, which is exactly the loss the held
+/// switch exists to prevent and which is the next slice. Retiring only stops a doomed loop and stops
+/// a dead pair from being mistaken for an owed one.
+pub(crate) fn retire_owed(p: &mut Pump) -> bool {
+    let superseded = p.retry.as_ref().is_some_and(|owed| owed.epoch != p.epoch);
+    if superseded {
+        p.retry = None;
+        // The pair too: leaving it would let the NEXT refusal re-arm a record about a document that
+        // is no longer open, which is the same dead pair wearing the retry's coat again.
+        p.last_send = None;
+    }
+    superseded
+}
+
 /// A6: the failure lane's whole job, in one call. The payload comes from last_send, NEVER from the
 /// buffer: the buffer may already hold text typed since the failure, and a retry that re-reads it is
 /// a Flush wearing a Save's coat - the same pair the engine has already seen is the pair it must
 /// see again. Returns false when nothing was recorded, which is the honest no-op.
 pub(crate) fn retry_arm(pump: &RefCell<Pump>) -> bool {
     let mut p = pump.borrow_mut();
+    // FIX FIVE: opt-in data, installed by product wiring and by nothing else. The door that
+    // discharges a record lives in the product wake, so a pump in a build that has no door must never
+    // be handed one - it would be a parked write nothing can retire, showing up as one extra line in a
+    // transcript nobody diffs. Today the instrument cannot arm a retry, because CHORD_DRIVE has no
+    // save act; but probe.rs already maps Route::Save to invoke_save_asked, so ONE string added to
+    // that walk would route through the shared save_now, set last_send, and arm a record on the next
+    // refusal. This flag is what makes that sequence inert rather than a latent second transcript.
+    if !p.retry_enabled {
+        return false;
+    }
     let Some((text, revision, epoch)) = p.last_send.clone() else {
         return false;
+    };
+    // FIX TWO, at arming: the pair must be the NEWEST thing sent, because a refusal answers whichever
+    // command went out and this lane used to ignore which one it was. The review traced the sequence
+    // inside one epoch: Ctrl+S sends (T1, rev 5); the person types T2; the debounce sends
+    // Flush(T2, rev 6); that flush is refused; re-arming off last_send installed the STALE (T1, 5);
+    // and the door wrote T1 OVER THE NEWER FILE, because the engine revision step is a greater-than
+    // (5 > 6 is false, so nothing re-dirties), should_save_manual consults only the dirty bit, and
+    // Saved comes back with the dot clean. Disk T1, buffer T2, no carrier - silent loss of the newest
+    // text, which is worse than the bug this slice set out to fix, and the old lane could not do it
+    // because it re-read the buffer. The comparison that stops it already existed and was unread:
+    // record.revision against pump.edits, the sender clock bumped at both send sites.
+    if revision < p.edits {
+        p.last_send = None;
+        p.retry = None;
+        return false;
+    }
+    // FIX ONE: re-arming ADVANCES the existing ladder and never restarts it. A refusal produced BY a
+    // retry is the same document owing the same write, one rung further up. Installing attempts 0 and
+    // RETRY_FIRST on every refusal - what this function used to do - meant attempts could never pass
+    // 1, so the delay never doubled, so a permanent failure looped at 750 ms forever: terminal, its
+    // clear, and the door terminal report were all dead in the field, reachable only from a unit test
+    // that rewinds a clock by hand. Nothing before this commit proved a second arm carries the ladder
+    // forward, and that missing proof is exactly why the shape survived review.
+    // The carry-forward is conditional on it being the SAME obligation: a record for a different
+    // revision is a different write, and a new write climbing a ladder it never paid for would be
+    // as wrong as the restart - it could be terminal on its very first refusal. The real path keeps
+    // this honest anyway, because a newer save_now retires the older ladder outright; the guard is
+    // here so the rule is true of this function and not only of its callers.
+    let (attempts, every) = match p.retry.as_ref() {
+        Some(owed) if owed.revision == revision => (owed.attempts, owed.every),
+        _ => (0, RETRY_FIRST),
     };
     p.retry = Some(Retry {
         text,
         revision,
         epoch,
         at: Instant::now(),
-        every: RETRY_FIRST,
-        attempts: 0,
+        every,
+        attempts,
     });
-    // The dirty witness comes back too, so the dot lies about nothing while a retry is owed.
+    // The edited flag is set because it is TRUE - there is text that has not landed - and NOT because
+    // the dot can be trusted with it. EDITED_IS_DIRTY_WITNESS is false, so the dot is computed by the
+    // compare lane and this flag is inert for it. The sentence that used to sit here claimed the dot
+    // "lies about nothing" while a retry is owed; it lied twice, because the compare sees text equal
+    // to last_sent (the adoption made them equal at the send) and reports clean, and the exit reads
+    // that clean. FIX FOUR is the repair, and it consults the record rather than the witness.
     p.edited_flag = true;
     true
 }
@@ -914,6 +1012,11 @@ pub(crate) fn note_adoption(pump: &RefCell<Pump>, path: &Path) -> i32 {
         p.edited_flag = false;
         p.pending_at = None;
         p.generation = next_generation(p.generation);
+        // FIX THREE: D61 put this branch in place precisely BECAUSE a different document arrived,
+        // and yet the one fact in the pump that is about a document was left behind - an owed retry
+        // for the file being replaced. A switch cannot be paid for with the previous note.
+        p.retry = None;
+        p.last_send = None;
     }
     p.adopted_path = Some(path.to_path_buf());
     p.generation
@@ -1122,6 +1225,11 @@ pub(crate) struct Pump {
     /// longer stamp over a verdict about the DISK. 0 = nothing, 1 = the bridge's own skip sentence,
     /// 2 = the port's failure sentence. Saved clears both, as it always did.
     pub(crate) why_rank: u8,
+    /// FIX FIVE: whether THIS build may owe a retry at all. Only the product root installs it
+    /// (`retry_door` is the sole discharger, and it lives in that root), so an instrument pump that
+    /// cannot discharge a record is never handed one. Default false is the safe direction: a field
+    /// that must be switched ON by the code that can finish the job.
+    pub(crate) retry_enabled: bool,
     /// The port has NO event that echoes autosave - engine.rs:601-602 assigns the bool
     /// and says nothing back - so this is InitialState's answer XORed by every
     /// Command::SetAutosave this bridge sends. The bridge's own last ask, named as such
@@ -1316,6 +1424,12 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 let adopted = lf(text);
                 let mut p = pump.borrow_mut();
                 p.epoch = *epoch;
+                // A6 / the epoch question: a switch happened, so a retry owed about the document
+                // that was open BEFORE it can never be answered - the port refuses it on Superseded
+                // forever, which is a doomed loop rather than a safety net. Retired here, silently
+                // (no line for the instrument to report), and covered in both arms because the three
+                // bump sites reach this bridge as exactly two events.
+                retire_owed(&mut p);
                 p.last_sent = adopted.clone();
                 p.load_answers += 1; // S4d: an answer arrived - what the locked act waits for
                 // S8b: THE VERDICT, read at last. This pattern used to end in `..`, which dropped
@@ -1385,6 +1499,11 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 // path, and the bridge may not assume the answer.
                 let mut p = pump.borrow_mut();
                 p.epoch = *epoch;
+                // A6: the same retirement the Loaded arm does, because a Save As rebind is the THIRD
+                // bump site and it arrives here. An in-place Save echoes the epoch UNCHANGED, so the
+                // Rebound every save takes retires nothing - which is what makes this call safe to sit
+                // on the path every Ctrl+S travels.
+                retire_owed(&mut p);
                 let word = lock_verdict(meta.read_only, meta.oversize);
                 p.locked = !word.is_empty();
                 p.lock_word = word.to_string();
@@ -1507,6 +1626,19 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                     p.saves += 1;
                     p.saves_settled += 1;
                     p.saves_answer = "Saved";
+                    // FIX THREE: a Saved that answers THIS pair retires the record and the pair, by
+                    // identity - the revision the event names against the revision the send carried,
+                    // which is the rule the held-switch note states for the funnel and which applies
+                    // here for the same reason: a counter says something answered, not that MY send
+                    // answered. Anything it does not match survives, so an answer for an unrelated
+                    // write cannot wipe an owed one.
+                    if p.retry
+                        .as_ref()
+                        .is_some_and(|owed| owed.revision == *revision)
+                    {
+                        p.retry = None;
+                        p.last_send = None;
+                    }
                     p.saves
                 };
                 // The bytes landed, so the failure is over - cleared here and nowhere
@@ -2596,13 +2728,151 @@ mod tests {
         // channel here - drain needs a window and a queue - so the arm wiring is the one structural
         // claim at the bottom, and every claim above it is a call.
         let pump = RefCell::new(Pump::default());
+        // 0. FIX FIVE, the opt-in, asserted before anything can work: a pump in a build that never
+        //    installed the door may not be handed a record, because it cannot discharge one. The
+        //    instrument is exactly that build - CHORD_DRIVE has no save act today, but probe.rs
+        //    already maps Route::Save to invoke_save_asked, so one string added to that walk would
+        //    route through the shared save_now, set last_send, and arm a record on the next refusal:
+        //    a parked write inside the frozen instrument, worth one extra line in a transcript nobody
+        //    diffs. This block is the tripwire for that day, and it is TWO-SIDED on purpose: an
+        //    assert that arms nothing from an empty pump would pass just as well if the opt-in check
+        //    were deleted, because last_send alone would explain the false. So the pump is given a
+        //    REAL refused pair first - the only thing that can then stop it is the flag - and the
+        //    same pump with the flag installed arms the same pair. Delete the check and the first
+        //    assert reddens; delete the install and the second does.
+        {
+            let mut p = pump.borrow_mut();
+            p.last_send = Some(("bytes with nowhere to go".to_string(), 1, 1));
+        }
+        assert!(
+            !super::retry_arm(&pump),
+            "a pump whose build has no door must arm nothing, even with a real refused pair recorded"
+        );
+        assert!(pump.borrow().retry.is_none(), "and no record was made");
+        // The product root installs the capability at startup; said out loud here so what follows
+        // is visibly about the armed build and not about the default one.
+        pump.borrow_mut().retry_enabled = true;
+        assert!(
+            super::retry_arm(&pump),
+            "the SAME pump with the door installed arms the SAME pair - so the flag was the reason"
+        );
+        assert!(
+            pump.borrow().retry.is_some(),
+            "a record exists in the armed build"
+        );
+        // Back to the clean slate steps 1 and 2 need.
+        {
+            let mut p = pump.borrow_mut();
+            p.retry = None;
+            p.last_send = None;
+        }
         // 1. A clean pump owes nothing.
         assert!(matches!(super::retry_take(&pump), super::Retake::Idle));
         // 2. A refusal with no explicit Save behind it - a Save As answer, a debounced flush -
-        //    invents no pair and owes nothing.
+        //    invents no pair and owes nothing, now that arming is allowed at all.
         assert!(
             !super::retry_arm(&pump),
             "nothing went out as a Save, so nothing is owed"
+        );
+        // 2b. THE STALE PAIR, which is the sequence the review traced inside one epoch, and the proof
+        //     that was MISSING from the first version of this test: Ctrl+S sends (T1, rev 5); the
+        //     person types T2; the debounce sends Flush(T2, rev 6); that flush is refused; and the
+        //     retry must not go out with T1 over the newer file. Drive it with no window: arm the
+        //     refused pair, then move the SENDER CLOCK and last_sent the way that flush moves them,
+        //     and take. Idle, and the record gone - not a Save of bytes nobody asked for.
+        {
+            let mut p = pump.borrow_mut();
+            p.epoch = 3;
+            p.edits = 5;
+            p.last_send = Some(("T1".to_string(), 5, 3));
+        }
+        assert!(
+            super::retry_arm(&pump),
+            "T1 at rev 5 is owed, because it is the newest send"
+        );
+        {
+            let mut p = pump.borrow_mut();
+            let owed = p.retry.as_mut().expect("owed");
+            owed.at = Instant::now()
+                .checked_sub(Duration::from_millis(800))
+                .expect("a rewound clock is a valid clock");
+            p.edits = 6;
+            p.last_sent = "T2".to_string();
+            let (t2, rev6) = ("T2".to_string(), 6u64);
+            p.last_send = Some((t2, rev6, 3));
+        }
+        assert!(
+            matches!(super::retry_take(&pump), super::Retake::Idle),
+            "the owed T1 is now older than the sender clock and must not be sent"
+        );
+        assert!(pump.borrow().retry.is_none(), "and its record is dropped");
+        // 2c. And the same guard where it bites hardest: the record still carries T1 and the SAVED
+        //     that arrives names rev 6, so the identity clear must not be what retires it either -
+        //     it is retirement by the clock that saves this case.
+        {
+            let mut p = pump.borrow_mut();
+            p.edits = 5;
+            p.last_send = Some(("T1".to_string(), 5, 3));
+        }
+        assert!(super::retry_arm(&pump), "T1 owed again for the next claim");
+        {
+            let mut p = pump.borrow_mut();
+            p.edits = 6; // a newer send; last_send deliberately left at the stale pair
+        }
+        assert!(
+            matches!(super::retry_take(&pump), super::Retake::Idle),
+            "a newer send alone makes the owed pair undeliverable"
+        );
+        // 2d. FIX ONE, the rung nothing proved before: a SECOND refusal, answering a retry rather
+        //     than an act, must ADVANCE the ladder - attempts and delay carried forward - because
+        //     resetting them is what made the cap unreachable and the loop endless at 750 ms. The
+        //     first version of this test armed once and could not see the difference.
+        {
+            let mut p = pump.borrow_mut();
+            p.edits = 6;
+            p.last_send = Some(("T2".to_string(), 6, 3));
+        }
+        assert!(
+            super::retry_arm(&pump),
+            "a fresh refusal arms the newest pair"
+        );
+        {
+            let mut p = pump.borrow_mut();
+            let owed = p.retry.as_mut().expect("owed");
+            owed.attempts = 3;
+            owed.every = Duration::from_millis(6000);
+        }
+        assert!(
+            super::retry_arm(&pump),
+            "and a refusal answering a retry arms again"
+        );
+        {
+            let p = pump.borrow();
+            let owed = p.retry.as_ref().expect("still owed");
+            assert_eq!(
+                owed.attempts, 3,
+                "a second arm carries the attempts forward"
+            );
+            assert_eq!(
+                owed.every,
+                Duration::from_millis(6000),
+                "and the delay it reached"
+            );
+            assert_eq!(owed.revision, 6, "and the payload is the newest pair");
+        }
+        assert!(
+            matches!(
+                super::retry_says(Duration::from_millis(6000), Duration::from_millis(6000), 3),
+                super::Due::Send { .. }
+            ),
+            "the carried-forward ladder still has rungs left before the cap"
+        );
+        assert!(
+            matches!(
+                super::retry_says(Duration::from_millis(6000), Duration::from_millis(6000), 6),
+                super::Due::Terminal
+            ),
+            "and it still ends - which a restarted ladder never would"
         );
         // 3. REPAIR ONE, the case a string comparison cannot see. The buffer is EMPTY and so is
         //    last_sent: text != last_sent is false in EVERY configuration, autosave on or off, and
@@ -2696,6 +2966,56 @@ mod tests {
             pump.borrow().retry.is_none(),
             "terminal must retire the record"
         );
+        // 6e. FIX THREE, the other two clears. The switching branch is behavioural: D61 put that
+        //     branch in place precisely BECAUSE a different document arrived, and a switch cannot be
+        //     paid for with the previous note's bytes - so the owed write and the pair behind it both
+        //     go. And note_adoption on the SAME path, which is what every Ctrl+S answers with, must
+        //     retire nothing: that is the case D61 settled, and it is asserted here so the two rules
+        //     cannot drift apart.
+        {
+            let mut p = pump.borrow_mut();
+            p.edits = 8;
+            p.last_send = Some(("T5".to_string(), 8, 3));
+        }
+        let here = Path::new("C:/notes/the-owed-one.notes");
+        let elsewhere = Path::new("C:/notes/some-other-note.notes");
+        super::note_adoption(&pump, here);
+        assert!(super::retry_arm(&pump), "T5 is owed on this document");
+        super::note_adoption(&pump, here);
+        assert!(
+            pump.borrow().retry.is_some(),
+            "an in-place adoption retires nothing - D61's own rule"
+        );
+        super::note_adoption(&pump, elsewhere);
+        {
+            let p = pump.borrow();
+            assert!(p.retry.is_none(), "a switch retires the outgoing write");
+            assert!(p.last_send.is_none(), "and the pair behind it");
+        }
+        // The Saved clear needs a live port to reach, so it is pinned as the IDENTITY it matches on:
+        // a Saved naming a DIFFERENT revision must not retire an owed write. That is rule 1 of the
+        // held-switch note - a counter says something answered, not that MY send answered - and this
+        // slice must not become the place that quietly ignores it. Call-site claim, named as one.
+        {
+            fn saved_arm() -> String {
+                let whole = include_str!("../src/surface.rs");
+                let src = &whole[..whole.find("mod tests").expect("the tests module")];
+                let saved = &src[src
+                    .find("Event::Saved { path, revision } =>")
+                    .expect("the Saved arm")..];
+                saved[..saved.find("Event::AutosaveSkipped").expect("the next arm")].to_string()
+            }
+            let saved = saved_arm();
+            assert!(
+                saved.contains("owed.revision == *revision"),
+                "a Saved retires an owed retry by identity, never because a counter moved"
+            );
+            assert!(
+                saved.contains("p.retry = None;") && saved.contains("p.last_send = None;"),
+                "and the clear must be a call in that arm, not a rule in a comment"
+            );
+        }
+
         // 7. REPAIR TWO, the precedence. A verdict about the DISK outranks a verdict about a
         //    SETTING, so a skip arriving after a failure can no longer stamp "a file this app did
         //    not create: Save once (Ctrl+S) and it keeps saving" over the reason the save failed -
@@ -2720,6 +3040,47 @@ mod tests {
                 "with nothing above it a setting may speak"
             );
         }
+        // 6b. THE EPOCH QUESTION, answered in code. An owed retry belongs to a DOCUMENT, and the port
+        //     already refuses to write it into another one: Engine::save runs its epoch guard FIRST
+        //     (api/engine.rs:1550, and the ordering contract at :1493), so the fear - the outgoing
+        //     note landing in the file the person just opened - is closed upstream, on the only channel
+        //     where it could be, since Save carries no path. What upstream does NOT do is retire the
+        //     record: every later attempt is answered by the same Superseded skip, which is not a
+        //     SaveFailed, so the failure lane never re-arms and nothing clears it either - a doomed
+        //     pair climbing its own ladder. Retiring is SILENT, deliberately: the instrument reports
+        //     what it reports and this slice adds no line to it.
+        {
+            let mut p = pump.borrow_mut();
+            p.epoch = 3;
+            p.last_send = Some(("second note".to_string(), 9, 3));
+        }
+        assert!(super::retry_arm(&pump), "the pair is owed at epoch 3");
+        {
+            // The in-place Save echoes an UNCHANGED epoch (api/engine.rs:1517-1524), so the case D61
+            // is about retires nothing: a Ctrl+S must not cancel its own retry.
+            let mut p = pump.borrow_mut();
+            assert!(
+                !super::retire_owed(&mut p),
+                "an unchanged epoch retires nothing"
+            );
+        }
+        assert!(
+            pump.borrow().retry.is_some(),
+            "the owed write survives its own Rebound"
+        );
+        {
+            let mut p = pump.borrow_mut();
+            p.epoch = 4;
+            assert!(
+                super::retire_owed(&mut p),
+                "a moved epoch retires the record"
+            );
+        }
+        assert!(pump.borrow().retry.is_none(), "the record goes");
+        assert!(
+            pump.borrow().last_send.is_none(),
+            "and so does the dead pair, or the next refusal re-arms it"
+        );
         // 8. The one structural claim, and it is the arm: the failure lane must OWE the retry, and
         //    must NOT be clearing the send witness any more - clearing last_sent is what made the
         //    Flush lane the carrier, and the channel law forbids that carrier.
@@ -2756,6 +3117,54 @@ mod tests {
         assert!(
             skip.contains("note_why(&mut p, WHY_SETTING"),
             "the setting lane must write through the rank, or it still stamps over the disk"
+        );
+        // 9. And the retirement's call sites, which ARE a census and are claimed as one: the three
+        //    bump sites (open, restore_missing_scratch, save_as) reach this bridge as exactly TWO
+        //    events - the first two both emit Loaded - so exactly two arms may retire, one in each.
+        //    Deleting either call reddens this and nothing else, which is the price of having no
+        //    window to drive.
+        assert_eq!(
+            src.matches("retire_owed(&mut p)").count(),
+            2,
+            "exactly the two arms that adopt an epoch may retire an owed retry"
+        );
+        let loaded = &src[src.find("let adopted = lf(text);").expect("the Loaded arm")..];
+        let loaded = &loaded[..loaded.find("Event::Rebound {").expect("the next arm")];
+        assert!(
+            loaded.contains("retire_owed(&mut p)"),
+            "the switch lane must retire the outgoing document's retry"
+        );
+        let rebound = &src[src.find("Event::Rebound {").expect("the Rebound arm")..];
+        let rebound = &rebound[..rebound
+            .find("Event::Saved { path, revision } =>")
+            .expect("the next arm")];
+        assert!(
+            rebound.contains("retire_owed(&mut p)"),
+            "and so must the rebind lane, because a Save As bumps the epoch"
+        );
+        // 9. And the retirement's call sites, which ARE a census and are claimed as one: the three
+        //    bump sites (open, restore_missing_scratch, save_as) reach this bridge as exactly TWO
+        //    events - the first two both emit Loaded - so exactly two arms may retire, one in each.
+        //    Deleting either call reddens this and nothing else, which is the price of having no
+        //    window to drive.
+        assert_eq!(
+            src.matches("retire_owed(&mut p)").count(),
+            2,
+            "exactly the two arms that adopt an epoch may retire an owed retry"
+        );
+        let loaded = &src[src.find("let adopted = lf(text);").expect("the Loaded arm")..];
+        let loaded = &loaded[..loaded.find("Event::Rebound {").expect("the next arm")];
+        assert!(
+            loaded.contains("retire_owed(&mut p)"),
+            "the switch lane must retire the outgoing document's retry"
+        );
+        let rebound = &src[src.find("Event::Rebound {").expect("the Rebound arm")..];
+        let rebound = &rebound[..rebound
+            .find("Event::Saved { path, revision } =>")
+            .expect("the next arm")];
+        assert!(
+            rebound.contains("retire_owed(&mut p)"),
+            "and so must the rebind lane, because a Save As bumps the epoch"
         );
         assert!(
             !src.contains("reason:?"),

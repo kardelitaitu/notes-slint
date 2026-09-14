@@ -583,6 +583,13 @@ fn main() {
     }
 
     let pump = Rc::new(RefCell::new(Pump::default()));
+    // FIX FIVE / OPT-IN DATA, and this line is the whole of it: the retry ladder lives in the shared
+    // Pump, the DOOR that can discharge a record lives here, and this root is the only one that wires
+    // the door. So this root is also the only one that may create the work. An instrument pump that
+    // cannot finish a retry is never handed one - `retry_arm` returns false before it looks at
+    // anything - which is the same principle the held-switch note states for the funnel, applied
+    // backwards: never install data in a build that has no consumer for it.
+    pump.borrow_mut().retry_enabled = true;
     // AUTOSAVE FROM THE STORED STATE, in both directions. The probe OVERRIDES this bit to true
     // because autosave is what that spike was watching; a product reads it, draws the menu check
     // from it, and lets only the user's Ctrl+T (routed by surface::route_of) change it. Nothing is
@@ -862,7 +869,19 @@ fn main() {
     let settled_at_entry = pump.borrow().saves_settled;
     text_pump(&ui, &gateway, &pump);
     drain(&events, &pump, &ui.as_weak());
-    let dirty_at_exit = pump.borrow().dirty;
+    // FIX FOUR: THE EXIT COULD NOT SEE AN OWED RETRY, and the old comment's promise that "the next
+    // user act carries it" was words this lane had no way to honour - the act that always comes is
+    // THIS one, not another Ctrl+S. The shutdown compare is gated on the buffer against last_sent, and
+    // the send-time adoption exists precisely to make those equal, so a refused write left the compare
+    // clean: this line read the dot, the dot said clean, and the close reported "dirty at exit: false"
+    // while a record was owed. With EDITED_IS_DIRTY_WITNESS false the edited flag cannot carry it
+    // either, so the honest fact is the record itself. Asking for it is also what makes the cap's
+    // terminal state true at close: the door runs in the wait below, so an owed write is ATTEMPTED
+    // before the window goes, instead of being silently dropped by a lane that never looked.
+    let dirty_at_exit = {
+        let p = pump.borrow();
+        p.dirty || p.retry.is_some()
+    };
     let asked = Instant::now();
     while dirty_at_exit
         && pump.borrow().saves == saves_at_entry
@@ -872,6 +891,7 @@ fn main() {
         std::thread::sleep(Duration::from_millis(10));
         text_pump(&ui, &gateway, &pump);
         drain(&events, &pump, &ui.as_weak());
+        retry_door(&gateway, &pump);
     }
     let verdict = {
         let p = pump.borrow();
