@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  notes-gpui app icon: a white capital N on a green rounded square.
+
+  The letter is a PATH, not <text> - deliberately. Any later conversion to
+  .ico / .png sizes (M5a) must not depend on a font being installed, and
+  path geometry renders identically everywhere. The viewBox is 256 so the
+  common icon sizes (16/24/32/48/64/128/256) are whole-number scalings.
+
+  Source artwork for the taskbar/exe icon. Not embedded anywhere yet:
+  embedding owes the M5a decisions (rc.exe vs winres build-dependency door,
+  and the ID-24 manifest trap that keeps bridge-gpui/build.rs empty).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="notes-gpui icon">
+  <rect x="16" y="16" width="224" height="224" rx="52" ry="52" fill="#2EA043"/>
+  <path fill="#FFFFFF" d="M78 58 L104 58 L152 148 L152 58 L178 58 L178 198 L152 198 L104 108 L104 198 L78 198 Z"/>
+</svg>
