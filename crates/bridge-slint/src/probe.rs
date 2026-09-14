@@ -1941,7 +1941,8 @@ mod chords {
     #[test]
     fn the_caption_buttons_reuse_the_existing_doors() {
         // Bounded at BOTH ends: the caption region is not the end of the file, and slicing to
-        // EOF reaches the popup, whose six rows legitimately DO write menu-open - the first
+        // EOF reaches the popup, whose rows legitimately DO write menu-open - the six command
+        // rows AND the recent rows, since the recents moved into the popup - and the first
         // draft of this test failed on exactly that, which is the assertion working as a
         // question about scope rather than about behaviour.
         let start = POPUP
@@ -1980,8 +1981,14 @@ mod chords {
     fn menu_open_has_exactly_one_writing_file() {
         // The single-writer proof, as two greps. Chrome owns its in-out bit; the mounter may
         // read it (the mirrors and the backdrop's visible binding do) but may not assign it,
-        // and every dismissal route - hamburger, six rows, backdrop, Escape - ends inside
-        // chrome.slint. ABOUTSLINT: the same proof now covers TWO bits, and it is exact about
+        // and every dismissal route - hamburger, the six command rows, the recent rows, backdrop,
+        // Escape - ends inside chrome.slint. THE COUNT MOVED 13 -> 14 LINES when the recents came
+        // home, and it moved by ONE line because a capped `for` is one static write, not ten runtime
+        // ones: thirteen write statements (the six handlers, the six command rows, the recent rows)
+        // plus the one line of prose at chrome.slint:171 that quotes the grep - the off-by-one is
+        // documented where it is counted, and the assertion below is exact rather than the loose
+        // floor it used to be, because a floor is exactly what lets a fifth writer in quietly.
+        // ABOUTSLINT: the same proof now covers TWO bits, and it is exact about
         // the new one - Chrome owns all seven writes to about-open (two opens: the row's click
         // and the about-asks door; five closes: backdrop, Escape, the hamburger twice, and the
         // probe's dismissal bump), while the mount assigns none.
@@ -1996,9 +2003,10 @@ mod chords {
             0,
             "the mount reads Chrome's About bit through a binding and never assigns it"
         );
-        assert!(
-            chrome_writes >= 8,
-            "Chrome should own every write; found {chrome_writes}"
+        assert_eq!(
+            chrome_writes, 14,
+            "Chrome owns every write to menu-open, and there are exactly thirteen of them plus one
+             comment that quotes the grep; found {chrome_writes}"
         );
         let outside_writes = MARKUP.matches("menu-open =").count();
         assert_eq!(

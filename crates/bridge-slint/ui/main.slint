@@ -171,13 +171,16 @@ export component Spike inherits Window {
 
     in property <[string]> recents;
     callback open-at-index(int);
-    // Row height is a constant, and the layout is deliberately crude: this is a
-    // spike list to prove the model binds and a click maps back to an index.
-    // NOTE the names: plain `row` is refused - "Cannot override property 'row'",
-    // because Rectangle already answers to a layout-attachment property of that
-    // name. A fifth 1.17 finding, and the reason these are suffixed.
-    property <length> row-h: 15px;
-    property <length> stack-h: root.recents.length * root.row-h;
+    /// THE STACK IS GONE, and the two numbers it owned went with it. The rows used to hang under the
+    // status line, each at `status-line.y + 18px + index * row-h`, and the editor was pushed down by
+    // `stack-h` - a height this file computed from the row count. Since the recents became ROWS OF
+    // THE POPUP (see chrome.slint's recents-shown), the editor stops caring how many files the port
+    // remembers: a list that only shows while a menu is open cannot be allowed to move the text. The
+    // cap, the labels and the empty chord cell are Chrome's business now; this file forwards two
+    // lines and holds the two doors - the property and the callback - that Rust already speaks.
+    // (The 1.17 finding this block used to carry is still true and still cited where it bites:
+    // a plain `row` property name is refused because Rectangle answers to the layout-attachment
+    // property of that name. Chrome hits it on every command row.)
 
     // S6: THE CHORD SCOPE. The nesting IS the mechanism: capture-key-pressed on the
     // OUTERMOST scope runs before the focused child's key handler (events-and-overlays), so
@@ -295,31 +298,15 @@ export component Spike inherits Window {
         font-size: 11px;
     }
 
-    // One row per entry, `for` over the array the port sent.
-    for name[index] in root.recents: Rectangle {
-        x: 0px;
-        y: status-line.y + 18px + index * root.row-h;
-        width: parent.width;
-        height: root.row-h;
-        Text {
-            x: 6px;
-            vertical-alignment: center;
-            text: name;
-            color: Theme.text-row;
-            font-size: 11px;
-        }
-        TouchArea {
-            clicked => {
-                root.open-at-index(index);
-            }
-        }
-    }
-
+    // THE EDITOR, at full height: one row per entry no longer lives here. The recents crossed into
+    // the popup with this edit, so the only thing between the status line and the text is the 18px
+    // the status line always needed - the row count is Chrome's to lay out and the popup's to show,
+    // and a menu that opens over the text cannot also be allowed to shove it down.
     editor := TextEdit {
         x: 0px;
-        y: status-line.y + 18px + root.stack-h;
+        y: status-line.y + 18px;
         width: parent.width;
-        height: parent.height - status-line.y - 18px - root.stack-h;
+        height: parent.height - status-line.y - 18px;
         font-size: 14px;
         // S10, PARITY: no wrapping. Not a style choice - the whole project never wrapped
         // (editor.rs:883 puts word wrap out of scope) and the first bridge never had it, so
@@ -398,6 +385,11 @@ export component Spike inherits Window {
         autosave: root.autosave;
         why-not-saved: root.why-not-saved;
         file-words: root.file-words;
+        // THE RECENTS, forwarded - not re-decided. Same one-way rule as every other fact on this
+        // mount: the array Rust loaded from the port goes INTO Chrome, and the pick comes back OUT
+        // as an index through the callback this file already owns for Alt+1..0. Two lines, no
+        // arithmetic: the cap and the layout are Chrome's, the labels are core's.
+        recents: root.recents;
         // C1: Chrome carries a pin STATE, never a window level - nothing in this file
         // names always-on-top or a level, and notes-platform stays the one
         // WS_EX_TOPMOST writer. The bool Chrome hands back is the WIDGET'S GUESS at
@@ -432,6 +424,13 @@ export component Spike inherits Window {
         }
         clear-recents-asked => {
             root.clear-recents-asked();
+        }
+        // A recent row, now Chrome's, lands on the SAME door the chords fire above (Alt+1..9, then
+        // Alt+0 for the tenth) - which is the whole reason the rows could move without touching
+        // surface.rs: there was already one way to open number three, and a click joined it instead
+        // of replacing it. Chrome closed its own popup on the way out, as it does for every row.
+        open-at-index(index) => {
+            root.open-at-index(index);
         }
         quit-asked => {
             root.quit-asked();

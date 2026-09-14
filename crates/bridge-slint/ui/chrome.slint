@@ -100,6 +100,21 @@ export component Chrome inherits Rectangle {
     in property <string> why-not-saved: "";
     in property <string> file-words: "";
 
+    /// THE RECENTS, moved home. The README has described this surface as the menu holding
+    /// "recent files (up to 10) with Clear" from the first draft, and for five slices the rows
+    /// lived OUTSIDE it - a stack under the status line, computed by main.slint, which pushed the
+    /// editor down and dismissed nothing. Here they are rows of the popup: they hang under the six
+    /// command rows and above the footer (ACTS OVER PROSE - see footer-y below), and a pick closes
+    /// the menu the way every other act does. The labels are core's words verbatim, built by
+    /// recents_rows in surface.rs, and no path crosses into markup: an index is what maps back to
+    /// a file, which is the same rule the stack followed.
+    in property <[string]> recents;
+
+    /// A recent row was clicked. Chrome fires the index and asks nothing else - main.slint
+    /// forwards this to its OWN open-at-index(int), the very callback Alt+1..0 reach, so a pointer
+    /// and a chord cannot grow two answers to "open number three".
+    callback open-at-index(int);
+
     // ---- what the bar may decide by itself --------------------------------------
     // 'in-out', not 'in': a handler may not assign an 'in' property (this bridge's own
     // finding 3), and the menu is local state - it opens a list of things the app already
@@ -589,10 +604,17 @@ export component Chrome inherits Rectangle {
         height: parent.height;
     }
 
-    // ---- THE POPUP: six rows - the port's vocabulary, then the licence's ------------
+    // ---- THE POPUP: six command rows, then the list, then the licence's -----------------
     // Open / Save As / Auto-save / Clear recents / Quit (titlebar.rs:183, with Clear under
     // the recents it acts on and Quit last), and a SIXTH row the model does not have: About
-    // Slint - there because the royalty-free licence's section 2(a) asks for an About screen
+    //
+    // "WITH CLEAR UNDER THE RECENTS IT ACTS ON" IS NOW TRUE OF THIS SURFACE, and it was not
+    // until today: the model always showed the recent files above that row, and this bridge
+    // kept them in a stack on the window instead, so the row named a list the menu did not
+    // hold. The six COMMAND rows are still six, and the probe still counts them that way -
+    // the recents are rows of the popup but not of the vocabulary, and they hang below the
+    // grid rather than inside it (see the block, and the cap above the menu Rectangle).
+    //    // Slint - there because the royalty-free licence's section 2(a) asks for an About screen
     // reachable from the top level menu, and this menu IS this app's top level menu.
     // SIX is the row count, and it is still the row count: what was added on 2026-09-14 is a
     // FOOTER below them (§4.4's reason, and the FileMeta verdict), which asks for nothing and is
@@ -671,16 +693,58 @@ export component Chrome inherits Rectangle {
         ? 0px
         : 1px + Theme.menu-gap + notes.min-height;
 
+    // ---- THE RECENTS' SIZE, capped at FIVE -------------------------------------------------
+    // THE CAP IS GEOMETRY, NOT THE MODEL. The port hands up to ten (recents_rows' MAX_RECENTS, ten
+    // because there are ten doors) and this file may not ask the window how tall it is - the same
+    // rule that makes host-height an in-property - so the popup hangs FIVE rows and no more below a
+    // 28px band. Entries six..ten are therefore reachable and undrawn: Alt+6..0 still open them, and
+    // that is a divergence, said here rather than smoothed over. It wants a clamp on host-height
+    // the day a bar is given a window height it can trust; until then the constant is honest about
+    // being a constant.
+    //
+    // 1.17 has NO array-slice builtin to cut the model with (no subarray/slice in builtins or the
+    // style library), so the cap is spent TWICE: once in this arithmetic, once in the per-row
+    // visibility guard below. Zero entries cost ZERO - no row, no leading gap, no separator. That is
+    // menu.rs:280's "no dangling separator" in the shape this toolkit has, and surface.rs guards it.
+    property <int> recents-shown: Math.min(root.recents.length, 5);
+    property <length> recents-height: root.recents-shown <= 0 ? 0px
+        : root.recents-shown * Theme.menu-row-height
+            + (root.recents-shown - 1) * Theme.menu-gap;
+    /// THE SEAM IS READ, NOT RE-WRITTEN. This block used to state `menu-pad + 6 * row-height +
+    /// 5 * gap` a third time to know where the rows end, and a property is cheap until someone
+    /// changes the row count: the footer lane already guards that exact expression by COUNTING it in
+    /// this file (plumbing.rs's the_footer_explains_and_asks_for_nothing), which is the repo's way
+    /// of saying a third copy is two too many. So the grid is named and its own y+height is asked -
+    /// the rows now own their measure, and the popup below the grid can only follow it.
+    /// Local to the menu Rectangle, because `rows` lives there; the recents block reaches it as
+    /// `menu.rows-bottom`, and there is no cycle to fear: the grid's height is the literal, and
+    /// nothing above derives from this line.
+    /// ACTS OVER PROSE, and nothing had to be re-anchored to get it: the footer hangs off
+    /// `parent.height - footer-height`, so it stays LAST the moment the popup's height spends a term
+    /// for this block. That is why the recents are inserted ABOVE it by being measured from the row
+    /// seam below, while the footer keeps its own anchor from the bottom - two blocks, one order,
+    /// no arithmetic shared between them to drift.
+
     menu := Rectangle {
+        /// Where the six command rows stop - the seam every block below the grid measures
+        /// from. READ off the grid (`rows.y + rows.height`), not re-stated: a third copy of the row
+        /// arithmetic is two too many, and the footer lane already counts that expression in this
+        /// file. The grid owns its measure; everything under it can only follow.
+        property <length> rows-bottom: rows.y + rows.height;
+
         x: root.popup-x;
         y: parent.height;
         width: Theme.menu-width;
-        // SIX rows (the 6th is About, and it is the licence's row - see the import above), so both
-        // numbers move together: the count of rows and the count of gaps between them. One constant
-        // per row, one less gap, and the test that counts writes to menu-open moves with this line
-        // rather than after it. The footer hangs below that arithmetic and grows it, which is why it
-        // is one term outside it rather than two more rows inside it.
+        // SIX command rows (the 6th is About, and it is the licence's row - see the import above),
+        // so both numbers move together: the count of rows and the count of gaps between them. One
+        // constant per row, one less gap, and the test that counts writes to menu-open moves with
+        // this line rather than after it. Then TWO things hang below that arithmetic and grow it:
+        // the capped recents block and the footer, each one term outside the row count rather than
+        // rows inside it - the recents because they are a list and not vocabulary, the footer
+        // because it asks nothing. Both terms are zero when there is nothing to say or nothing to
+        // open, which is the no-dangling-separator rule paying rent in a height formula.
         height: Theme.menu-pad * 2 + 6 * Theme.menu-row-height + 5 * Theme.menu-gap
+            + (root.recents-shown > 0 ? Theme.menu-gap + root.recents-height : 0px)
             + (root.note-lines > 0 ? Theme.menu-gap + root.footer-height : 0px);
         visible: root.menu-open;
         background: Theme.menu-bg;
@@ -688,11 +752,16 @@ export component Chrome inherits Rectangle {
         border-width: 1px;
         border-color: Theme.bar-edge;
 
-        GridLayout {
+        rows := GridLayout {
             x: Theme.menu-pad;
             y: Theme.menu-pad;
             width: parent.width - Theme.menu-pad * 2;
-            height: parent.height - Theme.menu-pad * 2;
+            // THE ROWS REGION, stated once. This used to be `parent.height - pad * 2`, which was
+            // exact while the popup's height WAS the row arithmetic; the moment the footer grew the
+            // popup it would have stretched six rows to fill a box grown for a seventh thing. An
+            // explicit height keeps the rows the size the constants say and leaves the footer's
+            // reserved tail alone.
+            height: 6 * Theme.menu-row-height + 5 * Theme.menu-gap;
             spacing-vertical: Theme.menu-gap;
             spacing-horizontal: Theme.gap;
 
@@ -739,6 +808,37 @@ export component Chrome inherits Rectangle {
             row-about := TouchArea { col: 0; row: 5; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.about-open = true; root.menu-open = false; } }
         }
 
+        // ---- ROWS 6.. : THE RECENTS, home at last ------------------------------------------------
+        // The list is a SIBLING of the grid, not more rows inside it, and that is the one 1.17
+        // finding this move had to respect: a GridLayout sizes its rows from the children it can
+        // count at compile time, and `row: 6 + index` over a runtime-length model is a row count
+        // nobody can count. Mixing literal and computed rows is exactly the compiler rabbit hole an
+        // earlier draft of this change died in, so the rows take the shape the stack already proved
+        // it could compile - absolute y, one block, no layout attached - and the popup pays for it
+        // in the one height term above.
+        //
+        // THE CHORD CELL IS EMPTY, and the emptiness is the binding: recents_rows builds the label
+        // as "3. <core's own display>" so the NUMBER a person reads and the index the row fires are
+        // one expression, born together (the parity note in surface.rs; menu.rs:88-90 says the same
+        // about the first bridge). Printing "Alt+3" beside it would be a hand-copied second copy of
+        // a fact the row already starts with, and the chord table would then be claiming a key for
+        // an act whose key is a slot. The empty cell keeps Quit's and About's shape for a reason.
+        for name[index] in root.recents: Rectangle {
+            x: Theme.menu-pad;
+            y: menu.rows-bottom + Theme.menu-gap + index * (Theme.menu-row-height + Theme.menu-gap);
+            width: parent.width - Theme.menu-pad * 2;
+            height: Theme.menu-row-height;
+            // The cap, spent the second time (see recents-shown): rows six..ten exist in the model,
+            // are reachable by chord, and are not painted. Absolute placement is what makes an
+            // invisible row cost nothing - inside a layout it would still hold its cell.
+            visible: index < root.recents-shown;
+
+            Rectangle { width: parent.width; height: parent.height; background: Theme.hover-bg; opacity: row-recent.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
+            Text { x: 0px; vertical-alignment: center; text: name; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; overflow: elide; }
+            Text { x: 0px; width: parent.width; horizontal-alignment: right; vertical-alignment: center; text: ""; color: Theme.text-muted; font-size: 1rem * Theme.font-scale-menu; }
+            row-recent := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.open-at-index(index); root.menu-open = false; } }
+        }
+
         // ---- THE FOOTER: the one block in this popup that asks for nothing ----------------------
         // Sibling of the GridLayout, placed by the same arithmetic the height above spends. The 1px
         // hairline of Theme.bar-edge on top - the line the popup's own border is drawn with - is what
@@ -751,7 +851,12 @@ export component Chrome inherits Rectangle {
         // costs nothing, which is the same reason notes.min-height is trusted here.
         footer := Rectangle {
             x: Theme.menu-pad;
-            y: Theme.menu-pad + 6 * Theme.menu-row-height + 5 * Theme.menu-gap + Theme.menu-gap;
+            // Anchored to the BOTTOM, because the popup's height already reserved exactly this much
+            // tail (see the height above: gap + footer-height). Computed from the top instead, the
+            // footer would sit at the nominal end of the row arithmetic and any difference between
+            // that and the layout's own measure would slide it into the last row - which is what the
+            // first render of this block did, by 4px.
+            y: parent.height - root.footer-height;
             width: parent.width - Theme.menu-pad * 2;
             height: root.footer-height;
             visible: root.note-lines > 0;

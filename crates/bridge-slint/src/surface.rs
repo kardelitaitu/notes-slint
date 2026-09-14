@@ -2460,10 +2460,11 @@ mod tests {
     #[test]
     fn an_empty_recent_list_leaves_nothing_to_divide() {
         // menu.rs:280's "no dangling separator", in the shape this toolkit has. There is no
-        // separator ELEMENT in these rows; the thing that would dangle is the STACK'S HEIGHT - the
-        // gap the rows push the editor down by - and main.slint computes it as row count times row
-        // height. Zero rows is zero gap, which is the same claim, and the builder must not invent
-        // a placeholder to fill it.
+        // separator ELEMENT in these rows, and since the recents moved into the popup the thing that
+        // would dangle is no longer a gap over the EDITOR at all - it is the popup's own height, which
+        // chrome.slint grows by one capped block when the list is non-empty and by NOTHING when it is
+        // empty. Same claim, new owner: zero rows must cost zero height, and the builder must not
+        // invent a placeholder to fill it.
         assert!(recents_rows(&[]).is_empty(), "no entries, no rows");
         assert!(
             recents_rows(&Vec::new()).is_empty(),
@@ -2480,9 +2481,29 @@ mod tests {
             1,
             "one row, when there is one"
         );
+        // THE CAP GUARD, read off the file that owns the cap now. This assertion used to read
+        // main.slint's stack height; the stack is gone, so reading the mount would prove nothing
+        // about an empty list. The cap lives in chrome.slint, which main.slint's MARKUP const does
+        // not include - hence the local read below, the same pattern the drag guards use
+        // (`the_drag_closes_the_popup_once_per_gesture` and
+        // `the_drag_band_stops_where_the_caption_begins` both include_str! the bar).
+        let popup = include_str!("../ui/chrome.slint");
         assert!(
-            MARKUP.contains("property <length> stack-h: root.recents.length * root.row-h"),
-            "the gap IS the row count, so an empty list cannot leave a rule hanging over the editor"
+            popup.contains("property <int> recents-shown: Math.min(root.recents.length, 5)"),
+            "the popup's height IS the row count, capped at the five it can hang - so an empty list
+             cannot leave a gap in the menu, and a ten-entry list cannot overflow the popup"
+        );
+        // AND PERMANENCE, the negative half: the stack must not come back as a second copy of the
+        // list. `stack-h`/`row-h` are matched as DECLARATIONS, not as words - this file's own
+        // comments name the old shape, and a guard that only passes when nobody explains anything
+        // is a guard that punishes documentation.
+        assert!(
+            !MARKUP.contains("property <length> stack-h"),
+            "the editor's offset must not be re-computed from the row count: one list, one home"
+        );
+        assert!(
+            !MARKUP.contains("for name[index] in root.recents"),
+            "no second rendering of recents in the mount"
         );
         // The needle names the empty case as empty instead of printing a slot range that does not
         // exist. "slots 1..=0" is the bug this line forbids.
