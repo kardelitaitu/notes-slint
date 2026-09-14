@@ -119,3 +119,25 @@ only pointer door to a chord disappear without a line said about it.
   (overlapping the pin).
 - Whether `Recent Files >` keeps `Alt+1..0` pointing at files or pointing at the panel.
 - Where `Ctrl+T` lives visually once its row is gone, and whether the table drops the row with it.
+
+## The answers, from the human (round 13)
+
+- **`Ctrl+S` -> `Save`, `Save As` -> `Ctrl+Shift+S`.** Approved explicitly ("= yes"), which
+  settles the chord reassignment this note named as unavoidable. Consequence to carry in: the row moves
+  in `SHORTCUTS`, so both bridges' legends, the synthetic driver that walks the table, `route_of`
+  and `39239fd5`'s crossing guard all see the change together - which is what that guard is for.
+- **"new tab" means opening another `.notes` goes into a new tab rather than replacing the document
+  in this window.** Read plainly that IS the declared non-goal - "Tabs or multiple documents per
+  window" in AGENTS.md - so this section is the paragraph that non-goal asks for, not an
+  implementation. What it reaches, in the order the cost grows: (1) `core` owns ONE `Document` and
+  the engine one epoch/generation pair, so a tab makes the unit of identity stop being the window;
+  (2) persistence is one file per window - `session.json` stores one `path` and one `rect`, and
+  the autosave witness (dirty, armed, save-failed) is one set of bits, which is precisely what
+  ADR-0001's arming rule and this menu's footer render - so both become per-tab and the footer has to
+  say WHICH tab it is explaining; (3) the pin means "this window, on top, with this file", `Alt+1..0`
+  address slots in one list, and Quit means the window - three meanings to negotiate; (4) then the UI:
+  a tab strip, per-tab state, and rows meaning "open here" vs "open in a new tab", which is what the
+  toggle in the row list is for.
+
+  None of that is a menu change. The menu is only the first place the decision becomes visible, which
+  is probably why it arrived as a menu row.
