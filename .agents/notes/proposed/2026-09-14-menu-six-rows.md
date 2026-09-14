@@ -35,7 +35,7 @@ then, and the footer's "Save As once and it keeps saving" copy changes to name t
 `api` (a new `Command`), both bridges' `describe` arms, `route_of`, the chord table.
 
 **`Recent Files >` — a submenu, not inline rows.** This is the one that un-builds recent work rather
-than extending it: the recents are currently six-of-ten rows *inside* the popup, which is what the
+than extending it: the recents are currently five-of-ten rows *inside* the popup, which is what the
 height clamp (`519df1c7`), the y bound (`140106fd`) and the About x rule (`5c8cf189`) were all sized
 around. A submenu means a second surface that opens beside the popup, its own placement against the
 host on both axes, its own dismissal, and — because 1.17's `PopupWindow` is a separate native window
@@ -43,6 +43,12 @@ while our popup is a `Rectangle` — a child-window question the current `no-fra
 has never answered. The chord law also moves: `Alt+1..0` currently opens slots 1..10 with the number
 printed *in the label*; under a submenu the chord opens a hidden panel, or it still opens the file
 with no visible row to point at. Worth deciding on purpose rather than discovering mid-edit.
+
+The count above is the audit's correction, not the author's find: this line said six-of-ten when the
+note was written, and the shipped cap is FIVE — `Math.min(5, root.recents-fit)` at chrome.slint:798,
+drawn from `recents-fit` at :791. Ten still exist in the model (`MAX_RECENTS`), and the rows six..ten
+are the reachable-undrawn ones the same file names at :700; the popup has never drawn more than five
+of them, so every number sized "around" this list sizes around five.
 
 **`Open in new tab toggle` — a declared non-goal, so it cannot be built from a chat line.**
 AGENTS.md: "Deliberate non-goals: **Tabs or multiple documents per window**", and the instruction that
