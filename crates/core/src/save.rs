@@ -613,35 +613,151 @@ mod tests {
         }
     }
 
+    /// (4) What the witness is waiting for. The child prints this ONLY after File::Open has
+    /// returned, so seeing it means the handle exists; it has never meant anything less.
+    #[cfg(windows)]
+    const HELD: &str = "HELD-OPEN";
+
+    /// How long to wait for that token before calling the run unjudgeable. 15 s is not a guess at
+    /// the disk: it is ~10x the slowest handshake measured here (a cold .NET first touch inside a
+    /// freshly started shell), and it replaces a FIXED 2 s sleep that could not tell a slow start
+    /// from a lost race - which is the whole failure mode under review. A cap, not a sleep, also
+    /// means a machine with no shell at all fails in milliseconds: both spawn attempts error
+    /// before any waiting happens.
+    #[cfg(windows)]
+    const HANDSHAKE_CAP: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// The holder, as a separate process, because std cannot set share modes: PowerShell's
+    /// File::Open with FileShare::Read takes the handle the product's rename must not be able to
+    /// replace. (2) Its stdout AND stderr go to a file, not to a pipe and not to null: a pipe
+    /// nobody drains can block the child on a verbose error, and nulling them - what this test
+    /// used to do - is how a policy block, a type that would not resolve, and a slow cold start
+    /// all came to look identical to a held file. (3) pwsh first, then Windows PowerShell 5.1,
+    /// which is the probe this repo already runs in xtask/src/smoke.rs:940-953, for the reason it
+    /// states there: a runner may ship either, and neither is a dependency of this crate.
+    ///
+    /// Returns the child plus the log path, or the two spawn errors if neither shell exists.
+    #[cfg(windows)]
+    fn hold_the_file_open(
+        target: &std::path::Path,
+        log: &std::path::Path,
+    ) -> Result<(std::process::Child, &'static str), Vec<String>> {
+        let path = target.display().to_string();
+        let script = format!(
+            "$ErrorActionPreference='Stop'; try {{ $f = [System.IO.File]::Open('{path}', 'Open', 'Read', 'Read'); [Console]::Out.WriteLine('{HELD}'); [Console]::Out.Flush(); Start-Sleep -Seconds 30; $f.Close() }} catch {{ [Console]::Error.WriteLine(\"OPEN-FAILED: \" + $_.Exception.Message); exit 3 }}",
+        );
+        let mut failures = Vec::new();
+        for program in ["pwsh", "powershell"] {
+            let log_file = match std::fs::File::create(log) {
+                Ok(f) => f,
+                Err(e) => {
+                    failures.push(format!("{program}: cannot create the holder log: {e}"));
+                    continue;
+                }
+            };
+            // One file description, shared by both streams: a try_clone keeps stdout and stderr
+            // in the order the child wrote them, where opening the log a second time would let
+            // them land in whichever order the OS felt like. And still no pipe, for the reason in
+            // the doc above.
+            let stderr_log = match log_file.try_clone() {
+                Ok(clone) => clone,
+                Err(err) => {
+                    failures.push(format!("{program}: cannot clone the holder log: {err}"));
+                    continue;
+                }
+            };
+            let spawned = std::process::Command::new(program)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    &script,
+                ])
+                .stdout(std::process::Stdio::from(log_file))
+                .stderr(std::process::Stdio::from(stderr_log))
+                .spawn();
+            match spawned {
+                Ok(child) => return Ok((child, program)),
+                Err(e) => failures.push(format!("{program}: {e}")),
+            }
+        }
+        Err(failures)
+    }
+
+    /// (1) The handshake, bounded. Reads the log until the token appears, and reports how long
+    /// that took so the cost of this wait is a measured number and not a rumor. Anything that
+    /// stops the token from ever arriving - a shell that died, an exception in the script, no
+    /// shell at all - is a HARNESS failure and is said as one, with the child's own words in the
+    /// message. This never returns false and never skips: an unjudgeable run stays red.
+    #[cfg(windows)]
+    fn wait_until_held(child: &mut std::process::Child, program: &str, log: &std::path::Path) {
+        let began = std::time::Instant::now();
+        loop {
+            let said = std::fs::read_to_string(log).unwrap_or_default();
+            if said.contains(HELD) {
+                eprintln!(
+                    "holder: {program} confirmed the open in {:?}",
+                    began.elapsed()
+                );
+                return;
+            }
+            // A child that already exited cannot produce the token, so say so with its status and
+            // its output rather than waiting out the cap.
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!(
+                    "the holder never confirmed the open - the refusal was NOT JUDGED ({program} exited {status} before printing {HELD}; it said: {said})"
+                );
+            }
+            if began.elapsed() >= HANDSHAKE_CAP {
+                panic!(
+                    "the holder never confirmed the open - the refusal was NOT JUDGED ({program} printed no {HELD} within {HANDSHAKE_CAP:?}; it said: {said})"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
     /// M1, end to end: a target held open by another PROCESS with share-read
-    /// only (PowerShell's File::Open with FileShare::Read — std cannot set
+    /// only (PowerShell's File::Open with FileShare::Read - std cannot set
     /// share modes) fails the save with Locked, and the previous bytes
     /// survive. This is the real Windows autosave failure, not a synthesis.
+    ///
+    /// WHY THE TEST, AND NOT THE SAVE PATH, IS THE THING THAT CHANGED. The product write is a
+    /// single std::fs::rename (save.rs:206) - MoveFileExW with REPLACE_EXISTING - and that needs
+    /// DELETE access on the destination, so it does refuse while a handle without FILE_SHARE_DELETE
+    /// is open. Nothing about that is in doubt here, and nothing below loosens it. What the first CI
+    /// run on windows-latest actually showed was a witness that had been weakened to a sleep: the
+    /// child's streams were nulled, its exit status was never read, and no line ever confirmed the
+    /// open, so "the save succeeded" could have meant either a bug in save_document or a handle that
+    /// was never taken. Those two now print different sentences, and only one of them is a product
+    /// bug.
     #[cfg(windows)]
     #[test]
     fn locked_target_reports_locked_end_to_end() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let target = dir.path().join("n.notes");
         std::fs::write(&target, b"previous good bytes")?;
-        let path_for_ps = target.display().to_string();
-        let mut holder = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "$f = [System.IO.File]::Open('{path_for_ps}', 'Open', 'Read', 'Read'); Start-Sleep -Seconds 30; $f.Close()",
-                ),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        // Give the holder a moment to actually open the file.
-        std::thread::sleep(std::time::Duration::from_millis(2_000));
+        let log = dir.path().join("holder.log");
+        let (mut holder, program) = match hold_the_file_open(&target, &log) {
+            Ok(got) => got,
+            Err(failures) => panic!(
+                "the holder never confirmed the open - the refusal was NOT JUDGED (no shell could start: {})",
+                failures.join("; ")
+            ),
+        };
+        wait_until_held(&mut holder, program, &log);
         let result = save_document(&target, "new", det(TextEncoding::Utf8, false));
         let _ = holder.kill();
         let _ = holder.wait();
         let Err(e) = result else {
-            panic!("a target held open without share-delete must refuse the save");
+            // The other half of (4): the handle WAS confirmed held, and the save went through
+            // anyway. That is the product talking, and it must never be confused with the
+            // harness failing above.
+            panic!(
+                "THE SAVE SUCCEEDED while {program} had {HELD}: a confirmed held handle did not refuse the rename - this is a bug in save_document, not in the test"
+            );
         };
         assert_eq!(e, SaveError::Locked, "the Locked copy must be reachable");
         assert_eq!(std::fs::read(&target)?, b"previous good bytes");
