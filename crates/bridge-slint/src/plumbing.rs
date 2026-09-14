@@ -713,6 +713,92 @@ mod tests {
         );
     }
 
+    /// THE LEGEND CROSSING: what the popup PRINTS against what the port BINDS.
+    ///
+    /// `probe.rs:2493 legend_names_every_bound_chord_and_nothing_else` already guards the table
+    /// against `legend()`, and that is a fair guard of two things generated from one source - if a
+    /// row is deleted, both move together and the test stays green. The popup's four chord cells are
+    /// the third place, and the only one written BY HAND, in a language the table cannot reach:
+    /// rebind Ctrl+T to Ctrl+A in Rust and the legend prints the truth while the menu keeps saying
+    /// Ctrl+T for as long as nobody looks. chrome.slint:843-845 states the law this enforces -
+    /// "a label names a key the map binds, or the legend lies" - and until now nothing checked it
+    /// across the seam.
+    ///
+    /// The table is read as a constant, not as text: `SHORTCUTS` is `pub(crate)`, so this compares
+    /// against the same bytes `route_of` dispatches on rather than against a grep of a comment.
+    #[test]
+    fn the_popup_advertises_only_chords_the_table_actually_binds() {
+        let chrome = include_str!("../ui/chrome.slint");
+        let quoted = |line: &str| -> String {
+            let after = line
+                .split_once("text:")
+                .unwrap_or_else(|| panic!("a chord cell with no text: {line}"))
+                .1;
+            after
+                .split_once('"')
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(inner, _)| inner.to_string())
+                .unwrap_or_else(|| panic!("a chord cell with no quoted text: {line}"))
+        };
+        // The six rows' chord cells. `col: 1; row:` is the grid's own spelling and nothing else in
+        // the file uses it: the recents hang outside the grid, and their cell is placed by x.
+        let cells: Vec<String> = chrome
+            .lines()
+            .filter(|line| line.contains("col: 1; row:"))
+            .map(quoted)
+            .collect();
+        assert_eq!(
+            cells.len(),
+            6,
+            "six rows, six chord cells - a seventh would mean the grid grew past the popup's height"
+        );
+
+        let advertised: Vec<&str> = cells
+            .iter()
+            .map(String::as_str)
+            .filter(|cell| !cell.is_empty())
+            .collect();
+        let bound: Vec<&str> = crate::surface::SHORTCUTS
+            .iter()
+            .map(|(_, display, _, _)| *display)
+            .filter(|display| !display.starts_with("Alt+"))
+            .collect();
+
+        assert_eq!(
+            advertised.len(),
+            bound.len(),
+            "the menu advertises {advertised:?} while the table binds {bound:?}"
+        );
+        for cell in &advertised {
+            assert!(
+                bound.iter().any(|display| display == cell),
+                "the popup prints {cell}, which nothing binds: the legend would be lying"
+            );
+        }
+        for display in &bound {
+            assert!(
+                advertised.contains(display),
+                "{display} is bound and routed but the menu has no cell for it - a chord with no row \
+                 is a key nobody finds, which is the other half of the same lie"
+            );
+        }
+
+        // The two cells that are deliberately empty, and the count that keeps them that way: Quit has
+        // no Command and About has no chord (probe.rs:2082 names both absences). If a third row goes
+        // quiet, or one of these gains a key it does not have, this is the line that asks why.
+        assert_eq!(
+            cells.iter().filter(|cell| cell.is_empty()).count(),
+            2,
+            "exactly Quit and About advertise no key"
+        );
+        // And the recents' cell stays empty forever, which is not an omission but the binding:
+        // recents_rows labels a row "3. <name>" so the number read and the slot fired are one
+        // expression, and printing "Alt+3" beside it would hand-copy that fact a second time.
+        assert!(
+            cells.iter().all(|cell| !cell.starts_with("Alt+")),
+            "no chord cell in the popup names an Alt slot; the number lives in the label"
+        );
+    }
     /// THE WIDER PANEL GETS THE CLAMP THE NARROWER ONE WAS SUPPOSED TO HAVE. Two claims live here,
     /// and the second is arithmetic rather than taste: `popup-x`'s floor (8px) sits ABOVE the inset
     /// (4px) its ceiling is capped against, so `Math.max(8, Math.min(4, host-198))` returns 8 on
