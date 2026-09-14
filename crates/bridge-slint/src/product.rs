@@ -561,6 +561,9 @@ fn main() {
     let tick_dialog_rx = Rc::clone(&dialog_rx);
     let tick_focus = Rc::clone(&focus_budget);
     let tick_settle = Rc::new(RefCell::new(Settle::default()));
+    // B-S5: one refusal sentence per unfit episode, not one per wake. The reader that uses it is in
+    // the geometry block below, beside the mirrors it reads.
+    let tick_about_said = Rc::new(Cell::new(false));
     // B-S3a: the size THIS root asked the window for, kept only so the first baseline can be
     // compared against the request it is supposed to answer. Copy, and read-only from here on.
     let tick_want = want;
@@ -683,7 +686,7 @@ fn main() {
                 // then overruled". One line, on the wake that seeds, never again this run.
                 if wake == Wake::Baseline && floored_says(tick_want, measured) {
                     report(&format!(
-                        "geometry: floored {:.0}x{:.0} -> {}x{} (not the size the restore asked for)",
+                        "geometry: floored {:.0}x{:.0} -> {}x{} (Slint's own window.size(), NOT an OS frame measurement - the window on screen can be smaller; not the size the restore asked for)",
                         tick_want.width, tick_want.height, measured.w, measured.h
                     ));
                 }
@@ -704,6 +707,35 @@ fn main() {
                         since_send.is_some_and(|ago| ago >= GEOMETRY_FORCE)
                     ));
                 }
+            }
+            // B-S5: THE MIRRORS' FIRST READER. chrome.slint now gates the ACT - row 5's press and
+            // the about-asks door both ask about-fits before they raise the panel - and a gate that
+            // changes nothing on screen leaves the person holding a row that did nothing. Somebody
+            // has to say why, and it cannot be the write that did not happen. So this reads BOTH
+            // sides: Chrome's own width flag, through the out mirror B-S2 opened for exactly this
+            // (the first reader that mirror has ever had), and the rect this wake measured; then it
+            // says the reason once per unfit episode, on the status line the pin refusal already
+            // uses (surface.rs "pin refused: {reason}") and in the log where the numbers live.
+            //
+            // THE ASYMMETRY, STATED NOT HIDDEN: a refused POINTER press leaves no trace Rust can
+            // see - the bit simply never changes, and a row that declined emits nothing - so the
+            // sentence is keyed to the state a person is looking at (popup open, row on screen,
+            // host too small for what the row offers) rather than to the press itself. The Rust-side
+            // door gets the same words for the same reason. Nothing here reads a 340/260 literal out
+            // of markup: the two need_* numbers are the floor's own consts, which
+            // the_floor_contract... proves sit at or above the panel's parsed demand.
+            let (need_w, need_h) = (FLOOR_WIDTH as u32, FLOOR_HEIGHT as u32);
+            let unfit = measured.w < need_w || measured.h < need_h || ui.get_about_overflow();
+            if unfit && ui.get_menu_shown() && !tick_about_said.get() {
+                tick_about_said.set(true);
+                report(&format!(
+                    "about: declined - the licence box needs {}x{} of host, this window measured {}x{}, and Chrome's own width flag says overflow={}",
+                    need_w, need_h, measured.w, measured.h, ui.get_about_overflow()
+                ));
+                ui.set_status("about: this window is too small to hold the licence".into());
+            }
+            if !unfit {
+                tick_about_said.set(false);
             }
         }
         drain(&tick_events, &tick_pump, &ui.as_weak());
@@ -1234,6 +1266,102 @@ mod tests {
         assert!(
             chrome_squeezed.contains("inproperty<bool>about-raised:root.host-height>0px&&root.popup-top(about.height)<Theme.bar-height;"),
             "about-raised, the vertical twin, also had better still read the same thing"
+        );
+    }
+
+    /// B-S5: the licence act is GATED on the panel's own two demand terms, the gate WRAPS the two
+    /// existing writes instead of adding a third surface, and the refusal SPEAKS through a reader of
+    /// the mirrors B-S2 opened. Four separate claims, because four separate things could rot.
+    #[test]
+    fn the_about_act_is_gated_on_the_panels_own_terms_and_the_decline_speaks() {
+        let chrome = include_str!("../ui/chrome.slint");
+        let chrome_squeezed = squeezed(chrome);
+        let whole = include_str!("product.rs");
+        let head = &whole[..whole
+            .find("mod tests")
+            .expect("product.rs lost the mod tests block this guard reads")];
+
+        // 1. THE GATE ITSELF, read as ORDERING on the panel's own numbers - never as equality, and
+        // never as a copy of them. The width term is about.width with no padding; the height term is
+        // about.height plus the ONE menu-gap popup-top keeps below it; the border is not a term
+        // because a Slint Rectangle draws it centered on the edge, so the box already includes it.
+        // The leading host-width <= 0px clause is the unknown-host case: it FITS, because a gate
+        // that refuses on its own missing measurement is worse than no gate.
+        assert!(
+            chrome_squeezed.contains("property<bool>about-fits:root.host-width<=0px||(root.host-width>=about.width&&root.host-height>=about.height+Theme.menu-gap);"),
+            "about-fits no longer compares the host against about.width and about.height plus one Theme.menu-gap with >=: the gate was replaced by a literal, or turned into an equality"
+        );
+        // squeezed() eats newlines too, so the binding has to be cut out by its own delimiters
+        // rather than read as a line: from the declaration's colon to the semicolon that ends it.
+        let predicate = chrome_squeezed
+            .split_once("property<bool>about-fits:")
+            .map(|(_, rest)| rest.split(';').next().unwrap_or(""))
+            .expect("about-fits is gone from chrome.slint; nothing gates the About act");
+        for restated in ["340", "260", "262"] {
+            assert!(
+                !predicate.contains(restated),
+                "the gate now carries the literal {restated}: a copied demand drifts the day the panel is resized, which is the whole reason the flags were mirrored"
+            );
+        }
+
+        // 2. WRAPPED, NOT ADDED. probe.rs counts LINES CONTAINING the open-write substring and pins
+        // the total, so a third open - or an else branch that writes it, or a comment that spells it
+        // - goes red over there. This is the local half of the same claim: exactly two sites raise
+        // the panel, both are inside the gate on the SAME line, and neither has an else.
+        let opens: Vec<&str> = chrome
+            .lines()
+            .filter(|line| line.contains("about-open = true"))
+            .collect();
+        assert_eq!(
+            opens.len(),
+            2,
+            "the licence is now opened from {} places, and the census in probe.rs expects the two              it counts (the about-asks door and row 5)",
+            opens.len()
+        );
+        for line in &opens {
+            assert!(
+                line.contains("if root.about-fits {") && !line.contains("else"),
+                "an open site is not wrapped in the gate on its own line: {line}"
+            );
+        }
+
+        // 3. THE READ IS REAL, not a wish. about-overflow is the flag that says the panel is wider
+        // than its host, and until this slice NOTHING in the workspace read the mirrored trio -
+        // which is why B-S2's out-mirroring needed a customer to be honest about. The head, not the
+        // whole file, so this test's own prose cannot arm it.
+        for door in ["ui.get_about_overflow(", "ui.get_menu_shown("] {
+            assert!(
+                head.contains(door),
+                "the About mirror {door} has no reader again, and the gate's reason cannot be said"
+            );
+        }
+        assert!(
+            head.contains("\"about: declined"),
+            "the refusal stopped saying why: the log sentence is gone from the shipping code"
+        );
+        assert!(
+            head.contains("let (need_w, need_h) = (FLOOR_WIDTH as u32, FLOOR_HEIGHT as u32);"),
+            "the decline message no longer quotes the floor's own consts - it has started copying              the demand a third time"
+        );
+        // 4. AND IT IS STILL ORDERING on the Rust side too: a host is refused for being SMALLER than
+        // the demand, not for differing from it by a pixel of antialiasing.
+        assert!(
+            head.contains("measured.w < need_w || measured.h < need_h"),
+            "the unfit test stopped being an ordering comparison, so it would refuse a host that              fits or accept one that does not"
+        );
+
+        // 5. THE OTHER HALF OF THIS COMMIT: the floored trace line must name where its number came
+        // from. Measured four times on this machine: it printed "-> 340x262" from Slint's own
+        // window.size() while GetWindowRect said the window was 120x120 for the whole run. A line
+        // that reports one source in the grammar of the other is a lie on the screen, so the source
+        // is now IN the string and this needle keeps it there.
+        let floored = head
+            .split_once("geometry: floored ")
+            .map(|(_, rest)| rest.split('\n').next().unwrap_or(""))
+            .expect("the floored trace line is gone from the shipping code entirely");
+        assert!(
+            floored.contains("window.size()") && floored.contains("NOT an OS"),
+            "the geometry: floored line stopped naming its source ({floored}); it must say the              number is Slint's bookkeeping, because the OS frame can be smaller"
         );
     }
 

@@ -240,6 +240,30 @@ export component Chrome inherits Rectangle {
     in property <bool> about-overflow: root.host-width > 0px
         && root.host-width < about.width;
 
+    /// B-S5: DOES THIS HOST HOLD THE LICENCE AT ALL - the gate on the ACT, not on the layout.
+    ///
+    /// The panel is a fixed box (see its own block below), Chrome can move it inside the host it is
+    /// given but cannot make the host bigger, and Slint clips a child at the client edge with no
+    /// scroll and no warning - so on a short or narrow window the act currently offered in row 5
+    /// produces a CUT licence and no sentence saying so. about-overflow already admits the width
+    /// case; this is the decision the admission was waiting for: do not open what cannot be shown.
+    ///
+    /// Both terms are the panel's OWN numbers, never a copy of them: the width demand is
+    /// about.width with no padding (popup-left's floor is zero, so the 8px margins are policy while
+    /// the width is obligation), and the height demand is about.height plus the ONE menu-gap that
+    /// popup-top keeps below it. The border is not a term - a Slint Rectangle draws it centered on
+    /// the geometry edge, so the box's own height already includes it.
+    ///
+    /// An unknown host (host-width 0, the frames before the first layout) FITS: the same
+    /// "when in doubt, show the licence" direction popup-left takes on that input. A gate that
+    /// refuses on its own missing measurement would be worse than no gate.
+    ///
+    /// Internal on purpose - no visibility, so no generated setter for anyone and no new mirror to
+    /// read: the mount already exports the three flags this is built from.
+    property <bool> about-fits: root.host-width <= 0px
+        || (root.host-width >= about.width
+            && root.host-height >= about.height + Theme.menu-gap);
+
     // ---- the asks ---------------------------------------------------------------
     // toggled-pin carries the state to ASK for, because this closure cannot see the wire and
     // the bridge must not keep a second copy of the bit (titlebar.rs:310-311).
@@ -270,8 +294,15 @@ export component Chrome inherits Rectangle {
     /// deliberately leaves Escape to the editor.
     callback escape-asked();
 
-    /// The hamburger's ask, as a callback so the real click and the synthetic act run one
-    /// line of code, which is the whole point of the drag/toggle/close precedent.
+    /// The hamburger's ask, as a callback, so the click handler on menu-touch and the synthetic act
+    /// share ONE body - but only FROM THE CALLBACK INWARD, and that limit is the honest wording.
+    /// Both routes arrive here (the press at menu-touch's clicked arm, the counter the `changed` arm
+    /// below reads), and from this line on there is exactly one implementation. What is NOT shared,
+    /// and has never been tested, is the road from a pixel to this callback: every instrument that
+    /// opens the popup raises the counter, which bypasses hit-testing entirely, and the only legs in
+    /// the repo that press real pixels are smoke modes 4-7 - which carry no recorded green run
+    /// anywhere. So do not read this comment as "the pointer path works": it says one body from the
+    /// callback in, and nothing further.
     callback toggle-menu-asked();
 
     /// S8: minimize - the only one of the three caption buttons with no door to reuse.
@@ -714,8 +745,11 @@ export component Chrome inherits Rectangle {
     }
     changed about-asks => {
         // The act's door. It opens About AND closes the popup, which is what the row does, so the
-        // needle measures the same path a pointer takes.
-        root.about-open = true;
+        // needle measures the same path a pointer takes. B-S5 wrapped the act in the fits test IN
+        // PLACE - one line, one write, no else: a decline changes nothing about the bit, which is
+        // why the product has to say the reason out loud (see the mirrors' first reader in
+        // product.rs), and why the write census in probe.rs still counts the lines it counts.
+        if root.about-fits { root.about-open = true; }
         root.menu-open = false;
     }
     toggle-menu-asked => {
@@ -896,7 +930,7 @@ export component Chrome inherits Rectangle {
             Rectangle { col: 0; row: 5; colspan: 2; background: Theme.hover-bg; opacity: row-about.has-hover ? 1 : 0; animate opacity { duration: 180ms; } }
             Text { col: 0; row: 5; text: "About Slint"; color: Theme.menu-fg; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
             Text { col: 1; row: 5; text: ""; color: Theme.text-muted; horizontal-alignment: right; font-size: 1rem * Theme.font-scale-menu; vertical-alignment: center; }
-            row-about := TouchArea { col: 0; row: 5; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { root.about-open = true; root.menu-open = false; } }
+            row-about := TouchArea { col: 0; row: 5; colspan: 2; mouse-cursor: MouseCursor.pointer; clicked => { if root.about-fits { root.about-open = true; } root.menu-open = false; } }
         }
 
         // ---- ROWS 6.. : THE RECENTS, home at last ------------------------------------------------
