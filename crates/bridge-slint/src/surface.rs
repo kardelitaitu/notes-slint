@@ -216,6 +216,10 @@ pub(crate) fn save_now(
         p.last_sent = text.clone();
         p.pending_at = None;
         p.edited_flag = false;
+        // A6: remember the PAIR, not just the bytes. This is the record a refusal turns into an
+        // owed retry, so the retry can carry the revision and epoch the engine already saw rather
+        // than a fresh reading - and so "something is unsaved" stops being a string comparison.
+        p.last_send = Some((text.clone(), p.edits, p.epoch));
         (p.edits, p.epoch, text.len())
     };
     report(&format!(
@@ -229,6 +233,122 @@ pub(crate) fn save_now(
             epoch,
         },
     );
+}
+
+/// A6 / THE CHANNEL LAW, as a pure decision so the curve is testable and only the SENDING needs a
+/// live note: settle_says and floored_says in the product are the same idiom, and this one sits HERE
+/// rather than there because the numbers it reads - RETRY_FIRST and RETRY_CAP - belong to the record
+/// it decides about, and a law split across two files drifts the day either moves.
+///
+/// Three answers, and the third is what keeps this from being a leak: NotYet (the back-off has not
+/// expired, the door does nothing), Send with the delay to back off to next, and Terminal - the
+/// ladder is spent, so the record is dropped and the write is handed to the next user act instead of
+/// being attempted forever against a refusal that will not change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // read only by the product's door; see Retake
+pub(crate) enum Due {
+    NotYet,
+    Send { next: Duration },
+    Terminal,
+}
+
+/// Attempts before the state goes terminal: 750 ms, 1.5 s, 3 s, 6 s, 10 s, 10 s - six real attempts
+/// inside about 31 s, which covers a drive asleep or a OneDrive lock clearing, and stops being useful
+/// long before it becomes a load.
+#[allow(dead_code)] // the ladder's end, read only by the door's law
+pub(crate) const RETRY_TRIES: u32 = 6;
+
+#[allow(dead_code)] // the law is read by retry_take, which only the product's door calls
+pub(crate) fn retry_says(waited: Duration, every: Duration, attempts: u32) -> Due {
+    if waited < every {
+        return Due::NotYet;
+    }
+    if attempts >= RETRY_TRIES || every >= RETRY_CAP {
+        return Due::Terminal;
+    }
+    Due::Send {
+        next: every.saturating_mul(2).min(RETRY_CAP),
+    }
+}
+
+/// A6: read the owed write and, if it is due, advance the record in the SAME breath - so no caller
+/// can send a retry and forget to re-arm it, which is how a retry loop becomes a flood. Idle means
+/// nothing is owed; Waiting means it is owed and quiet.
+#[allow(dead_code)] // called only from the product's wake, which is the one timed sender
+pub(crate) fn retry_take(pump: &RefCell<Pump>) -> Retake {
+    let Some(record) = pump.borrow().retry.clone() else {
+        return Retake::Idle;
+    };
+    match retry_says(record.waited(), record.every, record.attempts) {
+        Due::NotYet => Retake::Waiting,
+        Due::Terminal => {
+            pump.borrow_mut().retry = None;
+            Retake::Terminal
+        }
+        Due::Send { next } => {
+            let attempt;
+            {
+                let mut p = pump.borrow_mut();
+                if let Some(cur) = p.retry.as_mut() {
+                    cur.attempts += 1;
+                    cur.at = Instant::now();
+                    cur.every = next;
+                }
+                // The count the log prints. The old lane counted witness-restores, which is not the
+                // same fact as counting attempts; now it is the same fact, because an attempt is this
+                // function handing back a pair to send.
+                p.retries += 1;
+                attempt = p.retries;
+            }
+            Retake::Send {
+                text: record.text,
+                revision: record.revision,
+                epoch: record.epoch,
+                next,
+                attempt,
+            }
+        }
+    }
+}
+
+/// A6: the failure lane's whole job, in one call. The payload comes from last_send, NEVER from the
+/// buffer: the buffer may already hold text typed since the failure, and a retry that re-reads it is
+/// a Flush wearing a Save's coat - the same pair the engine has already seen is the pair it must
+/// see again. Returns false when nothing was recorded, which is the honest no-op.
+pub(crate) fn retry_arm(pump: &RefCell<Pump>) -> bool {
+    let mut p = pump.borrow_mut();
+    let Some((text, revision, epoch)) = p.last_send.clone() else {
+        return false;
+    };
+    p.retry = Some(Retry {
+        text,
+        revision,
+        epoch,
+        at: Instant::now(),
+        every: RETRY_FIRST,
+        attempts: 0,
+    });
+    // The dirty witness comes back too, so the dot lies about nothing while a retry is owed.
+    p.edited_flag = true;
+    true
+}
+
+/// A6, repair two: WHO MAY SPEAK IN THE STATUS LINE. Both lanes used to write why unconditionally,
+/// and the arrival order decided what a person read - an autosave skip stamped "a file this app did
+/// not create: Save once (Ctrl+S) and it keeps saving" OVER the disk's own "save failed: ...",
+/// telling someone to perform the act that had just failed and deleting the reason it failed. With
+/// the toggle off it wrote "auto-save is off", true about a setting, erasing the only trace that a
+/// write was attempted at all. The rank is the rule: a verdict about the DISK outranks a verdict
+/// about a SETTING, and nothing outranks itself, so the newest word of the same kind still wins.
+pub(crate) const WHY_NONE: u8 = 0;
+pub(crate) const WHY_SETTING: u8 = 1;
+pub(crate) const WHY_DISK: u8 = 2;
+
+pub(crate) fn note_why(p: &mut Pump, rank: u8, words: &str) {
+    if rank >= p.why_rank {
+        p.why = words.to_string();
+        p.why_rank = rank;
+    }
 }
 
 /// S8b: the port's verdict, put into a word. Empty means not locked. The two causes stay
@@ -329,6 +449,14 @@ pub(crate) fn next_generation(previous: i32) -> i32 {
 /// (its main.rs:122) rather than reading core's - and the same rule with it: a
 /// Flush only goes out when the buffer actually changed.
 const AUTOSAVE_IDLE: Duration = Duration::from_millis(750);
+/// A6 / the channel law: a FAILED SAVE is retried by the bridge, on a back-off it owns, with
+/// Command::Save - NEVER with Command::Flush. 750 ms first, doubling, and the door stops asking once
+/// the next delay would pass the cap; from there the state is terminal: the text stays unsent, the
+/// status line keeps the reason, and the next user act carries it. A retry that never ends is the
+/// resource leak this note warned about, now with a write attempt attached to it.
+pub(crate) const RETRY_FIRST: Duration = Duration::from_millis(750);
+#[allow(dead_code)] // the cap is the door's, not the failure lane's
+pub(crate) const RETRY_CAP: Duration = Duration::from_millis(10_000);
 
 // S10b: THE UNDO QUARANTINE, as a decision a test can hold. The capture handler in
 // main.slint implements the same rule in markup (this file cannot call into it and markup
@@ -790,6 +918,56 @@ pub(crate) fn note_adoption(pump: &RefCell<Pump>, path: &Path) -> i32 {
     p.adopted_path = Some(path.to_path_buf());
     p.generation
 }
+/// A6: one owed write, and everything the retry lane needs to know about it. The payload is stored
+/// IN FULL on purpose - the same text, the same revision, the same epoch that failed - because the
+/// channel law says a retry re-sends the pair, not a fresh reading of a buffer the user may have gone
+/// on typing into, and because a revision that moved between the failure and the retry would make the
+/// engine's own epoch guard discard the retry as Superseded: the exact silence, on the other lane.
+#[derive(Clone, Debug)]
+pub(crate) struct Retry {
+    pub(crate) text: String,
+    pub(crate) revision: u64,
+    pub(crate) epoch: u64,
+    /// When this attempt went out. The back-off is measured from here, in the wake.
+    pub(crate) at: Instant,
+    /// The delay currently in force - RETRY_FIRST, then doubling, until the door calls it terminal.
+    pub(crate) every: Duration,
+    /// Attempts already made, which is how the pure timing law decides when to stop.
+    pub(crate) attempts: u32,
+}
+
+#[allow(dead_code)] // the door's clock reading; the instrument never arms a retry, so it never asks
+impl Retry {
+    /// How long the current attempt has been quiet, the only clock reading this type does.
+    pub(crate) fn waited(&self) -> Duration {
+        self.at.elapsed()
+    }
+}
+
+/// A6: the retry as THREE named operations instead of field edits scattered over the door and the
+/// failure lane, because the hazard is a half-updated record: a take that forgot to re-install would
+/// drop the owed write, and the fact is the whole point of the field.
+#[allow(dead_code)] // the door's three answers; the instrument never sends on a timer
+pub(crate) enum Retake {
+    /// Nothing is owed.
+    Idle,
+    /// An attempt is owed and its delay has not passed: the door must do nothing.
+    Waiting,
+    /// Send this pair - the same text, revision and epoch that failed - and what to back off to.
+    Send {
+        text: String,
+        revision: u64,
+        epoch: u64,
+        next: Duration,
+        /// Which attempt this is: the number the door prints, so a person watching the log can see the
+        /// ladder being spent rather than wondering whether anything is still trying.
+        attempt: u64,
+    },
+    /// The cap passed. The record is GONE from here; the text stays unsent and the next act carries
+    /// it, which is what makes a cap safe rather than a parked write.
+    Terminal,
+}
+
 /// What the pin pump remembers. Deliberately holds no opinion about the window: the
 /// only bool in here that is a FACT is the one an `Event::Pinned` wrote.
 #[derive(Default)]
@@ -928,6 +1106,22 @@ pub(crate) struct Pump {
     /// is, and a live run can be read for it. See the SaveFailed arm for why the loop is the lesser
     /// evil and for who should really own the policy.
     pub(crate) retries: u64,
+    /// A6, repair ONE: the unsaved FACT, carried rather than inferred. Before this, "there is text
+    /// that never landed" was a string comparison - text against last_sent - and the review that
+    /// found it names the case that proves a comparison cannot work: select-all, delete, Ctrl+S,
+    /// refused. The buffer is now EMPTY, and the failure lane used to clear last_sent, so the empty
+    /// string did not differ from it either. The one file a person can lose forever is the one with
+    /// nothing to compare. Some(..) IS the fact; None means nothing is owed.
+    pub(crate) retry: Option<Retry>,
+    /// The pair the last explicit Save put on the wire, kept so a refusal can retry THAT pair - same
+    /// bytes, same revision, same epoch - rather than re-reading a buffer the user may have gone on
+    /// typing into. The Save As answer and the debounced flush do not populate it: a retry is a Save,
+    /// and only save_now sends one.
+    pub(crate) last_send: Option<(String, u64, u64)>,
+    /// A6, repair TWO: the rank of whoever last spoke in why, so a verdict about a SETTING can no
+    /// longer stamp over a verdict about the DISK. 0 = nothing, 1 = the bridge's own skip sentence,
+    /// 2 = the port's failure sentence. Saved clears both, as it always did.
+    pub(crate) why_rank: u8,
     /// The port has NO event that echoes autosave - engine.rs:601-602 assigns the bool
     /// and says nothing back - so this is InitialState's answer XORed by every
     /// Command::SetAutosave this bridge sends. The bridge's own last ask, named as such
@@ -1137,6 +1331,7 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 // decides the lock decides what the menu's footer says about this document.
                 p.file_words = file_words(meta);
                 p.why.clear();
+                p.why_rank = WHY_NONE;
                 let (locked, word) = (p.locked, p.lock_word.clone());
                 drop(p);
                 // An adoption is not a user edit, and the startup one is not a switch either -
@@ -1199,6 +1394,7 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                 // thing that flips here, which is the one word in the footer a user acts on.
                 p.file_words = file_words(meta);
                 p.why.clear();
+                p.why_rank = WHY_NONE;
                 let (locked, word) = (p.locked, p.lock_word.clone());
                 drop(p);
                 let generation = note_adoption(pump, path);
@@ -1364,7 +1560,7 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
                     // the status line, and the next event erased it - so a file that will never be
                     // saved explained itself for one frame. The words are the bridge's by api's
                     // design; plumbing::skip_words says why they are not describe()'s Debug shape.
-                    p.why = skip_words(*reason).to_string();
+                    note_why(&mut p, WHY_SETTING, skip_words(*reason));
                 }
                 if let Some(ui) = weak.upgrade() {
                     ui.set_status(describe(event).into());
@@ -1374,40 +1570,46 @@ pub(crate) fn drain(events: &Receiver<Event>, pump: &RefCell<Pump>, weak: &slint
             Event::SaveFailed { reason, .. } => {
                 pump.borrow_mut().save_failed = true;
                 let dirty = pump.borrow().dirty;
-                // THE WITNESS COMES BACK. bridge-gpui clears its in-flight marker on Saved|SaveFailed
-                // (bridge-gpui/src/main.rs:996-1000) so a failure never leaves a bridge believing
-                // bytes went out. This bridge's equivalent marker is its SEND WITNESS - last_sent
-                // plus the edited flag - and the pump cleared BOTH AT THE SEND, which meant: bytes
-                // refused, witness clean, and nothing going out again until the user typed. A save
-                // failure that cannot retry is a silent loss of the newest edit (AGENTS.md 4.4), so
-                // the failure restores the witness and the next quiet tick re-sends.
+                // THE WITNESS COMES BACK, and A6 changed WHAT comes back. bridge-gpui clears its
+                // in-flight marker on Saved|SaveFailed (bridge-gpui/src/main.rs:996-1000) so a failure
+                // never leaves a bridge believing bytes went out; this bridge's marker is its send
+                // witness, and the lane used to clear last_sent and set the edited flag and let the
+                // ordinary debounce pump re-send - a FLUSH. The channel law says that loop is
+                // structurally incapable in the default case: armed is set only on write success, so
+                // the file whose first Ctrl+S failed is un-armed, should_flush refuses a retry of it
+                // on ForeignFileNotArmed, and with the toggle off on AutosaveDisabled. Four gates,
+                // each there for a reason, composing into silence.
                 //
-                // WHAT THAT BUYS AND WHAT IT COSTS, out loud: a permanent failure now retries every
-                // AUTOSAVE_IDLE, forever. Each retry is a real attempt that lands the moment the
-                // cause clears, and the printed count makes the loop audible instead of mysterious -
-                // but a cap wants a back-off, and this bridge has no business inventing that policy
-                // alone: gpui retries on the next edit and does not loop, so if the two bridges are
-                // to agree, the RETRY RULE BELONGS TO THE PORT. Raised here, not settled here.
+                // So the failure now OWNS a record: the exact text, revision and epoch that were
+                // refused, held in pump.retry, retried by the door as Command::Save on a back-off,
+                // and terminal at the end of the ladder. last_sent is deliberately NOT cleared -
+                // clearing it is what made the comparison lane the carrier, and an empty buffer
+                // cannot differ from an empty string, which is repair one's own case: select-all,
+                // delete, Ctrl+S, refused used to retry nothing in every configuration.
                 {
                     let mut p = pump.borrow_mut();
-                    p.last_sent.clear();
-                    p.edited_flag = true;
-                    p.retries += 1;
-                    // HYGIENE (P1b): a refusal is an ANSWER too - the close wait must not
-                    // sit out its deadline because the bytes it waited for are never coming.
+                    // HYGIENE (P1b): a refusal is an ANSWER too - the close wait must not sit out its
+                    // deadline because the bytes it waited for are never coming.
                     p.saves_settled += 1;
                     p.saves_answer = "SaveFailed";
-                    // The port's OWN sentence, passed through rather than re-worded: SaveError has
-                    // a Display precisely because "the UI must render the reason" (AGENTS.md, code
-                    // conventions) - unlike SkipReason, which no Display reaches, so the bridge
-                    // words that one itself. The prefix is the status line's, character for
-                    // character: one hex-owner rule, and the footer outlives the line it copies.
-                    p.why = format!("save failed: {reason}");
-                    report(&format!(
-                        "retry: a failed save restored the send witness (retry #{})",
-                        p.retries
-                    ));
+                    // The port's OWN sentence, passed through rather than re-worded: SaveError has a
+                    // Display precisely because "the UI must render the reason" (AGENTS.md) - unlike
+                    // SkipReason, which no Display reaches, so the bridge words that one itself. The
+                    // prefix is the status line's, character for character: one hex-owner rule, and
+                    // the footer outlives the line it copies. RANKED now: this is the disk speaking,
+                    // and a setting's sentence must not arrive later and erase it.
+                    note_why(&mut p, WHY_DISK, &format!("save failed: {reason}"));
                 }
+                if retry_arm(pump) {
+                    report(
+                        "retry: a refused Save is OWED - the door re-sends Command::Save on the back-off (750 ms, doubling, terminal at the cap)",
+                    );
+                }
+                // The no-op arm is GONE, and it is a record question rather than a style one: what the
+                // instrument REPORTS is the protected artifact (ADR-0006 §4), so an adapter slice may
+                // not add a line the record never had - and the sentence proved nothing anyway, because
+                // the behaviour is already pinned by a test asserting retry_arm returns false when there
+                // is no explicit-Save pair behind the refusal.
                 note_dot(pump, weak, dirty, "save-failed");
                 if let Some(ui) = weak.upgrade() {
                     // STRIP-4b row 2: this printed the Debug of a public-contract enum - a variant
@@ -1553,6 +1755,7 @@ pub(crate) fn wire_callbacks(
                 // setting the user has just changed, and the next save answers under the new one -
                 // leaving it standing would be the footer contradicting the row above it.
                 p.why.clear();
+                p.why_rank = WHY_NONE;
                 was
             };
             report(&format!(
@@ -2384,10 +2587,142 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_save_rearms_the_witness_and_the_copy_is_the_ports() {
-        // STRIP-4b rows 1 and 2, grep-grade: a guard that CALLS the arm cannot exist (drain needs
-        // a window and a queue), so the invariant is asserted against the source it is written in,
-        // sliced at this file's own test module - the self-grep trap this crate already learned.
+    fn a_refused_save_owes_a_retry_and_the_retry_carries_the_same_pair() {
+        // A6, BEHAVIOURAL. The guard this replaces was grep-grade: it sliced the SaveFailed arm
+        // SOURCE TEXT for three substrings - last_sent.clear(), edited_flag = true, retries += 1 -
+        // and the review named exactly why that is not a test. Wrap the restore in a condition on
+        // the autosave toggle, which is the exact shape of the bug, and all 128 assertions still
+        // passed. So this drives the state and reads the payload. It cannot watch bytes cross a real
+        // channel here - drain needs a window and a queue - so the arm wiring is the one structural
+        // claim at the bottom, and every claim above it is a call.
+        let pump = RefCell::new(Pump::default());
+        // 1. A clean pump owes nothing.
+        assert!(matches!(super::retry_take(&pump), super::Retake::Idle));
+        // 2. A refusal with no explicit Save behind it - a Save As answer, a debounced flush -
+        //    invents no pair and owes nothing.
+        assert!(
+            !super::retry_arm(&pump),
+            "nothing went out as a Save, so nothing is owed"
+        );
+        // 3. REPAIR ONE, the case a string comparison cannot see. The buffer is EMPTY and so is
+        //    last_sent: text != last_sent is false in EVERY configuration, autosave on or off, and
+        //    the FACT is still carried. This is select-all, delete, Ctrl+S, refused - the one file a
+        //    person can lose forever under the old lane.
+        {
+            let mut p = pump.borrow_mut();
+            p.last_send = Some((String::new(), 7, 3));
+        }
+        assert!(
+            super::retry_arm(&pump),
+            "an empty refused buffer must still be owed"
+        );
+        {
+            let r = pump.borrow().retry.clone().expect("the owed record");
+            assert_eq!(
+                (r.text.as_str(), r.revision, r.epoch),
+                ("", 7, 3),
+                "the retry carries the refused pair, not a fresh reading of the buffer"
+            );
+            assert_eq!(r.attempts, 0);
+            assert!(
+                pump.borrow().edited_flag,
+                "and the dot does not claim clean while a write is owed"
+            );
+        }
+        // 4. The ladder, as triples: not due; due, with the doubled back-off; and terminal by BOTH
+        //    endings independently - the cap in force, and the attempt count spent.
+        assert_eq!(
+            super::retry_says(
+                super::RETRY_FIRST - std::time::Duration::from_millis(1),
+                super::RETRY_FIRST,
+                0
+            ),
+            super::Due::NotYet,
+            "one ms short of the delay must not send"
+        );
+        assert_eq!(
+            super::retry_says(super::RETRY_FIRST, super::RETRY_FIRST, 0),
+            super::Due::Send {
+                next: std::time::Duration::from_millis(1500)
+            },
+            "due: the next back-off is double"
+        );
+        assert_eq!(
+            super::retry_says(super::RETRY_CAP, super::RETRY_CAP, 1),
+            super::Due::Terminal,
+            "at the cap the ladder is over"
+        );
+        assert_eq!(
+            super::retry_says(super::RETRY_FIRST, super::RETRY_FIRST, super::RETRY_TRIES),
+            super::Due::Terminal,
+            "the attempt count is an independent ending"
+        );
+        // 5. take() advances the record in the SAME breath, so one delay buys exactly one attempt.
+        //    The back-off is measured FROM the attempt, so this rewinds the record's own clock by
+        //    800 ms: the door cannot be tested by sleeping, and the law must not be tested by being
+        //    handed a due-ness it did not compute. Now it is due - the refused pair comes back, and
+        //    the second take on the just-advanced record WAITS instead of sending it twice.
+        {
+            let mut p = pump.borrow_mut();
+            let r = p.retry.as_mut().expect("owed");
+            r.at = Instant::now()
+                .checked_sub(Duration::from_millis(800))
+                .expect("a rewound clock is a valid clock");
+        }
+        assert!(
+            matches!(
+                super::retry_take(&pump),
+                super::Retake::Send {
+                    revision: 7,
+                    epoch: 3,
+                    ..
+                }
+            ),
+            "the door sends the refused pair itself"
+        );
+        assert!(matches!(super::retry_take(&pump), super::Retake::Waiting));
+        // 6. Terminal RETIRES the record - a back-off with an end, not a parked write - because
+        //    past the cap the next user act is the carrier.
+        {
+            let mut p = pump.borrow_mut();
+            let r = p.retry.as_mut().expect("owed");
+            r.attempts = super::RETRY_TRIES;
+            r.at = Instant::now()
+                .checked_sub(r.every + Duration::from_millis(1))
+                .expect("a rewound clock is a valid clock");
+        }
+        assert!(matches!(super::retry_take(&pump), super::Retake::Terminal));
+        assert!(
+            pump.borrow().retry.is_none(),
+            "terminal must retire the record"
+        );
+        // 7. REPAIR TWO, the precedence. A verdict about the DISK outranks a verdict about a
+        //    SETTING, so a skip arriving after a failure can no longer stamp "a file this app did
+        //    not create: Save once (Ctrl+S) and it keeps saving" over the reason the save failed -
+        //    which told the user to perform the act that had just failed and deleted why. The newest
+        //    word of the same kind still wins, and with nothing above it a setting may speak.
+        {
+            let mut p = pump.borrow_mut();
+            super::note_why(&mut p, super::WHY_DISK, "save failed: the disk said no");
+            let disk = p.why.clone();
+            super::note_why(&mut p, super::WHY_SETTING, "auto-save is off");
+            assert_eq!(p.why, disk, "a setting erased the disk verdict");
+            super::note_why(&mut p, super::WHY_DISK, "save failed: read-only");
+            assert_eq!(
+                p.why, "save failed: read-only",
+                "the newest disk verdict speaks"
+            );
+            p.why.clear();
+            p.why_rank = super::WHY_NONE;
+            super::note_why(&mut p, super::WHY_SETTING, "auto-save is off");
+            assert_eq!(
+                p.why, "auto-save is off",
+                "with nothing above it a setting may speak"
+            );
+        }
+        // 8. The one structural claim, and it is the arm: the failure lane must OWE the retry, and
+        //    must NOT be clearing the send witness any more - clearing last_sent is what made the
+        //    Flush lane the carrier, and the channel law forbids that carrier.
         let whole = include_str!("../src/surface.rs");
         let src = &whole[..whole.find("mod tests").expect("the tests module")];
         let arm = &src[src
@@ -2395,24 +2730,32 @@ mod tests {
             .expect("the arm")..];
         let arm = &arm[..arm.find("other =>").expect("the next arm")];
         assert!(
-            arm.contains("p.last_sent.clear();"),
-            "the send witness must come back"
+            arm.contains("retry_arm(pump)"),
+            "the failure lane must owe the retry"
         );
         assert!(
-            arm.contains("p.edited_flag = true;"),
-            "and so must the edited-flag witness"
+            !arm.contains("p.last_sent.clear()"),
+            "the Flush lane may not be the carrier again"
         );
         assert!(
-            arm.contains("p.retries += 1;"),
-            "the loop is counted and printed, not hidden"
+            arm.contains("p.saves_settled += 1;"),
+            "a refusal is an answer"
         );
+        // The precedence is only real if BOTH writers go through the rank, and the second writer is a
+        // different arm - so the skip arm is sliced to its own end and pinned as well. Without this
+        // the wiring in one arm could be deleted quietly, which is the same failure the retired
+        // grep-grade guard had: a rule that exists as a function and not as a call.
         assert!(
-            !arm.contains("{reason:?}"),
-            "Debug of a public enum is not the user's copy"
+            arm.contains("note_why(&mut p, WHY_DISK"),
+            "the disk lane must write through the rank"
         );
+        let skip = &src[src
+            .find("Event::AutosaveSkipped { reason } =>")
+            .expect("the skip arm")..];
+        let skip = &skip[..skip.find("Event::SaveFailed").expect("the next arm")];
         assert!(
-            arm.contains("format!(\"save failed: {reason}\")"),
-            "the port's Display sentence, one owner of the wording"
+            skip.contains("note_why(&mut p, WHY_SETTING"),
+            "the setting lane must write through the rank, or it still stamps over the disk"
         );
         assert!(
             !src.contains("reason:?"),

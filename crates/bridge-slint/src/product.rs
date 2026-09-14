@@ -81,10 +81,72 @@ mod ui_gen;
 
 use plumbing::{arm_drop_target, fingerprint_of, hwnd_of, note_dot, publish_title, report, send};
 use surface::{
-    DialogReply, Pump, answer_dialog, ask_corners, drain, legend, restore_from_session, text_pump,
-    wire_callbacks,
+    DialogReply, Pump, Retake, answer_dialog, ask_corners, drain, legend, restore_from_session,
+    retry_take, text_pump, wire_callbacks,
 };
 use ui_gen::Spike;
+
+/// A6 / THE DOOR: the one place in this bridge allowed to send on a TIMER, and it is a step in the
+/// product's own wake - after the drain that fills the owed record, beside the pump that already
+/// holds a gateway legitimately. Two rules it exists to keep.
+///
+/// THE CHANNEL: a retry is a Save. The record carries the exact text, revision and epoch that were
+/// refused and this sends THAT pair, not a fresh reading of the buffer. Not a Flush at all, because
+/// the default case is a foreign file whose FIRST save failed: armed is set only on write success,
+/// so should_flush refuses a retry of that file on ForeignFileNotArmed, and with the toggle off on
+/// AutosaveDisabled. A retry routed past those gates is a retry that can never fire - which is what
+/// made the old witness-clearing lane structurally dead rather than merely inelegant.
+///
+/// THE END: six attempts, 750 ms doubling to a 10 s cap, then terminal. At the cap the record is
+/// gone, the witness stays dirty, the reason stays on the status line, and the next user act carries
+/// the text. A cap costs nothing here precisely because the terminal state hands the write over;
+/// an uncapped loop against a permanent refusal is the resource leak.
+/// A6, step four: the door's DECISION, split out so it can be tested with no window and no queue.
+/// This is where the law lives in code: an owed retry becomes a `Command::Save` carrying the refused
+/// pair, and nothing else the record can say - not yet due, nothing owed, the ladder spent - becomes a
+/// command at all. Exactly one line in the door below is left untested, and it is the line that hands
+/// the command to the port, because that line needs a live gateway.
+fn retry_sends(take: &Retake) -> Option<Command> {
+    match take {
+        Retake::Send {
+            text,
+            revision,
+            epoch,
+            ..
+        } => Some(Command::Save {
+            text: text.clone(),
+            revision: *revision,
+            epoch: *epoch,
+        }),
+        Retake::Idle | Retake::Waiting | Retake::Terminal => None,
+    }
+}
+
+fn retry_door(gw: &Rc<RefCell<Option<Gateway>>>, pump: &RefCell<Pump>) {
+    let take = retry_take(pump);
+    if let Retake::Send {
+        text,
+        revision,
+        epoch,
+        next,
+        attempt,
+    } = &take
+    {
+        report(&format!(
+            "retry: attempt {attempt} - re-sending Command::Save rev={revision} epoch={epoch} ({bytes} bytes) - a retry is a Save, never a Flush, next back-off {next:?}",
+            bytes = text.len()
+        ));
+    } else if matches!(take, Retake::Terminal) {
+        report(
+            "retry: terminal - the cap is spent, the text stays unsent, the reason stays on the line, and the next act carries it",
+        );
+    }
+    // The one untested line, and it is untested because it needs a live port: the decision above is
+    // the part that can be wrong in a way a test could not see.
+    if let Some(command) = retry_sends(&take) {
+        send(gw, command);
+    }
+}
 
 /// THE PORT RULE AND NOTHING ELSE. The probe overrides its state dir with a directory beside its
 /// own exe ("slint-probe data") so that a thousand probe runs cannot dirty a person's real session;
@@ -740,6 +802,9 @@ fn main() {
         }
         drain(&tick_events, &tick_pump, &ui.as_weak());
         text_pump(&ui, &tick_gw, &tick_pump);
+        // A6: THE DOOR, the only timed send in the bridge. Nothing is owed on most wakes, and
+        // retry_take says so without touching the gateway.
+        retry_door(&tick_gw, &tick_pump);
         // The picker's answer, if a person finished choosing. Read here and nowhere else, so no
         // callback on the loop ever waits for a modal (probe.rs:722-728 in shape, minus its act
         // prints): while the dialog thread is still blocked, this try_recv simply misses.
@@ -1528,5 +1593,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_owed_retry_decides_a_save_and_the_door_is_called_after_the_drain() {
+        // A6, step four: the weak point of the whole slice was a door no test could reach, because a
+        // send needs a live port. Splitting the decision off the sending turns "no test at all" into
+        // "the decision is tested and exactly one line performs it" - that line is the send(gw, ...)
+        // in retry_door, and it is still unverified. Say it plainly: this test does NOT prove a byte
+        // reached the channel.
+        let owed = Retake::Send {
+            text: "typed while the disk said no".to_string(),
+            revision: 7,
+            epoch: 3,
+            next: Duration::from_millis(1500),
+            attempt: 4,
+        };
+        match retry_sends(&owed) {
+            Some(Command::Save {
+                text,
+                revision,
+                epoch,
+            }) => assert_eq!(
+                (text.as_str(), revision, epoch),
+                ("typed while the disk said no", 7, 3),
+                "a retry re-sends the REFUSED pair - not a fresh reading of the buffer, which is a Flush                  wearing a Save's coat, and not the latest revision either, which the epoch guard would                  discard"
+            ),
+            Some(Command::Flush { .. }) => panic!("a retry rode the Flush lane, which is the bug"),
+            Some(other) => panic!("a retry rode the wrong command: {other:?}"),
+            None => panic!("an owed retry decided to send nothing"),
+        }
+        // And the three answers that must send NOTHING. The last one is the cap: at the end of the
+        // ladder a silent door is the correct door, because the next user act carries the text.
+        for quiet in [Retake::Idle, Retake::Waiting, Retake::Terminal] {
+            assert!(
+                retry_sends(&quiet).is_none(),
+                "this answer from the record must not send a command"
+            );
+        }
+        // ORDERING, and nothing more: named as such because this crate already has enough source-slice
+        // asserts passing for behaviour, and one mistaken for proof is worse than the gap. What these
+        // three facts guard is the door's place in the wake - after the drain that FILLS the record,
+        // and beside the pump that already sends through this gateway, which is the only reason the
+        // door may live in a root that owns a gateway at all.
+        // Sliced at this file's own test module, because the strings below appear IN that slice too:
+        // an un-sliced grep of this file matched its own needle and reported the door as running
+        // after a drain that is literally further down the page. The self-grep trap, caught by the
+        // test that exists to catch ordering, which is the one lesson worth paying for.
+        let whole = include_str!("product.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        let door = src
+            .find("retry_door(&tick_gw, &tick_pump);")
+            .expect("the door is called in the tick");
+        let drain = src
+            .find("drain(&tick_events, &tick_pump")
+            .expect("the tick drain");
+        let pump = src
+            .find("text_pump(&ui, &tick_gw, &tick_pump);")
+            .expect("the flush pump call");
+        let start = src.find("Gateway::start(").expect("the port start");
+        assert!(
+            door > drain,
+            "a door before the drain reads yesterday's record"
+        );
+        assert!(
+            door > pump,
+            "and the door belongs beside the pump that holds this gateway"
+        );
+        assert!(
+            door > start,
+            "and it is nowhere in the startup band the panic-hook guard slices"
+        );
     }
 }
