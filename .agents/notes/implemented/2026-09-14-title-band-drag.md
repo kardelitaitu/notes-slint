@@ -3,7 +3,7 @@ title: The orphan that turned out real - the title band now moves the window
 status: implemented
 id: 2026-09-14-title-band-drag
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-15
 relates: [§5.5, §9, §12]
 decision: null
 ---
@@ -121,9 +121,98 @@ item: if a hidden-window or unresponsive-close case recurs - start with the R2 c
 where declining a close must leave the window visible - and read the decoy section above before
 believing any persistence number.
 
-## Recommendation
+## S1 (2026-09-15): frame debt, and the hold that made the live read safe again
 
-Adopted and shipped: the delta lands in surface.rs::drag_by (:1478) on top of the pure
+The episode above is dated 2026-09-14 and describes the state the drag had reached when it
+shipped: read the window once per gesture, ignore it afterwards, accumulate the pointer's travel
+locally. That shape was correct against a band that re-anchored every event, and 1085ef63 stopped
+the band re-anchoring - ui/chrome.slint now HOLDS `last-x`/`last-y` at the press sample, so each
+emitted delta is the OUTSTANDING ERROR between pointer travel and travel the frame has applied.
+The consequence was not noticed at the commit and is fixed in b12b7246: summing cumulative
+quantities is quadratic. Five events 6 logical px apart against a note that lands every ask asked
+for 396, 402, 408, 414, 420 - a gesture worth 30 px that outruns the hand, because each event was
+credited with the whole error AND with the events before it.
+
+**THE HOLD BECAME THE LOAD-BEARING PART.** The cure is to trust the live read again: the ask is
+`drag_destination(here, dx, dy, scale)` - frame plus outstanding error - which resolves to
+`origin + pointer_travel` on both branches, apply-landed and apply-refused, with no accumulator in
+between. `DragEpisode` keeps its origin (the release line measures displacement from it), its gap
+and its printed bit; `travel` survived as a WITNESS computed from the same two numbers, not as a
+runner. What retired is the integrating role, and the reason it is safe is entirely in the other
+file. That is a coupling, so it is now a guard and not a comment:
+`the_hold_is_what_makes_the_read_safe` slices the `moved =>` block out of ui/chrome.slint, strips
+the comment lines (that block documents the abandoned re-anchor in prose, quoting the very
+assignment it refuses, so a raw grep finds a false positive on the commit that fixed the bug) and
+asserts no `last-x =` write reaches it. Advance the anchor and this goes red here rather than
+shipping a note that outruns the cursor.
+
+**THE PROBE NOW DIVERGES, DELIBERATELY.** probe.rs:1713-1760 drives its synthetic drags with the
+old read-modify-write decomposition. It is FROZEN (ADR-0006) and it is the instrument, not the
+product: it still measures what it was built to measure, and its verdicts keep meaning what they
+said on 2026-09-14. Citing it as evidence about the product's drag arithmetic after this commit is
+the error - it is evidence about the shape the product used to have.
+
+**DPI MID-GESTURE IS NOW A FREEZE, NOT A GUESS.** `DragEpisode` carries one new field,
+`scale: Option<f32>`, settled by the press delta. A later delta whose `window.scale_factor()`
+differs spends that field and the episode stops writing position for the rest of the gesture; the
+transition prints once (`scale changed mid-gesture, release to re-grab`) and the release resets.
+The two candidate repairs each discard a fact the other keeps - re-sample the origin and you throw
+away the pointer, re-base the anchor and you throw away the frame - so the gesture waits for the
+next press. A field on the episode, not on the Pump, because a scale that disagrees with its own
+gesture is a per-gesture fact and must die with it like `origin`, `last` and `printed` do.
+
+**THE MINIMISED FRAME IS REFUSED BEFORE IT IS READ.** A parked window reports <-32000,-32000>
+(the measured fact in plumbing.rs's `Fingerprint::minimized`), and adding an outstanding error to
+a parking place is the maximised `<-8,-8>` bug in a different costume - perfect arithmetic, a
+restore point made out of -32000. The guard sits above the read for the same reason the maximised
+arm does: a refusal must not sample an origin, must not write a position, and must not reach
+`advance`. It reuses `drag_refused_shown` rather than adding a second latch, so one line per
+refusal streak and nothing to keep in step.
+
+**WHAT THIS DOES NOT SETTLE.** Items (2) and (3) of the honest-limits list above are retired by
+this change: the delta-vs-read question is now answered by the decomposition rather than by which
+quantity happened to be starved on someone's desktop, and a scripted 6-of-10 delivery shortfall
+no longer changes where the note ends up, because the ask is pointer-referenced instead of
+count-referenced - four delivered events of a ten-event gesture produce the same final target as
+ten. Item (1), NO LIVE 150 PERCENT EVIDENCE, is NOT retired and is now slightly sharper: the
+freeze path exists only because a mid-gesture scale change is unhandleable, and it has unit
+evidence and no window evidence at all.
+
+## The live field, run 2026-09-15 against b12b7246
+
+The same three gitignored harnesses in `/target`, one window at a time, each closing with a
+`Stop-Process` on the PID it started. dpi=96, so scale 1.0 - the DPI limit above still stands.
+
+- **A (12 x +1 px, release on the band):** asked == reads on every line; released at
+  <4260,200>, `travel (12, 0)`; relaunch L=4260 T=200, `dLeft 0, dTop 0`.
+- **B (12 x +5 px, release 45 px BELOW the band):** exactly ONE `drag: from` line for the whole
+  gesture (the once-per-episode print, not once per frame), one release, `travel (60, 45)` = the
+  pointer's own path; relaunch L=4320 T=245 exact.
+- **C / D (60 px as six steps / as one step):** 4200 -> 4260 and 4260 -> 4331, `travel (60, 0)`
+  and `travel (71, 13)` - the one-step gesture picking up 13 px of y the scripted cursor carried
+  with it, which is what a pointer-faithful witness is supposed to say.
+- **THE WORK-AREA CLAMP LEG, run for the first time.** Three legs park the note, walk 8 steps
+  INTO the constraint, hold 400 ms, then walk 8 steps back out:
+  E-left park 80,300 out 8 x -20, F-right park 6000,300 out 8 x +20, G-top park 2000,80 out
+  8 x -10. The per-step rect sequence is UNIFORM on every leg - `s-20/0` eight times then
+  `b20/0` eight times, `s20/0`/`b-20/0`, `s0/-10`/`b0/10` - and the note ends each leg exactly
+  where it parked (80,300 / 6000,300 / 2000,80), with `relaunch rect=2000,80` confirming the
+  saved rect. THIS is the claim the accumulator could not hold: while the frame is refused,
+  `here + error` walks the debt forward one step at a time, and releasing it does not pay back a
+  jump. Under sum-of-cumulative the return leg would have had to spend the whole accrued
+  triangle at once; no such spike appears in any of the three sequences.
+- **The 400 ms hold is a second, unplanned witness.** It crosses `DRAG_EPISODE_GAP`, so each
+  clamp leg runs as TWO episodes and prints two `drag: from` lines - and the travel the release
+  reports (80,0), (-80,0), (0,40) is the SECOND episode's ask-minus-origin, not the gesture's
+  whole path. That is the gap net doing exactly what `a_stranded_release_cannot_carry_over...`
+  says it should, observed live; it also means the release line is per-episode and a reader
+  comparing one against a scripted pointer path must count the pauses.
+- **NOT RUN: the teleport leg.** The decomposition is tested at its exact numbers by
+  `a_frame_that_teleported_under_the_drag_is_paid_for_once` (press frame <1000,500>, cursor
+  <1050,512>, frame taken +300/+150, outstanding error <-310,-150> -> ask <990,500>), but no
+  harness moves a window under a live drag mid-gesture, so that remains unit-grade only.
+
+## RecommendationAdopted and shipped: the delta lands in surface.rs::drag_by (:1478) on top of the pure
 drag_destination (:1460), registered by wire_callbacks at surface.rs:1421 (on_drag_delta) and
 :1434 (on_drag_ended). Keep three rules from this episode:
 
