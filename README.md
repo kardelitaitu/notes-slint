@@ -28,10 +28,13 @@ product, and the editing surface can stay deliberately minimal.
 ## Stack
 
 - **Engine:** Rust — pure, headless, unit-testable, no UI or OS types in the core.
-- **UI:** [Slint](https://slint.dev) — it **ships**: `crates/bridge-slint` builds `notes-slint.exe`,
-  beside the instrumented probe that proved the window contract (`notes-slint-probe.exe`). GPUI
-  remains the other bridge, not the past tense of this one. Same rule on both sides: one adapter per
-  toolkit, so the toolkit stays a swappable detail ([record](.agents/notes/implemented/2026-09-14-strip-program.md),
+- **UI:** [Slint](https://slint.dev) — it **ships**, and it is the product: `crates/bridge-slint`
+  builds `notes-slint.exe`, beside the instrumented probe that proved the window contract
+  (`notes-slint-probe.exe`). GPUI is becoming the past tense of this one: `crates/bridge-gpui` is
+  **frozen** — it still builds, still runs, and still earns citation as evidence, but it takes no new
+  features, and its terminal delete is governed by the six re-earnings in
+  [ADR-0006](docs/decisions/0006-gpui-is-frozen-not-deleted.md). Same rule on both sides: one adapter
+  per toolkit, so the toolkit stays a swappable detail ([record](.agents/notes/implemented/2026-09-14-strip-program.md),
   [how it got here](.agents/notes/implemented/2026-09-13-bridge-slint-spike.md)).
 - **Platform:** Windows first. macOS and Linux planned; the plan and its honest limits
   (Wayland restricts both window positioning and always-on-top) are in the whitepaper §6.
@@ -64,7 +67,7 @@ placement validator fails the build when two files claim the same section.
 |---|---|
 | **M0** | **Spike — done 2026-09-10.** Does a standalone GPUI app build and run on Windows, and can we set topmost, set position, and open a native file dialog? Verdict: viable, every blocking question passed ([docs/roadmap.md](docs/roadmap.md) §12). |
 | M1 | **Done.** Core engine, headless. Tested with no window at all. |
-| M2 | **In flight, on two bridges.** First usable UI — *you can use it as a notepad.* The Slint product passes its own smoke leg locally (`cargo xtask smoke --binary=slint`); what is still owed is the CI evidence trail (this repo has no remote, so no workflow has ever run) and the human eye-pass list — [detail](docs/roadmap.md) §9. |
+| M2 | **In flight on the Slint bridge.** First usable UI — *you can use it as a notepad*, and the app to run is `notes-slint.exe`: it passes its own smoke leg locally (`cargo xtask smoke --binary=slint`). `bridge-gpui` is **frozen**, not deleted — still built, still cited by the 3-of-7 machine-proven ledger in [docs/roadmap.md](docs/roadmap.md) §9, no new needles and no loosening of rows, and its removal waits on [ADR-0006](docs/decisions/0006-gpui-is-frozen-not-deleted.md). What is still owed is the CI evidence trail (this repo has no remote, so no workflow has ever run) and the human eye-pass list — [detail](docs/roadmap.md) §9. |
 | M3 | **Done.** Restore, monitor validation, DPI, and coming back maximised — the last one machine-proven, the smoke harness asserting the restore rect is unchanged across a real maximise-close-relaunch. |
 | M4 | **Done.** Autosave and pin. |
 | M5 | Polish, and the Windows portable + installer builds. |
