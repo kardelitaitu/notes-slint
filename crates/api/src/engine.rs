@@ -2204,8 +2204,10 @@ impl Engine {
     /// [`Event::SettingsWriteFailed`], [`Event::StateDirUnusable`]) instead of
     /// this one with a revision of 0 - a number the UI could render and the
     /// user could believe. Core refuses a nameless target as InvalidPath
-    /// before any save outcome exists (save.rs:141), so an empty path here
-    /// could only mean the port built the lie itself; the assert is the tripwire.
+    /// before any save outcome exists (core/src/save.rs, `atomic_write`'s
+    /// file_name() guard - "the path has no file name component"), so an empty
+    /// path here could only mean the port built the lie itself; the assert is
+    /// the tripwire.
     fn document_save_failed(path: PathBuf, revision: u64, reason: SaveError) -> Event {
         debug_assert!(
             !path.as_os_str().is_empty(),

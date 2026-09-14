@@ -417,7 +417,9 @@ pub enum Event {
     /// so this is how the failure reaches the status line (AGENTS.md).
     ///
     /// DOCUMENT-ONLY, and that is the contract this variant's old shape broke
-    /// (event.rs:312): `path` is the file the write was attempted on and
+    /// (the pre-split `SaveFailed` declaration this doc block sits on - its doc
+    /// named no subject, so a state write could ride it): `path` is the file
+    /// the write was attempted on and
     /// `revision` is the buffer revision that write would have anchored (D11),
     /// and both are REAL, because a document has both. State files have
     /// neither, and riding them here forced a `revision: 0` the UI could
@@ -426,7 +428,8 @@ pub enum Event {
     /// ([`Event::StateWriteFailed`], [`Event::StateDirUnusable`]). The port builds this variant at exactly
     /// one site - `Engine::document_save_failed` - whose assert is the
     /// tripwire for the empty-path case core already refuses as InvalidPath
-    /// (save.rs:141) before any save outcome exists.
+    /// (core/src/save.rs, `atomic_write`'s file_name() guard - "the path has no
+    /// file name component") before any save outcome exists.
     SaveFailed {
         path: PathBuf,
         revision: u64,
