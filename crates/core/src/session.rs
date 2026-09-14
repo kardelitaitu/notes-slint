@@ -485,9 +485,16 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let state = dir.path().join("state");
         std::fs::create_dir_all(&state)?;
+        // THE SID FORM, not the name: "Everyone" is a LOCALISED trustee name - on a non-English
+        // image icacls rejects it, and the assert below would then be reporting a missing English
+        // alias as a broken writability probe, which is a wrong-machine red in product clothing. A
+        // SID is the same identity in every locale. This is the form the api twin already uses and
+        // documents (crates/api/tests/first_run.rs:509, "*S-1-1-0:(WD,AD)" with the comment "SID
+        // form - locale-proof"); the right names OI/CI/W are syntax, not localised, so they stay.
+        // What the probe proves is unchanged, and so is the assertion on it.
         let denied = std::process::Command::new("icacls")
             .arg(&state)
-            .args(["/deny", "Everyone:(OI)(CI)(W)"])
+            .args(["/deny", "*S-1-1-0:(OI)(CI)(W)"])
             .output()?;
         assert!(
             denied.status.success(),
@@ -495,10 +502,21 @@ mod tests {
             String::from_utf8_lossy(&denied.stderr)
         );
         let result = ensure_state_dir(&state);
-        let _ = std::process::Command::new("icacls")
+        // Removed by the SAME identity it was denied with, or the tempdir would be left holding
+        // a denied ACL on the machine that ran this. The status stays non-fatal, because the
+        // verdict below is about the probe and not about clean-up, but it is no longer
+        // UNINSPECTED: a removal that fails silently leaks a write-denied directory into TEMP,
+        // and an exit status nobody reads is how a witness stops speaking.
+        let removed = std::process::Command::new("icacls")
             .arg(&state)
-            .args(["/remove:d", "Everyone"])
-            .output();
+            .args(["/remove:d", "*S-1-1-0"])
+            .output()?;
+        if !removed.status.success() {
+            eprintln!(
+                "note: the ACL removal failed, the tempdir may leak: {}",
+                String::from_utf8_lossy(&removed.stderr).trim()
+            );
+        }
         let Err(e) = result else {
             panic!("an unwritable state dir must be refused at startup");
         };

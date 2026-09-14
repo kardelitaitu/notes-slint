@@ -22,10 +22,24 @@
 //! removed by its own plain spelling); what survives is reported by
 //! probe_scratch_is_cleanable instead of leaked quietly.
 //!
-//! Threading: every probe wipes and owns ITS OWN root (named after the test),
-//! this file with --test-threads=1. A wipe in the middle of another test would
-//! delete that test's evidence -- a probe that destroys its own evidence is worse
-//! than no probe.
+//! Threading: every probe wipes and owns ITS OWN root, named after the test
+//! (`scratch("<test>")`), and THAT naming - not any runner setting - is what makes the
+//! default parallel run safe: a wipe can only ever delete the wiper's own evidence, so
+//! two probes in flight cannot destroy each other's table. This sentence used to claim the
+//! file is run "with --test-threads=1", which no file in this repo does: no harness setting
+//! in Cargo.toml and no step in .github/workflows/ci.yml passes that flag, here or in CI, so
+//! it described an enforcement that never existed - the same family of defect as a test that
+//! reports a skip by failing. The naming is load-bearing, not incidental, and it is what a
+//! future contributor must preserve: share one root between two probes and a mid-run wipe
+//! deletes another test's evidence, which is a probe that destroys what it came to measure.
+//!
+//! PLATFORM: eleven of the fifteen tests below are `#[cfg(windows)]`, and the number is not
+//! caution - it is the subject. They argue with Win32 NAME semantics (trailing-dot stripping,
+//! the `\\?\` prefix, one-letter-with-a-colon streams, case-folded identity), and a kernel
+//! without those rules cannot fail them, so a red there would be a fact about the runner.
+//! Four stay ungated on purpose: the drive-relative pair and the scratch-location table assert
+//! NAME-ONLY policy, which has no platform in it. Nothing here is `#[ignore]`d to make a
+//! platform quiet; the ignored row is a child process driven by its own probe.
 //!
 //! Lints: notes-core denies unwrap_used/expect_used for ALL targets, so every
 //! case here is ?-typed and asserts instead.
@@ -44,15 +58,23 @@ use toml as _;
 use notes_core::{
     Detected, LineEnding, PathVerdict, RecentEntry, SessionError, StateDir, TextEncoding, clear,
     display_labels, ensure_scratch_dir, identity_key, is_notes_path, path_policy, push,
-    save_document, save_session_bytes, scratch_note_path,
+    save_document, scratch_note_path,
 };
 
+/// Reached only by the Windows-gated probe that asks whether core creates a missing state dir. On
+/// Linux nothing calls it, and an unused import there is the very ubuntu red this fix exists to
+/// remove - so a gate on a test and a gate on what only that test imports travel together.
+#[cfg(windows)]
+use notes_core::save_session_bytes;
+
 /// Scratch root under %TEMP%.
+#[cfg(windows)]
 const ROOT_NAME: &str = "notes-hazard-probe";
 /// The extended-length prefix: two separators, a question mark, one. A raw string
 /// may end in a backslash, which is the only honest way to spell it here.
 const EXT: &str = r"\\?\";
 /// One path separator.
+#[cfg(windows)]
 const BS: &str = r"\";
 
 fn utf8_det() -> Detected {
@@ -64,14 +86,17 @@ fn utf8_det() -> Detected {
     }
 }
 
+#[cfg(windows)]
 fn ch(code: u32) -> char {
     char::from_u32(code).unwrap_or('?')
 }
 
+#[cfg(windows)]
 fn rtl() -> char {
     ch(0x202E)
 }
 
+#[cfg(windows)]
 fn zwsp() -> char {
     ch(0x200B)
 }
@@ -103,10 +128,12 @@ fn verb(p: &Path) -> PathBuf {
     }
 }
 
+#[cfg(windows)]
 fn exact_exists(p: &Path) -> bool {
     fs::symlink_metadata(verb(p)).is_ok()
 }
 
+#[cfg(windows)]
 fn remove_hard(p: &Path) {
     let v = verb(p);
     if fs::remove_dir_all(&v).is_err() {
@@ -114,24 +141,31 @@ fn remove_hard(p: &Path) {
     }
 }
 
+#[cfg(windows)]
 fn scratch(test: &str) -> PathBuf {
     let mut root = std::env::temp_dir();
     root.push(format!("{ROOT_NAME}-{test}"));
     root
 }
 
-/// The scratch root, rebuilt clean. Hostile names need a real absolute path that
-/// outlives a TempDir's Drop, which cannot delete them.
+/// WHY THESE PROBES ARE GATED AND NOT IGNORED. This function used to begin
+/// "if !cfg!(windows) { return Err(...) }", which looked like a skip and was not one: a
+/// Result-returning #[test] that returns Err is a FAILED test, so on any non-Windows runner all
+/// ten callers printed "this probe measures Win32 name behaviour" as a red against core, saying
+/// nothing about core and everything about the machine. #[ignore] would have made the red go away
+/// by deleting the evidence, which is worse. So the gate is a real cfg(windows) on each caller -
+/// compiled only where its subject exists - and the lie here is gone. The portable rows in this
+/// file (the drive-relative NAME policy, the scratch-location table, the roaming proof) stay
+/// ungated, because they judge name-only code that has no platform in it.
+#[cfg(windows)]
 fn init_scratch(test: &str) -> Result<PathBuf, Box<dyn Error>> {
-    if !cfg!(windows) {
-        return Err("this probe measures Win32 name behaviour".into());
-    }
     let root = scratch(test);
     remove_hard(&root);
     fs::create_dir_all(&root)?;
     Ok(root)
 }
 
+#[cfg(windows)]
 fn row_dir(root: &Path, i: usize) -> Result<PathBuf, Box<dyn Error>> {
     let dir = root.join(format!("t{i:02}"));
     fs::create_dir_all(&dir)?;
@@ -142,12 +176,14 @@ fn io_line(e: &std::io::Error) -> String {
     format!("{:?}(os={:?})", e.kind(), e.raw_os_error())
 }
 
+#[cfg(windows)]
 fn name_of(p: &Path) -> String {
     p.file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
 /// Make the invisible characters visible in the printed table.
+#[cfg(windows)]
 fn shown(name: &str) -> String {
     name.replace(&rtl().to_string(), "<U+202E>")
         .replace(&zwsp().to_string(), "<U+200B>")
@@ -155,6 +191,7 @@ fn shown(name: &str) -> String {
 }
 
 #[derive(Debug)]
+#[cfg(windows)]
 struct Row {
     name: String,
     verdict: String,
@@ -166,6 +203,7 @@ struct Row {
 }
 
 /// One row: what policy says, what the write does, what is really on disk.
+#[cfg(windows)]
 fn run_row(root: &Path, i: usize, display: &str, target: &Path) -> Result<Row, Box<dyn Error>> {
     let fallback = row_dir(root, i)?;
     let token = format!("HAZARD-{i:02}-PAYLOAD");
@@ -254,6 +292,7 @@ fn run_row(root: &Path, i: usize, display: &str, target: &Path) -> Result<Row, B
     })
 }
 
+#[cfg(windows)]
 fn print_rows(title: &str, rows: &[Row]) {
     println!();
     println!("=== {title} ===");
@@ -279,6 +318,7 @@ fn print_rows(title: &str, rows: &[Row]) {
 /// THE TABLE: every name from the brief, judged by policy and then attempted for
 /// real, with the directory itself as the witness of where the bytes landed.
 #[test]
+#[cfg(windows)]
 fn policy_table_vs_real_win32() -> Result<(), Box<dyn Error>> {
     let root = init_scratch("policy_table_vs_real_win32")?;
     let mut rows: Vec<Row> = Vec::new();
@@ -456,6 +496,7 @@ fn policy_table_vs_real_win32() -> Result<(), Box<dyn Error>> {
 /// is an ALTERNATE DATA STREAM on the file "a". drive_separator() accepts any
 /// ASCII letter before the colon, so the stream rule never fires for these.
 #[test]
+#[cfg(windows)]
 fn one_letter_name_with_a_colon_is_a_stream_not_a_drive() -> Result<(), Box<dyn Error>> {
     let root = init_scratch("one_letter_name_with_a_colon_is_a_stream_not_a_drive")?;
     let dir = row_dir(&root, 95)?;
@@ -661,6 +702,7 @@ fn drive_relative_child() -> Result<(), Box<dyn Error>> {
 /// to "sub.\x.notes" lands in "sub\x.notes", policy-Allowed named one file and
 /// wrote another -- and save_document reports Ok for both.
 #[test]
+#[cfg(windows)]
 fn stripped_middle_component_shadows_a_real_dot_directory() -> Result<(), Box<dyn Error>> {
     let root = init_scratch("stripped_middle_component_shadows_a_real_dot_directory")?;
     let dir = row_dir(&root, 92)?;
@@ -713,6 +755,7 @@ fn stripped_middle_component_shadows_a_real_dot_directory() -> Result<(), Box<dy
 /// A trailing dot past \\?\ is a LITERAL character, so the file really is named
 /// "x.notes." -- and no plain spelling of that name can reach it again.
 #[test]
+#[cfg(windows)]
 fn extended_prefix_trailing_dot_is_a_file_no_plain_name_reaches() -> Result<(), Box<dyn Error>> {
     let root = init_scratch("extended_prefix_trailing_dot_is_a_file_no_plain_name_reaches")?;
     let dir = row_dir(&root, 93)?;
@@ -762,6 +805,7 @@ fn extended_prefix_trailing_dot_is_a_file_no_plain_name_reaches() -> Result<(), 
 /// label that renders backwards, or two labels that render identically, is the
 /// same "the name you see is not the file you get" class in user terms.
 #[test]
+#[cfg(windows)]
 fn invisible_names_reach_the_menu_verbatim() -> Result<(), Box<dyn Error>> {
     let root = init_scratch("invisible_names_reach_the_menu_verbatim")?;
     let dir = row_dir(&root, 96)?;
@@ -830,6 +874,7 @@ fn invisible_names_reach_the_menu_verbatim() -> Result<(), Box<dyn Error>> {
 /// CASE AND COLLISION: NTFS is case-insensitive and case-preserving, so a second
 /// spelling of a name must not become a second document.
 #[test]
+#[cfg(windows)]
 fn case_only_difference_is_one_file_and_one_identity() -> Result<(), Box<dyn Error>> {
     let root = init_scratch("case_only_difference_is_one_file_and_one_identity")?;
     let dir = row_dir(&root, 90)?;
@@ -887,6 +932,7 @@ fn case_only_difference_is_one_file_and_one_identity() -> Result<(), Box<dyn Err
 /// to "notes"), yet identity_key is computed WITHOUT canonicalising a refused
 /// name -- so one file on disk becomes two recent entries.
 #[test]
+#[cfg(windows)]
 fn refused_spelling_of_an_existing_file_splits_the_recent_list() -> Result<(), Box<dyn Error>> {
     let root = init_scratch("refused_spelling_of_an_existing_file_splits_the_recent_list")?;
     let dir = row_dir(&root, 91)?;
@@ -926,6 +972,7 @@ fn refused_spelling_of_an_existing_file_splits_the_recent_list() -> Result<(), B
 /// that works here works without the manifest, and a failure here cannot be
 /// blamed on the manifest.
 #[test]
+#[cfg(windows)]
 fn long_path_round_trip_plain_vs_extended() -> Result<(), Box<dyn Error>> {
     let root = init_scratch("long_path_round_trip_plain_vs_extended")?;
     let dir = row_dir(&root, 94)?;
@@ -1001,6 +1048,7 @@ fn long_path_round_trip_plain_vs_extended() -> Result<(), Box<dyn Error>> {
 /// STATE DIR (D54): core does NOT create the directory it saves into -- that is
 /// api's create_dir_all. Measured so the manager knows which side the fix is on.
 #[test]
+#[cfg(windows)]
 fn core_does_not_create_the_state_dir() -> Result<(), Box<dyn Error>> {
     let base = init_scratch("core_does_not_create_the_state_dir")?.join("state-missing");
     remove_hard(&base);
@@ -1023,6 +1071,7 @@ fn core_does_not_create_the_state_dir() -> Result<(), Box<dyn Error>> {
 
 /// Honest clean-up: a hostile NAME can survive a cleanup that throws on it.
 #[test]
+#[cfg(windows)]
 fn probe_scratch_is_cleanable() -> Result<(), Box<dyn Error>> {
     // Its OWN root, wiped fresh, then deliberately polluted with a hostile
     // name this test creates itself: the proof is that removal still wins.
