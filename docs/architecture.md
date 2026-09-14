@@ -3,7 +3,7 @@ title: Architecture
 type: planning
 owns: ['§5']
 status: living
-updated: 2026-09-11
+updated: 2026-09-14
 ---
 
 # Architecture
@@ -116,20 +116,22 @@ notes-gpui/
 ├── rust-toolchain.toml        # pin it; GPUI API churn is a known risk (R1)
 ├── .cargo/config.toml
 ├── .github/workflows/
-│   ├── ci.yml                 # fmt + clippy + test + check-docs, matrix over 3 OSes
-│   └── release.yml            # builds the 5 artifacts (§7) on tag
+│   ├── ci.yml                 #   fmt, clippy, test, the xtask gates, docs — Windows only
+│   └── (release.yml)          #   NOT BUILT. Nothing builds the 5 artifacts on tag yet (§7).
 │
 ├── crates/
 │   ├── core/                  # PURE RUST. No gpui, no windows, no unsafe.
-│   │   ├── src/
+│   │   ├── src/               #   ten modules, none of them allowed to see a window
+│   │   │   ├── lib.rs         #   the purity invariant, in the file the linter reads
 │   │   │   ├── document.rs    #   buffer, revision counter, dirty tracking
 │   │   │   ├── format.rs      #   .notes: frontmatter parse/serialise (§4.5)
 │   │   │   ├── encoding.rs    #   UTF-8/16, BOM, EOL — detect once, write back same
+│   │   │   ├── geometry.rs    #   Rect in FRAME pixels — client space drifts 8/19 px (§12.2)
 │   │   │   ├── save.rs        #   atomic: temp → fsync → rename
-│   │   │   ├── autosave.rs    #   debounce, periodic flush, blur/close triggers
 │   │   │   ├── session.rs     #   rect, monitor id, scale, maximized, pinned, last file
 │   │   │   ├── recent.rs      #   MRU ≤10, canonical-path dedupe, missing-file state
 │   │   │   ├── settings.rs    #   deliberate prefs
+│   │   │   ├── path_policy.rs #   name-only verdicts — no fs, no canonicalisation, no timeout
 │   │   │   └── paths.rs       #   resolve_state_dir() — portable vs installed
 │   │   └── tests/
 │   │       ├── roundtrip.rs   #   load→save byte-identical (R10)
@@ -140,37 +142,64 @@ notes-gpui/
 │   │   │   ├── lib.rs         #   WindowBackend trait, geometry types
 │   │   │   ├── geometry.rs    #   rect/monitor/scale — ONE documented unit (§4.1)
 │   │   │   └── windows/       #   #[cfg(windows)]
+│   │   │       ├── mod.rs     #   the one module tree allowed unsafe; HWND in, answer out
 │   │   │       ├── topmost.rs #   SetWindowPos + SWP_NOACTIVATE (§4.3)
 │   │   │       ├── monitors.rs#   EnumDisplayMonitors, per-monitor DPI (R5)
-│   │   │       └── dialog.rs  #   IFileOpenDialog (R9)
-│   │   ├── build.rs           #   winres: icon, version info, DPI-awareness manifest
+│   │   │       ├── corners.rs #   DWM corner attribute — one call, it reports the OS answer
+│   │   │       ├── file_drop.rs#   shell paths in; decides nothing about what they are
+│   │   │       └── paths.rs   #   volume identity of an OPEN handle — immune to a rename
 │   │   └── Cargo.toml
 │   │
 │   ├── api/                   # THE GATEWAY (§5.4). Commands in, Events out.
-│   │   └── src/
+│   │   └── src/               #   the vocabulary is FROZEN; the lifecycle is what a bridge wires
 │   │       ├── lib.rs         #   Gateway: start(), send(Command), events()
+│   │       ├── gateway.rs     #   the port's only handle — two channels, one engine thread
 │   │       ├── command.rs     #   UI → engine, one variant per user intent
 │   │       ├── event.rs       #   engine → UI, incl. async failures (§5.4)
 │   │       ├── engine.rs      #   the worker loop; owns core + platform handles
+│   │       ├── file_drop.rs   #   arm_file_drop(): the one synchronous call, rule 4
 │   │       └── dto.rs         #   types the UI may see — re-exported, never leaked
 │   │
-│   ├── bridge-gpui/           # THE FIRST BRIDGE (§5.5). gpui-kit (ADR-0002).
-│   │   └── src/
-│   │       ├── main.rs        #   #![windows_subsystem = "windows"] — no console window
-│   │       ├── bridge.rs      #   hands the window handle to api (§5.5)
-│   │       ├── app.rs         #   GPUI root state; drains Events onto the UI thread
-│   │       ├── actions.rs     #   sends Open / Save / SaveAs / TogglePin Commands
-│   │       ├── keymap.rs      #   Ctrl+S, Ctrl+Shift+S, pin shortcut
-│   │       └── views/
-│   │           ├── editor.rs  #   OWNS THE TEXT BUFFER — deliberately not abstracted
-│   │           ├── menu.rs    #   hamburger
-│   │           ├── titlebar.rs#   custom chrome — ADR-0003
-│   │           └── status.rs  #   dirty + autosave-failed indicator (§4.4)
+│   ├── bridge-gpui/           # THE FIRST BRIDGE (§5.5). gpui-kit (ADR-0002). FROZEN (ADR-0006).
+│   │   ├── src/               #   flat — these four files are the whole crate, no views/ subtree
+│   │   │   ├── main.rs        #   #![windows_subsystem = "windows"] — no console window
+│   │   │   ├── editor.rs      #   OWNS THE TEXT BUFFER — model, paint, focus, the IME seam
+│   │   │   ├── menu.rs        #   the chord table — the bar is stored, never drawn (Windows)
+│   │   │   ├── titlebar.rs    #   custom chrome — ADR-0003, LEFT + CENTRE regions only
+│   │   ├── build.rs           #   a no-op now: gpui's own RT_MANIFEST took the embed
+│   │   ├── app.manifest       #   DPI + long paths; the input the post-link step writes back
+│   │   └── tests/             #   editor_roundtrip, ime_seam, paint_cost
+│   │
+│   ├── bridge-slint/          # THE SHIPPED BRIDGE (§5.5). Slint; the product is notes-slint.exe.
+│   │   ├── src/               #   two [[bin]] roots — the four modules below compile into BOTH
+│   │   │   ├── product.rs     #   bin notes-slint — a root that owns no policy
+│   │   │   ├── probe.rs       #   bin notes-slint-probe — the instrument that earned it
+│   │   │   ├── surface.rs     #   the pure decisions both roots must not disagree about
+│   │   │   ├── plumbing.rs    #   needle prefix, send(), the title strip and unsaved dot
+│   │   │   ├── title_contract.rs#   the title bar's text half, with no toolkit in it
+│   │   │   └── ui_gen.rs      #   the slint! entry — imports ../ui/main.slint
+│   │   ├── ui/                #   main.slint, chrome.slint, theme.slint, icons/*.svg
+│   │   └── tests/             #   editor_roundtrip, panic_hook
+│   │
+│   ├── xtask/                 # REPO AUTOMATION (§5.2). Builds no product; imports no UI.
+│   │   ├── src/               #   one module per gate; main.rs holds the roster
+│   │   │   ├── main.rs        #   subcommand dispatch + the usage text
+│   │   │   ├── arch.rs        #   check-arch — the layering gate, rules and their limits (§5.2)
+│   │   │   ├── check.rs       #   check — the AGENTS.md gate as one command
+│   │   │   ├── check_ci.rs    #   check-ci — ci.yml must run exactly that roster
+│   │   │   ├── check_unsafe.rs#   check-unsafe — the ledger keeping unsafe in platform
+│   │   │   ├── deps.rs        #   check-deps — member manifests match the workspace template
+│   │   │   ├── fixtures.rs    #   fixtures verify — the R10 corpus is byte-exact vs manifest
+│   │   │   ├── identity.rs    #   proves the checker binary is the code it claims to be
+│   │   │   ├── manifest.rs    #   manifest — app.manifest into the exe post-link, then read back
+│   │   │   ├── metadata.rs    #   cargo metadata, shared; never `cargo tree -i`
+│   │   │   └── smoke.rs       #   smoke — drives a real window, greps its needles (§9)
+│   │   └── Cargo.toml
 │   │
 │   └── (bridge-tauri/)        # NOT BUILT. A seam, not a task — see §5.5.
 │
-├── assets/                    # icon.ico / .icns / .png; fonts if GPUI needs them
-├── packaging/
+├── assets/                    # icons/ holds one .svg; .ico/.icns/.png are NOT BUILT (§7)
+├── (packaging/)               # NOT BUILT. §7's five artifacts are a plan, not a tree.
 │   ├── windows/               #   WiX .wxs or Inno .iss — NOT MSIX (§7)
 │   ├── linux/                 #   deb control, .desktop, AppImage recipe
 │   └── macos/                 #   Entitlements.plist, dmg settings, notarise script (§7.1)
@@ -178,7 +207,7 @@ notes-gpui/
 │   ├── README.md              #   the docs map, and the tense rule (§5.6)
 │   ├── dev/                   #   how to build/test/package - written once code exists
 │   └── decisions/             #   ADRs, one per settled decision (§5.6)
-└── scripts/                   #   local dev: run, bundle, regenerate fixtures
+└── (scripts/)                 # NOT BUILT. Its duties landed as cargo xtask subcommands (§5.2)
 ```
 
 ### 5.2 Rules that keep this honest
@@ -220,10 +249,20 @@ testability of `core` is quietly compromised. Review for this.
 
 ### 5.3 Two structural notes
 
-- **`build.rs` is where DPI awareness actually gets set (R5).** Per-monitor v2 DPI must be
-  declared in the exe's application manifest, not called at runtime — a runtime call is too
-  late once the process has already been DPI-scaled. So the manifest is a build-time
-  artifact, which is why it sits beside the icon and version info in `winres`.
+- **DPI awareness does travel in the exe's application manifest (R5) — the plan's error
+  was the WHEN, never the fact.** Per-monitor v2 must be declared there, not called at
+  runtime: a runtime call is too late once the process is already DPI-scaled, and with
+  nothing declared Windows virtualises every coordinate it reports (M0's D1/D9). No build
+  script puts it in. gpui's own `windows-manifest` feature is in its DEFAULT list and is
+  not subtractable from outside, so the linker always embeds *a* manifest — GPUI's,
+  which drops `longPathAware` and the `system` DPI fallback. `cargo xtask manifest`
+  therefore replaces that resource AFTER the link, from `crates/bridge-gpui/app.manifest`,
+  and then proves itself by reading the exe back for its markers rather than trusting its
+  own run: 0 = replaced and verified, 20 = no `mt.exe` (no Windows SDK), 21 = the
+  read-back refused to judge, 22 = the work could not run. There is deliberately no
+  "already fine, did nothing" path. The icon and the version info — the other half of the
+  old sentence — are still owed to M5a (§7), where `winres` is one door under discussion
+  and not a dependency this repo has.
 - **The shipped binary's name is load-bearing.** Portable mode resolves state relative to
   the exe's directory (§5), so renaming the binary relocates the user's notes. Pin it
   early and keep it stable across all five artifacts.
@@ -257,8 +296,8 @@ So the gateway must be **command/event**, not call/return:
 // UI → engine. One variant per user intent. Fire-and-forget.
 enum Command {
     Open(PathBuf),
-    SaveAs(PathBuf),
-    Flush { text: String, revision: u64 },  // Ctrl+S and every autosave trigger
+    SaveAs { path: PathBuf, text: String, revision: u64 },
+    Flush { text: String, revision: u64, epoch: u64 },  // Ctrl+S and every autosave trigger
     SetAutosave(bool),
     SetPinned(bool),
     ClearRecents,
@@ -307,10 +346,13 @@ app -i core` check in §5.2 exists to prevent. And a real temptation to let logi
 ### 5.5 Bridges: one port, many UIs
 
 A **bridge** is an adapter that owns a UI toolkit end to end and speaks to nothing else in
-this repo except `api`. `bridge-gpui` today; `bridge-tauri`, `bridge-egui`, or
-`bridge-objc` later if a toolkit ever has to be replaced. `api` is the port, bridges are the
-adapters, and the dependency arrow only ever points one way: bridge -> api. The port never
-learns that any bridge exists (rule 4, §5.2).
+this repo except `api`. **Two are built; one of them is past tense.** `bridge-slint` ships
+the product — `notes-slint.exe`, beside the instrumented probe that earned it — while
+`bridge-gpui` is FROZEN (ADR-0006): still built, still cited as evidence, no new needles.
+`bridge-tauri`, `bridge-egui`, or `bridge-objc` would come later only if a toolkit ever
+had to be replaced. One adapter per toolkit is what keeps the toolkit a swappable detail.
+`api` is the port, bridges are the adapters, and the dependency arrow only ever points one
+way: bridge -> api. The port never learns that any bridge exists (rule 4, §5.2).
 
 **The toolkit `bridge-gpui` speaks is `gpui-kit`, not bare `gpui`** — ADR-0002, taken with
 the §10.2 chrome resolution (ADR-0003). The kit wraps GPUI plus a component layer, and that
