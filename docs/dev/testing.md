@@ -87,18 +87,27 @@ headless runner may have no desktop at all — so `cargo xtask check` reports it
 and `--quick` skips it; it is never a blocking gate step.
 
 `--binary` names which artifact the harness resolves, builds, staleness-checks and, where
-a leg is wired, judges. Both shapes parse (`--binary=slint`, `--binary slint`); the
-default is `gpui`, which is what CI and `cargo xtask check` run (`crates/xtask/src/smoke.rs`,
-`BINARY_NAMES`). One package, two bins, two contracts: which is why the flag picks an
-**artifact**, not a package.
+a leg is wired, judges. Both shapes parse (`--binary=slint`, `--binary slint`); the flag picks an
+**artifact**, not a package — one package, two bins, two contracts (`crates/xtask/src/smoke.rs`,
+`BINARY_NAMES`).
+
+**The default is the product.** [ADR-0006](../decisions/0006-gpui-is-frozen-not-deleted.md)
+orders the retarget — `cargo xtask smoke`, with no flag, judged against `notes-slint.exe` —
+and that flip lands in the same wave as this sentence, so read the bare command as "judge what
+we ship". Until the flip is in your tree the default leg still runs the needle schedule; a
+script that means the product names it: `cargo xtask smoke --binary=slint`. `cargo xtask check`
+runs smoke as an **advisory** step either way — never a gate, never a promise that CI said so:
+this repo has no remote, so the workflow's own smoke rows have never executed.
 
 | `--binary` | exe | what the harness does with it |
 |---|---|---|
-| `gpui` | `target\debug\notes-gpui.exe` | judged — the needle schedule (`Leg::GpuiSchedule`) |
-| `slint` | `target\debug\notes-slint.exe` | judged — the product contract (`Leg::Product`) |
-| `slint-probe` | `target\debug\notes-slint-probe.exe` | path named, then declined — **not built, not launched, not judged** (`Leg::NotWired`) |
+| `gpui` | `target\debug\notes-gpui.exe` | judged — the **frozen** needle schedule (`Leg::GpuiSchedule`): still legal, always explicit now, and no longer where a bare `smoke` goes |
+| `slint` | `target\debug\notes-slint.exe` | judged — the product contract (`Leg::Product`), and the artifact a bare `smoke` is being retargeted to default to |
+| `slint-probe` | `target\debug\notes-slint-probe.exe` | path named, then declined — **not built, not launched, not judged** (`Leg::NotWired`), permanently by design |
 
-An unlisted value is refused, naming the legal list, before anything is built.
+An unlisted value is refused, naming the legal list, before anything is built. The `gpui` row
+staying legal is the schedule, not an invitation: ADR-0006 freezes that bridge, so the needle
+schedule keeps running as evidence while nothing new is added to it.
 
 ### The Product leg, and what its green does not buy
 
@@ -120,8 +129,10 @@ read a rect or poll a pin.
 
 ### `slint-probe` declines, out loud
 
-The instrumented build is never judged, and the harness prints why instead of leaving a
-blank to be read as a pass. The decline is asked **before** the build step — after the exe
+The instrumented build is never judged — and [ADR-0006](../decisions/0006-gpui-is-frozen-not-deleted.md)
+settles that this is forever, not a gap: the probe stays frozen, exit 2, its needles donated to
+`Leg::Product` as claims, rather than re-earned by editing the instrument. The harness prints why
+instead of leaving a blank to be read as a pass. The decline is asked **before** the build step — after the exe
 path is named, before anything is compiled, launched or measured — so the run costs nothing
 and claims nothing. The reason lives in one function, `not_wired_reason`, and is printed
 verbatim:
