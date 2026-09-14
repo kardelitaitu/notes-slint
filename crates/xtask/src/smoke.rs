@@ -4186,6 +4186,24 @@ public static class PROD {
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  // THE MENU LEGS' DOORS. A click is placed by the CLIENT area, not the frame: Chrome is
+  // drawn inside the window (main.slint's WindowLayout::None), so the bar's own (0,0) is
+  // the client's (0,0) and GetWindowRect's top-left is the shadow edge. GetDpiForWindow
+  // is the logical-to-physical step, because every coordinate in chrome.slint is a LOGICAL
+  // px and the cursor is moved in physical ones. WindowFromPoint is asked BEFORE the press
+  // is made - the OS delivers a click to whatever is under the cursor, so "the menu did not
+  // answer" and "we pressed on somebody else's window" must be tellable apart, and they are
+  // only tellable apart if the press says who was under it.
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+  // THE DIALOG's tree. A modal file picker is a second top-level of OUR pid, and the only
+  // way to see one is to walk the desktop: EnumWindows + GetClassNameW + the owner pid.
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder s, int max);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
 }
 '@
 $win32 = [bool](Add-Type -TypeDefinition $code -PassThru)
@@ -4263,6 +4281,135 @@ function Get-Settled($h, $ceiling) {
         if ($next -ne $prev) { $prev = $next } else { $stable = 1; break }
     }
     return "$prev|$stable"
+}
+# ---- THE POINTER arithmetic every menu leg shares --------------------------------
+# Every number below is chrome.slint's, in chrome.slint's units (LOGICAL px), named at
+# its source: Theme.bar-height 28, slot-width 60, icon-size 24, menu-width 190,
+# menu-inset 4, menu-pad 4, menu-gap 2, menu-row-height 20; Chrome's popup-x rule
+# max(8, min(menu-inset, host-width - menu-width - 8)) at :172, the popup hung at
+# y = parent.height (:736) and the rows grid inset by one pad on each axis (:756), with
+# row i starting at i*(row-height + gap). A stale constant here clicks on the wrong pixel,
+# ONE ASSUMPTION IS LOADED HERE AND SAID OUT LOUD: every row coordinate below is measured from
+# the popup hung UNDER the bar, which is what Chrome does while the popup fits. chrome.slint
+# has since grown a popup-top() rule that lifts it above the bar when it does not, and these
+# legs do not follow it - at 800x600 the 6-row menu fits comfortably, and a window small
+# enough to flip the popup would show up as a MISS WITH A PIXEL BESIDE IT rather than a
+# pass, which is the only failure shape a coordinate like this is allowed to have.
+# and the leg PRINTS THE PIXEL IT CLICKED and WHO WAS UNDER IT, so the failure mode is a
+# number in the log and not a silent "the product ignored the menu".
+$BAR = 28.0; $SLOT = 60.0; $ICON = 24.0; $MENUW = 190.0; $MINSET = 4.0; $PAD = 4.0
+$GAP = 2.0; $ROWH = 20.0
+# The hamburger's centre: the left slot is a centred HorizontalLayout of two icon-size
+# cells, so the FIRST cell runs from (slot - 2*icon)/2 = 6 to 30 and its centre is 18 -
+# NOT slot/2 = 30, which is the boundary between the hamburger and the pin. Said because
+# the boundary is exactly the kind of pixel that "looks like it works" on one DPI and
+# presses the pin on another.
+$HAMBURGER_X = ($SLOT - 2 * $ICON) / 2 + $ICON / 2
+$BAR_MID_Y = $BAR / 2
+function Get-RowY([int]$i) { return $script:BAR + $script:PAD + $i * ($script:ROWH + $script:GAP) + $script:ROWH / 2 }
+function Get-Client($h) {
+    $rc = New-Object PROD+RECT
+    if (-not [PROD]::GetClientRect($h, [ref]$rc)) { return $null }
+    $pt = New-Object PROD+POINT
+    if (-not [PROD]::ClientToScreen($h, [ref]$pt)) { return $null }
+    $dpi = [PROD]::GetDpiForWindow($h)
+    $s = 1.0
+    if ($dpi -gt 0) { $s = $dpi / 96.0 }
+    return @{ ox = [int]$pt.X; oy = [int]$pt.Y; lw = [double](($rc.Right - $rc.Left) / $s); s = $s }
+}
+function Get-PopupX($h) {
+    $c = Get-Client $h
+    if ($null -eq $c) { return -1.0 }
+    return [Math]::Max(8.0, [Math]::Min($MINSET, $c.lw - $MENUW - 8.0))
+}
+# One press, from the LOGICAL point the markup says the row occupies, delivered through
+# the OS the way a hand delivers it: move the cursor, press, release. Returns the pixel it
+# pressed at and whether our window was the thing under the cursor, as one string, so the
+# Rust side can print both without guessing which press answered.
+function Click-Logical($h, $lx, $ly) {
+    $c = Get-Client $h
+    if ($null -eq $c) { return 'none,0,0' }
+    $px = [int]($c.ox + $lx * $c.s); $py = [int]($c.oy + $ly * $c.s)
+    $probe = New-Object PROD+POINT; $probe.X = $px; $probe.Y = $py
+    $under = [PROD]::WindowFromPoint($probe)
+    $ours = ([int64]$under -eq [int64]$h)
+    if (-not $ours) { return "$px,$py,0,$([int64]$under)" }
+    [void][PROD]::SetCursorPos($px, $py)
+    Start-Sleep -Milliseconds 180
+    [PROD]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 70
+    [PROD]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 420
+    return "$px,$py,1,$([int64]$under)"
+}
+# A title-band drag, the same door a hand uses: press, MOVE IN STEPS, release. The steps
+# matter - Slint's TouchArea has no 'dragged' callback, so a drag is its 'moved' handler
+# guarded by the pressed bit (chrome.slint:556), and a single jump from A to B delivers one
+# 'moved' at most. Eight steps of 5 logical px is what the band's own delta arithmetic
+# wants, and the window really does travel: every later click re-reads the client origin,
+# because a coordinate cached before the drag is a coordinate about a window that moved.
+function Drag-Band($h, $lx, $ly, $dx) {
+    $c = Get-Client $h
+    if ($null -eq $c) { return 'none,0' }
+    $px = [int]($c.ox + $lx * $c.s); $py = [int]($c.oy + $ly * $c.s)
+    $probe = New-Object PROD+POINT; $probe.X = $px; $probe.Y = $py
+    $under = [PROD]::WindowFromPoint($probe)
+    if ([int64]$under -ne [int64]$h) { return "$px,$py,0" }
+    [void][PROD]::SetCursorPos($px, $py)
+    Start-Sleep -Milliseconds 180
+    [PROD]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 90
+    for ($i = 1; $i -le 8; $i++) {
+        [void][PROD]::SetCursorPos([int]($px + $i * $dx * $c.s / 8), $py)
+        Start-Sleep -Milliseconds 30
+    }
+    Start-Sleep -Milliseconds 90
+    [PROD]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 420
+    return "$px,$py,1"
+}
+# The foreground lock, lifted from the mode-3 recipe VERBATIM (attach self->target and
+# foreground->target with the ids from GetWindowThreadProcessId's RETURN value, then ask).
+# Left in mode 3 as it shipped rather than refactored under a proven leg: mode 3 is green
+# and paid for; these legs are new, and a shared helper is the right call for the NEXT
+# slice, not for one running out of clock.
+function Set-Active($h) {
+    $cur = [PROD]::GetCurrentThreadId()
+    $fgH = [PROD]::GetForegroundWindow()
+    $a = [uint32]0; $b = [uint32]0
+    $fgTid = [PROD]::GetWindowThreadProcessId($fgH, [ref]$a)
+    $tTid = [PROD]::GetWindowThreadProcessId($h, [ref]$b)
+    $att1 = [PROD]::AttachThreadInput($cur, $tTid, $true)
+    $att2 = $false
+    if ($fgTid -ne 0 -and $fgTid -ne $tTid) { $att2 = [PROD]::AttachThreadInput($fgTid, $tTid, $true) }
+    [void][PROD]::SetForegroundWindow($h)
+    Start-Sleep -Milliseconds 500
+    $ok = ([int64][PROD]::GetForegroundWindow() -eq [int64]$h)
+    if ($att1) { [void][PROD]::DetachThreadInput($cur, $tTid) }
+    if ($att2) { [void][PROD]::DetachThreadInput($fgTid, $tTid) }
+    return [int][bool]$ok
+}
+# Any visible #32770 belonging to a pid - THE DIALOG, if there is one. Walked rather than
+# waited-for, because the only honest form of "the modal appeared" is a handle and a class
+# name read off the desktop after the ask.
+function Get-Dialog([int64]$wantPid) {
+    # The delegate is a compiled action of its own: it sees SCRIPT scope, not this
+    # function's locals, so the pid travels in a $script: variable. And the pid is checked
+    # at all because a #32770 belonging to somebody else's explorer is not our dialog - a
+    # proof that counted THAT would be a proof of nothing.
+    $script:wantPid = $wantPid
+    $script:dlg = [IntPtr]::Zero
+    $cb = [PROD+EnumProc] {
+        param($h, $l)
+        $sb = New-Object System.Text.StringBuilder 256
+        [void][PROD]::GetClassNameW($h, $sb, 256)
+        if ($sb.ToString() -eq '#32770' -and [PROD]::IsWindowVisible($h)) {
+            $pid2 = [uint32]0
+            [void][PROD]::GetWindowThreadProcessId($h, [ref]$pid2)
+            if ([int64]$pid2 -eq $script:wantPid) { $script:dlg = $h; return $false }
+        }
+        return $true
+    }
+    [void][PROD]::EnumWindows($cb, [IntPtr]::Zero)
+    return [int64]$script:dlg
 }
 # From here every read goes through Get-Handle, so the cached $handle is only ever the
 # "did a window appear at all" answer the ALIVE line above is about.
@@ -4394,7 +4541,7 @@ if ($Maximise -eq 3) {
     Report 'A2'; Report 'A3'
   }
   'NORMAL='; 'NORMAL_STABLE=0'; 'NORMAL_SHOWCMD=-1'; 'MAX_ASKED=0'; 'SHOWCMD_AFTER_MAX=-1'
-} elseif ([int64]$handle -ne 0 -and $Maximise -ge 1) {
+} elseif ([int64]$handle -ne 0 -and ($Maximise -eq 1 -or $Maximise -eq 2)) {
     # Mode 0 - the plain launch - takes NONE of this path at all, so the geometry phase
     // cannot add a single second to the runtime the 45s claim is timed against.
     $a = (Get-Settled (Get-Handle $p) $SettleMs).Split('|')
@@ -4456,7 +4603,113 @@ if ($Maximise -eq 3) {
         "NORMAL_RELAUNCH=$($c[0])"
         "NORMAL_RELAUNCH_STABLE=$($c[2])"
     }
-} else { 'NORMAL='; 'NORMAL_STABLE=0'; 'NORMAL_SHOWCMD=-1'; 'MAX_ASKED=0'; 'SHOWCMD_AFTER_MAX=-1' }
+}
+# MODE 4 - LEG A: THE MENU ANSWERS A REAL CLICK. Two presses, both placed by the
+# markup's own arithmetic, and this script decides NOTHING: it reports who was under the
+# cursor and where the pixel was, and the machine-visible truth of the act is the line the
+# PRODUCT prints on its own stderr ("menu: autosave-row toggled true->false" for the row,
+# "dialog[skipped]: SLINT_NO_DIALOG - ... (Open -> ...)" for the Open row). The toggle's
+# other half - the autosave actually holding a letter back - is what the chord leg proved
+# at 1bf46326; what is proved here is that the SAME code path is reached by a POINTER,
+# which is the claim nobody has made until now.
+elseif ($Maximise -eq 4) {
+    $h4 = Get-Handle $p
+    "ACTIVE=$([int](Set-Active $h4))"
+    $r = Click-Logical (Get-Handle $p) $HAMBURGER_X $BAR_MID_Y 'HAMBURGER'
+    "HAMBURGER_AT=$r"
+    Start-Sleep -Milliseconds 350
+    $r2 = Click-Logical (Get-Handle $p) ((Get-PopupX (Get-Handle $p)) + $PAD + 40.0) (Get-RowY 2) 'ROW'
+    "ROW_AT=$r2"
+    Start-Sleep -Milliseconds 600
+    "ROW_HANDLE=$([int64](Get-Handle $p))"
+}
+# MODE 5 - LEG B, THE REFUSAL PROOF. Same two presses, the Open row instead of the
+# Auto-save row, and SLINT_NO_DIALOG set by the harness so no modal is in the way. What
+# the refusal buys is the ONLY cheap proof that the row's geometry is right: the app
+# reached Rust, decided not to show a modal, and said so out loud. A wrong pixel cannot
+# produce that line.
+elseif ($Maximise -eq 5) {
+    $h5 = Get-Handle $p
+    "ACTIVE=$([int](Set-Active $h5))"
+    "HAMBURGER_AT=$(Click-Logical (Get-Handle $p) $HAMBURGER_X $BAR_MID_Y 'HAMBURGER')"
+    Start-Sleep -Milliseconds 350
+    "ROW_AT=$(Click-Logical (Get-Handle $p) ((Get-PopupX (Get-Handle $p)) + $PAD + 40.0) (Get-RowY 0) 'ROW')"
+    Start-Sleep -Milliseconds 800
+}
+# MODE 6 - ITEM 4, THE NATIVE DIALOG ON CAMERA. Identical press, and NOTHING standing it
+# down: the harness removes SLINT_NO_DIALOG for this mode, so the ask reaches rfd and a
+# real #32770 appears as a second top-level of our pid. It is looked for by walking the
+# desktop for two seconds, then dismissed with WM_CLOSE - the same message the main window
+# gets at the end of every launch, sent to the dialog instead - and both the dismissal and
+# the survival of the MAIN window are printed. Until this mode ran, no machine had ever
+# asserted that the native dialog flows of this product work; ADR-0006's item 4 is that
+# absence, and this is the first attempt at filling it.
+elseif ($Maximise -eq 6) {
+    $h6 = Get-Handle $p
+    "ACTIVE=$([int](Set-Active $h6))"
+    "HAMBURGER_AT=$(Click-Logical (Get-Handle $p) $HAMBURGER_X $BAR_MID_Y 'HAMBURGER')"
+    Start-Sleep -Milliseconds 350
+    "ROW_AT=$(Click-Logical (Get-Handle $p) ((Get-PopupX (Get-Handle $p)) + $PAD + 40.0) (Get-RowY 0) 'ROW')"
+    # TWO SECONDS, polled: the dialog is spawned on its own thread (surface.rs's
+    # ask_dialog, because the loop may not block), so the ask and the window are separate
+    # events in time and a single sample after the click measures the harness, not the app.
+    $zd = [Diagnostics.Stopwatch]::StartNew()
+    $dlg = [int64]0
+    while ($zd.ElapsedMilliseconds -lt 2000) {
+        $dlg = Get-Dialog ([int64]$p.Id)
+        if ($dlg -ne 0) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    "DIALOG_HANDLE=$dlg"
+    "DIALOG_SEEN=$([int][bool]($dlg -ne 0))"
+    "DIALOG_MS=$($zd.ElapsedMilliseconds)"
+    if ($dlg -ne 0) {
+        [void][PROD]::SendMessageW([IntPtr]$dlg, 16, [IntPtr]::Zero, [IntPtr]::Zero)
+        $zg = [Diagnostics.Stopwatch]::StartNew()
+        $gone = $false
+        while ($zg.ElapsedMilliseconds -lt 3000) {
+            if ((Get-Dialog ([int64]$p.Id)) -eq 0) { $gone = $true; break }
+            Start-Sleep -Milliseconds 100
+        }
+        "DIALOG_GONE=$([int][bool]$gone)"
+        "DIALOG_GONE_MS=$($zg.ElapsedMilliseconds)"
+    } else {
+        'DIALOG_GONE=0'; 'DIALOG_GONE_MS=-1'
+    }
+    $p.Refresh()
+    "MAIN_ALIVE=$([int][bool]((-not $p.HasExited) -and [PROD]::IsWindow((Get-Handle $p))))"
+}
+# MODE 7 - LEG C: THE DRAG CLOSES THE POPUP (b76c277c's promise, first machine proof).
+# The shape, and why THIS one: the bit that closes is Chrome's and Rust is forbidden from
+# touching it (surface.rs forbids set_menu_open, and the guard test says so), so there is
+# NO line for "the popup closed" to count. What there IS, is the ask. So the gesture is
+# driven, the Open-row pixel is pressed AGAIN without reopening anything, and a SECOND
+# full cycle hamburger-then-row is driven after it. Three outcomes and all three mean
+# something: exactly one ask = the drag closed it AND the click path works; two asks =
+# the drag left the popup open, which is the promise broken; zero asks = the row pixel is
+# wrong, which is an instrument finding and is reported as one.
+elseif ($Maximise -eq 7) {
+    $h7 = Get-Handle $p
+    "ACTIVE=$([int](Set-Active $h7))"
+    "HAMBURGER_AT=$(Click-Logical (Get-Handle $p) $HAMBURGER_X $BAR_MID_Y 'HAMBURGER')"
+    Start-Sleep -Milliseconds 350
+    # The band, one slot in and 40 px right: 021bf7d0 made the band END where the caption
+    # begins, so the press has to start clear of both the left slot and the caption cells -
+    # slot-width is the markup's own left edge for the band (chrome.slint:537).
+    "BAND_DRAG=$(Drag-Band (Get-Handle $p) ($SLOT + 24.0) $BAR_MID_Y 40.0)"
+    Start-Sleep -Milliseconds 500
+    # PRESS 1 AT THE ROW, with no hamburger before it. If the drag closed the popup this
+    # press lands on the editor and asks for nothing.
+    "ROW_AT=$(Click-Logical (Get-Handle $p) ((Get-PopupX (Get-Handle $p)) + $PAD + 40.0) (Get-RowY 0) 'ROW')"
+    Start-Sleep -Milliseconds 400
+    # THEN THE SAME PIXELS AGAIN, OPENED PROPERLY: this one must ask. Without this second
+    # half, "no ask" would not distinguish a closed popup from dead coordinates.
+    "HAMBURGER2_AT=$(Click-Logical (Get-Handle $p) $HAMBURGER_X $BAR_MID_Y 'HAMBURGER2')"
+    Start-Sleep -Milliseconds 350
+    "ROW2_AT=$(Click-Logical (Get-Handle $p) ((Get-PopupX (Get-Handle $p)) + $PAD + 40.0) (Get-RowY 0) 'ROW2')"
+    Start-Sleep -Milliseconds 600
+}
+else { 'NORMAL='; 'NORMAL_STABLE=0'; 'NORMAL_SHOWCMD=-1'; 'MAX_ASKED=0'; 'SHOWCMD_AFTER_MAX=-1' }
 # THE CLOSE: WM_CLOSE through CloseMainWindow, the same door PROBE uses. Nothing here
 # kills the app unless it refused to leave, and a kill is reported, not hidden.
 $closed = $false
@@ -4489,6 +4742,11 @@ exit 0
 /// landed. NOT [PRODUCT_ALIVE_SECS] - the 45s claim is one claim about the shipped app,
 /// and the plain launch makes it exactly once.
 const PRODUCT_TOGGLE_ALIVE_SECS: u64 = 5;
+/// How long a MENU leg sits on screen before its presses. Shorter than the toggle's five
+/// and far shorter than the plain launch's forty-five: these legs wait on nothing the app
+/// has to do on its own - the act is theirs, and they start it as soon as the window is
+/// settled - so the only thing a longer sit buys is a slower bare smoke.
+const PRODUCT_MENU_ALIVE_SECS: u64 = 3;
 
 /// What the autosave round trip said.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4574,7 +4832,7 @@ fn product_autosave_toggle(script: &Path, exe: &Path, session: &Path) -> Toggle 
         draft.display()
     );
     let probe = match run_product_probe(script, exe, session, PRODUCT_TOGGLE_ALIVE_SECS, 3) {
-        Ok(probe) => probe,
+        Ok((probe, _)) => probe,
         Err(e) => {
             restore_draft(&draft, before.as_deref());
             return Toggle::NotJudged(format!("the toggle launch did not report: {e}"));
@@ -4639,48 +4897,65 @@ fn spawn_product_probe(
     session: &Path,
     alive_secs: u64,
     // MODE: 0 = the plain launch, which reads nothing about geometry; 1 = the maximise
-    // leg; 2 = the relaunch leg. An int and not a bool, because the cycle needs THREE
-    // behaviours out of one script and a bool plus a second flag is how the two start
-    // disagreeing.
+    // leg; 2 = the relaunch leg; 3 = the chord leg; 4, 5, 6 and 7 = the menu legs. An int
+    // and not a bool, because one script answers EIGHT behaviours and a bool plus a second
+    // flag is how the two start disagreeing.
     mode: u8,
 ) -> Result<Child, String> {
+    // THE DIALOG GATE, decided by the MODE and nowhere else. plumbing.rs's rule is that the
+    // PRESENCE of SLINT_NO_DIALOG stands the modal down and its value is irrelevant, so this
+    // is env/env_remove and never "=0" - and it lives here, beside the spawn, because a leg
+    // that relies on an environment set somewhere upstream of itself is proving whatever the
+    // shell happened to hold.
+    //
+    // Modes 4, 5 and 7 press the Open row to say something about the ROW - its geometry, its
+    // wiring, whether a drag closed the popup it is in - and cannot afford a modal in the
+    // way. Mode 6 is the leg that WANTS the modal, so it removes the gate from the child's
+    // environment whatever the parent's happened to be.
     let mut missing = Vec::new();
     for program in ["pwsh", "powershell"] {
-        let spawned = Command::new(program)
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ])
-            .arg(script)
-            .arg("-Exe")
-            .arg(exe)
-            .arg("-OutFile")
-            .arg(out)
-            .arg("-ErrFile")
-            .arg(err)
-            // The path the app persists to, handed to the script so the relaunch can be
-            // asked about the SAME file the first launch wrote. Read-only: the script
-            // never writes it, and the harness does not move it aside either - which is
-            // the point of the leg, and is why it resolves the app's own directory
-            // instead of guessing at one.
-            .arg("-Session")
-            .arg(session.as_os_str())
-            .arg("-WindowSecs")
-            .arg(WINDOW_SECS.to_string())
-            .arg("-AliveSecs")
-            .arg(alive_secs.to_string())
-            .arg("-CloseSecs")
-            .arg(CLOSE_SECS.to_string())
-            .arg("-Maximise")
-            .arg(mode.to_string())
-            .arg("-SettleMs")
-            .arg(SETTLE_MS.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+        let mut cmd = Command::new(program);
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(script)
+        .arg("-Exe")
+        .arg(exe)
+        .arg("-OutFile")
+        .arg(out)
+        .arg("-ErrFile")
+        .arg(err)
+        // The path the app persists to, handed to the script so the relaunch can be
+        // asked about the SAME file the first launch wrote. Read-only: the script
+        // never writes it, and the harness does not move it aside either - which is
+        // the point of the leg, and is why it resolves the app's own directory
+        // instead of guessing at one.
+        .arg("-Session")
+        .arg(session.as_os_str())
+        .arg("-WindowSecs")
+        .arg(WINDOW_SECS.to_string())
+        .arg("-AliveSecs")
+        .arg(alive_secs.to_string())
+        .arg("-CloseSecs")
+        .arg(CLOSE_SECS.to_string())
+        .arg("-Maximise")
+        .arg(mode.to_string())
+        .arg("-SettleMs")
+        .arg(SETTLE_MS.to_string());
+        match mode {
+            4 | 5 | 7 => {
+                cmd.env("SLINT_NO_DIALOG", "1");
+            }
+            6 => {
+                cmd.env_remove("SLINT_NO_DIALOG");
+            }
+            _ => {}
+        }
+        let spawned = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
         match spawned {
             Ok(child) => return Ok(child),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -4707,7 +4982,7 @@ fn run_product_probe(
     session: &Path,
     alive_secs: u64,
     mode: u8,
-) -> Result<Probe, String> {
+) -> Result<(Probe, String), String> {
     let out = temp_path("cycle-out", "txt");
     let err = temp_path("cycle-err", "txt");
     let junk = [out.clone(), err.clone()];
@@ -4728,6 +5003,10 @@ fn run_product_probe(
         }
         Ok(Some(_)) => parse_probe(&read_pipe(child.stdout.as_mut())),
     };
+    // The launch's OWN stderr, handed back beside the readings. Every menu leg decides on
+    // a line the product printed there, so a probe that threw the capture away would be an
+    // instrument burning its own evidence.
+    let trace = fs::read_to_string(&err).unwrap_or_default();
     // The relaunch writes its own stderr, and that capture is the one holding the
     // product's own line about what the port told it at startup. Printed, never judged
     // here: the startup-needle rule belongs to the plain leg, and this launch exists to
@@ -4736,7 +5015,7 @@ fn run_product_probe(
         let _ = report_captured(&err, "the relaunched product on its own stderr");
     }
     drop_junk();
-    Ok(probe)
+    Ok((probe, trace))
 }
 
 /// What the app's own session.json says right now: its persisted rect and its maximised
@@ -4851,7 +5130,7 @@ fn product_maximised_cycle(script: &Path, exe: &Path, session: &Path) -> Product
 
     // ---- LEG 1: read where it sits, ask the OS to zoom it, close it -----------------
     let first = match run_product_probe(script, exe, session, PRODUCT_CYCLE_ALIVE_SECS, 1) {
-        Ok(probe) => probe,
+        Ok((probe, _)) => probe,
         Err(e) => {
             restore_session(session, before.as_deref());
             return ProductCycle::NotJudged(format!("the maximise launch did not report: {e}"));
@@ -4940,7 +5219,7 @@ fn product_maximised_cycle(script: &Path, exe: &Path, session: &Path) -> Product
 
     // ---- LEG 2: relaunch, read what it did BY ITSELF, close again --------------------
     let second = match run_product_probe(script, exe, session, PRODUCT_CYCLE_ALIVE_SECS, 2) {
-        Ok(probe) => probe,
+        Ok((probe, _)) => probe,
         Err(e) => {
             restore_session(session, before.as_deref());
             return ProductCycle::NotJudged(format!("the relaunch did not report: {e}"));
@@ -5000,6 +5279,365 @@ impl std::fmt::Display for ProductCycle {
             ProductCycle::Broken(note) => write!(f, "{note}"),
         }
     }
+}
+
+/// The three lines the MENU legs read, each with the file that prints it. Quoted in one
+/// place on purpose: a leg that searches for its own copy of a string is a leg that keeps
+/// passing after the product starts saying something else.
+pub const PRODUCT_MENU_NEEDLES: [(&str, &str); 3] = [
+    (
+        "menu: autosave-row toggled",
+        "surface.rs on_autosave_asked - the Auto-save row's handler ran",
+    ),
+    (
+        "dialog[skipped]: SLINT_NO_DIALOG",
+        "surface.rs ask_dialog - an Open row's ask reached Rust and the gate stood the modal down",
+    ),
+    (
+        "dialog: spawning the",
+        "surface.rs ask_dialog - an Open row's ask reached Rust and a real modal was asked for",
+    ),
+];
+
+/// How many PRODUCT-VOICE lines carry a needle. Not `str::matches`: the same words can
+/// appear inside a capture this harness echoes under its own prefix, and the plain leg's
+/// rule has always been that an unvoiced match is not the product speaking. Counting
+/// voiced lines only is what lets a leg assert "exactly one ask" instead of "an ask
+/// somewhere in the noise".
+pub fn voice_count(trace: &str, needle: &str) -> usize {
+    trace
+        .lines()
+        .filter(|l| l.trim_start().starts_with(PRODUCT_VOICE) && l.contains(needle))
+        .count()
+}
+
+/// Did the toggled line actually report a TRANSITION? The line carries both words -
+/// "toggled true->false" - so this reads them rather than trusting that a print means a
+/// change. A handler that printed its own name without flipping the bit would otherwise
+/// pass every assert in this file.
+pub fn voice_toggled(trace: &str) -> bool {
+    trace.lines().any(|l| {
+        l.trim_start().starts_with(PRODUCT_VOICE)
+            && l.contains("menu: autosave-row toggled")
+            && (l.contains("true->false") || l.contains("false->true"))
+    })
+}
+
+/// One press as the script answered it: "x,y,ours,hwnd-under-the-cursor". Malformed or
+/// absent is None, and None is never a pass - the shape of every reading rule in this
+/// file.
+pub fn press_reading(text: Option<&str>) -> Option<(i32, i32, bool, i64)> {
+    let parts: Vec<&str> = text?.split(',').map(|s| s.trim()).collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2] == "1",
+        parts[3].parse().ok()?,
+    ))
+}
+
+/// What a MENU leg said. Its own type and not [Toggle]: a toggle is about a draft file
+/// landing or not landing, and these are about an ASK arriving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Menu {
+    Held { detail: String },
+    NotJudged(String),
+    Broken(String),
+}
+
+impl std::fmt::Display for Menu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Menu::Held { detail } => write!(f, "PASS - {detail}"),
+            Menu::NotJudged(why) => write!(f, "NOT JUDGED (advisory) - {why}"),
+            Menu::Broken(note) => write!(f, "{note}"),
+        }
+    }
+}
+
+/// LEG A'S VERDICT: a pointer press on the Auto-save row reached the same handler the
+/// chord reaches. Pure, so the counting rule is testable without a desktop.
+pub fn judge_click_toggle(asked: usize, flipped: bool, press_landed: bool) -> Menu {
+    if !press_landed {
+        return Menu::NotJudged(
+            "WindowFromPoint did not answer our window under the press, so nothing was clicked   that the product could see - an instrument finding, not a verdict on the menu".to_string(),
+        );
+    }
+    if asked == 0 {
+        return Menu::Broken(
+            "THE MENU IGNORED A REAL CLICK: the hamburger and the Auto-save row were both pressed at the pixels chrome.slint's own arithmetic gives them, on our own window, and the product printed no 'menu: autosave-row toggled' line at all. Either the popup was not open under the cursor or the row's TouchArea is not the window the click reaches".to_string(),
+        );
+    }
+    if !flipped {
+        return Menu::Broken(
+            "the row answered a click with a line that names NO transition - 'toggled' printed   without true->false or false->true beside it".to_string(),
+        );
+    }
+    Menu::Held {
+        detail: format!(
+            "{asked} toggled line(s) from one press on row 2, and one of them carried a real   transition"
+        ),
+    }
+}
+
+/// LEG B'S VERDICT (the cheap half of item 4): with the modal stood down, the Open row's
+/// ask still has to arrive - and the refusal line is the only proof of that which costs
+/// nobody a window.
+pub fn judge_dialog_asked(skipped: usize, press_landed: bool) -> Menu {
+    if !press_landed {
+        return Menu::NotJudged(
+            "the press was not over our window, so the row was never asked to answer".to_string(),
+        );
+    }
+    if skipped == 0 {
+        return Menu::Broken(
+            "THE OPEN ROW NEVER REACHED RUST: it was pressed at the pixel chrome.slint gives row 0 (popup-x + pad + 40, bar-height + pad + row-height/2) on our own window, and no 'dialog[skipped]: SLINT_NO_DIALOG' line came back - so either the popup was not open there, or the row geometry the markup states is not the geometry the window shows".to_string(),
+        );
+    }
+    Menu::Held {
+        detail: format!(
+            "the Open row's ask reached Rust {skipped} time(s); the gate, not a wrong pixel, is   why no modal appeared"
+        ),
+    }
+}
+
+/// LEG C'S VERDICT - ADR-0006 re-earning item 4, the native dialog, on camera. Four
+/// readings and one order, because the earliest missing one is the one that explains the
+/// rest: did Rust get the ask, did the desktop get a window, did that window go away when
+/// asked, and was the MAIN window still alive afterwards.
+pub fn judge_native_dialog(
+    spawned: usize,
+    seen: bool,
+    gone: bool,
+    main_alive: bool,
+    ms: i64,
+) -> Menu {
+    if spawned == 0 {
+        return Menu::Broken(
+            "THE OPEN ROW NEVER ASKED FOR A DIALOG: with SLINT_NO_DIALOG removed from the   child's environment the ask has to reach surface.rs ask_dialog and print 'dialog: spawning   the ... picker'; a silent stderr means the click never became an ask, which is leg A's   finding, not this one".to_string(),
+        );
+    }
+    if !seen {
+        return Menu::Broken(
+            "ITEM 4 STILL OWED: the ask reached Rust and NO '#32770' top-level of our own pid   appeared on the desktop within {ms}ms - the native dialog this product promises on Open was   not on the screen, and nothing here can say it works".to_string(),
+        );
+    }
+    if !gone {
+        return Menu::Broken(
+            "THE MODAL WOULD NOT CLOSE: a '#32770' of our pid was up and WM_CLOSE did not take   it down - and the leg refuses to Stop-Process its way out of that, because a killed dialog   is not a closed one".to_string(),
+        );
+    }
+    if !main_alive {
+        return Menu::Broken(
+            "THE DIALOG TOOK THE LOOP WITH IT: the modal came and went and the MAIN window was   gone when we looked - an unresponsive-loop finding, exactly the one ask_dialog's own comment   says the rule was chosen to avoid".to_string(),
+        );
+    }
+    Menu::Held {
+        detail: format!(
+            "a real '#32770' of our pid answered within {ms}ms of the row press, closed on WM_CLOSE,   and the main window was still alive behind it - the first machine proof this product's native   dialog flow works at all"
+        ),
+    }
+}
+
+/// LEG D'S VERDICT: b76c277c's promise, told through the ONLY observable that exists for
+/// it. Chrome owns the menu-open bit and Rust is forbidden from touching it (surface.rs
+/// names `set_menu_open(` as a forbidden call, and the guard test holds the line), so
+/// there is no "the popup closed" print to count - but every ask IS printed, and the
+/// gesture leg drives TWO presses at the row: one blind after the drag, one after a fresh
+/// hamburger. One ask therefore means the drag closed it AND the pixel works. Two means
+/// the popup was still open. Zero means the second press found nothing either, which is
+/// the shape that makes this leg's evidence depend on leg B's - said out loud below rather
+/// than hidden in an assert.
+pub fn judge_drag_closes(asks: usize, press_landed: bool) -> Menu {
+    if !press_landed {
+        return Menu::NotJudged(
+            "no press in the gesture landed on our window, so the gesture never happened"
+                .to_string(),
+        );
+    }
+    match asks {
+        1 => Menu::Held {
+            detail: "the row pixel asked ONCE - the press after the drag asked for nothing (the   popup was closed) and the press after a fresh hamburger did (the pixel is alive)".to_string(),
+        },
+        0 => Menu::Broken(
+            "NEITHER PRESS ASKED: the popup was opened by a press and the Open-row pixel was   pressed twice, once after a fresh hamburger, and Rust heard nothing - so the drag leg cannot   say anything about a popup it could not open. Leg B (the same pixel, no drag) is the leg that   says whether this is geometry or the product".to_string(),
+        ),
+        n => Menu::Broken(format!(
+            "THE DRAG DID NOT CLOSE THE MENU: {n} asks where exactly one was promised - the press   that was supposed to land on a closed popup landed on an open one, which is the b76c277c   behaviour breaking in the direction the user notices"
+        )),
+    }
+}
+
+/// THE MENU LEGS, all four, in the order their costs rise: two presses on the Auto-save
+/// row, two on the Open row with the modal stood down, the same pair with the modal ALLOWED
+/// (item 4), and the drag gesture. Each one is its own bounded child, its own probe run,
+/// and its own verdict - a leg that stops at the first decline would hide the interesting
+/// one behind the boring one.
+///
+/// The user's session.json is put back after all four. These legs move the window (the drag
+/// moves it 40 px), close windows, and can leave a recents entry behind, and none of that is
+/// what a developer wants to find in their own app tomorrow morning.
+fn product_menu_legs(
+    script: &Path,
+    exe: &Path,
+    session: &Path,
+    // Whether the CHORD leg, the one instrument in this file that has ever landed a real
+    // key on this window, actually got through. See the downgrade below.
+    input_live: bool,
+) -> Vec<(&'static str, Menu)> {
+    let before = fs::read(session).ok();
+    // The order below is cost and nothing else - A presses two pixels and counts a line, B
+    // the same, C waits up to two seconds for a window it may never find, D drags - and the
+    // vec is a literal rather than four pushes because a leg that stops the run at the first
+    // decline would hide the interesting answer behind the boring one. Each leg is still its
+    // own child, its own probe, its own verdict.
+    let legs = vec![
+        ("menu-click", product_menu_click(script, exe, session)),
+        (
+            "dialog-asked",
+            product_dialog_asked_leg(script, exe, session),
+        ),
+        (
+            "native-dialog",
+            product_native_dialog_leg(script, exe, session),
+        ),
+        (
+            "drag-closes-menu",
+            product_drag_closes_menu(script, exe, session),
+        ),
+    ];
+    // THE DOWNGRADE, and why a leg that was written to go red accepts being told to go grey.
+    // Every one of these four legs decides on a line the PRODUCT prints after a press, and
+    // "no line" has two causes that look identical from here: the menu is deaf, or the press
+    // never arrived. The chord leg above is the only instrument in this file that answers
+    // the second question - it drives the same SetCursorPos/mouse_event/keybd_event doors at
+    // the same window, and it was proven green on real bytes - so when it did NOT land a
+    // keystroke, a menu leg that heard nothing cannot accuse the menu, and says so instead.
+    // When it did land, nothing here is softened: the promise stays red.
+    let legs = if input_live {
+        legs
+    } else {
+        legs.into_iter()
+            .map(|(name, verdict)| match verdict {
+                Menu::Broken(why) => (
+                    name,
+                    Menu::NotJudged(format!(
+                        "no answer to the press, but the chord leg did not land a keystroke on   this window either - injected input is not arriving, so this is not a verdict about the   menu. Named gap: {why}"
+                    )),
+                ),
+                other => (name, other),
+            })
+            .collect()
+    };
+    restore_session(session, before.as_deref());
+    legs
+}
+
+/// LEG A: hamburger, then the Auto-save row. Verdict in [judge_click_toggle].
+fn product_menu_click(script: &Path, exe: &Path, session: &Path) -> Menu {
+    let (probe, trace) = match run_product_probe(script, exe, session, PRODUCT_MENU_ALIVE_SECS, 4) {
+        Ok(v) => v,
+        Err(e) => return Menu::NotJudged(format!("the click launch did not report: {e}")),
+    };
+    if !probe.flag("DESKTOP") {
+        return Menu::NotJudged(
+            "the click launch found no interactive desktop, so there was no cursor to place"
+                .to_string(),
+        );
+    }
+    let press = press_reading(probe.get("ROW_AT"));
+    let landed = press.map(|p| p.2).unwrap_or(false);
+    let asked = voice_count(&trace, PRODUCT_MENU_NEEDLES[0].0);
+    println!(
+        "smoke: menu-click: INFO - hamburger {} | row {} | toggle lines={} active={}",
+        probe.get("HAMBURGER_AT").unwrap_or("-"),
+        probe.get("ROW_AT").unwrap_or("-"),
+        asked,
+        probe.number("ACTIVE").unwrap_or(-1)
+    );
+    judge_click_toggle(asked, voice_toggled(&trace), landed)
+}
+
+/// LEG B: the Open row, modal stood down. Verdict in [judge_dialog_asked].
+fn product_dialog_asked_leg(script: &Path, exe: &Path, session: &Path) -> Menu {
+    let (probe, trace) = match run_product_probe(script, exe, session, PRODUCT_MENU_ALIVE_SECS, 5) {
+        Ok(v) => v,
+        Err(e) => return Menu::NotJudged(format!("the refusal launch did not report: {e}")),
+    };
+    if !probe.flag("DESKTOP") {
+        return Menu::NotJudged("the refusal launch found no interactive desktop".to_string());
+    }
+    let landed = press_reading(probe.get("ROW_AT"))
+        .map(|p| p.2)
+        .unwrap_or(false);
+    let skipped = voice_count(&trace, PRODUCT_MENU_NEEDLES[1].0);
+    println!(
+        "smoke: dialog-asked: INFO - row {} | refusal lines={}",
+        probe.get("ROW_AT").unwrap_or("-"),
+        skipped
+    );
+    judge_dialog_asked(skipped, landed)
+}
+
+/// LEG C: item 4 proper. Verdict in [judge_native_dialog].
+fn product_native_dialog_leg(script: &Path, exe: &Path, session: &Path) -> Menu {
+    let (probe, trace) = match run_product_probe(script, exe, session, PRODUCT_MENU_ALIVE_SECS, 6) {
+        Ok(v) => v,
+        Err(e) => return Menu::NotJudged(format!("the dialog launch did not report: {e}")),
+    };
+    if !probe.flag("DESKTOP") {
+        return Menu::NotJudged(
+            "the dialog launch found no interactive desktop, so no modal could exist".to_string(),
+        );
+    }
+    let spawned = voice_count(&trace, PRODUCT_MENU_NEEDLES[2].0);
+    let seen = probe.flag("DIALOG_SEEN");
+    let gone = probe.flag("DIALOG_GONE");
+    let main_alive = probe.flag("MAIN_ALIVE");
+    println!(
+        "smoke: native-dialog: INFO - spawn lines={} handle={} seen={} at {}ms gone={}   main_alive={} row={}",
+        spawned,
+        probe.number("DIALOG_HANDLE").unwrap_or(0),
+        seen,
+        probe.number("DIALOG_MS").unwrap_or(-1),
+        gone,
+        main_alive,
+        probe.get("ROW_AT").unwrap_or("-"),
+    );
+    judge_native_dialog(
+        spawned,
+        seen,
+        gone,
+        main_alive,
+        probe.number("DIALOG_MS").unwrap_or(-1),
+    )
+}
+
+/// LEG D: the drag. Verdict in [judge_drag_closes].
+fn product_drag_closes_menu(script: &Path, exe: &Path, session: &Path) -> Menu {
+    let (probe, trace) = match run_product_probe(script, exe, session, PRODUCT_MENU_ALIVE_SECS, 7) {
+        Ok(v) => v,
+        Err(e) => return Menu::NotJudged(format!("the drag launch did not report: {e}")),
+    };
+    if !probe.flag("DESKTOP") {
+        return Menu::NotJudged("the drag launch found no interactive desktop".to_string());
+    }
+    let asks = voice_count(&trace, PRODUCT_MENU_NEEDLES[1].0);
+    let landed = ["HAMBURGER_AT", "ROW_AT", "ROW2_AT"]
+        .iter()
+        .filter_map(|k| press_reading(probe.get(k)))
+        .filter(|p| p.2)
+        .count();
+    println!(
+        "smoke: drag-closes-menu: INFO - band {} | presses landed on our window={}/3 |   refusal lines={} (want exactly 1)",
+        probe.get("BAND_DRAG").unwrap_or("-"),
+        landed,
+        asks
+    );
+    judge_drag_closes(asks, landed >= 2)
 }
 
 /// Kill anything the failed run left on screen. ONLY called on a failure path: on a
@@ -5271,11 +5909,10 @@ fn run_product_leg(target: &ArtifactTarget, exe: &Path) -> i32 {
     // [restore_draft]. Run only off a clean plain launch AND a cycle that did not break:
     // a window that will not close politely has already been accused of the louder thing.
 
-    // ITEM 4 (the OPEN / SAVE-AS dialogs) IS STILL OPEN AND IS NOT STUBBED. Ctrl+O and
-    // Ctrl+Shift+S raise a NATIVE rfd dialog, which is a second, foreign window on the
-    // desktop, and this slice never reached automating it: the assertion is ABSENT, not
-    // faked. The door item 4 needs is live in this probe - the settled rect, the double
-    // AttachThreadInput, real scancodes, the foreground gate - plus the dialog own tree.
+    // ITEM 4 (the OPEN / SAVE-AS dialogs) IS NO LONGER AN ABSENT ASSERTION - see the menu
+    // legs below, of which one exists to walk the desktop and find the modal. What is still
+    // not proved here is the SAVE-AS half: the legs press the Open row, because Open is the
+    // row the ADR names and the one whose refusal is printed with its label.
     let toggle: Option<Toggle> = if gaps.is_empty() && !cycle_broke {
         Some(product_autosave_toggle(&script, exe, &session))
     } else {
@@ -5296,7 +5933,58 @@ fn run_product_leg(target: &ArtifactTarget, exe: &Path) -> i32 {
         }
         None => {}
     }
+    // ---- THE MENU, ANSWERING A REAL CLICK: legs A, B, C and D -----------------------
+    // Same gate as the toggle above, for the same reason: every one of these drives a
+    // window, and a launch that did not pass leaves no window that could take a press.
+    // Their findings go into `gaps`, which is the exit-1 road - these are NOT the geometry
+    // promise, and nothing here reaches for {GEOMETRY_FAILED_EXIT}, whose two producers are
+    // the cycle and stay the cycle's.
+    let menu_legs: Vec<(&'static str, Menu)> = if gaps.is_empty() && !cycle_broke {
+        product_menu_legs(&script, exe, &session, matches!(toggle, Some(Toggle::Held)))
+    } else {
+        println!("smoke: menu-click: NOT RUN - as above, and the three legs after it with it");
+        Vec::new()
+    };
+    for (name, verdict) in &menu_legs {
+        match verdict {
+            Menu::Held { detail } => println!("smoke: {name}: PASS - {detail}"),
+            Menu::NotJudged(why) => {
+                println!("smoke: {name}: NOT JUDGED (advisory) - {why}")
+            }
+            Menu::Broken(why) => {
+                println!("SMOKE {name} FAIL: {why}");
+                println!("smoke: {name}: BROKE - see the line above");
+                gaps.push(format!("SMOKE FAIL: {name} - {why}"));
+            }
+        }
+    }
     let elapsed = started.elapsed();
+    // THE MENU CLAUSE IS EARNED, NOT SHIPPED. Four legs that all said NOT JUDGED cannot be
+    // summarised two lines later as "a pointer pressed its own menu and a native dialog was
+    // found on the desktop" - that sentence is the one a reader quotes into a roadmap, and
+    // it has to be able to survive being quoted.
+    let menu_held = menu_legs
+        .iter()
+        .filter(|(_, verdict)| matches!(verdict, Menu::Held { .. }))
+        .count();
+    let menu_clause = if !menu_legs.is_empty() && menu_held == menu_legs.len() {
+        " A pointer then pressed its own menu, and it answered: the Auto-save row, the Open \
+row, the title-band drag, and a real native dialog that was found on the desktop, closed and \
+survived."
+            .to_string()
+    } else if menu_held > 0 {
+        format!(
+            " A pointer then pressed its own menu, and {menu_held} of {n} legs answered; the \
+             others are named above.",
+            n = menu_legs.len()
+        )
+    } else if menu_legs.is_empty() {
+        String::new()
+    } else {
+        " What a pointer did NOT prove this run: every one of the four menu legs declined to \
+judge, so nothing about the menu answering a click is claimed here - the lines above say why."
+            .to_string()
+    };
     if gaps.is_empty() && !cycle_broke {
         println!(
             "smoke: product=PASS alive=PASS close=PASS exit=0 {:.1}s",
@@ -5306,8 +5994,9 @@ fn run_product_leg(target: &ArtifactTarget, exe: &Path) -> i32 {
             "smoke:   what this proves: {} said its startup lines, was still on screen at \
  {PRODUCT_ALIVE_SECS}s, took a WM_CLOSE, said the close and the joined shutdown, left with 0 \
  by itself, and then did the thing this leg used to refuse to read: a real maximise, a close, \
- a relaunch and a close again, with the restore rect unchanged to the pixel.{}",
+ a relaunch and a close again, with the restore rect unchanged to the pixel.{}{}",
             target.bin,
+            menu_clause,
             match &cycle {
                 // The drift was already printed; the sentence says which claim it carries.
                 Some(ProductCycle::Held { .. }) => " That is the M9 window-memory promise,  measured on PRODUCT bytes.".to_string(),
@@ -5317,7 +6006,7 @@ fn run_product_leg(target: &ArtifactTarget, exe: &Path) -> i32 {
             }
         );
         println!(
-            "smoke:   what it still does NOT prove: the pin, the dragged-rect round trip, and  the recents trace. Those stay the needle schedule's claims, and this leg does not run it.",
+            "smoke:   what it still does NOT prove: the pin, the dragged-rect round trip, the  recents trace, and SAVE AS by pointer - the menu legs above press the Open row, not the Save As  row, because Open is the row ADR-0006 names. Those stay the needle schedule's claims, and  this leg does not run it.",
         );
         cleanup("pass");
         return PASS_EXIT;
@@ -7841,10 +8530,16 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
             "public static extern bool ShowWindow",
             "public static extern bool IsZoomed",
             "rcNormalPosition",
-            // The three modes, and the fact that mode 0 takes none of this path.
+            // The modes this branch serves, and the fact that mode 0 takes none of this
+            // path. 1 and 2 are the geometry pair; 3 is the chord and 4 through 7 are the
+            // menu legs, each with its own branch. The gate used to say "-ge 1", which was
+            // true while those were the only two modes above 0 and became a lie the moment
+            // a mode that owns no geometry at all was added - a maximise leg running
+            // under a click leg would print a MAX_ASKED nobody asked for and read the
+            // wrong window state. So the enumeration is explicit now, and asserted so.
             "[int]$Maximise = 1",
-            "$Maximise -ge 1",
             "$Maximise -eq 1",
+            "$Maximise -eq 2",
             // The keys, printed with the SAME spelling the Rust reads.
             "\"NORMAL=$($a[0])\"",
             "\"NORMAL_STABLE=$($a[2])\"",
@@ -8034,6 +8729,181 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
             1
         );
         assert_eq!(GEOMETRY_FAILED_EXIT, 6);
+    }
+
+    // ---- THE MENU LEGS ----------------------------------------------------------------
+    // The counting rule first, because every one of the four verdicts below is a count, and
+    // a count that credits an UNVOICED line is a leg passing on the harness's own echo.
+    #[test]
+    fn a_needle_only_counts_when_the_product_said_it() {
+        let trace = "notes-gpui: menu: autosave-row toggled true->false\n\
+menu: autosave-row toggled true->false (echoed, no voice)\n\
+notes-gpui: dialog[skipped]: SLINT_NO_DIALOG - (Open -> x)\n";
+        assert_eq!(
+            voice_count(trace, "menu: autosave-row toggled"),
+            1,
+            "the unvoiced line is somebody else saying the words"
+        );
+        assert_eq!(voice_count(trace, "dialog[skipped]: SLINT_NO_DIALOG"), 1);
+        assert_eq!(voice_count(trace, "dialog: spawning the"), 0);
+        assert!(voice_toggled(trace));
+        assert!(
+            !voice_toggled("notes-gpui: menu: autosave-row toggled true->true"),
+            "a handler that prints its own name without changing the bit did not toggle"
+        );
+    }
+
+    #[test]
+    fn a_press_reading_that_is_not_four_fields_is_no_answer() {
+        assert_eq!(
+            press_reading(Some("4299,228,1,197388")),
+            Some((4299, 228, true, 197388))
+        );
+        assert_eq!(
+            press_reading(Some("4299,228,0,7")),
+            Some((4299, 228, false, 7))
+        );
+        // The script's own "there was no client area to map" answer, and a missing key:
+        // neither is a pass, and neither is the product's fault either.
+        assert_eq!(press_reading(Some("none,0,0")), None);
+        assert_eq!(press_reading(None), None);
+    }
+
+    #[test]
+    fn a_click_that_reached_the_row_is_held_and_one_that_did_not_is_red() {
+        assert!(matches!(
+            judge_click_toggle(1, true, true),
+            Menu::Held { .. }
+        ));
+        let broke = judge_click_toggle(0, false, true);
+        assert!(matches!(broke, Menu::Broken(_)));
+        assert!(
+            format!("{}", broke).contains("THE MENU IGNORED A REAL CLICK"),
+            "the headline of the leg is the sentence a reader scans for"
+        );
+        assert!(matches!(
+            judge_click_toggle(1, false, true),
+            Menu::Broken(_)
+        ));
+        assert!(
+            matches!(judge_click_toggle(3, true, false), Menu::NotJudged(_)),
+            "a press that WindowFromPoint says was not ours proves nothing about the menu"
+        );
+    }
+
+    #[test]
+    fn the_refusal_line_is_what_proves_the_open_row_was_hit() {
+        assert!(matches!(judge_dialog_asked(1, true), Menu::Held { .. }));
+        let broke = judge_dialog_asked(0, true);
+        assert!(matches!(broke, Menu::Broken(_)));
+        assert!(
+            format!("{}", broke).contains("row 0"),
+            "the gap has to name the geometry it distrusts"
+        );
+        assert!(matches!(judge_dialog_asked(0, false), Menu::NotJudged(_)));
+    }
+
+    /// ADR-0006's item 4, in six lines: the ORDER of the four readings is the finding, so
+    /// each failure mode has to name itself and not the one before it.
+    #[test]
+    fn item_four_reports_the_earliest_thing_that_went_wrong() {
+        assert!(
+            format!("{}", judge_native_dialog(0, false, false, false, 2000))
+                .contains("NEVER ASKED FOR A DIALOG")
+        );
+        let no_window = judge_native_dialog(1, false, false, true, 2001);
+        assert!(matches!(no_window, Menu::Broken(_)));
+        assert!(
+            format!("{}", no_window).contains("ITEM 4 STILL OWED"),
+            "asked-but-no-modal is the gap the ADR is about, and it must be named"
+        );
+        assert!(
+            format!("{}", judge_native_dialog(1, true, false, true, 120))
+                .contains("WOULD NOT CLOSE")
+        );
+        assert!(
+            format!("{}", judge_native_dialog(1, true, true, false, 120)).contains("TOOK THE LOOP")
+        );
+        assert!(matches!(
+            judge_native_dialog(1, true, true, true, 120),
+            Menu::Held { .. }
+        ));
+    }
+
+    /// Leg D's three outcomes, all three meaningful - which is why this shape was chosen
+    /// over screenshotting the popup: 1 = closed by the drag, 2 = the promise broken, 0 =
+    /// the instrument blind. Only the middle one is the product failing.
+    #[test]
+    fn one_ask_is_the_drag_having_closed_the_menu() {
+        assert!(matches!(judge_drag_closes(1, true), Menu::Held { .. }));
+        assert!(
+            format!("{}", judge_drag_closes(2, true)).contains("THE DRAG DID NOT CLOSE THE MENU")
+        );
+        let blind = judge_drag_closes(0, true);
+        assert!(matches!(blind, Menu::Broken(_)));
+        assert!(
+            format!("{}", blind).contains("NEITHER PRESS ASKED"),
+            "zero is an instrument finding and is printed as one, never as a pass"
+        );
+        assert!(matches!(judge_drag_closes(1, false), Menu::NotJudged(_)));
+    }
+
+    #[test]
+    fn the_script_clicks_where_chrome_draws_and_walks_for_the_dialog() {
+        // The coordinates are the markup's, the press is the OS's, and the dialog is looked
+        // for by class name AND owner pid - all of it has to be in the shipped script.
+        for shape in [
+            "WindowFromPoint",
+            "$HAMBURGER_X",
+            "function Get-RowY",
+            "function Drag-Band",
+            "'#32770'",
+            "EnumWindows",
+            "DIALOG_GONE",
+            "MAIN_ALIVE",
+            "elseif ($Maximise -eq 6)",
+        ] {
+            assert!(
+                PRODUCT_PROBE.contains(shape),
+                "PRODUCT_PROBE lost a menu-leg shape: {shape}"
+            );
+        }
+        // The dialog gate is a property of the MODE, not of whatever the shell happened to hold.
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/smoke.rs"))
+            .expect("smoke.rs must be readable from its own test");
+        for shape in [
+            "cmd.env(\"SLINT_NO_DIALOG\", \"1\")",
+            "cmd.env_remove(\"SLINT_NO_DIALOG\")",
+            "4 | 5 | 7 =>",
+            "fn product_menu_legs",
+        ] {
+            assert!(
+                src.contains(shape),
+                "the spawn lost a menu-leg shape: {shape}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_product_leg_runs_the_menu_after_the_cycle_and_before_its_verdict() {
+        let leg = run_product_leg_text();
+        // The flag is the whole honesty of the four legs, so it is asserted at the call: a
+        // menu leg that went red on a machine where NO injected input arrives would send a
+        // reader to chrome.slint to fix a click that was never delivered.
+        assert!(leg.contains(
+            "product_menu_legs(&script, exe, &session, matches!(toggle, Some(Toggle::Held)))"
+        ));
+        assert!(leg.contains("gaps.is_empty() && !cycle_broke"));
+        let at_menu = leg
+            .find("SMOKE {name} FAIL")
+            .expect("the menu legs must print their own headline");
+        let at_elapsed = leg
+            .find("let elapsed = started.elapsed()")
+            .expect("the leg's verdict block moved");
+        assert!(
+            at_menu < at_elapsed,
+            "a menu finding raised after the verdict is printed would never reach the exit code"
+        );
     }
 
     /// The leg's own source, as text, for the shape asserts above. Read at test time from
