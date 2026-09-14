@@ -52,7 +52,7 @@ so it is a tripwire, not the contract. Answers `Event::Saved` then `Event::Rebou
 UNCHANGED path and epoch, precedent engine.rs:1311-1336. `api` owns the no-path branch by
 reusing that scratch arm; no bridge grows a dialog, because SaveAs remains the only act that
 names a file. Every `Save` is answered by exactly one of `Saved` / `SaveFailed` /
-`AutosaveSkipped`. On send the bridge retires the flush that Save replaces — it sends `Save`
+`AutosaveSkipped`. A file the port refused to read is answered `SaveFailed` with `SaveError::NoTarget`, not a skip: a skip names a verdict about the document, and the document is fine — it is the target that is forbidden. On send the bridge retires the flush that Save replaces — it sends `Save`
 with the pair it would have flushed and **adopts that pair as its send witness** (bump `edits`,
 resync `last_sent`, clear `pending_at`), exactly as the SaveAs dialog answer does at
 surface.rs:657-663 — because `should_flush` absorbing the duplicate today is an accident of the
@@ -121,7 +121,7 @@ breaks no compile. **This ADR governs the contract.** The note moves to `archive
 `.agents/notes/proposed/2026-09-14-menu-six-rows.md:123-143`. All six quoted pointers
 (0001:29-30, 0001:44-45, 0001:58, 0003:29, document.rs:46-48, command.rs:80-91) were read
 directly against the tree before transcription; one v1 pointer (`document.rs:41-42`) was wrong
-and is corrected here. The by-id chord walk added four assertions to the probe target, and that
+and is corrected here. A third gap was found afterwards, by the test-honesty review of the Save leg: nothing here said which answer a refused-load `Save` gets, and the choice lived only in `Engine::save`'s refused-load guard and in its pinning test `a_save_cannot_write_the_file_whose_open_was_just_refused`; the Decision now decides it. The by-id chord walk added four assertions to the probe target, and that
 is permitted under ADR-0006 §4 read as a rule about what the instrument **reports** rather than
 about test count — the five driven acts and their order are pinned unchanged, so nothing the
 verdict certifies was widened; and a floor or mirror claim is a PRODUCT claim that re-earns on
