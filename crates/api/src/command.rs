@@ -63,11 +63,61 @@ pub enum Command {
         revision: u64,
     },
 
-    /// A snapshot of the buffer: every autosave trigger, and the final flush the bridge
-    /// sends before `Shutdown`. The user's explicit act is NOT here - the port has no
-    /// plain Save, so "save this now" is [`Command::SaveAs`](crate::Command::SaveAs)
-    /// (`Ctrl+S` in the shipped chord set), which carries its own text for the same
-    /// reason this variant does.
+    /// THE HAND-TRIGGERED SAVE: write the note to the path it already has, because
+    /// a human asked - the Save menu row and its chord. Answers with EXACTLY ONE
+    /// of [`Event::Saved`](crate::Event::Saved) (then [`Event::Rebound`](crate::Event::Rebound),
+    /// carrying the arming this write just caused), [`Event::SaveFailed`](crate::Event::SaveFailed),
+    /// or [`Event::AutosaveSkipped`](crate::Event::AutosaveSkipped) naming the verdict core reached.
+    /// Never silence: ADR-0001 requirement 1 forbids silence on an autosave, and a
+    /// port that answered a debounce but not a keystroke would leave the pressed
+    /// key unexplained - the same hole, one level up.
+    ///
+    /// THE RULE IS NOT HERE: [`notes_core::Document::should_save_manual`] decides, and this
+    /// variant is the routing plus the translation. AGENTS.md rule 1 is the
+    /// reason a rule that belongs to "may this save happen" lives in core: an
+    /// api-side copy would be a second gate, and two gates in two crates is how a
+    /// fix lands in one and not the other.
+    ///
+    /// THE GATE DIFFERS FROM [`Command::Flush`] AT EXACTLY TWO POINTS, and both follow from
+    /// the difference between an unattended write and an attended one: the
+    /// auto-save TOGGLE does not gate this (the toggle declines saves that happen
+    /// behind the user's back; refusing an asked-for save would make "autosave
+    /// off" mean "no saving"), and a foreign file's DISARM does not gate it -
+    /// per ADR-0001 this command IS the arming act, so a gate that refused it
+    /// until the file was armed would make its own rule unreachable. What
+    /// survives: a read-only file and an over-guard file are still refused, and a
+    /// document with nothing to write is answered Clean rather than rewritten.
+    ///
+    /// FLUSH'S SHAPE, NOT [`Command::SaveAs`]'s, and the reason is staleness.
+    /// SaveAs rebinds identity, so a stale SaveAs cannot ride it - the rebind
+    /// would itself be the answer. Save writes the CURRENT path with the buffer it
+    /// was handed, so the echoed `epoch` is the only stale-write defense on
+    /// the path: a Save whose generation the engine has already replaced is
+    /// DISCARDED with [`SkipReason::Superseded`](crate::SkipReason::Superseded), exactly as a
+    /// stale Flush is. The text travels for the reason this enum already carries
+    /// it twice: the bridge owns the buffer, and a command naming only an intent
+    /// would write whatever the last debounce left behind.
+    ///
+    /// NO PATH YET IS NOT A DIALOG. An untitled note is bound to its scratch file
+    /// here - the same file, the same two events, the same
+    /// [`SkipReason::NeedsPath`](crate::SkipReason::NeedsPath) fallback and the same non-bump of the
+    /// epoch as on the debounced path - so [`Command::SaveAs`] stays the only
+    /// command on this port that asks a human a question.
+    Save {
+        text: String,
+        revision: u64,
+        epoch: u64,
+    },
+
+    /// A snapshot of the buffer: every autosave trigger, and the final flush the
+    /// bridge sends before `Shutdown`. The user's explicit act is NOT here either -
+    /// it has a variant of its own now, [`Command::Save`](crate::Command::Save). The two share a
+    /// payload for the same reason (the bridge owns the buffer, and an
+    /// intent-only command would save whatever the last debounce happened to leave
+    /// behind), and they do NOT share a gate: Save answers to core's
+    /// `should_save_manual`, which neither the auto-save toggle nor a foreign
+    /// file's disarm refuses. The shipped UI copy naming Save As as the arming act
+    /// is a bridge decision to revise, not a fact about this port.
     ///
     /// This is the whole of the bridge's text obligation. The live buffer stays
     /// in the bridge and no keystroke ever crosses the port
@@ -181,6 +231,15 @@ mod tests {
                 text: text.clone(),
                 revision: *revision,
             },
+            Command::Save {
+                text,
+                revision,
+                epoch,
+            } => Command::Save {
+                text: text.clone(),
+                revision: *revision,
+                epoch: *epoch,
+            },
             Command::Flush {
                 text,
                 revision,
@@ -207,6 +266,7 @@ mod tests {
         match command {
             Command::Open { .. } => "Open",
             Command::SaveAs { .. } => "SaveAs",
+            Command::Save { .. } => "Save",
             Command::Flush { .. } => "Flush",
             Command::SetAutosave(_) => "SetAutosave",
             Command::SetPinned(_) => "SetPinned",
@@ -228,6 +288,11 @@ mod tests {
                 path: PathBuf::from("C:/notes/b.notes"),
                 text: "the buffer, at the moment the dialog closed".to_string(),
                 revision: 4,
+            },
+            Command::Save {
+                text: "the buffer, at the moment the key went down".to_string(),
+                revision: 9,
+                epoch: 1,
             },
             Command::Flush {
                 text: "hello".to_string(),
@@ -262,9 +327,10 @@ mod tests {
             all.len(),
             "the fixture must cover each variant exactly once: {names:?}"
         );
-        // Open, SaveAs, Flush, SetAutosave, SetPinned, SetCornerRounding, ClearRecents,
-        // Shutdown, RegisterWindow, GeometryChanged, UnregisterWindow.
-        assert_eq!(all.len(), 11, "Command gained or lost a variant");
+        // Open, SaveAs, Save, Flush, SetAutosave, SetPinned,
+        // SetCornerRounding, ClearRecents, Shutdown, RegisterWindow,
+        // GeometryChanged, UnregisterWindow.
+        assert_eq!(all.len(), 12, "Command gained or lost a variant");
 
         for command in &all {
             assert_eq!(command, &command.clone(), "{command:?} clone is not equal");

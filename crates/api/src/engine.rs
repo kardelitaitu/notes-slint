@@ -864,6 +864,11 @@ impl Engine {
                 text,
                 revision,
             } => self.save_as(&path, &text, revision),
+            Command::Save {
+                text,
+                revision,
+                epoch,
+            } => self.save(text, revision, epoch),
             Command::Flush {
                 text,
                 revision,
@@ -1251,6 +1256,14 @@ impl Engine {
             });
             return;
         }
+        // THE ORDER IS A CONTRACT, not a style choice, and the rules
+        // below it belong to core: crates/core/src/document.rs owns
+        // should_flush / should_autosave / should_save_manual and this port only
+        // routes. Mark dirty if the bridge is ahead, note the revision, THEN ask
+        // - asking first refuses real work as Clean - and on the write side
+        // note_revision must precede mark_saved, because mark_saved
+        // debug_assert!(revision <= noted) compiles out in release. The same
+        // three steps, same order, on the hand-triggered path below.
         if revision > self.doc.revision() {
             self.doc.apply_edit();
         }
@@ -1265,107 +1278,11 @@ impl Engine {
             return;
         }
         let Some(path) = self.doc.path().map(Path::to_path_buf) else {
-            // D69: an untitled buffer is not an error, it is a note nobody has
-            // named yet - the first-run user types, autosave fires, and the text
-            // MUST land somewhere real instead of being dropped with a skip.
-            // Core owns WHERE (scratch_note_path + ensure_scratch_dir, the same
-            // judge and probe every other state path uses); the port owns the
-            // write, through the SAME machinery Save As uses (sibling temp,
-            // fsync, rename - no second writer). Then the document is rebound:
-            // Saved announces the bytes, Rebound announces the new identity, and
-            // the session is pointed at the scratch so the next launch restores
-            // it. The scratch does NOT join the recents (see
-            // [`Engine::remember`]'s split): it is a restore target, not a file
-            // the user chose.
-            //
-            // This mirrors save_as's body minus its refused-target guard: the
-            // refused-load state protects a FOREIGN file from a blind overwrite,
-            // and the scratch is this port's own freshly created file - the
-            // guard has no jurisdiction here. NeedsPath survives as the FALLBACK
-            // (its meaning is now "we could not make a file for it": a scratch
-            // directory that cannot be created, or a refused write), and the
-            // startup StateDirUnusable event has usually already said why.
-            //
-            // An EMPTY untitled buffer is the one case D69 does not cover: there
-            // is no text to lose, so creating (and re-writing) a zero-byte
-            // scratch file on every flush would be pure churn. NeedsPath stays
-            // its answer until the user actually types something.
-            if text.is_empty() {
-                self.emit(Event::AutosaveSkipped {
-                    reason: SkipReason::NeedsPath,
-                });
-                return;
-            }
-            if let Err(err) = notes_core::paths::ensure_scratch_dir(&self.state_dir) {
-                let _ = err; // the reason reached the user at startup, or rides the next one
-                self.emit(Event::AutosaveSkipped {
-                    reason: SkipReason::NeedsPath,
-                });
-                return;
-            }
-            let scratch = notes_core::paths::scratch_note_path(&self.state_dir);
-            let detected = self.detected;
-            let disk_text = self.text_for_disk(&text);
-            match self.write(&scratch, &disk_text, detected, revision) {
-                Ok(()) => {
-                    // NO EPOCH BUMP HERE, and that is a load-bearing
-                    // non-action, not an oversight: the bridge mirrors the
-                    // engine's generation at the SEND of an Open or a Save As
-                    // (Wire::rebind), and it sent neither to get here — an
-                    // untitled note is bound to its scratch from the engine's
-                    // own side of the seam. The guard above compares the two
-                    // counters for EQUALITY, so a bump here would put the engine
-                    // one generation ahead of every flush the bridge has in the
-                    // debounce and silently discard the autosave of the one
-                    // document this product always has. Pinned by
-                    // `the_scratch_bind_does_not_bump_the_epoch` in
-                    // tests/scratch_restart.rs; the two bump sites are
-                    // [`Engine::open`] and [`Engine::save_as`] and nothing else.
-                    self.doc.save_as(&scratch);
-                    self.detected = detected;
-                    let read_only =
-                        fs::metadata(&scratch).is_ok_and(|meta| meta.permissions().readonly());
-                    self.emit(Event::Saved {
-                        path: scratch.clone(),
-                        revision,
-                    });
-                    // Saved THEN Rebound: Rebound's contract is literally "the
-                    // open document is now a DIFFERENT file", which is only
-                    // true once Saved has announced the bytes.
-                    self.emit(Event::Rebound {
-                        path: scratch.clone(),
-                        meta: FileMeta {
-                            encoding: api_encoding(detected.encoding),
-                            line_ending: api_line_ending(detected.line_ending),
-                            trailing_newline: detected.trailing_newline,
-                            // The port just wrote this file successfully; it
-                            // was not read-only a moment ago.
-                            read_only,
-                            oversize: false,
-                            // A brand-new scratch note is armed: autosave owns
-                            // it from this moment (ADR-0001 requirement 4).
-                            armed: self.doc.is_armed(),
-                        },
-                        revision,
-                        // The UNCHANGED number, stated anyway: the bind is not a
-                        // rebind of the buffer the bridge holds - same text, same
-                        // window, the note just acquired a file - and saying so in
-                        // the event is what lets a bridge echo a number it never
-                        // has to predict. This is the line the mutation test reads.
-                        epoch: self.epoch,
-                    });
-                    // Binds session.path to the scratch and stops there:
-                    // `remember` keeps the scratch out of the MRU.
-                    self.remember(&scratch);
-                }
-                Err(_) => {
-                    // The write was refused (locked, ACL, full disk): the
-                    // fallback skip, and NO file was created.
-                    self.emit(Event::AutosaveSkipped {
-                        reason: SkipReason::NeedsPath,
-                    });
-                }
-            }
+            // D69: no path is not an error and not a dialog. The bind is the
+            // SAME function the hand-triggered Save calls - one answer to
+            // "where do an untitled note's bytes go", shared so the two
+            // paths can never drift apart. It emits the answer; return.
+            self.bind_scratch(&text, revision);
             return;
         };
 
@@ -1378,6 +1295,245 @@ impl Engine {
                 // in this same place.
                 self.doc.mark_saved();
                 self.emit(Event::Saved { path, revision });
+            }
+            Err(reason) => self.emit(Self::document_save_failed(path, revision, reason)),
+        }
+    }
+
+    /// THE SCRATCH BIND (D69), shared VERBATIM by [`Engine::flush`] and
+    /// [`Engine::save`]. It exists as one function because "where do the bytes
+    /// of a note nobody has named go" has exactly one answer and two paths that
+    /// can reach it: an autosave debounce and a hand-triggered Save. A copy in
+    /// each is how the two grow different rules about the same file - which is
+    /// why the body below was moved, not rewritten, and why it is the SAME
+    /// machinery Save As uses (sibling temp, fsync, rename; no second writer).
+    ///
+    /// It answers for itself - `Saved` then `Rebound`, or
+    /// [`Event::AutosaveSkipped`] with [`SkipReason::NeedsPath`] - and both
+    /// callers return immediately after calling it, so neither can stack a
+    /// second answer on top. NO EPOCH BUMP, and the reason is the load-bearing
+    /// line inside: the bridge echoed a generation it was never rebound to.
+    fn bind_scratch(&mut self, text: &str, revision: u64) {
+        // D69: an untitled buffer is not an error, it is a note nobody has
+        // named yet - the first-run user types, autosave fires, and the text
+        // MUST land somewhere real instead of being dropped with a skip.
+        // Core owns WHERE (scratch_note_path + ensure_scratch_dir, the same
+        // judge and probe every other state path uses); the port owns the
+        // write, through the SAME machinery Save As uses (sibling temp,
+        // fsync, rename - no second writer). Then the document is rebound:
+        // Saved announces the bytes, Rebound announces the new identity, and
+        // the session is pointed at the scratch so the next launch restores
+        // it. The scratch does NOT join the recents (see
+        // [`Engine::remember`]'s split): it is a restore target, not a file
+        // the user chose.
+        //
+        // This mirrors save_as's body minus its refused-target guard: the
+        // refused-load state protects a FOREIGN file from a blind overwrite,
+        // and the scratch is this port's own freshly created file - the
+        // guard has no jurisdiction here. NeedsPath survives as the FALLBACK
+        // (its meaning is now "we could not make a file for it": a scratch
+        // directory that cannot be created, or a refused write), and the
+        // startup StateDirUnusable event has usually already said why.
+        //
+        // An EMPTY untitled buffer is the one case D69 does not cover: there
+        // is no text to lose, so creating (and re-writing) a zero-byte
+        // scratch file on every flush would be pure churn. NeedsPath stays
+        // its answer until the user actually types something.
+        if text.is_empty() {
+            self.emit(Event::AutosaveSkipped {
+                reason: SkipReason::NeedsPath,
+            });
+            return;
+        }
+        if let Err(err) = notes_core::paths::ensure_scratch_dir(&self.state_dir) {
+            let _ = err; // the reason reached the user at startup, or rides the next one
+            self.emit(Event::AutosaveSkipped {
+                reason: SkipReason::NeedsPath,
+            });
+            return;
+        }
+        let scratch = notes_core::paths::scratch_note_path(&self.state_dir);
+        let detected = self.detected;
+        let disk_text = self.text_for_disk(text);
+        match self.write(&scratch, &disk_text, detected, revision) {
+            Ok(()) => {
+                // NO EPOCH BUMP HERE, and that is a load-bearing
+                // non-action, not an oversight: the bridge mirrors the
+                // engine's generation at the SEND of an Open or a Save As
+                // (Wire::rebind), and it sent neither to get here — an
+                // untitled note is bound to its scratch from the engine's
+                // own side of the seam. The guard in EACH caller compares the two
+                // counters for EQUALITY, so a bump here would put the engine
+                // one generation ahead of every Save or flush the bridge has in the
+                // debounce and silently discard the autosave of the one
+                // document this product always has. Pinned by
+                // `the_scratch_bind_does_not_bump_the_epoch` in
+                // tests/scratch_restart.rs; the two bump sites are
+                // [`Engine::open`] and [`Engine::save_as`] and nothing else.
+                self.doc.save_as(&scratch);
+                self.detected = detected;
+                let read_only =
+                    fs::metadata(&scratch).is_ok_and(|meta| meta.permissions().readonly());
+                self.emit(Event::Saved {
+                    path: scratch.clone(),
+                    revision,
+                });
+                // Saved THEN Rebound: Rebound's contract is literally "the
+                // open document is now a DIFFERENT file", which is only
+                // true once Saved has announced the bytes.
+                self.emit(Event::Rebound {
+                    path: scratch.clone(),
+                    meta: FileMeta {
+                        encoding: api_encoding(detected.encoding),
+                        line_ending: api_line_ending(detected.line_ending),
+                        trailing_newline: detected.trailing_newline,
+                        // The port just wrote this file successfully; it
+                        // was not read-only a moment ago.
+                        read_only,
+                        oversize: false,
+                        // A brand-new scratch note is armed: autosave owns
+                        // it from this moment (ADR-0001 requirement 4).
+                        armed: self.doc.is_armed(),
+                    },
+                    revision,
+                    // The UNCHANGED number, stated anyway: the bind is not a
+                    // rebind of the buffer the bridge holds - same text, same
+                    // window, the note just acquired a file - and saying so in
+                    // the event is what lets a bridge echo a number it never
+                    // has to predict. This is the line the mutation test reads.
+                    epoch: self.epoch,
+                });
+                // Binds session.path to the scratch and stops there:
+                // `remember` keeps the scratch out of the MRU.
+                self.remember(&scratch);
+            }
+            Err(_) => {
+                // The write was refused (locked, ACL, full disk): the
+                // fallback skip, and NO file was created.
+                self.emit(Event::AutosaveSkipped {
+                    reason: SkipReason::NeedsPath,
+                });
+            }
+        }
+    }
+
+    /// Save: THE HAND-TRIGGERED SAVE, routed. The rule is core's
+    /// ([`Document::should_save_manual`]); what lives here is routing and
+    /// translation, which is the whole of this crate's job (AGENTS.md rule 1: a
+    /// rule that lands in the port instead of in `core` is a silent
+    /// architecture change).
+    ///
+    /// THE ORDER IS THE CONTRACT, and it is the part a `&self` query cannot
+    /// enforce from inside core: GUARD, MARK, NOTE, ASK, WRITE, ANCHOR, ANSWER.
+    ///
+    /// * The epoch guard runs FIRST, verbatim from [`Engine::flush`], because
+    ///   `Save` carries Flush's shape for exactly this reason: it writes the
+    ///   CURRENT path with the buffer it was handed, so the echoed generation is
+    ///   the only stale-write defense on the path. SaveAs cannot go stale the
+    ///   same way - it rebinds, and the rebind is itself the answer - so the
+    ///   guard could not travel with its shape. A discarded Save says so
+    ///   ([`SkipReason::Superseded`]): a keystroke the user pressed is not
+    ///   allowed to vanish quietly.
+    /// * `apply_edit` when the command's revision is above core's counter, THEN
+    ///   `note_revision`, THEN ask. Ask-first is the bug this ordering exists to
+    ///   prevent: [`Document::should_save_manual`] refuses an undirtied buffer
+    ///   as Clean, so a bridge whose edits core has never been told about would
+    ///   be refused for work that really exists. Note-before-anchor for the D11
+    ///   reason - `mark_saved`'s `debug_assert!(revision <= noted)` compiles
+    ///   out in release, so the assert is a tripwire and this line order IS the
+    ///   contract.
+    /// * The ANSWER. `Some(skip)` from core maps through the existing
+    ///   [`api_skip`] onto [`Event::AutosaveSkipped`]: no new event, no new
+    ///   variant, no parallel vocabulary for "why nothing saved". A refused
+    ///   write answers [`Event::SaveFailed`]. Every path through this function
+    ///   emits exactly one answer, and no `return` here is bare.
+    ///
+    /// SUCCESS EMITS `Saved`, THEN `Rebound`, WITH THE PATH AND THE EPOCH
+    /// UNCHANGED. The Rebound is not ceremony: `armed` is a field of
+    /// [`FileMeta`], and a hand-save of a foreign file is the act that sets it
+    /// (ADR-0001 requirement 3), so `Saved` alone would leave the bridge
+    /// rendering "save once and it keeps saving" about a file that has just been
+    /// saved once - an arming that reached the disk and never reached the user.
+    /// The precedent is [`Engine::bind_scratch`], which already announces an
+    /// identity that did not move together with the generation it did not bump.
+    /// NO EPOCH BUMP here either: the bump sites stay [`Engine::open`] and
+    /// [`Engine::save_as`] and nothing else, which is what keeps the equality
+    /// test in the guard above a test a bridge can pass on its own echo.
+    ///
+    /// NO NEW DOOR PAST THE PORT'S OWN GUARD. [`Engine::save_as`] refuses to
+    /// write a buffer into the file whose [`Command::Open`] was refused
+    /// (`load_refused_for`: the measured 0-byte overwrite) and that question
+    /// stays asked in that one place, because `Save` has no caller-named target:
+    /// it can only write `Document::path()`, a file this engine either read
+    /// successfully or created itself. The residue is named instead of hidden: a
+    /// refused RE-open of the path already open leaves `doc.path()` equal to
+    /// `load_refused_for`, and a Save then writes the buffer read earlier, which
+    /// is what a debounced [`Engine::flush`] already does today. So this slice
+    /// opens no exposure that Flush does not already have; widening or closing
+    /// it is the refused-load owner's decision, not a routing side effect.
+    fn save(&mut self, text: String, revision: u64, epoch: u64) {
+        // 1. THE STALE GUARD - flush's, same shape because same payload.
+        if epoch != self.epoch {
+            self.emit(Event::AutosaveSkipped {
+                reason: SkipReason::Superseded,
+            });
+            return;
+        }
+        // 2. TELL CORE ABOUT THE BUFFER before asking it anything.
+        if revision > self.doc.revision() {
+            self.doc.apply_edit();
+        }
+        self.doc.note_revision(revision);
+        // 3. THE RULE, IN CORE: crates/core/src/document.rs,
+        //    Document::should_save_manual. This is its only call site, and the
+        //    gate is CALLED, never copied - a predicate restated here is a second
+        //    rule, and the two would drift. Nothing below decides whether to
+        //    write; the mark/note order above is what makes the answer honest.
+        if let Some(skip) = self.doc.should_save_manual() {
+            self.emit(Event::AutosaveSkipped {
+                reason: api_skip(skip),
+            });
+            return;
+        }
+        // 4. NO PATH, and NOT a dialog: the shared scratch bind, its own
+        //    NeedsPath fallback included. Core owns WHERE; Save As stays the only
+        //    command on this port that asks a human a question.
+        let Some(path) = self.doc.path().map(Path::to_path_buf) else {
+            self.bind_scratch(&text, revision);
+            return;
+        };
+        // 5. THE WRITE, through the one write path, at the DETECTED settings -
+        //    no second writer, no normalising a foreign file on the way (§4.5).
+        let detected = self.detected;
+        let disk_text = self.text_for_disk(&text);
+        match self.write(&path, &disk_text, detected, revision) {
+            Ok(()) => {
+                // 6. ANCHOR, then ANSWER. mark_saved is the one site that clears
+                //    dirty and arms (ADR-0001 requirement 3), so the Rebound
+                //    below READS the arming this write caused instead of
+                //    restating it - and a stale flush arriving after this point
+                //    is judged Clean against a real anchor.
+                self.doc.mark_saved();
+                self.emit(Event::Saved {
+                    path: path.clone(),
+                    revision,
+                });
+                let read_only = fs::metadata(&path).is_ok_and(|meta| meta.permissions().readonly());
+                self.emit(Event::Rebound {
+                    path,
+                    meta: FileMeta {
+                        encoding: api_encoding(detected.encoding),
+                        line_ending: api_line_ending(detected.line_ending),
+                        trailing_newline: detected.trailing_newline,
+                        read_only,
+                        oversize: false,
+                        armed: self.doc.is_armed(),
+                    },
+                    revision,
+                    // The UNCHANGED number, stated anyway so a bridge never has
+                    // to predict it: same document, same generation, new bytes.
+                    epoch: self.epoch,
+                });
             }
             Err(reason) => self.emit(Self::document_save_failed(path, revision, reason)),
         }

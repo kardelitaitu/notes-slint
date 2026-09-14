@@ -132,9 +132,12 @@ pub enum SkipReason {
     /// The global toggle is off ([`Command::SetAutosave(false)`](crate::Command::SetAutosave)).
     AutosaveDisabled,
     /// A file this app did not create, not yet saved once explicitly
-    /// (ADR-0001). The UI copy is the bridge's: `Save As once (Ctrl+S) and it keeps
-    /// saving` (main.rs, the arm for this variant), because the port has no plain Save
-    /// command - naming the act must name the one command that arms.
+    /// (ADR-0001). The UI copy is the bridge's, and it has to name an act the user
+    /// can actually perform - [`Command::Save`](crate::Command::Save) IS that act now.
+    /// So `Save As once (Ctrl+S) and it keeps saving` (main.rs, the arm for this
+    /// variant) is stale copy about a chord table, not a missing command: retitling
+    /// it is bridge work, and the port no longer has to refuse a save someone asked
+    /// for in order to keep this variant reachable.
     ForeignFileNotArmed,
     /// The buffer matches what is on disk (D11: the `Flush` revision is at or
     /// below the last saved revision), so there is nothing to write.
@@ -391,10 +394,16 @@ pub enum Event {
         /// The platform's own words for why it refused.
         reason: String,
     },
-    /// The open document is now a DIFFERENT file: Save As wrote it elsewhere, so
-    /// the path changed, the arming changed with it (ADR-0001 requirement 4), and
-    /// the `meta` field describes the file that exists now rather than the one first
-    /// opened. Emitted right after [`Event::Saved`] for the same write.
+    /// The open document's FILE FACTS changed. Usually because it is now a
+    /// DIFFERENT file: Save As wrote it elsewhere, so the path moved and the arming
+    /// moved with it (ADR-0001 requirement 4). Once, deliberately, because nothing
+    /// moved: a [`Command::Save`](crate::Command::Save) of a foreign document arms it
+    /// IN PLACE, and `armed` is a field of this event - so a `Saved` alone would
+    /// leave the status line telling the user to save once, about a file that has
+    /// just been saved once. A Rebound with an UNCHANGED path and an UNCHANGED epoch
+    /// is therefore legal and meaningful, not a bug: it is how an arming that reached
+    /// the disk also reaches the UI. Either way `meta` describes the file that exists
+    /// now, and this arrives right after [`Event::Saved`] for the same write.
     ///
     /// A variant of its own rather than a second [`Event::Loaded`] because Loaded
     /// carries the whole text and the bridge owns the buffer: re-sending a document

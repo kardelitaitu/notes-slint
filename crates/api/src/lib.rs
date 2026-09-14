@@ -130,6 +130,13 @@
 //! without reading or decoding 8 MiB — then reads, detects and decodes, and answers
 //! [`Event::Loaded`] or [`Event::LoadFailed`]; [`Command::SaveAs`] writes the
 //! snapshot at the chosen path and ARMS the document (ADR-0001 requirement 4);
+//! [`Command::Save`] is the HAND-TRIGGERED save - it routes core's
+//! `Document::should_save_manual`, so neither the auto-save toggle nor a foreign
+//! file's disarm refuses it while read-only and oversize still do, and every ask
+//! is answered by exactly one of [`Event::Saved`] (then [`Event::Rebound`], which
+//! is how the arming it just caused reaches the bridge), [`Event::SaveFailed`], or
+//! [`Event::AutosaveSkipped`]; an untitled note binds the same scratch file the
+//! debounced path binds, so no save on this port requires a dialog;
 //! [`Command::Flush`] saves behind core's own `Document`'s fixed skip order, so a foreign
 //! file refuses and says why, and a stale revision is reported Clean rather than
 //! written (D11); [`Command::ClearRecents`] empties the list the engine reports;
