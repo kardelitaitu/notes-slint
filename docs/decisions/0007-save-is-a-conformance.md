@@ -7,7 +7,7 @@ deciders: [human decision 2026-09-14 round 13, department execution]
 supersedes: null
 superseded_by: null
 relates: [ADR-0001, ADR-0003, ADR-0006, docs/features.md §4.2/§4.4, docs/roadmap.md §9,
-          .agents/notes/proposed/2026-09-14-explicit-save-act]
+          .agents/notes/proposed/2026-09-14-explicit-save-act.md]
 ---
 
 ## Context
@@ -16,7 +16,7 @@ Three records already describe a plain Save the port did not have. ADR-0001 name
 as "one explicit save (`Ctrl+S` or the Save menu item)" (0001:29-30), states requirement 4 as
 "Save As arms the new path" (0001:44-45), and carries as an accepted negative "press Ctrl+S
 once, then it just saves forever" (0001:58). ADR-0003:29 lists the hamburger's menu as "Open /
-Save / Save As / Auto-save toggle / Recent files". `crates/features.md §4.4` tables the row and
+Save / Save As / Auto-save toggle / Recent files". `docs/features.md §4.4` tables the row and
 its chord. And `core` wrote the act into its own type long before anyone could send it:
 `document.rs:46-48` — armed "is set only by the constructor, an explicit save, or a Save As".
 The code lagged the documents. This is the record of catching up.
