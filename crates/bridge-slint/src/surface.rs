@@ -913,11 +913,13 @@ pub(crate) struct Pump {
     /// against what the port actually persisted, which is what the next launch restores
     /// from; kept here because the tick that printed it is long gone.
     pub(crate) drag_target: Option<(i32, i32)>,
-    /// C3: has THIS drag episode printed its one line yet? A real drag emits a callback per
-    /// mouse-move frame, so an unguarded print is a hundred lines for one gesture - the same
-    /// flood the instrument refused for its refusal print (`drag_refused_shown` above), for the
-    /// same reason. Written by the product's drag handler; cleared when the band releases.
-    pub(crate) drag_reported: bool,
+    /// THE DRAG EPISODE IN PROGRESS: the corner the note stood at when this gesture's first
+    /// delta arrived, plus the travel accumulated since, plus the one-line-per-gesture print
+    /// bit. Pure state (see `DragEpisode`), owned here because this pump is the only memory
+    /// the product root keeps across callbacks, and per-gesture state must die with the gesture
+    /// rather than live in a bool next to it - which is why the C3 print bit that used to sit in
+    /// this list is a field of the episode now.
+    pub(crate) drag_episode: DragEpisode,
     /// C4: the corner shape this bridge last ASKED the port for, `None` before the first ask.
     /// The wake that watches maximisation runs every 8 ms, so without this a held maximise
     /// would name an attribute to the OS ~125 times a second; with it, a normal→maximised
@@ -1529,7 +1531,10 @@ pub(crate) fn wire_callbacks(
     // main.slint has been forwarding since the same slice (:408-412), and NOTHING on the product
     // side was listening - so every title-band drag fell on the floor of an unwired callback.
     // This is the bug the user reported as "we cannot move the window", and it is the same shape
-    // as STEP B's unwired chords: markup fires, Rust never registered.
+    // as STEP B's unwired chords: markup fires, Rust never registered. C3 wired the handler; the
+    // handler it wired was a read-modify-write, and the same gesture still lagged the pointer -
+    // so the delta now goes through `DragEpisode`, which holds the gesture's origin and its
+    // accumulated travel instead of re-reading the corner the write is meant to move.
     {
         let weak = ui.as_weak();
         let pump = Rc::clone(pump);
@@ -1547,11 +1552,29 @@ pub(crate) fn wire_callbacks(
         let gw = Rc::clone(gw);
         let pump = Rc::clone(pump);
         ui.on_drag_ended(move || {
-            let target = pump.borrow_mut().drag_target.take();
-            pump.borrow_mut().drag_reported = false;
+            // TAKE THE GESTURE'S FACTS, THEN KILL THE GESTURE. `end()` is what stops the next
+            // press from accumulating onto this one - the hazard an episode exists to create, and
+            // the reason the release is not merely a send.
+            let (target, travel, moved) = {
+                let mut p = pump.borrow_mut();
+                let target = p.drag_target.take();
+                let travel = p.drag_episode.travel;
+                let moved = p.drag_episode.origin.is_some();
+                p.drag_episode.end();
+                (target, travel, moved)
+            };
+            // The total is printed ONCE, here, which is where an accumulated gesture belongs: the
+            // delta-vs-read question micro-2 has to settle is answerable from this line plus the
+            // first-delta line, without a print per mouse-move frame.
             report(&format!(
-                "drag: released from {target:?}, asking the port to store the rect"
+                "drag: released from {target:?} (travel {:?}, {}), asking the port to store the rect",
+                travel,
+                if moved { "episode closed" } else { "no episode was open" }
             ));
+            // ONE ask to store the rect, and it is the release's - including for a drag the
+            // maximised state refused, which asked for nothing and moved nothing: the release is
+            // the only door, so a refusal cannot half-open it, and a rect that did not change
+            // costs the engine a write of what it already had.
             send(&gw, Command::GeometryChanged);
         });
     }
@@ -1587,6 +1610,128 @@ pub(crate) fn drag_destination(here: (i32, i32), dx: f32, dy: f32, scale: f32) -
     )
 }
 
+/// How long a delta may be followed by silence before the next one is read as a NEW press
+/// rather than the continuation of this one. A real drag emits a callback per mouse-move frame
+/// (this bridge wakes every 8 ms), so a quarter second without one is a released band whose
+/// release edge never arrived, not a person thinking mid-gesture. Both ways of getting it wrong
+/// are named at `DragEpisode::gone_cold`.
+const DRAG_EPISODE_GAP: Duration = Duration::from_millis(250);
+
+/// ONE title-band gesture's own state, so the arithmetic never reads the thing it is writing.
+///
+/// THE BUG THIS KILLS (2026-09-15, the "we cannot move the window" repair, micro-1 of three).
+/// `drag_by` used to read `window.position()`, add the delta and write the sum back - a
+/// read-modify-write whose INPUT is the very thing the write is supposed to change. Slint's
+/// `set_position` is an ASK: what `position()` reports afterwards is whatever the windowing
+/// layer has applied, so a delta that arrives before that lands reads the OLD corner and re-asks
+/// for a target the note already holds. Two events 6 px apart both reading `<390,278>` both ask
+/// for `<396,278>`, and the pointer's second 6 px is gone for good. The ruler rides the thing it
+/// measures. It is scale-independent, which is precisely why every DPI needle in this file stayed
+/// green while the note lagged the hand.
+///
+/// WHY THIS SHAPE IS RIGHT WHICHEVER WAY THE MEASUREMENT LANDS. Micro-2 has to decide which of
+/// the two quantities is actually starved on a real desktop, and the two candidate answers used
+/// to need two different repairs. Accumulating the travel fixes the read-starved case outright -
+/// the window's position is sampled AT MOST ONCE PER GESTURE, so nothing downstream can starve
+/// it - and it fixes the delta-starved case as far as the bridge can: a delta that is never
+/// emitted is lost by any scheme, but a delta that IS emitted can no longer be spent against a
+/// stale base. Whichever way the measurement lands, the OS-apply dependency leaves the arithmetic,
+/// and the only thing still depending on it is the read-back in the print, which is a WITNESS and
+/// not an input.
+///
+/// WHAT THIS CARRIES AND WHAT IT COULD CARRY: the press's cursor position in physical px would
+/// let a gesture be reconstructed from one sample instead of a sum of deltas, and the band has it
+/// (`ui/chrome.slint` samples `mouse-x`/`mouse-y` on press). The product cannot see it -
+/// `drag-delta(dx, dy)` is the only fact that crosses the seam - so holding it would cost a
+/// markup argument. Not taken: accumulated travel needs no press sample to be correct, and
+/// reaching into the markup to store a field that changes no arithmetic is the kind of scope the
+/// project's own rules ask be raised, not spent.
+///
+/// THE ONE HAZARD THIS CREATES, priced rather than hidden: an episode whose release never arrives
+/// keeps its origin, and the NEXT press would then accumulate onto the LAST gesture - a jump
+/// across the screen. `end()` on the release is the reset; `gone_cold` is the net under a
+/// release that never came. Both are tested below, because a fix that trades lag for teleporting
+/// is not a fix.
+#[derive(Default)]
+pub(crate) struct DragEpisode {
+    /// Where the note's corner stood at this gesture's FIRST delta, in PHYSICAL px - the same
+    /// unit `drag_destination` returns, so the write below never converts twice. `None` means
+    /// no gesture in progress: the next delta samples a fresh origin.
+    origin: Option<(i32, i32)>,
+    /// Pointer travel since that origin, PHYSICAL px, summed one rounded step per event by the
+    /// one arithmetic function. Zero deltas add nothing and, more importantly, lose nothing.
+    travel: (i32, i32),
+    /// When the last delta of this episode arrived, and whether this episode has printed once
+    /// yet. Both are per-gesture facts, so both die with the gesture.
+    last: Option<Instant>,
+    printed: bool,
+}
+
+impl DragEpisode {
+    /// ONE delta of ONE episode. IN: what the window reads right now (`here`), which is trusted
+    /// exactly once per gesture; the pointer's delta in LOGICAL px; the scale; and the clock,
+    /// taken as an argument so a stall is testable without waiting for one. OUT: the target in
+    /// PHYSICAL px, ready for `set_position`.
+    pub(crate) fn advance(
+        &mut self,
+        here: (i32, i32),
+        dx: f32,
+        dy: f32,
+        scale: f32,
+        now: Instant,
+    ) -> (i32, i32) {
+        // A cold start or a cold gap: sample, and start the travel over. Everything after this
+        // line ignores `here` - that ignoring IS the repair.
+        if self.origin.is_none() || self.gone_cold(now) {
+            self.origin = Some(here);
+            self.travel = (0, 0);
+            self.printed = false;
+        }
+        let Some(origin) = self.origin else {
+            // Unreachable: the block above just filled it. A return rather than an expect(),
+            // because a position this bridge cannot read is not worth a panic over.
+            return here;
+        };
+        // THE PER-DELTA ARITHMETIC IS UNTOUCHED and still the only place a logical px becomes a
+        // physical one: asked for the step from `<0,0>`, `drag_destination` yields exactly the
+        // increment the old read-modify-write line added to a live read. What moved is the BASE.
+        let step = drag_destination((0, 0), dx, dy, scale);
+        self.travel = (self.travel.0 + step.0, self.travel.1 + step.1);
+        self.last = Some(now);
+        (origin.0 + self.travel.0, origin.1 + self.travel.1)
+    }
+
+    /// The release: this gesture is over, so its origin is history and its travel is spent.
+    pub(crate) fn end(&mut self) {
+        *self = Self::default();
+    }
+
+    /// True while a gesture owns an origin whose first delta has not printed. The caller prints
+    /// one line per episode for the same flood reason `drag_refused_shown` exists for.
+    pub(crate) fn unprinted(&self) -> bool {
+        self.origin.is_some() && !self.printed
+    }
+
+    /// Mark this episode's one line as printed.
+    pub(crate) fn mark_printed(&mut self) {
+        self.printed = true;
+    }
+
+    /// Is the last delta far enough behind to be a different press? Getting this wrong in the
+    /// SHORT direction re-samples mid-gesture, which costs the user at most the travel since the
+    /// last wake; in the LONG direction a stranded origin survives and the next press JUMPS. The
+    /// cheap side of that asymmetry is where the window sits, which is why the gap is a quarter
+    /// second and not a frame.
+    fn gone_cold(&self, now: Instant) -> bool {
+        match self.last {
+            // `duration_since` saturates at zero for a clock that went backwards, which cannot
+            // then read as cold - the safe direction for the same reason as above.
+            Some(previous) => now.duration_since(previous) > DRAG_EPISODE_GAP,
+            None => false,
+        }
+    }
+}
+
 /// THE DRAG, moved. Reading and writing the window is bridge work (AGENTS.md: geometry RESTORE is
 /// the bridge's, geometry STORAGE is core's), so this function is the only place in the product
 /// that turns a pointer's movement into a position.
@@ -1614,28 +1759,43 @@ fn drag_by(weak: &slint::Weak<Spike>, pump: &RefCell<Pump>, dx: f32, dy: f32) {
         }
         return;
     }
+    // READ ONCE, AND ONLY WHEN THE EPISODE HAS NO ORIGIN YET. `here` is an input to `advance`,
+    // which uses it on the gesture's first delta and ignores it after that; the read-back below
+    // stays, but as a WITNESS of what the toolkit did, never as the base of the next sum. That
+    // separation is the whole repair.
     let here = window.position();
     let scale = window.scale_factor();
-    let want = drag_destination((here.x, here.y), dx, dy, scale);
-    window.set_position(PhysicalPosition::new(want.0, want.1));
-    // What the toolkit reads back is the fact; what was asked for is the intention, and the two
-    // are printed together because the gap between them is the DPI/clamp story.
-    let back = window.position();
-    let (first, was_refusing) = {
+    let (want, was_refusing, first) = {
         let mut p = pump.borrow_mut();
+        let want = p
+            .drag_episode
+            .advance((here.x, here.y), dx, dy, scale, Instant::now());
+        // THE FACT THAT WAS THE POINT OF C3: the frame-inclusive target the last delta asked for,
+        // printed at the release and compared by the instrument against what the port stored.
         p.drag_target = Some(want);
         // The refusal bit doubles as "the status line is currently lying about this band": a
         // delta that lands means the note moves after all, so stop saying otherwise.
         let was_refusing = p.drag_refused_shown;
         p.drag_refused_shown = false;
-        let first = !p.drag_reported;
-        p.drag_reported = true;
-        (first, was_refusing)
+        // One line per gesture, not per mouse-move frame (the flood reason `drag_refused_shown`
+        // carries for the refusal print). Owned by the episode now, so a gesture the gap restarts
+        // prints again instead of going silent for the rest of the run.
+        let first = p.drag_episode.unprinted();
+        p.drag_episode.mark_printed();
+        (want, was_refusing, first)
     };
+    window.set_position(PhysicalPosition::new(want.0, want.1));
+    // What the toolkit reads back is the fact; what was asked for is the intention, and the two
+    // are printed together because the gap between them is the DPI/clamp story.
+    let back = window.position();
     if was_refusing {
         ui.set_status(legend().into());
     }
     if first {
+        // THE SAME LINE C3 PRINTED, byte for byte on a gesture's first delta (where the episode's
+        // origin and this read are the same number by construction), so every recorded verdict
+        // about it keeps meaning what it said. The accumulation it cannot show is the accumulation
+        // the tests below show; the release line carries the episode's total, once per gesture.
         report(&format!(
             "drag: from <{},{}> by <{dx},{dy}> at scale {scale} -> asked <{},{}>, reads <{},{}>",
             here.x, here.y, want.0, want.1, back.x, back.y
@@ -1694,9 +1854,11 @@ mod tests {
     // arithmetic became testable without a window - which is the whole point of it being a
     // separate function. The recents tests are the same argument one step on: a ROW BUILDER that
     // touches no window can be driven by real files, so it is driven by real files.
-    use super::{MAX_RECENTS, RecentEntry, RecentRow, SHORTCUTS, drag_destination, recents_rows};
+    use super::{
+        DragEpisode, MAX_RECENTS, RecentEntry, RecentRow, SHORTCUTS, drag_destination, recents_rows,
+    };
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const MARKUP: &str = include_str!("../ui/main.slint");
 
@@ -2176,6 +2338,194 @@ mod tests {
         );
     }
 
+    /// Drive a stream of deltas through one episode against a window whose read NEVER advances.
+    /// That is the exact condition the repair is about: `set_position` is an ask, so a delta
+    /// arriving before the windowing layer applies it reads the corner the last delta already
+    /// asked to leave. The clock is a parameter, so a stall is a value here and not a wait.
+    fn stalled_gesture(deltas: &[(f32, f32)]) -> (Vec<(i32, i32)>, DragEpisode) {
+        let mut episode = DragEpisode::default();
+        let t0 = Instant::now();
+        // Frozen on purpose, and it is the number the instrument measured as a resting place.
+        let frozen_read = (390, 278);
+        let asked = deltas
+            .iter()
+            .enumerate()
+            .map(|(i, (dx, dy))| {
+                episode.advance(
+                    frozen_read,
+                    *dx,
+                    *dy,
+                    1.0,
+                    t0 + Duration::from_millis(8 * i as u64),
+                )
+            })
+            .collect();
+        (asked, episode)
+    }
+
+    #[test]
+    fn a_stalled_position_read_never_starves_a_gesture() {
+        // THE STALL SIMULATION: five events, 6 + 6 + 0 + 0 + 6 logical px, against a window that
+        // reads <390,278> every single time. The pointer travelled 18 px, so the last ask must be
+        // 390+18. Not 390+12, which is what the same stream credits the gesture with if a
+        // still-pointer event (a 0,0 delta) is mistaken for the end of it and the travel it
+        // carried is dropped; not 390+6, which is where a read-modify-write lands when every
+        // event reads the same stale corner and spends its delta against that.
+        let (asked, episode) =
+            stalled_gesture(&[(6.0, 0.0), (6.0, 0.0), (0.0, 0.0), (0.0, 0.0), (6.0, 0.0)]);
+        assert_eq!(
+            asked,
+            vec![(396, 278), (402, 278), (402, 278), (402, 278), (408, 278)],
+            "zero deltas hold the note still without costing it the travel it already has"
+        );
+        assert_eq!(episode.travel, (18, 0), "the sum, not the last sample");
+        assert_eq!(episode.origin, Some((390, 278)));
+        // And the 12, measured rather than asserted away: the same episode cut off at the first
+        // still-pointer event is worth 12 px, which is the number the full gesture is not.
+        let (short, _) = stalled_gesture(&[(6.0, 0.0), (6.0, 0.0)]);
+        assert_eq!(short.last(), Some(&(402, 278)));
+        assert_ne!(
+            episode.travel.0,
+            short.last().unwrap().0 - 390,
+            "18 px of pointer, not the 12 px of the truncated stream"
+        );
+    }
+
+    #[test]
+    fn an_episode_origin_survives_an_apply_that_refused() {
+        // Mid-episode failures are all silent: `set_position` returns nothing, so a clamp
+        // against the work area, a monitor that changed under the drag, or a windowing layer that
+        // simply had not applied the last ask all look identical from here. The origin must not
+        // care: it is a fact the episode sampled once, not a value the episode re-reads and
+        // therefore cannot lose.
+        let mut episode = DragEpisode::default();
+        let t0 = Instant::now();
+        assert_eq!(episode.advance((100, 100), 10.0, 0.0, 1.0, t0), (110, 100));
+        assert_eq!(
+            episode.origin,
+            Some((100, 100)),
+            "the first read is the base"
+        );
+        // The apply refused: the window still reads where it was.
+        assert_eq!(
+            episode.advance((100, 100), 10.0, 0.0, 1.0, t0 + Duration::from_millis(8)),
+            (120, 100)
+        );
+        // The apply refused AND something else moved the note out from under the drag: a read that
+        // disagrees with the episode is not trusted mid-gesture, because trusting it is the bug.
+        assert_eq!(
+            episode.advance((400, 400), 10.0, 0.0, 1.0, t0 + Duration::from_millis(16)),
+            (130, 100)
+        );
+        assert_eq!(episode.origin, Some((100, 100)), "the base never moved");
+        assert_eq!(episode.travel, (30, 0));
+    }
+
+    #[test]
+    fn releasing_the_band_resets_the_episode_for_the_next_press() {
+        let mut episode = DragEpisode::default();
+        let t0 = Instant::now();
+        assert_eq!(episode.advance((500, 500), 20.0, 5.0, 1.0, t0), (520, 505));
+        episode.end();
+        assert_eq!(
+            episode.origin, None,
+            "the gesture is over, so its base is history"
+        );
+        assert_eq!(episode.travel, (0, 0), "and its travel is spent");
+        assert_eq!(episode.last, None);
+        // The next press samples again from wherever the note now stands. Without the reset it
+        // would accumulate onto the last gesture: the jump an episode buys, and the reason the
+        // release is not just a send.
+        assert_eq!(episode.advance((520, 505), 30.0, 0.0, 1.0, t0), (550, 505));
+        assert_eq!(episode.origin, Some((520, 505)));
+        assert_eq!(episode.travel, (30, 0));
+    }
+
+    #[test]
+    fn a_release_that_never_arrived_cannot_strand_an_origin() {
+        // `drag-ended` is the reset and the band's `changed pressed` is the only thing that fires
+        // it. A release the markup never reports - the button let go off-window, a grab stolen by
+        // the OS - would otherwise leave the note accumulating across two gestures forever. The
+        // gap is the net: a delta a quarter second behind the last one is a NEW press.
+        let mut episode = DragEpisode::default();
+        let t0 = Instant::now();
+        assert_eq!(episode.advance((200, 200), 10.0, 0.0, 1.0, t0), (210, 200));
+        // still hot twenty-four wakes later: the same episode, still accumulating
+        assert_eq!(
+            episode.advance((200, 200), 10.0, 0.0, 1.0, t0 + Duration::from_millis(192)),
+            (220, 200)
+        );
+        // a full second cold, and the note has since been parked somewhere else: fresh origin
+        assert_eq!(
+            episode.advance((900, 900), 10.0, 0.0, 1.0, t0 + Duration::from_millis(1200)),
+            (910, 900)
+        );
+        assert_eq!(
+            episode.travel,
+            (10, 0),
+            "no carry-over from the press that never ended"
+        );
+        assert_eq!(episode.origin, Some((900, 900)));
+        // and the print bit dies with the episode, so the new gesture gets its one line
+        assert!(episode.unprinted());
+    }
+
+    #[test]
+    fn a_drag_refused_while_maximised_moves_nothing_and_asks_once() {
+        // THE REFUSAL PATH, still exactly one shape: a maximised note reports its position as
+        // <-8,-8> (the invisible border), so the arithmetic would be perfect and the answer
+        // wrong, and this bridge has already had a port store -8,52 as a restore point (see the
+        // comment above the guard in `drag_by`). The episode is on this file's other side of the
+        // same fact: a refusal must not OPEN an episode, because an episode whose origin is a lie
+        // would then be accumulated against for the rest of the gesture.
+        let episode = DragEpisode::default();
+        assert_eq!(episode.origin, None, "nothing has been sampled");
+        assert_eq!(episode.travel, (0, 0), "and there is no travel to carry");
+        assert!(
+            !episode.unprinted(),
+            "an episode that never opened has nothing to print"
+        );
+        // The grep half, which is the only way to see an ASK without a window. Cut at the tests
+        // module: this file includes ITSELF, so a literal counted below would otherwise match the
+        // line doing the counting.
+        let whole = include_str!("../src/surface.rs");
+        let src = &whole[..whole.find("mod tests").expect("the tests module")];
+        let hooks = &src[src
+            .find("C3 (5) THE DRAG")
+            .expect("the two drag hooks, by their heading")
+            ..src
+                .find("/// THE DRAG'S ARITHMETIC")
+                .expect("the arithmetic, which ends the hook block")];
+        assert_eq!(
+            hooks.matches("Command::GeometryChanged").count(),
+            1,
+            "the release is the ONLY door the port is asked through - a refusal adds no second ask"
+        );
+        assert!(
+            hooks.contains("drag_episode.end()"),
+            "and the release closes the episode, not just the send"
+        );
+        let by = &src[src.find("fn drag_by(").expect("the drag body")
+            ..src
+                .find("/// C4: the corner POLICY")
+                .expect("the next section")];
+        let refusal = &by[..by
+            .find("let here = window.position()")
+            .expect("the read, which is the end of the refusal arm")];
+        assert!(
+            !refusal.contains("window.set_position("),
+            "the maximised arm writes no position"
+        );
+        assert!(
+            !refusal.contains("drag_episode.advance("),
+            "and opens no episode"
+        );
+        assert!(
+            by.contains(".advance("),
+            "while the arm that moves does go through the episode"
+        );
+    }
+
     #[test]
     fn the_band_that_moves_the_window_is_listened_to() {
         // C3, and the shape of the bug it guards against is not hypothetical: the markup has
@@ -2200,6 +2550,26 @@ mod tests {
             src.matches("set_position(").count(),
             1,
             "drag_destination must be the only place this file moves the window"
+        );
+        // THE READ-ONCE RULE, grepped because it is the rule a future edit is most likely to undo:
+        // the window's corner is sampled exactly twice in this file - once to open an episode,
+        // once as the read-back witness - and never to base a sum on. A third read is the
+        // moving-ruler bug walking back in with a green arithmetic test.
+        assert_eq!(
+            src.matches("= window.position()").count(),
+            2,
+            "one origin sample and one witness: the delta must not be added to a fresh read"
+        );
+        // Token-shaped needles, not whole-call ones: rustfmt is free to break a method chain
+        // across lines, and a guard that only passes on one particular wrap is a test that fails
+        // on a format run rather than on a regression.
+        assert!(
+            src.contains(".advance("),
+            "the delta goes through the EPISODE, which owns the base"
+        );
+        assert!(
+            src.contains("drag_episode.end()"),
+            "and an episode is only safe because the release closes it"
         );
     }
 }
