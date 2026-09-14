@@ -575,7 +575,24 @@ mod tests {
         assert_eq!(list.len(), 2);
     }
 
+    /// THE SIX BELOW JUDGE WIN32 PATH SYNTAX, not the label law. Every
+    /// fixture is a `C:\...` spelling, and to a POSIX `Path` a backslash is an
+    /// ordinary character, so `C:\Docs\ReadMe.NOTES` has no basename - it is
+    /// ONE component, and file_name() hands the whole string back. That is
+    /// exactly what the Linux runner answered: the whole string where a
+    /// basename was expected, six times over. The rule they exercise is
+    /// platform-neutral and Linux keeps judging it through
+    /// colliding_labels_grow_jointly_until_they_differ below, plus the
+    /// un-gated MRU laws above; case_sensitive_platforms_keep_two_entries
+    /// covers the other platform side of the IDENTITY rule. This is a scope,
+    /// not an ignore - each case still runs, and still fails, on Windows.
+    /// STATED LOSS: on Linux the case-preserved basename, the bound that
+    /// marks its cut with an ellipsis, and the hard character cap are
+    /// UNJUDGED. Re-homing those three to root-and-slash terrain, the way the
+    /// growth case was re-homed, is the honest way to close that gap; it is
+    /// not this edit and it is not a thing to forget.
     #[test]
+    #[cfg(windows)]
     fn labels_are_the_case_preserved_file_name() {
         let labels = display_labels(&[
             entry(r"C:\Docs\ReadMe.NOTES", "whatever"),
@@ -588,6 +605,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn colliding_basenames_do_not_both_render_as_the_bare_word() {
         // D33: the collision rule. Two identical basenames must not both
         // render as the same bare word.
@@ -600,17 +618,33 @@ mod tests {
 
     #[test]
     fn colliding_labels_grow_jointly_until_they_differ() {
-        // The nearest folders agree; the second one distinguishes. Both
-        // folder chains fit inside the bound, so nothing was cut and no
-        // truncation marker is honest.
-        let labels = display_labels(&[
-            entry(r"C:\p\x\readme.txt", "r"),
-            entry(r"C:\q\x\readme.txt", "r"),
-        ]);
-        assert_eq!(labels, vec![r"p\x\readme.txt", r"q\x\readme.txt"]);
+        // THE ONE LABEL CASE HERE THAT STAYS UN-GATED, because the law it
+        // proves - grow both members of a collision together and stop at the
+        // first length where the labels come apart - is platform-neutral, so
+        // its terrain is spelled so that BOTH kernels read it identically: a
+        // root plus forward slashes is folders p/x and q/x on POSIX and the
+        // same three folders on Windows. The fixture it replaces,
+        // `C:\p\x\readme.txt`, is ONE component named exactly that to a
+        // POSIX Path, which is the fact the six gated cases below rest on.
+        // The claim is untouched: the nearest folder agrees, the second one
+        // separates them, both chains fit inside the bound, so no ellipsis is
+        // honest. Only the separator in the expectation is spelled by the
+        // platform, because compose() emits MAIN_SEPARATOR_STR - that is the
+        // rule, not a loosening of it.
+        let sep = MAIN_SEPARATOR_STR;
+        let labels =
+            display_labels(&[entry("/p/x/readme.txt", "r"), entry("/q/x/readme.txt", "r")]);
+        assert_eq!(
+            labels,
+            vec![
+                format!("p{sep}x{sep}readme.txt"),
+                format!("q{sep}x{sep}readme.txt")
+            ]
+        );
     }
 
     #[test]
+    #[cfg(windows)]
     fn the_parent_suffix_is_bounded_and_marks_the_cut() {
         // The distinguishing folder is three up: past the bound the label
         // caps at the two nearest parents and the ellipsis marks the cut.
@@ -623,6 +657,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn no_label_exceeds_the_hard_character_cap() {
         // A folder NAME has no length limit, so the component bound alone
         // cannot bound a label; the character cap keeps the promise.
@@ -643,6 +678,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn case_only_twin_names_stay_case_preserved_and_distinct() {
         // Same folder, different case: the suffix cannot help, but the
         // case-preserved names are different words — display is not identity.
@@ -654,6 +690,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn vanished_entries_get_the_same_label_greyed_elsewhere() {
         let mut entries = vec![
             entry(r"C:\a\one.notes", "one"),

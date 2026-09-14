@@ -361,7 +361,18 @@ mod tests {
         }
     }
 
+    /// SUBJECT: the `\\?\` extended prefix - Win32 spelling and nothing else, so
+    /// this case runs where that spelling means something. Its one wrong-machine
+    /// assert is `\\?\C:\CON`: to a POSIX path that whole string is ONE
+    /// ordinary, mangling-free filename, so the answer there is Allowed, not
+    /// ReservedDevice. Every OTHER assert in here is a raw-string law - the stream
+    /// colon, the `\\?\UNC` network prefix, the device namespace, the trailing
+    /// dot, COM0/LPT0 staying ordinary - and each one now has an un-gated twin in
+    /// the hostile table below, including the row moved there for exactly that
+    /// reason. So Linux gives up the prefix here, not a rule. Not an #[ignore]: the
+    /// case still runs, and still fails, on Windows.
     #[test]
+    #[cfg(windows)]
     fn extended_prefix_no_longer_bypasses_the_stripping_rule() {
         // MAJOR-4 reversal: the dot is a real character past the prefix, but
         // the note it writes can never be reopened by a plain spelling — so
@@ -471,6 +482,16 @@ mod tests {
     /// that once slipped through a hole, and the verdict that now names it.
     /// Run against the pure predicate — no filesystem, no elevation — which
     /// is also the only way to judge the \??\ forms without a real device.
+    /// One row's expectation when the LAW asserted is Win32 name mangling: the
+    /// verdict Windows must give, `Allowed` where no such law exists.
+    const fn win32_name_law(under_win32: PathVerdict) -> PathVerdict {
+        if cfg!(windows) {
+            under_win32
+        } else {
+            PathVerdict::Allowed
+        }
+    }
+
     #[test]
     fn hostile_input_table() {
         let cases: &[(&str, PathVerdict)] = &[
@@ -491,15 +512,32 @@ mod tests {
             // one-letter+colon corollary with them.
             (r"C:notes.notes", PathVerdict::DriveRelative),
             (r"a:b.notes", PathVerdict::DriveRelative),
-            // BLOCKER-2 siblings: the rules hold on EVERY component.
-            (r"C:\CON\x.notes", PathVerdict::ReservedDevice),
-            (r"C:\x\sub.\x.notes", PathVerdict::StrippedName),
+            // BLOCKER-2 siblings: the rules hold on EVERY component - and EVERY
+            // COMPONENT is the Win32 half of them. A POSIX path finds no separator
+            // in these two strings at all, so `C:\CON\x.notes` is one legal
+            // filename, CON names no device there, and `sub.` loses no dot:
+            // Allowed is the CORRECT verdict on Linux, not a hole in the policy.
+            // Every other row here is a raw-string law - a leading prefix, a colon,
+            // a drive-relative name, a final `.` or `..` - which is why those stay
+            // unconditional and why this table is the thing we want Linux to keep
+            // judging.
+            (
+                r"C:\CON\x.notes",
+                win32_name_law(PathVerdict::ReservedDevice),
+            ),
+            (
+                r"C:\x\sub.\x.notes",
+                win32_name_law(PathVerdict::StrippedName),
+            ),
             (r"C:\x\notes\.", PathVerdict::StrippedName),
             (r"C:\x\notes\..", PathVerdict::StrippedName),
             // MAJOR-4: the EXT trailing-dot row is refused now, so it moved
             // out of the carve-outs list; a LEGITIMATE long path (no stripped
             // component) is still Allowed past the prefix.
             (r"\\?\C:\a.notes.", PathVerdict::StrippedName),
+            // `\\?\C:\x:ads` is the raw-string colon law from the Windows-only case
+            // above, so it lives where Linux keeps judging it.
+            (r"\\?\C:\x:ads", PathVerdict::StreamName),
             (r"\\?\\dir\x.notes", PathVerdict::Allowed), // rooted verbatim form
             // ACCEPTED (audit item 4): Allowed-but-unwritable shapes. Win32
             // refuses both on write; no data moves; refusing them here would
