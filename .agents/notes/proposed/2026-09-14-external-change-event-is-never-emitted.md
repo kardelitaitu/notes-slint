@@ -193,6 +193,55 @@ the gap, edits no README, and does not touch the `#[ignore]`. The owner of the g
 the two honest exits are the same pair as above: build the document debounce so the test can be
 un-ignored, or stop advertising the word — with CI's account, not this note's.
 
+## Third instance: three disclaimed behaviours and one piece of machinery
+
+The workspace has four `#[ignore]`d tests. The honest census is **three disclaimed behaviours plus
+one piece of machinery**, and the count is written out because "four unproven behaviours" overstates
+by one. Each item below is attributed to the test's own words, not to a brief's summary of it.
+
+1. **The pin claim — where the defect is the doc register, not the code.** `README.md` promises
+   "**Pins** | One click (plus a shortcut) puts it above every other window. State persists.", and
+   `docs/features.md` §4.3 insists the flags matter ("without `NOACTIVATE` toggling pin steals
+   focus"). The only machine proof either sentence has is
+   `crates/platform/tests/geometry_live.rs`, whose single test
+   (`an_async_move_and_reband_land_when_the_owner_pumps`) is ignored with the reason "needs an
+   interactive desktop: it creates a real window and parks its owning thread; **machine-verified
+   proof** - run: `cargo test -p notes-platform --test geometry_live -- --ignored --nocapture`".
+   That shape is worth naming precisely, because it is the opposite of this note's other two
+   instances: the ignore string itself says the behaviour is **known good on a human desk** and
+   merely uncarried by any automated run. Nothing is suspected broken. The same file carries the
+   sharp edge in its header — "a pin applied while the window is still hidden will silently not
+   land; pin state must reach the window after (or with) it is shown" — and its phase-C print
+   shows the measurement behind it (`set_topmost` answered Applied quickly with the owner parked
+   while `WS_EX_TOPMOST` was still unset two seconds later). So the ask here is not a code change
+   and not a status move: it is that a row citing this proof say **which kind** of proof it is.
+2. **The IME contrast — the model the pin row should have followed.**
+   `crates/bridge-gpui/tests/ime_seam.rs` defers its manual test out loud: "needs a live window and
+   a real CJK IME - run by hand on Windows, **never counted as automated evidence**", and
+   [ADR-0003](../../../docs/decisions/0003-custom-chrome-titlebar.md) puts "IME behaviour under
+   custom chrome" on the open list and labels the whole list "All M2 acceptance work." The
+   deferral is filed where the claim lives. That is the difference between an honest gap and a
+   false statement, and it is what the pin citation lacks.
+3. **The machinery half, so the census is not repeated wrong.** `path_hazards.rs`'s
+   `drive_relative_child` is ignored with the reason "driven by
+   `drive_relative_name_lands_where_the_cwd_says`" — it is the **child half of an active test**,
+   spawned by its own parent once per working directory, and the attribute only stops it running
+   standalone. It proves nothing-unproven at all; three, not four.
+4. **A named open defect nobody has filed, parked for a human.** Inside that ignored IME test's own
+   recipe, step 5: "Type nihao a third time and press Ctrl+A before committing. **Today the mark
+   survives** (the red test above); watch whether the next keystroke replaces the whole selection or
+   the stale composition - that is the bug reproduced live." A live defect that exists **only inside
+   an ignored test body**, in `bridge-gpui`, and it is parked on two counts at once which whoever
+   holds it must be handed together: ADR-0006 freezes that bridge (no new needles; its terminal
+   delete is governed by the six re-earnings), and the fix is a behaviour change in a crate whose
+   removal is the very thing under governance. It is the first live defect found in `bridge-gpui`
+   since the freeze. Naming it to the human is the action; quietly repairing it is not, and leaving
+   it resident only in a test nobody runs is worse than either.
+
+Same shape across all three instances: the prose is ahead of the machine check, and the machine
+check is the better-drafted document. Recorded here, corrected nowhere — every exit from this
+section is a status move, and status moves wait on CI.
+
 ## Recommendation
 
 **Hold both options, and do the cheap probes first.** Concretely:

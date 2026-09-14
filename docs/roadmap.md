@@ -70,8 +70,17 @@ recents and menu work now in the tree):
       slot, a vanished path greyed rather than forgotten, ten and never eleven. *Still owed:*
       watching a live window draw it. The smoke harness captures the app's stderr but does not
       yet assert a `RecentsUpdated` line there — **assertion pending**, being added.
-- [ ] **6. Autosave toggle** — **not proven.** Debounce and flush are tested
-      (`crates/api/tests/debounce.rs`); the menu toggle driving them is not.
+- [ ] **6. Autosave toggle** — **not proven.** What this row used to cite as
+      "debounce and flush are tested" is not what that file says: the only test in
+      `crates/api/tests/debounce.rs` is `#[ignore]`d (at its `:69` as this was written),
+      its own reason is "the engine has no document debounce yet: flush() saves per Flush,
+      AUTOSAVE_IDLE gates only session/settings", and its header records that it **ran red** —
+      `Saved` revision 1 arriving in 0.04 s, three Flushes, three saves. So the true statement is:
+      a test exists, it is ignored because it fails against the current engine, and the behaviour
+      it would prove does not exist. The menu toggle driving either is likewise unproven. **This
+      corrects a false claim about code, not a verdict** — the row keeps its own "not proven"
+      untouched, and this is the same class of edit as fixing a chord-table citation, not a §9
+      status move; the ledger below still counts it as unproven, as it always did.
 - [ ] **7. Type and idle** — **half landed.** The scratch-note half is machine-proven: type,
       flush, quit, relaunch reopens `<StateDir>/notes/untitled.notes` with its text and CRLF
       intact (`crates/api/tests/first_run.rs`, `crates/api/tests/scratch_restart.rs`). The
