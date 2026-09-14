@@ -3,7 +3,7 @@ title: The strip program - the Slint bridge stops being a probe
 status: implemented
 id: 2026-09-14-strip-program
 created: 2026-09-14
-updated: 2026-09-14
+updated: 2026-09-16
 relates: [§4.4, §5.5, §9, §12]
 decision: null
 ---
@@ -110,6 +110,10 @@ Installed at the top of `main`, before the port is even asked for a snapshot, so
 is caught too; it writes through `report()` and then calls the default hook, which is what keeps a
 nonzero exit code. Only the format function is unit-tested: **no live panic was provoked**, because
 shipping a panic trigger in a binary people run is not a thing.
+
+**Debt paid, 2026-09-16:** a real `notes-slint.exe` child was provoked into a real startup panic and the
+hook's line was heard on its stderr, chained default and all - ledger, wording fix on row two and stated
+limits in [`2026-09-16-strip4-debt-reckoning`](2026-09-16-strip4-debt-reckoning.md).
 
 ## The licence row (`62ef5527`)
 
