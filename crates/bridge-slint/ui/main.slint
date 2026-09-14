@@ -28,19 +28,6 @@ export component Spike inherits Window {
     // Win+Up and the port's restore has nothing to restore INTO.
     no-frame: true;
     resize-border-width: 8px;
-    // THE FLOOR UNDER THE POPUPS. Nothing else in this app enforced a minimum size - not the bridge,
-    // not platform - so a person dragging an edge could reach a window shorter than the menu, where
-    // Slint clips the child at the client edge with no scroll and no warning and the part that
-    // disappears is the bottom of the licence panel. chrome.slint can keep a popup inside the host it
-    // is given (popup-top, popup-left) but cannot make a host bigger than itself.
-    // 264 and 340 are read off chrome.slint's own surfaces: the measured floors were 186px for the
-    // menu (six rows, its recents already surrendered) and 262px for the 340x260 About panel, plus
-    // their gaps - so 264 is the taller one with a hair for the border, and 340 is the width below
-    // which no placement exists for that panel at all, where the menu's is 198. Below the floor the
-    // drag simply stops, which is the whole point: a clipped licence is not a thing a person should be
-    // able to drag this app into.
-    min-height: 264px;
-    min-width: 340px;
 
     // R2: the close act, driven through the ONLY close door this build exposes.
     // `slint::Window` has no request_close(), so Rust cannot fire the request; the
