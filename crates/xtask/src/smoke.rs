@@ -65,7 +65,13 @@
 //!   was used, so whatever would be tested is not this tree.
 //! * 6 - the WINDOW MEMORY PROMISE DID NOT HOLD: the app ran, closed cleanly and
 //!   persisted something, but the seeded rect was not restored, or a harness-driven
-//!   move never reached session.json, or the relaunch came back elsewhere. Geometry
+//!   move never reached session.json, or the relaunch came back elsewhere, or - on the
+//!   PRODUCT leg, since S8 - a real maximise closed out of a window that came back at a
+//!   different restore rect. TWO producers now, one per lane: the needle schedule's seeded
+//!   round trip, and a default `--binary=slint` run whose cycle needs no flag, no seed and
+//!   no gpui. That second one is why the code has a producer again: with only the needle
+//!   lane able to reach 6, and ADR-0006 freezing that lane, the ci.yml arm for 6 was
+//!   guarding a code no default run could ever return. Geometry
 //!   that could not be measured prints "NOT JUDGED (advisory)" and leaves the exit
 //!   code alone - an unverifiable step must not be reported as a pass or a failure.
 //! * 8 - the exe under test carries a manifest that is not ours AND the run asked
@@ -3570,7 +3576,8 @@ pub fn run(args: &[String]) -> i32 {
         println!(
             "smoke:   judged legs today: the gpui needle schedule, and the product contract \
              (the startup lines on piped stderr, alive at 45s, a WM_CLOSE answered by an exit 0 \
-             with the session write joined) against {}.exe. This run launched nothing: there \
+             with the session write joined, and the M9 maximise fixed point on the restore rect) \
+             against {}.exe. This run launched nothing: there \
              is NO verdict about {bin} in either direction.",
             SLINT_TARGET.bin
         );
@@ -4002,9 +4009,37 @@ pub fn run(args: &[String]) -> i32 {
 /// no self-hide, so "alive at 45s" is a fact about the shipped app rather than a
 /// favour done to the probe.
 const PRODUCT_ALIVE_SECS: u64 = 45;
+/// How long each leg of the M9 cycle sits on screen before it is asked to close. NOT
+/// [PRODUCT_ALIVE_SECS]: "alive at 45s" is a claim about the shipped app and the plain
+/// launch makes it ONCE. A cycle launch only has to be up long enough to take a SETTLED
+/// placement reading, so it pays seconds rather than another 45s each.
+const PRODUCT_CYCLE_ALIVE_SECS: u64 = 4;
+/// [SETTLE_MS] spelled in seconds, rounded UP: the cycle's two settle polls are bounded
+/// internally by the millisecond number and externally by this one, and an outer bound
+/// that truncates the ceiling it is guarding kills a healthy child for no reason.
+const PRODUCT_CYCLE_SETTLE_SECS: u64 = SETTLE_MS as u64 / 1000 + 1;
+/// The outer bound on ONE cycle launch: the sighting wait, the short sit, the two settle
+/// polls, the bounded wait for the show state to apply, the close, and the same 20s
+/// headroom. Deliberately NOT folded into [PRODUCT_OUTER_SECS]: the plain launch keeps
+/// its own deadline, so a slow maximise can never turn a geometry that could not be
+/// measured into a false TIMEOUT on the promise the plain leg already proved.
+const PRODUCT_CYCLE_OUTER_SECS: u64 = WINDOW_SECS
+    + PRODUCT_CYCLE_ALIVE_SECS
+    + 2 * PRODUCT_CYCLE_SETTLE_SECS
+    + (PIN_WAIT_MS as u64 / 1000 + 1)
+    + CLOSE_SECS
+    + 20;
 /// The product probe's outer bound: every window the script itself bounds, plus the
 /// same 20s headroom [OUTER_SECS] keeps for the same reason.
 const PRODUCT_OUTER_SECS: u64 = WINDOW_SECS + PRODUCT_ALIVE_SECS + CLOSE_SECS + 20;
+
+/// `SW_SHOWMAXIMIZED`, the value `GetWindowPlacement` answers in `showCmd` for a window
+/// that is maximised NOW. The test is EQUALITY against it, which is the rule
+/// crates/platform/src/windows/monitors.rs:69-77 applies to the same iconic field and
+/// the reason it is not the `WPF_RESTORETOMAXIMIZED` flag: that bit names an INTENT to
+/// restore maximised, not a resting place, and a checker that reads the flag would pass
+/// a window the user never left zoomed.
+const SW_SHOWMAXIMIZED: i64 = 3;
 
 /// THE PREFIX, asserted rather than assumed: [crate] = plumbing.rs's `report()` is the
 /// one voice the product has with no console, and a line in somebody else's voice is
@@ -4106,7 +4141,8 @@ pub fn product_station_gaps(p: &Probe) -> Vec<String> {
 /// reported as FORCED=1, which the verdict turns into a failure rather than a pass.
 const PRODUCT_PROBE: &str = r#"
 param([Parameter(Mandatory)][string]$Exe, [string]$OutFile, [string]$ErrFile,
-       [int]$WindowSecs = 10, [int]$AliveSecs = 45, [int]$CloseSecs = 10)
+       [string]$Session = '', [int]$WindowSecs = 10, [int]$AliveSecs = 45,
+       [int]$CloseSecs = 10, [int]$Maximise = 1, [int]$SettleMs = 4500)
 $ErrorActionPreference = 'SilentlyContinue'
 $code = @'
 using System;
@@ -4114,6 +4150,19 @@ using System.Runtime.InteropServices;
 public static class PROD {
   [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+  // THE MAXIMISE DOOR, and the RESTORE RECT door. ShowWindow(SW_MAXIMIZE) is what the
+  // caption button and the title-band double-click both end up doing - the OS zooms the
+  // window and winit reports the resulting state change, which is the same route a user
+  // act takes; it is NOT SendMessage of a private message and it is not a call into the
+  // app. GetWindowPlacement is read because rcNormalPosition, not GetWindowRect, IS the
+  // thing the promise is about: a maximised window's frame is the zoomed overhang and can
+  // never show the place it will restore to.
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [StructLayout(LayoutKind.Sequential)] public struct WINDOWPLACEMENT { public int length; public int flags; public int showCmd; public POINT ptMinPosition; public POINT ptMaxPosition; public RECT rcNormalPosition; public RECT rcReserved; }
+  [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr h, ref WINDOWPLACEMENT wp);
 }
 '@
 $win32 = [bool](Add-Type -TypeDefinition $code -PassThru)
@@ -4150,6 +4199,114 @@ while ((-not $p.HasExited) -and ($sw.Elapsed.TotalSeconds -lt $AliveSecs)) {
 "ALIVE_MS=$($sw.ElapsedMilliseconds)"
 "ALIVE=$([int][bool]((-not $p.HasExited) -and ([int64]$p.MainWindowHandle -ne 0)))"
 if ($p.HasExited) { "EXIT_CODE_EARLY=$($p.ExitCode)" } else { 'EXIT_CODE_EARLY=' }
+# ---- S8: THE GEOMETRY FIXED POINT, RUN ON PRODUCT BYTES -----------------------------
+# Two rules this phase is built out of, both earned elsewhere in this file: read
+# rcNormalPosition and NOT GetWindowRect (a maximised window's frame is the zoomed
+# overhang and can never show the place it restores to), and read a SETTLED value and
+# not one sample (a rect that is still moving is not a fact about anything).
+function Get-Handle($proc) {
+    # Re-sighted on EVERY sample, and never the handle cached at sighting: the app may
+    # destroy the transient it first showed and keep a different top-level as its main, so
+    # a cached handle answers GetWindowPlacement about a window that is gone. The first
+    # live run of this leg was taught that the expensive way - it read 0,0,16,16 with
+    # showCmd 1, and called it a product that forgot its maximise, about a window the
+    # product itself reported as zoomed. GEOMETRY_PROBE's comment states the same rule for
+    # the needle lane ("sighting the title before the state, and not the handle it was
+    # sighted on"); this is that rule, ported, earned again in the worst fashion.
+    $proc.Refresh()
+    $h = $proc.MainWindowHandle
+    if ([int64]$h -eq 0) { return [IntPtr]::zero }
+    return $h
+}
+function Get-Placement($h) {
+    $wp = New-Object PROD+WINDOWPLACEMENT
+    $wp.length = [Runtime.InteropServices.Marshal]::SizeOf($wp)
+    if (-not [PROD]::GetWindowPlacement($h, [ref]$wp)) { return '' }
+    $r = $wp.rcNormalPosition
+    # The show state rides along in the same string, so the stability test below covers
+    # it too: a rect that has stopped moving while the show state is still flipping has
+    # not settled either.
+    return "$($r.Left),$($r.Top),$($r.Right),$($r.Bottom)|$($wp.showCmd)"
+}
+function Get-Settled($h, $ceiling) {
+    $prev = Get-Placement $h
+    if ($prev -eq '') { return '|-1|0' }
+    $sw2 = [Diagnostics.Stopwatch]::StartNew()
+    $stable = 0
+    while ($sw2.ElapsedMilliseconds -lt $ceiling) {
+        Start-Sleep -Milliseconds 100
+        $next = Get-Placement $h
+        if ($next -eq '') { break }
+        if ($next -ne $prev) { $prev = $next } else { $stable = 1; break }
+    }
+    return "$prev|$stable"
+}
+# From here every read goes through Get-Handle, so the cached $handle is only ever the
+# "did a window appear at all" answer the ALIVE line above is about.
+$handle = Get-Handle $p
+if ([int64]$handle -ne 0 -and $Maximise -ge 1) {
+    # Mode 0 - the plain launch - takes NONE of this path at all, so the geometry phase
+    // cannot add a single second to the runtime the 45s claim is timed against.
+    $a = (Get-Settled (Get-Handle $p) $SettleMs).Split('|')
+    "NORMAL=$($a[0])"
+    "NORMAL_SHOWCMD=$($a[1])"
+    "NORMAL_STABLE=$($a[2])"
+    if ($Maximise -eq 1) {
+        # THE ACT, through the product's own door for the caption button and the
+        # title-band double-click (surface.rs on_toggle_max -> window.set_maximized):
+        # ShowWindow(SW_MAXIMIZE) asks the OS to do what that callback asks the toolkit
+        # to do, and winit reports the result. It is a user act in every way that the
+        # harness is allowed to make one: no SendKeys, no message into the app, no call
+        # across the bridge. Maximise=0 is the RELAUNCH leg, where nothing is driven -
+        # the claim there is that the app zooms ITSELF from what it persisted.
+        $asked = [PROD]::ShowWindow((Get-Handle $p), 3)
+        "MAX_ASKED=$([int][bool]$asked)"
+        $sw3 = [Diagnostics.Stopwatch]::StartNew()
+        $landed = -1
+        while ($sw3.ElapsedMilliseconds -lt $SettleMs) {
+            $q = Get-Placement (Get-Handle $p)
+            if ($q -ne '') { $landed = [int](($q.Split('|'))[1]); if ($landed -eq 3) { break } }
+            Start-Sleep -Milliseconds 100
+        }
+        # The wait is printed, not trusted: "showCmd was 3 at once" and "showCmd was 3
+        # after 1.4s of the settle watch running" are the same verdict and different
+        # stories, and only the number separates them.
+        "MAX_LAND_MS=$($sw3.ElapsedMilliseconds)"
+        "SHOWCMD_AFTER_MAX=$landed"
+        $b = (Get-Settled (Get-Handle $p) $SettleMs).Split('|')
+        "NORMAL_WHILE_MAX=$($b[0])"
+        "NORMAL_WHILE_MAX_SHOWCMD=$($b[1])"
+        "NORMAL_WHILE_MAX_STABLE=$($b[2])"
+        "ZOOM_AFTER_MAX=$([int][bool]([PROD]::IsZoomed((Get-Handle $p))))"
+        # One grace tick so the app's OWN settle watch (250 ms quiet / 1 s force in
+        # product.rs) measures the zoomed window and tells the port BEFORE the close is
+        # asked. Without it the maximised bit could only ever reach disk through the
+        # terminal flush, and the run would be proving the shutdown write path while
+        # claiming to prove the mid-session one.
+        Start-Sleep -Milliseconds 1200
+    } else {
+        # MODE 2, THE RELAUNCH: nothing is driven. The only question is whether the app
+        # came back zoomed by itself, and where its restore rect is now. The show state
+        # is POLLED for up to one settle ceiling before it is read, because the bridge
+        # applies maximised from the session on a wake rather than inside the call that
+        # created the window - a single sample at the sighting tick measures when this
+        # harness looked, not what the product did. That is the needle leg's own stated
+        # weakness, and this leg refuses to inherit it.
+        $z = [Diagnostics.Stopwatch]::StartNew()
+        $seen = -1
+        while ($z.ElapsedMilliseconds -lt $SettleMs) {
+            $q = Get-Placement (Get-Handle $p)
+            if ($q -ne '') { $seen = [int](($q.Split('|'))[1]); if ($seen -eq 3) { break } }
+            Start-Sleep -Milliseconds 100
+        }
+        "SHOWCMD_AT_CREATE=$seen"
+        "ZOOM_AT_CREATE=$([int][bool]([PROD]::IsZoomed((Get-Handle $p))))"
+        "CREATE_LAND_MS=$($z.ElapsedMilliseconds)"
+        $c = (Get-Settled (Get-Handle $p) $SettleMs).Split('|')
+        "NORMAL_RELAUNCH=$($c[0])"
+        "NORMAL_RELAUNCH_STABLE=$($c[2])"
+    }
+} else { 'NORMAL='; 'NORMAL_STABLE=0'; 'NORMAL_SHOWCMD=-1'; 'MAX_ASKED=0'; 'SHOWCMD_AFTER_MAX=-1' }
 # THE CLOSE: WM_CLOSE through CloseMainWindow, the same door PROBE uses. Nothing here
 # kills the app unless it refused to leave, and a kill is reported, not hidden.
 $closed = $false
@@ -4179,7 +4336,19 @@ exit 0
 
 /// Same two-PowerShell fallback the first probe uses: a runner may ship either, and
 /// neither is a dependency of this crate.
-fn spawn_product_probe(script: &Path, exe: &Path, out: &Path, err: &Path) -> Result<Child, String> {
+fn spawn_product_probe(
+    script: &Path,
+    exe: &Path,
+    out: &Path,
+    err: &Path,
+    session: &Path,
+    alive_secs: u64,
+    // MODE: 0 = the plain launch, which reads nothing about geometry; 1 = the maximise
+    // leg; 2 = the relaunch leg. An int and not a bool, because the cycle needs THREE
+    // behaviours out of one script and a bool plus a second flag is how the two start
+    // disagreeing.
+    mode: u8,
+) -> Result<Child, String> {
     let mut missing = Vec::new();
     for program in ["pwsh", "powershell"] {
         let spawned = Command::new(program)
@@ -4197,12 +4366,23 @@ fn spawn_product_probe(script: &Path, exe: &Path, out: &Path, err: &Path) -> Res
             .arg(out)
             .arg("-ErrFile")
             .arg(err)
+            // The path the app persists to, handed to the script so the relaunch can be
+            // asked about the SAME file the first launch wrote. Read-only: the script
+            // never writes it, and the harness does not move it aside either - which is
+            // the point of the leg, and is why it resolves the app's own directory
+            // instead of guessing at one.
+            .arg("-Session")
+            .arg(session.as_os_str())
             .arg("-WindowSecs")
             .arg(WINDOW_SECS.to_string())
             .arg("-AliveSecs")
-            .arg(PRODUCT_ALIVE_SECS.to_string())
+            .arg(alive_secs.to_string())
             .arg("-CloseSecs")
             .arg(CLOSE_SECS.to_string())
+            .arg("-Maximise")
+            .arg(mode.to_string())
+            .arg("-SettleMs")
+            .arg(SETTLE_MS.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
@@ -4218,6 +4398,313 @@ fn spawn_product_probe(script: &Path, exe: &Path, out: &Path, err: &Path) -> Res
         "no PowerShell to run the product probe with (tried: {})",
         missing.join(", ")
     ))
+}
+
+/// One launch of the product probe, run to completion and parsed.
+///
+/// Split out of [run_product_leg] because the fixed point needs the SAME script twice
+/// more - once to maximise and close, once to relaunch and close - and a second copy of
+/// the spawn/wait/parse block is how two of them start disagreeing about the deadline
+/// while looking identical in the log.
+fn run_product_probe(
+    script: &Path,
+    exe: &Path,
+    session: &Path,
+    alive_secs: u64,
+    mode: u8,
+) -> Result<Probe, String> {
+    let out = temp_path("cycle-out", "txt");
+    let err = temp_path("cycle-err", "txt");
+    let junk = [out.clone(), err.clone()];
+    let drop_junk = || {
+        for p in junk.iter() {
+            let _ = fs::remove_file(p);
+        }
+    };
+    let mut child = spawn_product_probe(script, exe, &out, &err, session, alive_secs, mode)?;
+    let probe = match wait_bounded(&mut child, PRODUCT_CYCLE_OUTER_SECS) {
+        Err(e) => {
+            drop_junk();
+            return Err(e);
+        }
+        Ok(None) => {
+            drop_junk();
+            return Err("the product probe reported no exit status at all".to_string());
+        }
+        Ok(Some(_)) => parse_probe(&read_pipe(child.stdout.as_mut())),
+    };
+    // The relaunch writes its own stderr, and that capture is the one holding the
+    // product's own line about what the port told it at startup. Printed, never judged
+    // here: the startup-needle rule belongs to the plain leg, and this launch exists to
+    // be looked at, not to re-decide a promise the first launch already made.
+    if mode == 2 {
+        let _ = report_captured(&err, "the relaunched product on its own stderr");
+    }
+    drop_junk();
+    Ok(probe)
+}
+
+/// What the app's own session.json says right now: its persisted rect and its maximised
+/// bit, both absent-tolerant. A file that cannot be read is an ABSENT answer and never a
+/// false - which is exactly the line between NOT JUDGED and exit 6.
+fn session_state(path: &Path) -> (Option<Rect>, Option<bool>) {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return (None, None),
+    };
+    let maximised = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("maximized").and_then(serde_json::Value::as_bool));
+    (persisted_rect(&text), maximised)
+}
+
+/// The M9 fixed point on product bytes, told apart from every other answer here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductCycle {
+    /// Maximise, close, relaunch, close: the restore rect never moved.
+    Held { drift: (i32, i32, i32, i32) },
+    /// A precondition went missing, so nothing is claimed in either direction.
+    NotJudged(String),
+    /// Measured, and the window-memory promise did not hold. Exit 6.
+    Broken(String),
+}
+
+/// THE VERDICT, pure over its readings, because the arithmetic is the deliverable and a
+/// judge nobody can feed cannot be tested. Four inputs are the whole story: pre, the
+/// live SETTLED normal position before anything was maximised; persisted, what
+/// session.json said after the maximised window closed (its rect and its maximized bit);
+/// relaunch_maximised, whether the relaunched window answered SW_SHOWMAXIMIZED in
+/// GetWindowPlacement.showCmd; restore, the rect persisted on close-AGAIN.
+///
+/// What is deliberately NOT asserted here is that the maximise landed. A window the
+/// harness failed to zoom proves nothing about the product that would have had to
+/// remember it, so the caller reports NOT JUDGED before this function is ever reached -
+/// the same rule the needle leg states about its own ZOOM line, applied one step
+/// earlier, to the precondition rather than to the conclusion.
+pub fn product_cycle_verdict(
+    pre: Option<Rect>,
+    persisted: Option<bool>,
+    relaunch_maximised: Option<bool>,
+    restore: Option<Rect>,
+) -> ProductCycle {
+    let Some(stored_maximised) = persisted else {
+        return ProductCycle::NotJudged(
+            "session.json could not be read after the maximised close, so there is no recorded  state to assert either way".to_string(),
+        );
+    };
+    if !stored_maximised {
+        return ProductCycle::Broken(
+            "THE MAXIMISE WAS FORGOTTEN: the window was closed while it answered  SW_SHOWMAXIMIZED, and session.json came back with maximized:false - the state the user left  is not the state the port recorded".to_string(),
+        );
+    }
+    let relaunch = match relaunch_maximised {
+        None => {
+            return ProductCycle::NotJudged(
+                "the relaunched window's show state could not be read, so a promise about coming  back maximised is not judged either way".to_string(),
+            )
+        }
+        Some(false) => {
+            return ProductCycle::Broken(
+                "THE MAXIMISE DID NOT COME BACK: session.json recorded maximized:true and the  relaunch answered a showCmd that was not SW_SHOWMAXIMIZED - the state was stored and then  never applied to a window".to_string(),
+            )
+        }
+        Some(true) => true,
+    };
+    let _ = relaunch;
+    match rect_drift(pre, restore) {
+        Some((0, 0, 0, 0)) => ProductCycle::Held {
+            drift: (0, 0, 0, 0),
+        },
+        Some(d) => ProductCycle::Broken(format!(
+            "THE RESTORE RECT MOVED: one maximise-close-relaunch-close cycle took the rect from  {} to {}, a drift of ({},{},{},{}) - the window the user left maximised came back  remembering a different place",
+            pre.map(|r| r.text()).unwrap_or_else(|| "-".into()),
+            restore.map(|r| r.text()).unwrap_or_else(|| "-".into()),
+            d.0,
+            d.1,
+            d.2,
+            d.3
+        )),
+        None => ProductCycle::NotJudged(
+            "one of the two normal positions could not be read, so there is nothing to compare"
+                .to_string(),
+        ),
+    }
+}
+
+/// THE M9 FIXED POINT, RUN ON PRODUCT BYTES - the reason exit 6 has a producer again.
+///
+/// Three sentences of choreography, and one rule: the harness never writes the state it
+/// is about to read. The needle lane SEEDS a maximised session and asks whether the app
+/// obeyed, which is the right question for a bridge; this leg asks whether the product
+/// REMEMBERS, so it drives a real maximise into a running window, closes it, and reads
+/// what the app itself chose to write. Nothing here moves the user's file aside before
+/// the cycle, because a copy the harness made is a copy the harness could have fixed.
+///
+/// Returns [ProductCycle::NotJudged] whenever a precondition is missing - no desktop, no
+/// handle, a zoom the OS never entered, a file that cannot be read - and
+/// [ProductCycle::Broken] only for the three things that ARE the promise: the maximised
+/// state was not recorded, the relaunch did not come back maximised, or the restore rect
+/// moved. [run_product_leg] turns Broken into [GEOMETRY_FAILED_EXIT].
+fn product_maximised_cycle(script: &Path, exe: &Path, session: &Path) -> ProductCycle {
+    // The user's bytes, taken BEFORE anything runs, for the one rule at the bottom: the
+    // cycle leaves the app maximised in the file it persists, and that is a real change
+    // to somebody's working state made by a check that was only passing through.
+    let before = fs::read(session).ok();
+    println!(
+        "smoke: geometry: the cycle is armed (S8) - a real maximise, a close, a relaunch, a   close again; drift beyond zero is exit {GEOMETRY_FAILED_EXIT}"
+    );
+
+    // ---- LEG 1: read where it sits, ask the OS to zoom it, close it -----------------
+    let first = match run_product_probe(script, exe, session, PRODUCT_CYCLE_ALIVE_SECS, 1) {
+        Ok(probe) => probe,
+        Err(e) => {
+            restore_session(session, before.as_deref());
+            return ProductCycle::NotJudged(format!("the maximise launch did not report: {e}"));
+        }
+    };
+    if !first.flag("DESKTOP") {
+        restore_session(session, before.as_deref());
+        return ProductCycle::NotJudged(
+            "the maximise launch found no interactive desktop, so there was no window to zoom"
+                .to_string(),
+        );
+    }
+    if !first.flag("EXITED_WITHOUT_KILL") {
+        restore_session(session, before.as_deref());
+        return ProductCycle::Broken(format!(
+            "THE MAXIMISED WINDOW WOULD NOT CLOSE: launch 1 of the cycle had to be force-killed \
+             (EXIT_CODE_AFTER_FORCE={}), and a run that ends in Stop-Process -Force is never a \
+             pass - but it is this leg's finding, not the plain launch's, because the plain \
+             launch closed politely WITHOUT the zoom",
+            first
+                .number("EXIT_CODE_AFTER_FORCE")
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into())
+        ));
+    }
+    let pre = probe_rect(&first, "NORMAL");
+    let pre_stable = first.flag("NORMAL_STABLE");
+    let zoomed = first.number("SHOWCMD_AFTER_MAX") == Some(SW_SHOWMAXIMIZED);
+    println!(
+        "smoke: geometry: INFO - launch 1 read {} (stable={}) before the act; after \
+ ShowWindow(SW_MAXIMIZE) it answered showCmd {} after {}ms and IsZoomed said {}",
+        pre.map(|r| r.text()).unwrap_or_else(|| "-".into()),
+        pre_stable,
+        first.number("SHOWCMD_AFTER_MAX").unwrap_or(-1),
+        first.number("MAX_LAND_MS").unwrap_or(-1),
+        match first.number("ZOOM_AFTER_MAX") {
+            Some(1) => "1",
+            Some(0) => "0",
+            _ => "unknown",
+        }
+    );
+    if !first.flag("MAX_ASKED") || !zoomed {
+        // The precondition, declined rather than accused. That the act did not land is
+        // still worth a loud line - a product that cannot be maximised by the OS is news
+        // - but it is news about a door this leg did not come to test, and code 6 means
+        // "the window memory broke", which cannot be decided about a state that never
+        // existed.
+        restore_session(session, before.as_deref());
+        return ProductCycle::NotJudged(
+            "ShowWindow(SW_MAXIMIZE) never took effect on the window (MAX_ASKED=\
+ ShowWindow's own answer, SHOWCMD_AFTER_MAX the polled showCmd), so there is no maximised \
+ state for the product to have forgotten - the PRECONDITION was not measurable, which is not \
+ the same claim as a broken promise"
+                .to_string(),
+        );
+    }
+    if pre.is_none() || !pre_stable {
+        restore_session(session, before.as_deref());
+        return ProductCycle::NotJudged(
+            "the normal position before the maximise never settled into one answer, so the \
+             rect it is supposed to come back to is not a fact this harness could read"
+                .to_string(),
+        );
+    }
+
+    // What the app wrote while it was zoomed: its rect, and the bit this leg exists to
+    // check. Read from the app's OWN resolved directory (portable marker first) - never
+    // from a guessed %APPDATA%, which is how the 2026-09-13 dossier's probe watched an
+    // empty file all day while the process wrote next to the exe.
+    let (persisted_rect, persisted_maximised) = session_state(session);
+    println!(
+        "smoke: geometry: INFO - the app's own {} after that close says rect {} with   maximized:{}",
+        SESSION_FILE,
+        persisted_rect
+            .map(|r| r.text())
+            .unwrap_or_else(|| "-".into()),
+        persisted_maximised.unwrap_or(false)
+    );
+    let leg1 = product_cycle_verdict(pre, persisted_maximised, None, None);
+    if is_broken(&leg1) {
+        // The state was never recorded, so the relaunch could not have come back maximised
+        // either, and saying so twice would be one finding counted as two.
+        restore_session(session, before.as_deref());
+        return leg1;
+    }
+
+    // ---- LEG 2: relaunch, read what it did BY ITSELF, close again --------------------
+    let second = match run_product_probe(script, exe, session, PRODUCT_CYCLE_ALIVE_SECS, 2) {
+        Ok(probe) => probe,
+        Err(e) => {
+            restore_session(session, before.as_deref());
+            return ProductCycle::NotJudged(format!("the relaunch did not report: {e}"));
+        }
+    };
+    if !second.flag("DESKTOP") {
+        restore_session(session, before.as_deref());
+        return ProductCycle::NotJudged("the relaunch found no interactive desktop".to_string());
+    }
+    let came_back = match second.number("SHOWCMD_AT_CREATE") {
+        Some(SW_SHOWMAXIMIZED) => Some(true),
+        Some(-1) | None => None,
+        Some(_) => Some(false),
+    };
+    let after = probe_rect(&second, "NORMAL_RELAUNCH");
+    let (relaunch_rect, relaunch_maximised_now) = session_state(session);
+    println!(
+        "smoke: geometry: INFO - launch 2 answered showCmd {} after {}ms of polling, IsZoomed \
+ {}, its live restore rect {}; the file on disk now says rect {} maximized:{}",
+        second.number("SHOWCMD_AT_CREATE").unwrap_or(-1),
+        second.number("CREATE_LAND_MS").unwrap_or(-1),
+        second.number("ZOOM_AT_CREATE").unwrap_or(-1),
+        after.map(|r| r.text()).unwrap_or_else(|| "-".into()),
+        relaunch_rect
+            .map(|r| r.text())
+            .unwrap_or_else(|| "-".into()),
+        relaunch_maximised_now.unwrap_or(false),
+    );
+    // The rect the cycle LEAVES behind is the one that has to equal the pre-maximise
+    // reading; a missing live answer falls back to what the app persisted, which is the
+    // same substitution the needle lane documents and says out loud for the same reason.
+    let restore = after.or(relaunch_rect);
+    let verdict = product_cycle_verdict(pre, persisted_maximised, came_back, restore);
+    println!("smoke: geometry: {verdict}");
+    // DO NO HARM, last and unconditionally: whatever the verdict, the user's session file
+    // goes back byte-exactly. The check drove a maximise through their window to answer a
+    // question, and leaving their app maximised tomorrow morning is not an answer.
+    restore_session(session, before.as_deref());
+    verdict
+}
+
+/// A verdict that is specifically a broken promise (and not merely an unreadable one).
+fn is_broken(c: &ProductCycle) -> bool {
+    matches!(c, ProductCycle::Broken(_))
+}
+
+impl std::fmt::Display for ProductCycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProductCycle::Held { drift } => write!(
+                f,
+                "PASS - the restore rect is a fixed point across one real maximise on product \
+ bytes (drift ({},{},{},{}))",
+                drift.0, drift.1, drift.2, drift.3
+            ),
+            ProductCycle::NotJudged(why) => write!(f, "NOT JUDGED (advisory) - {why}"),
+            ProductCycle::Broken(note) => write!(f, "{note}"),
+        }
+    }
 }
 
 /// Kill anything the failed run left on screen. ONLY called on a failure path: on a
@@ -4237,12 +4724,21 @@ fn product_teardown(target: &ArtifactTarget) {
 /// THE PRODUCT LEG: build and freshness were already done from the selected row, so
 /// what is left is the launch, the lines, the 45s, the close, and the exit code.
 ///
-/// What it deliberately does NOT do: move the user's session.json aside, seed a recent,
-/// read a rect or poll a pin. Those are the needle schedule's claims about gpui's
-/// contract; the product's state dir is its own, and this leg judges what the product
-/// promised. Every verdict reuses an existing CONTRACT code - 0, 1, 2, 3 - and the
-/// table gains no row, because a default `--binary=slint` run cannot return anything
-/// the ci.yml arms do not already cover.
+/// What it does, in two acts. Act one is the plain launch: the startup lines, the 45s,
+/// the WM_CLOSE, the exit code - read with no rect, no seed and no move, because those
+/// were the needle schedule's claims about gpui's contract and the product's own claims
+/// are its own. Act two, added by S8 and run ONLY when act one passed, is the M9 rect
+/// fixed point on these bytes: a real maximise through the OS door the caption button
+/// reaches, a close, a read of what the app persisted, a relaunch, and a second close -
+/// so "comes back the size and place you left it" is now measured on the artifact that
+/// ships, and not only on the frozen instrument.
+///
+/// It still does NOT move the user's session.json aside, seed a recent, poll a pin, or
+/// write the state file it is about to read: the cycle drives the window and lets the
+/// product do the persisting, and it puts the user's own bytes back when it is done
+/// (see [product_maximised_cycle]). Verdict codes are still only the existing ones -
+/// 0, 1, 2, 3 and now 6 - and the table gains no row: 6 was already in CONTRACT and
+/// already armed in ci.yml; what it lacked was any default run able to produce it.
 fn run_product_leg(target: &ArtifactTarget, exe: &Path) -> i32 {
     println!(
         "smoke: LEG=PRODUCT - {} is judged by the product contract: the startup lines on \
@@ -4267,7 +4763,26 @@ fn run_product_leg(target: &ArtifactTarget, exe: &Path) -> i32 {
         return HARNESS_EXIT;
     }
     let started = Instant::now();
-    let mut child = match spawn_product_probe(&script, exe, &out_file, &err_file) {
+    // The session path the cycle reads back. Resolved through the app's OWN rule
+    // (state_dir_for, portable-marker-first) and not through the candidate SEARCH list:
+    // for a debug exe that is target/debug/data, not %APPDATA%, and a probe that watched
+    // the roaming profile all day while the portable marker sent the process next to the
+    // exe is the mistake the 2026-09-13 dossier records. app_state_dir is the same
+    // function the recents seed and the user-bytes relocation resolve through.
+    let session = app_state_dir(exe)
+        .map(|dir| dir.join(SESSION_FILE))
+        .unwrap_or_else(|| PathBuf::from(SESSION_FILE));
+    let mut child = match spawn_product_probe(
+        &script,
+        exe,
+        &out_file,
+        &err_file,
+        &session,
+        PRODUCT_ALIVE_SECS,
+        // Mode 0: the plain launch reads NOTHING about geometry, so the 45s claim keeps the
+        // runtime it had before this slice and the cycle's cost stays entirely its own.
+        0,
+    ) {
         Err(e) => {
             println!("SMOKE FAIL: {e}");
             println!("smoke: product=NOPOWERSHELL alive=NOBUILD close=NOBUILD 0.0s");
@@ -4411,18 +4926,72 @@ fn run_product_leg(target: &ArtifactTarget, exe: &Path) -> i32 {
             }
         }
     }
+    // ---- S8: THE M9 FIXED POINT, RUN ON THESE BYTES -------------------------------
+    // The plain launch has been judged and nothing about it is in question, so the cycle
+    // runs now against the same exe, and it is allowed to speak about exactly one thing:
+    // the window-memory promise. Two more bounded children. Leg 1 reads the window's
+    // SETTLED normal rect, drives a REAL maximise through the same OS door the caption
+    // button and the title-band double-click end up at (surface.rs on_toggle_max asks the
+    // toolkit to zoom; ShowWindow(SW_MAXIMIZE) asks the OS to, and winit reports the
+    // result to the app like any user act), and closes. Leg 2 asks whether the app came
+    // back zoomed BY ITSELF and where its restore rect is now. Between the two there is
+    // only one writer of the state file: the product.
+    //
+    // NOT RUN when the plain launch has gaps. A product that would not start or would not
+    // close has already been accused of the louder thing; launching it twice more to
+    // discover it also forgets its geometry adds a second finding about an app that never
+    // got as far as having any, and spends 15s doing it.
+    let cycle: Option<ProductCycle> = if gaps.is_empty() {
+        Some(product_maximised_cycle(&script, exe, &session))
+    } else {
+        println!(
+            "smoke: geometry: NOT RUN - the plain launch did not pass, so there is no window  whose memory could be judged"
+        );
+        None
+    };
+    // THE DRIFT LINE, printed in every case that reached the cycle. It is the whole
+    // deliverable of this slice in one number, so it is not folded into a PASS sentence
+    // where a green would hide it: a reader looking for "geometry: drift=" finds it
+    // whether the answer was zero, non-zero, or unreadable.
+    match &cycle {
+        Some(ProductCycle::Held { drift }) => println!(
+            "smoke: geometry: drift=({},{},{},{}) verdict=HELD - maximise, close, relaunch,  close: the rect a maximised window came back at is the rect it sat at BEFORE the  maximise, to the pixel",
+            drift.0, drift.1, drift.2, drift.3
+        ),
+        Some(ProductCycle::NotJudged(why)) => {
+            println!("smoke: geometry: drift=UNREADABLE verdict=NOT JUDGED (advisory) - {why}")
+        }
+        Some(ProductCycle::Broken(note)) => {
+            println!("SMOKE GEOMETRY FAIL: {note}");
+            println!(
+                "smoke: geometry: drift=NONZERO-or-UNRECORDED verdict=BROKE - see the line  above; this is the code {GEOMETRY_FAILED_EXIT} was written for"
+            );
+        }
+        None => {}
+    }
+    let cycle_broke = matches!(cycle, Some(ProductCycle::Broken(_)));
     let elapsed = started.elapsed();
-    if gaps.is_empty() {
+    if gaps.is_empty() && !cycle_broke {
         println!(
             "smoke: product=PASS alive=PASS close=PASS exit=0 {:.1}s",
             elapsed.as_secs_f64()
         );
         println!(
             "smoke:   what this proves: {} said its startup lines, was still on screen at \
- {PRODUCT_ALIVE_SECS}s, took a WM_CLOSE, said the close and the joined shutdown, and left \
- with 0 by itself. What it does NOT prove: the rect, the pin, the recents trace, or the \
- maximised cycle - those are the needle schedule's claims, and this leg does not run it.",
-            target.bin
+ {PRODUCT_ALIVE_SECS}s, took a WM_CLOSE, said the close and the joined shutdown, left with 0 \
+ by itself, and then did the thing this leg used to refuse to read: a real maximise, a close, \
+ a relaunch and a close again, with the restore rect unchanged to the pixel.{}",
+            target.bin,
+            match &cycle {
+                // The drift was already printed; the sentence says which claim it carries.
+                Some(ProductCycle::Held { .. }) => " That is the M9 window-memory promise,  measured on PRODUCT bytes.".to_string(),
+                Some(ProductCycle::NotJudged(_)) => " What it does NOT prove this run: the  rect - the cycle could not be measured here, and the drift line above says what was  missing.".to_string(),
+                Some(ProductCycle::Broken(_)) => unreachable!("a broken cycle returns below"),
+                None => " What it does NOT prove: the rect - the cycle never ran.".to_string(),
+            }
+        );
+        println!(
+            "smoke:   what it still does NOT prove: the pin, the dragged-rect round trip, and  the recents trace. Those stay the needle schedule's claims, and this leg does not run it.",
         );
         cleanup("pass");
         return PASS_EXIT;
@@ -4439,6 +5008,16 @@ fn run_product_leg(target: &ArtifactTarget, exe: &Path) -> i32 {
     );
     product_teardown(target);
     cleanup("fail");
+    // Exit 6, and it outranks 1 on purpose. Code 1 means the shutdown or the write broke;
+    // a cycle that BROKE is the opposite run - the app started, said its lines, closed
+    // politely, WROTE the file - and what failed is what the file remembers. That is the
+    // claim GEOMETRY_FAILED_EXIT was minted for, and after S8 the code has a producer on
+    // the product leg again: a default --binary=slint run can reach 6 with no flag, no
+    // needle schedule and no gpui anywhere near it, which is what ci.yml's 3e arm for 6
+    // has been waiting for since the product became the default.
+    if cycle_broke {
+        return GEOMETRY_FAILED_EXIT;
+    }
     STEP_FAILED_EXIT
 }
 
@@ -6799,5 +7378,258 @@ fn main() { println!("cargo:rerun-if-changed=app.manifest"); }
         );
         // A key ABSENT reads as 0, i.e. as a decline: absence is never a host.
         assert_eq!(product_station_gaps(&Probe::default()).len(), 3);
+    }
+
+    // ---- S8: the M9 fixed point, on the product leg --------------------------------
+    //
+    // Four kinds of test, in the order that costs least to run: the SCRIPT SHAPE (does
+    // the probe even carry the doors and the keys the judge reads - a typo there is a leg
+    // that silently stops asserting and keeps printing), the ARITHMETIC (pure over the
+    // readings, so the drift rule is checked without a desktop), the BUDGET (a const
+    // assertion, because "the cycle is bounded by more than it is bounded by" is the
+    // failure mode a timeout hides), and the CONTRACT (exit 6 has a producer here).
+
+    fn rect(s: &str) -> Option<Rect> {
+        Rect::parse(s)
+    }
+
+    /// The judge's happy path, spelled as the number the brief asked for.
+    #[test]
+    fn a_zero_drift_cycle_is_held_and_names_its_four_zeros() {
+        let v = product_cycle_verdict(
+            rect("120,90,920,690"),
+            Some(true),
+            Some(true),
+            rect("120,90,920,690"),
+        );
+        assert_eq!(
+            v,
+            ProductCycle::Held {
+                drift: (0, 0, 0, 0)
+            }
+        );
+        // The printed form is what a person reads in a CI log, so the format is asserted
+        // too: exactly "geometry: drift=(0,0,0,0)" must be reachable from this verdict.
+        let shown = format!("{v}");
+        assert!(shown.contains("(0,0,0,0)"), "{shown}");
+        assert!(shown.contains("PASS"), "{shown}");
+    }
+
+    /// ONE pixel of chrome, and the verdict is a finding with the arithmetic in it. The
+    /// quadruple is asserted as a tuple, not as prose, because the whole point of the
+    /// M9 fix was that dw/dh of +8/-8 is the frame/client double-count and dx/dy of 8/4
+    /// is a moved window - two different bugs, and a message that printed only "not zero"
+    /// could not tell them apart.
+    #[test]
+    fn any_movement_at_all_of_the_restore_rect_is_a_broken_promise() {
+        for (after, want) in [
+            // A moved LEFT edge is also a narrower window: rect_drift reports the size as
+            // (right-left), which is why pushing only the left edge by +1 reads as
+            // (+1, 0, -1, 0) and not as a pure move. Spelled here so the next reader does
+            // not "fix" the arithmetic and lose the double-count signature.
+            ("121,90,920,690", (1, 0, -1, 0)),
+            ("120,94,920,694", (0, 4, 0, 0)),
+            ("120,90,928,698", (0, 0, 8, 8)),
+        ] {
+            let v =
+                product_cycle_verdict(rect("120,90,920,690"), Some(true), Some(true), rect(after));
+            match v {
+                ProductCycle::Broken(note) => {
+                    let (dx, dy, dw, dh) =
+                        rect_drift(rect("120,90,920,690"), rect(after)).expect("both rects parse");
+                    assert_eq!((dx, dy, dw, dh), want, "{after} => {note}");
+                    assert!(note.contains("THE RESTORE RECT MOVED"), "{note}");
+                    assert!(note.contains(&format!("({dx},{dy},{dw},{dh})")), "{note}");
+                }
+                other => panic!("{after}: expected Broken, got {other:?}"),
+            }
+        }
+    }
+
+    /// The three ways this cycle can FAIL to be measurable, each of which must stay NOT
+    /// JUDGED rather than turn into an accusation: no file to read, no show state on the
+    /// relaunch, and a rect that cannot be read at all. All three print as advisory and
+    /// keep the leg's exit code at whatever the plain launch earned.
+    #[test]
+    fn an_absent_reading_never_becomes_an_acusation() {
+        let no_file =
+            product_cycle_verdict(rect("0,0,800,600"), None, Some(true), rect("0,0,800,600"));
+        assert!(
+            matches!(&no_file, ProductCycle::NotJudged(why) if why.contains("session.json")),
+            "{no_file:?}"
+        );
+        let no_show =
+            product_cycle_verdict(rect("0,0,800,600"), Some(true), None, rect("0,0,800,600"));
+        assert!(matches!(no_show, ProductCycle::NotJudged(_)), "{no_show:?}");
+        let no_rect = product_cycle_verdict(None, Some(true), Some(true), None);
+        assert!(
+            matches!(&no_rect, ProductCycle::NotJudged(why) if why.contains("nothing to compare")),
+            "{no_rect:?}"
+        );
+        // And an UNPARSEABLE rect is absent, not zero-sized: a wrong shape must not become
+        // a 0,0,0,0 rect that then "drifts" by the whole window.
+        assert_eq!(rect("not-a-rect"), None);
+    }
+
+    /// Two findings this leg exists to catch, kept separate because they point at
+    /// different code: the state never reached the file (persistence), versus the file
+    /// said it and the window ignored it (restore).
+    #[test]
+    fn a_forgotten_maximise_and_an_unapplied_one_are_different_failures() {
+        let forgotten = product_cycle_verdict(
+            rect("0,0,800,600"),
+            Some(false),
+            Some(false),
+            rect("0,0,800,600"),
+        );
+        assert!(
+            matches!(&forgotten, ProductCycle::Broken(n) if n.contains("THE MAXIMISE WAS FORGOTTEN")),
+            "{forgotten:?}"
+        );
+        let unapplied = product_cycle_verdict(
+            rect("0,0,800,600"),
+            Some(true),
+            Some(false),
+            rect("0,0,800,600"),
+        );
+        assert!(
+            matches!(&unapplied, ProductCycle::Broken(n) if n.contains("THE MAXIMISE DID NOT COME BACK")),
+            "{unapplied:?}"
+        );
+        // And the order is the one that blames the earliest cause: a run that recorded
+        // nothing is reported as a recording failure even though its window also did not
+        // come back zoomed, because "it did not restore" about a value never stored would
+        // send someone to the wrong file.
+        assert_ne!(forgotten, unapplied);
+    }
+
+    /// The script has to carry the doors the judge reads keys from. Every key named in
+    /// product_maximised_cycle appears here, because the day somebody edits one of the two
+    /// and not the other, the cycle would print NOT JUDGED forever and look like a machine
+    /// that simply has no geometry - which is exactly the silence this slice exists to end.
+    #[test]
+    fn the_product_probe_carries_every_door_and_every_key_the_judge_reads() {
+        for needle in [
+            // The OS doors, and the struct whose NORMAL position is the subject.
+            "public static extern bool GetWindowPlacement",
+            "public static extern bool ShowWindow",
+            "public static extern bool IsZoomed",
+            "rcNormalPosition",
+            // The three modes, and the fact that mode 0 takes none of this path.
+            "[int]$Maximise = 1",
+            "$Maximise -ge 1",
+            "$Maximise -eq 1",
+            // The keys, printed with the SAME spelling the Rust reads.
+            "\"NORMAL=$($a[0])\"",
+            "\"NORMAL_STABLE=$($a[2])\"",
+            "\"MAX_ASKED=$([int][bool]$asked)\"",
+            "\"SHOWCMD_AFTER_MAX=$landed\"",
+            "\"NORMAL_RELAUNCH=$($c[0])\"",
+            "\"SHOWCMD_AT_CREATE=$seen\"",
+            "\"EXIT_CODE_AFTER_FORCE=$($p.ExitCode)\"",
+        ] {
+            assert!(
+                PRODUCT_PROBE.contains(needle),
+                "the product probe no longer contains {needle:?}, and the judge in  product_maximised_cycle reads that key"
+            );
+        }
+        // A reading is only a fact once it stops moving; the settle helper is the only
+        // way this leg gets one, so its double-sample rule is asserted, not assumed.
+        assert!(PRODUCT_PROBE.contains("function Get-Settled"));
+        assert!(
+            PRODUCT_PROBE
+                .contains("if ($next -ne $prev) { $prev = $next } else { $stable = 1; break }")
+        );
+    }
+
+    /// The cycle's outer bound must be strictly larger than everything the script bounds
+    /// inside itself, or a healthy child is killed mid-measure and the leg prints a
+    /// TIMEOUT about a promise it never got to read. Encoded as arithmetic on the same
+    /// consts the script is handed, in a const block, so it is checked at compile time and
+    /// a "tidied" number cannot slip through a code path nobody ran.
+    #[test]
+    fn the_cycle_budget_affords_every_window_the_script_bounds() {
+        const _: () = assert!(
+            PRODUCT_CYCLE_OUTER_SECS
+                > WINDOW_SECS
+                    + PRODUCT_CYCLE_ALIVE_SECS
+                    + 2 * PRODUCT_CYCLE_SETTLE_SECS
+                    + CLOSE_SECS
+        );
+        const _: () = assert!(PRODUCT_CYCLE_ALIVE_SECS < PRODUCT_ALIVE_SECS);
+        // The plain launch's deadline is UNCHANGED by this slice: folding the cycle into
+        // PRODUCT_OUTER_SECS would have made a slow geometry eat the 45s claim's budget and
+        // turn an unmeasurable rect into a false failure of a promise that held.
+        const _: () =
+            assert!(PRODUCT_OUTER_SECS == WINDOW_SECS + PRODUCT_ALIVE_SECS + CLOSE_SECS + 20);
+        // And the growth this slice buys is bounded by the cycle's own two children, which
+        // is the arithmetic the brief's "< 40s" was written against: two legs, each
+        // sighting + a 4s sit + two settle polls + the close.
+        assert!(
+            2 * (PRODUCT_CYCLE_ALIVE_SECS as i64 + 2 * PRODUCT_CYCLE_SETTLE_SECS as i64) < 40,
+            "the cycle's expected growth outgrew its brief"
+        );
+        // The show-state test is equality against the iconic value, not a flag bit.
+        assert_eq!(SW_SHOWMAXIMIZED, 3);
+    }
+
+    /// The reason this slice exists as its own ticket: code 6 had no producer on the leg
+    /// that runs by default. It is not enough that 6 is IN the table - ci.yml arms the
+    /// table - the product leg has to be able to RETURN it, with no flag, no needle
+    /// schedule and no gpui anywhere near the call. Asserted against the leg's own text
+    /// because the alternative is a desktop run, and a test that needs a window cannot
+    /// live in the suite that runs headless.
+    #[test]
+    fn the_product_leg_has_a_producer_for_exit_six_and_it_is_the_cycle() {
+        let leg = run_product_leg_text();
+        // 1. the leg runs the cycle, only off a clean plain launch, and only on these bytes
+        assert!(
+            leg.contains("product_maximised_cycle(&script, exe, &session)"),
+            "{leg}"
+        );
+        assert!(
+            leg.contains("if gaps.is_empty()"),
+            "the cycle must not run on a launch that already failed - a second finding about an app that never started is noise, and 15s of it"
+        );
+        // 2. a broken cycle OUTRANKS the generic step-fail, which is the whole semantics of 6
+        let at = leg
+            .find("if cycle_broke")
+            .expect("no cycle_broke branch in the product leg");
+        let tail = &leg[at..];
+        assert!(tail.contains("return GEOMETRY_FAILED_EXIT"), "{tail}");
+        assert!(
+            tail.find("return GEOMETRY_FAILED_EXIT") < tail.find("STEP_FAILED_EXIT"),
+            "6 must be chosen before the fallback 1, or a geometry failure is reported as a shutdown failure: {tail}"
+        );
+        // 3. and 6 is still the same single row in the table: this leg gained a producer,
+        // not a code - ci.yml arms exactly contract_codes(), and a new row would need a CI
+        // edit that no one asked for.
+        assert_eq!(
+            contract_codes()
+                .iter()
+                .filter(|c| **c == GEOMETRY_FAILED_EXIT)
+                .count(),
+            1
+        );
+        assert_eq!(GEOMETRY_FAILED_EXIT, 6);
+    }
+
+    /// The leg's own source, as text, for the shape asserts above. Read at test time from
+    /// this file - the same trick geometry uses for its script, and it fails loudly (an
+    /// expect with the path in it) rather than vacuously if the file ever moves.
+    fn run_product_leg_text() -> String {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/smoke.rs"))
+            .expect("smoke.rs must be readable from its own test");
+        let start = src
+            .find("fn run_product_leg(")
+            .expect("run_product_leg vanished from smoke.rs");
+        let rest = &src[start..];
+        let end = rest
+            .find(
+                "
+/// One-line description of whatever already sits on the session path.",
+            )
+            .expect("the end of run_product_leg is no longer where the product tests read it");
+        rest[..end].to_string()
     }
 }
