@@ -4,7 +4,7 @@
 //! a [`#[cfg(test)] mod`] (crates/platform/src/lib.rs, line 176), so no other
 //! crate's tests can see it, and Slice B would otherwise serialise behind the
 //! platform worker landing [`pub mod mock`]. When that ships, deleting THIS file
-//! and the three [`mod host_mock;`] include lines is the whole migration - nothing
+//! and the four [`mod host_mock;`] include lines is the whole migration - nothing
 //! here redefines a trait, invents a geometry type, or encodes a product rule.
 //!
 //! One type serves both seams, exactly as platform's own Mock does, so a test hands

@@ -8,13 +8,13 @@
 //! header says that normalising on the way in would be the bug ("a buffer that normalised would
 //! be harmless for a newline and fatal for a BOM"). THIS bridge is not a glass jar, and the
 //! difference is in the source, not in the prose - Event::Loaded is handled at
-//! crates/bridge-slint/src/surface.rs:939-948 as "let adopted = lf(text); p.last_sent =
-//! adopted.clone();", where lf is crates/bridge-slint/src/plumbing.rs:49-51 replacing every CRLF
+//! crates/bridge-slint/src/surface.rs, `drain`'s `Event::Loaded` arm, as "let adopted =
+//! lf(text); p.last_sent = adopted.clone();", where lf is crates/bridge-slint/src/plumbing.rs:49-51 replacing every CRLF
 //! and then every lone CR with LF, and that adopted string is what goes INTO the widget
-//! (surface.rs:965, ui.set_buffer(adopted)). Two facts forced that shape, and they are separate:
+//! (surface.rs, the same `Event::Loaded` arm, ui.set_buffer(adopted)). Two facts forced that shape, and they are separate:
 //! a Slint TextEdit addresses its document by line and its line model cuts on LF, so a lone CR
 //! has nowhere to live in it; and the pump that decides whether to send reads the widget back
-//! through the SAME lf() (surface.rs:315), so adoption verbatim plus comparison normalised would
+//! through the SAME lf() (surface.rs, `text_pump`'s identical-check), so adoption verbatim plus comparison normalised would
 //! make every CRLF file look edited the instant it opened. The jar is deliberately not glass, and
 //! a twin that demanded glass would assert a contract this bridge does not hold.
 //!
@@ -25,7 +25,7 @@
 //!       more than gpui does: gpui's jar could not lie. This one can.
 //!   (b) DOMINANT-EOL RESTORATION - the normalisation is paid back at the save layer. Core keeps
 //!       LF internally and re-emits the file's own ending in layout()
-//!       (crates/core/src/encoding.rs:520-536, whose LineEnding::CrLf arm folds every kind of
+//!       (crates/core/src/encoding.rs, `layout`, whose LineEnding::CrLf arm folds every kind of
 //!       break back into CRLF), so an edited buffer still writes CRLF bytes
 //!       (an_edited_crlf_file_goes_back_as_crlf_through_the_ports_save_layer). Both halves of
 //!       "bytes-out == bytes-in" are asserted: the arming save of an UNTOUCHED buffer reproduces
@@ -103,13 +103,14 @@ fn lf(text: &str) -> String {
 /// backslashes below are CHARACTERS in plumbing.rs, which is why they are doubled here.
 const SHIPPED_LF_BODY: &str = "text.replace(\"\\r\\n\", \"\\n\").replace('\\r', \"\\n\")";
 
-/// What surface.rs:945 does with a Loaded text, named so the tests read as the contract.
+/// What surface.rs's `drain` / `Event::Loaded` arm does with a Loaded text, named so the
+/// tests read as the contract.
 fn adopt(text: &str) -> String {
     lf(text)
 }
 
-/// text_pump's guard (surface.rs:315-319, and the same comparison in its text_pump_by_compare
-/// fallback at 365-380): the string read out of the widget goes through lf() and is compared with
+/// text_pump's guard (surface.rs, `text_pump`'s identical-check, and the same comparison in
+/// its `text_pump_by_compare` fallback): the string read out of the widget goes through lf() and is compared with
 /// last_sent. Equal means nothing is sent.
 fn flush_due(buffer: &str, last_sent: &str) -> bool {
     lf(buffer) != last_sent
@@ -435,7 +436,7 @@ fn an_untouched_foreign_file_adopts_to_last_sent_and_wakes_no_flush() {
     );
     assert!(!meta.read_only, "a copy in a temp dir is writable");
 
-    // THE ADOPTION, as surface.rs:945-948 performs it.
+    // THE ADOPTION, as surface.rs's `drain` / `Event::Loaded` arm performs it.
     let last_sent = adopt(&text);
     assert!(
         !last_sent.contains('\r'),
@@ -447,7 +448,8 @@ fn an_untouched_foreign_file_adopts_to_last_sent_and_wakes_no_flush() {
          comparing two equal strings by accident and proving nothing"
     );
 
-    // The widget holds exactly the adopted string (surface.rs:965), and SharedString is byte-exact
+    // The widget holds exactly the adopted string (surface.rs, the same arm's
+    // `set_buffer`), and SharedString is byte-exact
     // about it: the lossy part of this bridge is the ADOPTION, not the storage, and a claim made
     // against the toolkit's own type is worth more than one made against a String stand-in.
     let buffer: slint::SharedString = last_sent.clone().into();

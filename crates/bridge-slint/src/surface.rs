@@ -751,7 +751,7 @@ pub(crate) struct Pump {
     pub(crate) saves: u64,
     /// HYGIENE (P1b, the close-burn fix): a terminal ANSWER to a flush, whatever it was. The
     /// close wait used to watch `saves` alone - and with autosave OFF the port does not go
-    /// silent, it answers `AutosaveSkipped` (engine.rs:1233-1285), after which no `Saved` ever
+    /// silent, it answers `AutosaveSkipped` (engine.rs, fn `flush`), after which no `Saved` ever
     /// comes. So every close of an autosave-off session paid the whole SAVE_WAIT for an event
     /// that cannot exist. This counts the ANSWERED family: `Saved`, `SaveFailed`,
     /// `AutosaveSkipped`. A COUNT, not a bool, because the waiter has to see the answer that

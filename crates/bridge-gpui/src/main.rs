@@ -1183,8 +1183,9 @@ fn one_line(text: String) -> String {
 /// `String` on `GeometryNotRestored` and `SettingsCorrupt`, and the `Display` of
 /// `SaveError`/`LoadError`, which the port documents as the user-visible copy. The
 /// bridge only supplies words where the port deliberately left them out, which is
-/// `SkipReason` (crates/api/src/event.rs:797: "SkipReason carries no Display on
-/// purpose ... the words are" the UI's).
+/// `SkipReason` (crates/api/src/event.rs, `honesty_tests`' fn
+/// `a_missing_target_is_a_skip_and_a_refused_save_is_not_an_invented_string`: "SkipReason
+/// carries no Display on purpose ... the words are" the UI's).
 fn describe(event: &Event) -> String {
     match event {
         // `text` is never echoed: the bridge owns the buffer, and the editor is a
@@ -1854,9 +1855,10 @@ fn main() {
 /// chrome too wide - 16 px across, 8 down at 100 %, measured.
 ///
 /// * WINDOWED: harmless, because the port then applies the stored FRAME rect itself
-///   through `SetWindowPos` (`restore_and_pin`, engine.rs:1274+), which lives in the
-///   same space the session stores. The apply overwrites what gpui did, the measure reads
-///   back what was applied, and the round trip is closed in frame space - it cannot drift.
+///   through `SetWindowPos` (`Engine::restore_and_pin`, crates/api/src/engine.rs), which
+///   lives in the same space the session stores. The apply overwrites what gpui did, the
+///   measure reads back what was applied, and the round trip is closed in frame space - it
+///   cannot drift.
 ///   This is the fix the comment at `rect_of` records (`16 px across, 39 px down` per
 ///   cycle, gone).
 /// * MAXIMISED: `restore_and_pin` SKIPS the apply on purpose (moving a maximised window
