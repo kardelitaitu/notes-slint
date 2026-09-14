@@ -1368,8 +1368,12 @@ impl Engine {
                 // debounce and silently discard the autosave of the one
                 // document this product always has. Pinned by
                 // `the_scratch_bind_does_not_bump_the_epoch` in
-                // tests/scratch_restart.rs; the two bump sites are
-                // [`Engine::open`] and [`Engine::save_as`] and nothing else.
+                // tests/scratch_restart.rs. THE THREE bump sites, and no fourth:
+                // [`Engine::open`], [`Engine::save_as`] and
+                // [`Engine::restore_missing_scratch`] - the last one safe for the
+                // same reason as the other two, because it announces the number
+                // through the `Loaded` that follows it, which is the event a bridge
+                // mirrors the new buffer along with.
                 self.doc.save_as(&scratch);
                 self.detected = detected;
                 let read_only =
@@ -1456,21 +1460,26 @@ impl Engine {
     /// saved once - an arming that reached the disk and never reached the user.
     /// The precedent is [`Engine::bind_scratch`], which already announces an
     /// identity that did not move together with the generation it did not bump.
-    /// NO EPOCH BUMP here either: the bump sites stay [`Engine::open`] and
-    /// [`Engine::save_as`] and nothing else, which is what keeps the equality
+    /// NO EPOCH BUMP here either. The bump sites stay three and only three -
+    /// [`Engine::open`], [`Engine::save_as`] and
+    /// [`Engine::restore_missing_scratch`] - each one carrying the new number
+    /// inside the event that replaces the buffer, which is what keeps the equality
     /// test in the guard above a test a bridge can pass on its own echo.
     ///
-    /// NO NEW DOOR PAST THE PORT'S OWN GUARD. [`Engine::save_as`] refuses to
-    /// write a buffer into the file whose [`Command::Open`] was refused
-    /// (`load_refused_for`: the measured 0-byte overwrite) and that question
-    /// stays asked in that one place, because `Save` has no caller-named target:
-    /// it can only write `Document::path()`, a file this engine either read
-    /// successfully or created itself. The residue is named instead of hidden: a
-    /// refused RE-open of the path already open leaves `doc.path()` equal to
-    /// `load_refused_for`, and a Save then writes the buffer read earlier, which
-    /// is what a debounced [`Engine::flush`] already does today. So this slice
-    /// opens no exposure that Flush does not already have; widening or closing
-    /// it is the refused-load owner's decision, not a routing side effect.
+    /// THE PORT'S OWN GUARD APPLIES HERE TOO. [`Engine::save_as`] refuses to write
+    /// a buffer into the file whose [`Command::Open`] was refused
+    /// (`load_refused_for`: the measured 0-byte overwrite), and step 4b below asks
+    /// that same question of the path this command is about to write - because
+    /// `Save` may have no caller-named target, but it does have a target, and a
+    /// refused RE-open of the file already on screen leaves `doc.path()` equal to
+    /// `load_refused_for` with the epoch untouched, so neither of the two guards
+    /// above can see the danger. The question can only be asked in the port: the
+    /// refusal is api state, no Document was constructed for the refused name, and
+    /// core was never told. [`Engine::flush`] asks nothing of the kind today, and
+    /// that asymmetry is recorded rather than fixed here: closing it changes what a
+    /// debounced write may do, which is autosave's owner's call, not a routing
+    /// slice's. The ADR sentence this makes true is 0007's `api still applies the
+    /// refused-load guard`.
     fn save(&mut self, text: String, revision: u64, epoch: u64) {
         // 1. THE STALE GUARD - flush's, same shape because same payload.
         if epoch != self.epoch {
@@ -1502,6 +1511,33 @@ impl Engine {
             self.bind_scratch(&text, revision);
             return;
         };
+        // 4b. THE REFUSED-LOAD GUARD, the same question [`Engine::save_as`] asks at
+        //     its head and for the same measured reason: `load_refused_for` names a
+        //     file whose bytes this engine DECLINED to read, and writing the buffer
+        //     into it destroys a document nobody ever saw (the 0-byte overwrite).
+        //     ADR-0007 says api still applies this guard on the Save path, and only
+        //     api can: the refusal is port state, no Document was ever constructed
+        //     for the refused name, and core has no fact to consult here. The
+        //     reachable sequence, from the review: load A, type into it, re-Open A
+        //     and be refused (the read policy and the size stat move no epoch and
+        //     replace no Document), then press Save - step 1 passes because nothing
+        //     rebound, step 3 passes on flags still honest as far as core knows them,
+        //     and without this line the write lands. ANSWERED, not written, with the
+        //     SAME verdict Save As states for the same refusal
+        //     ([`SaveError::NoTarget`]) so the UI renders one reason and not two.
+        //     Pinned by a_save_cannot_write_the_file_whose_open_was_just_refused.
+        if self
+            .load_refused_for
+            .as_ref()
+            .is_some_and(|refused| identity_key(refused) == identity_key(&path))
+        {
+            self.emit(Self::document_save_failed(
+                path,
+                revision,
+                SaveError::NoTarget,
+            ));
+            return;
+        }
         // 5. THE WRITE, through the one write path, at the DETECTED settings -
         //    no second writer, no normalising a foreign file on the way (§4.5).
         let detected = self.detected;

@@ -402,8 +402,14 @@ pub enum Event {
     /// leave the status line telling the user to save once, about a file that has
     /// just been saved once. A Rebound with an UNCHANGED path and an UNCHANGED epoch
     /// is therefore legal and meaningful, not a bug: it is how an arming that reached
-    /// the disk also reaches the UI. Either way `meta` describes the file that exists
-    /// now, and this arrives right after [`Event::Saved`] for the same write.
+    /// the disk also reaches the UI. What `meta` states depends on which write
+    /// caused it, and the difference is real: a Save As RE-DETECTS its target,
+    /// because the bytes already on disk must win over the source format (§4.5),
+    /// while an in-place Save restates the format the open found - [`Engine::flush`]
+    /// behaviour, kept deliberately rather than improved on this one path. So a
+    /// Save As answers with what the file IS; a Save answers with what the write
+    /// USED. Either way this arrives right after [`Event::Saved`], for the same
+    /// write.
     ///
     /// A variant of its own rather than a second [`Event::Loaded`] because Loaded
     /// carries the whole text and the bridge owns the buffer: re-sending a document
